@@ -1,0 +1,31 @@
+# OS Command Injection (CWE-78) — OWASP A03:2021 Injection
+attack_type: cmdi
+
+positive_examples:
+  - payload: "; id"
+    response_snippet: "uid=33(www-data) gid=33(www-data) groups=33(www-data)"
+    reasoning: >
+      The response contains the output of the `id` command, proving the payload
+      was executed by a system shell — full command injection.
+  - payload: "| ping -c 5 oob-collab.example.com"
+    response_snippet: "out-of-band DNS resolution + ICMP received from target host"
+    reasoning: >
+      An out-of-band callback triggered by a shell metacharacter payload proves
+      blind command execution even with no output reflected in the response.
+  - payload: "$(sleep 5)"
+    response_snippet: "response delayed 5.2s vs 0.1s baseline, reproducible"
+    reasoning: >
+      A payload-controlled, reproducible time delay from a shell command
+      substitution is deterministic proof of blind OS command injection.
+
+negative_examples:
+  - payload: "; id"
+    response_snippet: '{"error":"invalid characters in filename"}'
+    reasoning: >
+      Input validation rejected the metacharacters and no command output or
+      timing change appeared — the shell never received the payload.
+  - payload: "$(sleep 5)"
+    response_snippet: "the literal text $(sleep 5) stored and echoed in the response, no delay"
+    reasoning: >
+      The payload is treated as a literal string (stored/echoed) with no delay
+      and no command output, so no shell interpretation took place.

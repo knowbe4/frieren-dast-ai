@@ -1,0 +1,86 @@
+# Cookie attribute checks — fires on every Set-Cookie header in the response.
+# Covers OWASP A02 / A07 (Session management weaknesses).
+
+rules:
+  - id: cookie-missing-httponly
+    title: Cookie Missing HttpOnly Flag
+    severity: medium
+    cwe: CWE-1004
+    description: >
+      A cookie is set without the HttpOnly attribute, making it accessible to
+      JavaScript and vulnerable to theft via XSS.
+    match:
+      cookie_flag_absent: httponly
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Cookie '{cookie_name}' does not have the HttpOnly attribute"
+    needs_ai_validation: false
+
+  - id: cookie-missing-secure
+    title: Cookie Missing Secure Flag
+    severity: medium
+    cwe: CWE-614
+    description: >
+      A cookie is set without the Secure attribute on an HTTPS response, meaning
+      it may be transmitted over unencrypted connections.
+    match:
+      cookie_flag_absent: secure
+    conditions:
+      content_type: any
+      scheme: https
+      one_per_host: true
+    evidence_template: >-
+      Cookie '{cookie_name}' served over HTTPS but missing the Secure attribute
+    needs_ai_validation: false
+
+  - id: cookie-missing-samesite
+    title: Cookie Missing SameSite Attribute
+    severity: low
+    cwe: CWE-352
+    description: >
+      A cookie does not specify a SameSite attribute. Without SameSite=Lax or
+      Strict the cookie is sent on cross-site requests, enabling CSRF attacks.
+    match:
+      cookie_flag_absent: samesite
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Cookie '{cookie_name}' does not have a SameSite attribute"
+    needs_ai_validation: false
+
+  - id: session-cookie-no-httponly
+    title: Session / Auth Cookie Missing HttpOnly Flag
+    severity: medium
+    cwe: CWE-1004
+    description: >
+      A session or authentication cookie is set without the HttpOnly attribute.
+      Theft of this cookie via XSS gives an attacker full session access.
+    match:
+      cookie_flag_absent: httponly
+      cookie_name_regex: 'session|sess|auth|token|jwt|sid|JSESSIONID|PHPSESSID|ASP\.NET_SessionId'
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Session/auth cookie '{cookie_name}' does not have the HttpOnly attribute
+    needs_ai_validation: false
+
+  - id: cookie-samesite-none-without-secure
+    title: Cookie SameSite=None Without Secure
+    severity: medium
+    cwe: CWE-614
+    description: >
+      A Set-Cookie header declares SameSite=None (cookie sent on all cross-site
+      requests) but omits the Secure attribute. Browsers reject such cookies, and
+      when honoured the cookie is transmitted cross-site over any protocol,
+      exposing it to interception and CSRF. SameSite=None requires Secure.
+    match:
+      # Set-Cookie declaring SameSite=None but with no Secure attribute.
+      # The engine compiles header_value_regex with re.IGNORECASE.
+      header_value_regex: '^(?=.*samesite\s*=\s*none)(?!.*\bsecure\b).+'
+      header_name: set-cookie
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Set-Cookie uses SameSite=None without Secure: '{value}'"
+    needs_ai_validation: false

@@ -1,0 +1,31 @@
+# MFA / OTP Bypass (CWE-287, CWE-307) — OWASP A07:2021
+attack_type: mfa_bypass
+
+positive_examples:
+  - payload: "POST /verify-otp with the otp parameter removed entirely"
+    response_snippet: "200 OK, session upgraded to fully authenticated without an OTP"
+    reasoning: >
+      Dropping the OTP field still completed the MFA step, proving the server
+      does not require the second factor when the parameter is absent.
+  - payload: "POST /verify-otp with otp=000000, brute-forced 10,000 times"
+    response_snippet: "no 429, no lockout; a correct code eventually accepted"
+    reasoning: >
+      No rate limiting or lockout on the OTP endpoint makes a 6-digit code
+      brute-forceable, defeating the second factor.
+  - payload: "reuse a previously consumed OTP code on a second request"
+    response_snippet: "200 OK, the same code validated twice"
+    reasoning: >
+      An OTP that is not invalidated after use can be replayed, undermining the
+      one-time property of the factor.
+
+negative_examples:
+  - payload: "POST /verify-otp with otp removed"
+    response_snippet: '400 Bad Request {"error":"otp is required"}'
+    reasoning: >
+      The server rejects the request without the OTP field, so the second factor
+      is still mandatory — no bypass.
+  - payload: "POST /verify-otp with otp=000000 repeatedly"
+    response_snippet: "429 Too Many Requests after 5 attempts, then temporary lockout"
+    reasoning: >
+      Rate limiting and lockout prevent brute force, so guessing the code is not
+      feasible — the control is effective.

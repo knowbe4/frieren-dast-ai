@@ -1,0 +1,26 @@
+# GraphQL IDOR / Broken Object-Level Authorization (CWE-639) — OWASP API1:2023
+attack_type: graphql_idor
+
+positive_examples:
+  - payload: 'query { user(id: "8842") { email phone ssn } }  (authenticated as user 8841)'
+    response_snippet: '{"data":{"user":{"email":"victim@other.com","phone":"...","ssn":"..."}}}'
+    reasoning: >
+      The GraphQL resolver returned another user's private fields by id with no
+      authorization check — object-level access control is missing.
+  - payload: 'query { node(id: "T3JkZXI6OTkzMQ==") { ... on Order { total items } } }'
+    response_snippet: "200 OK returning an order belonging to a different account"
+    reasoning: >
+      A base64 Relay global-id was decoded and fetched cross-account, proving the
+      node resolver does not enforce ownership.
+
+negative_examples:
+  - payload: 'query { user(id: "8842") { email } }  (as user 8841)'
+    response_snippet: '{"errors":[{"message":"Not authorized to access user 8842"}]}'
+    reasoning: >
+      The resolver enforced authorization and returned an error with no data, so
+      no other user's fields were disclosed.
+  - payload: 'query { user(id: "8842") { secretField } }'
+    response_snippet: '{"errors":[{"message":"Cannot query field \"secretField\" on type \"User\""}]}'
+    reasoning: >
+      This is a schema validation error (field does not exist), not an
+      authorization bypass — no data crossed a trust boundary.

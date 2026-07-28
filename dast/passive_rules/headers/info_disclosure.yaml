@@ -1,0 +1,84 @@
+# Information disclosure header checks — detects headers that reveal server
+# technology, version strings, or framework details to potential attackers.
+# Covers OWASP A05 (Security Misconfiguration) / CWE-200.
+
+rules:
+  - id: server-version-disclosure
+    title: Server Version Disclosure via Response Header
+    severity: low
+    cwe: CWE-200
+    description: >
+      A response header reveals the server or framework name and version string,
+      giving attackers a precise target for known CVE exploitation.
+    match:
+      # Fires on any of: server, x-powered-by, x-aspnet-version,
+      # x-aspnetmvc-version, x-generator
+      header_value_regex: >-
+        (apache|nginx|iis|php|asp\.net|wordpress|drupal|joomla|express|rack|django|rails|laravel|spring|tomcat|jetty|gunicorn|werkzeug)[/\s][\d.]
+      header_name_any:
+        - server
+        - x-powered-by
+        - x-aspnet-version
+        - x-aspnetmvc-version
+        - x-generator
+    conditions:
+      content_type: any
+    evidence_template: "Header '{header}: {value}' reveals server/framework version"
+    needs_ai_validation: false
+
+  - id: debug-mode-detected
+    title: Application Debug Mode Detected
+    severity: medium
+    cwe: CWE-215
+    description: >
+      The response body contains debug toolbar or debug-mode artefacts, indicating
+      that the application is running with debug output enabled in production.
+    match:
+      body_regex: 'X-Debug-Token|__debugbar|django\.request|DJANGO_DEBUG'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains debug mode indicator"
+    needs_ai_validation: true
+
+  - id: x-powered-by-present
+    title: X-Powered-By Header Present
+    severity: info
+    cwe: CWE-200
+    description: >
+      The X-Powered-By header is present, disclosing the underlying technology
+      stack even without an explicit version number.
+    match:
+      header_present: x-powered-by
+    conditions:
+      content_type: any
+    evidence_template: "Header 'x-powered-by: {value}' discloses technology stack"
+    needs_ai_validation: false
+
+  - id: aspnet-version-header
+    title: ASP.NET Version Disclosed via X-AspNet-Version Header
+    severity: low
+    cwe: CWE-200
+    description: >
+      The X-AspNet-Version header exposes the exact ASP.NET runtime version,
+      enabling targeted attacks against that specific runtime.
+    match:
+      header_present: x-aspnet-version
+    conditions:
+      content_type: any
+    evidence_template: "Header 'x-aspnet-version: {value}' discloses ASP.NET version"
+    needs_ai_validation: false
+
+  - id: x-generator-header
+    title: CMS/Framework Disclosed via X-Generator Header
+    severity: info
+    cwe: CWE-200
+    description: >
+      The X-Generator header reveals the CMS or framework that generated the
+      response, aiding attacker reconnaissance.
+    match:
+      header_present: x-generator
+    conditions:
+      content_type: any
+    evidence_template: "Header 'x-generator: {value}' discloses generator technology"
+    needs_ai_validation: false

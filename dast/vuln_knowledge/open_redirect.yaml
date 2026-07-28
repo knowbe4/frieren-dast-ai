@@ -1,0 +1,26 @@
+# Open Redirect (CWE-601) — OWASP A01:2021
+attack_type: open_redirect
+
+positive_examples:
+  - payload: "?next=https://evil.example.com"
+    response_snippet: "302 Found, Location: https://evil.example.com"
+    reasoning: >
+      The server issued a redirect to an attacker-controlled external domain
+      taken verbatim from user input — a classic open redirect.
+  - payload: "?returnUrl=//evil.example.com"
+    response_snippet: "302 Found, Location: //evil.example.com"
+    reasoning: >
+      A protocol-relative URL was honoured as the redirect target, sending the
+      victim to an external host — usable for phishing or token theft.
+
+negative_examples:
+  - payload: "?next=https://evil.example.com"
+    response_snippet: "302 Found, Location: /dashboard (input ignored, redirect stays on-site)"
+    reasoning: >
+      The server ignored the external value and redirected to a fixed internal
+      path, so the redirect target is not attacker-controlled.
+  - payload: "?next=https://evil.example.com"
+    response_snippet: "302 Found, Location: https://app.example.com/evil.example.com"
+    reasoning: >
+      The value was treated as a relative path appended to the trusted host, so
+      the victim never leaves the origin — not an open redirect.

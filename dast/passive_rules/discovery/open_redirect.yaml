@@ -1,0 +1,38 @@
+# Open redirect detection — identifies HTML meta-refresh tags and JavaScript
+# assignments that redirect users to arbitrary external URLs.
+# Covers OWASP A01 (Broken Access Control) / CWE-601.
+
+rules:
+  - id: open-redirect-meta
+    title: Potential Open Redirect via Meta Refresh Tag
+    severity: medium
+    cwe: CWE-601
+    description: >
+      The response body contains an HTML meta http-equiv=refresh tag with a
+      URL pointing to an external or dynamic destination. If the URL is
+      derived from user input this enables open redirect attacks.
+    match:
+      body_regex: '<meta[^>]+http-equiv=[''"]?refresh[''"]?[^>]+url=https?://'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a meta-refresh redirect to an external URL"
+    needs_ai_validation: true
+
+  - id: open-redirect-js
+    title: Potential Open Redirect via JavaScript Location Assignment
+    severity: low
+    cwe: CWE-601
+    description: >
+      The response body contains a JavaScript location.href or window.location
+      assignment to a hardcoded external URL. If the URL is built from user
+      input this indicates an open redirect vulnerability.
+    match:
+      # location.href = "http(s)://..." OR window.location = "http(s)://..."
+      # ('' is a single quote inside a YAML single-quoted scalar).
+      body_regex: '(?:location\.href|window\.location(?:\.href)?)\s*=\s*[''"]https?://[^''"]{10,}'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a JavaScript redirect to an external URL"
+    needs_ai_validation: true

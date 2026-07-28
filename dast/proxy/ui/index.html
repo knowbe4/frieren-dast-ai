@@ -1,0 +1,1944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Frieren DAST-AI</title>
+<link rel="stylesheet" href="/ui/styles.css">
+</head>
+<body>
+
+<!-- TOP BAR -->
+<div id="topbar">
+  <span class="logo">Frieren DAST-AI</span><span id="app-version" style="font-size:9px;color:var(--txt2);margin-left:5px;font-weight:400"></span>
+  <!-- Mode switcher -->
+  <div style="display:flex;background:var(--bg3);border:1px solid var(--bdr);border-radius:20px;padding:2px;gap:2px;margin-left:6px">
+    <button id="pill-manual" class="mode-pill on" onclick="setMode('manual')"
+            title="Manual mode — scan only when you click">manual</button>
+    <button id="pill-ai" class="mode-pill" onclick="setMode('ai')"
+            title="AI mode — auto-scan every intercepted request in scope">ai</button>
+  </div>
+  <div class="sep"></div>
+  <div id="ws-dot"></div>
+  <span id="ws-lbl">connecting...</span>
+  <div class="sep"></div>
+  <div id="ai-dot" style="width:7px;height:7px;border-radius:50%;background:#555"></div>
+  <span id="ai-lbl" style="font-size:11px;color:var(--txt2)">AI checking...</span>
+  <!-- session bar -->
+  <span style="font-size:11px;color:var(--txt2)">Session:</span>
+  <input id="session-name" value="Untitled session"
+         style="background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);
+                padding:2px 6px;border-radius:3px;font-size:11px;width:160px;font-family:inherit"
+         title="Session name — shown in saved file">
+  <button class="tbtn" onclick="saveSessionAs()" title="Save session — choose where to save">Save</button>
+  <label id="autosave-lbl" title="Auto-save every 5 minutes (requires at least one manual save first)"
+         style="display:none;font-size:11px;color:var(--txt2);user-select:none;cursor:pointer">
+    <input type="checkbox" id="autosave-chk" onchange="toggleAutoSave(this.checked)"
+           style="margin-right:3px;cursor:pointer">Auto-save
+  </label>
+  <span id="autosave-ts" style="display:none;font-size:10px;color:var(--txt2)"></span>
+  <button class="tbtn" onclick="document.getElementById('session-file-input').click()" title="Open session file from disk">Open</button>
+  <div class="sp"></div>
+  <div class="sep"></div>
+  <button class="tbtn" id="btn-sel" disabled onclick="scanSelected()" title="Scan checked requests with AI">Scan selected</button>
+  <button class="tbtn pri" onclick="scanAll()" title="Queue all captured requests for AI scan">Scan all</button>
+  <div class="sep"></div>
+  <button class="tbtn del" onclick="clearSession()">Clear</button>
+</div>
+
+<!-- MAIN TAB BAR -->
+<div id="tabbar">
+  <div class="mtab on"  id="mt-overview" onclick="switchMain('overview')">Dashboard</div>
+  <div class="mtab"     id="mt-proxy"    onclick="switchMain('proxy')">Proxy</div>
+  <div class="mtab"    id="mt-browse"   onclick="switchMain('browse')">Discovery</div>
+  <div class="mtab"    id="mt-ai"       onclick="switchMain('ai')">AI</div>
+  <div class="mtab"    id="mt-scan"     onclick="switchMain('scan')">Scan</div>
+  <div class="mtab"    id="mt-plugins"  onclick="switchMain('plugins')">Plugins</div>
+  <div class="mtab"    id="mt-graphql"  onclick="switchMain('graphql')">GraphQL</div>
+  <div class="mtab"    id="mt-repeater" onclick="switchMain('repeater')">Repeater</div>
+  <div class="mtab"    id="mt-intruder"      onclick="switchMain('intruder')">Intruder</div>
+  <div class="mtab"    id="mt-logs"     onclick="switchMain('logs')">Logs</div>
+  <div class="mtab"    id="mt-extras"   onclick="switchMain('extras')">Extras</div>
+</div>
+
+<!-- hidden file inputs for OS file picker -->
+<input type="file" id="session-file-input"  accept=".json" style="display:none" onchange="onSessionFileSelected(event)">
+<input type="file" id="settings-file-input" accept=".json" style="display:none" onchange="onSettingsFileSelected(event)">
+
+<!-- AI OFFLINE BANNER -->
+<div id="ai-offline-banner">
+  <strong>AI Offline</strong>
+  <span>AWS credentials expired — run <code>aws sso login</code> in your terminal, then click Resume.</span>
+  <button class="tbtn" id="ai-resume-btn" onclick="resumeAi()" style="margin-left:4px;border-color:#7a2020;background:#5a1d1d;color:#faa">Resume</button>
+  <span id="ai-resume-msg" style="font-size:10px;color:var(--txt2);display:none"></span>
+</div>
+
+<!-- SESSIONS MODAL OVERLAY -->
+<div id="sessions-overlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;
+     align-items:center;justify-content:center;">
+  <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;
+              width:700px;max-height:80vh;display:flex;flex-direction:column;overflow:hidden;">
+    <div style="padding:14px 18px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:10px">
+      <span style="font-weight:600;font-size:13px;flex:1">Saved Sessions</span>
+      <button class="tbtn" onclick="document.getElementById('session-file-input').click()" title="Open a session JSON from disk">Open from file</button>
+      <button class="tbtn" onclick="hideSessionsPanel()">Close</button>
+    </div>
+    <div style="padding:10px 18px;border-bottom:1px solid var(--bdr);display:flex;gap:8px;align-items:center">
+      <input id="new-session-name" placeholder="Session name..."
+             style="flex:1;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                    padding:4px 8px;border-radius:3px;font-size:12px;font-family:inherit">
+      <input id="new-session-desc" placeholder="Description (optional)"
+             style="flex:1;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                    padding:4px 8px;border-radius:3px;font-size:12px;font-family:inherit">
+      <button class="tbtn pri" onclick="saveNamedSessionAs()">Save current session</button>
+    </div>
+    <div style="flex:1;overflow-y:auto;" id="sessions-list">
+      <div class="empty">Loading...</div>
+    </div>
+  </div>
+</div>
+
+<div id="workspace">
+
+  <!-- ══ OVERVIEW / DASHBOARD PANEL ══ -->
+  <div class="tpanel on" id="panel-overview">
+    <div class="settings-body" style="max-width:none;padding:20px 28px;overflow-y:auto">
+
+      <!-- top stat cards -->
+      <div id="ov-stat-cards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:22px"></div>
+
+      <!-- middle row: findings by severity + agents status -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px">
+        <!-- findings breakdown -->
+        <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:5px;padding:14px 16px">
+          <div style="font-size:11px;color:var(--txt2);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:12px">Findings by Severity</div>
+          <div id="ov-findings-sev" style="display:flex;flex-direction:column;gap:7px"></div>
+        </div>
+        <!-- agent status -->
+        <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:5px;padding:14px 16px">
+          <div style="font-size:11px;color:var(--txt2);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:12px">Registered Agents</div>
+          <div id="ov-agents" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>
+      </div>
+
+      <!-- bottom row: recent findings + scan queue -->
+      <div style="display:grid;grid-template-columns:2fr 1fr;gap:16px">
+        <!-- recent findings -->
+        <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:5px;padding:14px 16px;min-height:200px">
+          <div style="font-size:11px;color:var(--txt2);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:10px">Recent Findings</div>
+          <div id="ov-recent-findings"></div>
+        </div>
+        <!-- scan engine status -->
+        <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:5px;padding:14px 16px">
+          <div style="font-size:11px;color:var(--txt2);font-weight:600;text-transform:uppercase;letter-spacing:.4px;margin-bottom:12px">Scan Engine</div>
+          <div id="ov-engine"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ PROXY PANEL ══ -->
+  <div class="tpanel" id="panel-proxy">
+    <div class="subtab-bar">
+      <div class="stab on" id="st-history"   onclick="switchProxySub('history')">HTTP history</div>
+      <div class="stab"    id="st-intercept" onclick="switchProxySub('intercept')">
+        Intercept<span id="intercept-badge"></span>
+      </div>
+      <div class="stab"    id="st-sitemap"   onclick="switchProxySub('sitemap')">Site map</div>
+      <div class="stab"    id="st-issues"    onclick="switchProxySub('issues')">Issues</div>
+      <div class="stab"    id="st-psettings" onclick="switchProxySub('psettings')">Settings</div>
+      <div class="sp"></div>
+      <button id="intercept-toggle-btn" class="intercept-btn" onclick="interceptToggle()"
+              title="Pause matching requests for manual review">Intercept</button>
+    </div>
+
+    <!-- HTTP history: three columns -->
+    <div id="proxy-history" style="display:flex;flex:1;overflow:hidden;">
+
+      <!-- col 1: hosts -->
+      <div class="hosts-col" id="proxy-hosts-col">
+        <div class="hosts-hdr">Hosts</div>
+        <div class="hosts-list" id="hosts-list">
+          <div class="host-all on" id="host-all" onclick="selectHost(null)">All hosts</div>
+        </div>
+      </div>
+      <div class="panel-resizer" id="proxy-resizer-left" title="Drag to resize"></div>
+
+      <!-- col 2: request list -->
+      <div id="list-col">
+        <div id="filterbar">
+          <input id="filter" placeholder="Filter path..." oninput="applyFilter()">
+          <span style="font-size:10px;color:var(--txt2);margin-left:2px">Show:</span>
+          <label title="Manual browser traffic"><input type="checkbox" id="chk-src-proxy"   checked onchange="applyFilter()"> <span class="src-tag src-proxy"  >proxy</span></label>
+          <label title="Headless browse session"><input type="checkbox" id="chk-src-browse"  checked onchange="applyFilter()"> <span class="src-tag src-browse" >browse</span></label>
+          <label title="SPA crawler traffic"><input type="checkbox" id="chk-src-crawler" checked onchange="applyFilter()"> <span class="src-tag src-crawler">crawl</span></label>
+          <label title="AI agent probes (LLM-driven)"><input type="checkbox" id="chk-src-agent" checked onchange="applyFilter()"> <span class="src-tag src-agent">agent</span></label>
+          <label title="Deterministic scan probes (code-driven)"><input type="checkbox" id="chk-src-scan" checked onchange="applyFilter()"> <span class="src-tag src-scan">scan</span></label>
+          <input type="checkbox" id="chk-src-oos" style="display:none" onchange="applyFilter()">
+          <div class="sep" style="margin:0 2px"></div>
+          <label><input type="checkbox" id="chk-conn" checked onchange="applyFilter()"> Hide CONNECT</label>
+          <label><input type="checkbox" id="chk-vuln" onchange="applyFilter()"> Vuln only</label>
+          <label title="Show requests outside configured scope" style="color:var(--txt2)">
+            <input type="checkbox" id="chk-oos-label" onchange="toggleOos()"> Out-of-scope
+          </label>
+          <div class="sep" style="margin:0 2px"></div>
+          <div style="position:relative;display:inline-block">
+            <button class="tbtn" style="font-size:10px;padding:2px 7px" onclick="toggleColMenu()" title="Show/hide columns">Columns ▾</button>
+            <div id="col-menu" style="display:none;position:absolute;top:100%;right:0;z-index:200;background:var(--bg3);border:1px solid var(--bdr);border-radius:4px;padding:6px 10px;min-width:110px;box-shadow:0 4px 12px #0006;white-space:nowrap">
+              <div style="font-size:10px;color:var(--txt2);margin-bottom:4px;font-weight:600">Visible columns</div>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="c1"   checked onchange="applyColVis()"> #</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="csrc" checked onchange="applyColVis()"> Src</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cm"   checked onchange="applyColVis()"> Method</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cs"   checked onchange="applyColVis()"> Status</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="ch"   checked onchange="applyColVis()"> Host</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cp"   checked onchange="applyColVis()"> Path</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cb"   checked onchange="applyColVis()"> Body</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cpl"  checked onchange="applyColVis()"> Payload</label>
+              <label style="display:block;font-size:11px;margin:2px 0"><input type="checkbox" data-col="cz"         onchange="applyColVis()"> ms</label>
+            </div>
+          </div>
+        </div>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr>
+              <th class="c0"><input type="checkbox" id="chk-all" onchange="toggleAll(this)"></th>
+              <th class="c1 sortable" id="th-seq"    onclick="setSort('seq')">#<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="csrc" title="Request source">Src<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cm sortable" id="th-method" onclick="setSort('method')">Method<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cs sortable" id="th-status" onclick="setSort('status')">St<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="ch sortable" id="th-host"   onclick="setSort('host')">Host<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cp sortable" id="th-path"   onclick="setSort('path')">Path<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cb"          id="th-body"   >Body<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cpl"         id="th-payload" title="Injected payload (agent probes only)">Payload<div class="col-resizer" onclick="event.stopPropagation()"></div></th>
+              <th class="cz sortable" id="th-ms"     onclick="setSort('ms')">ms</th>
+            </tr></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel-resizer" id="proxy-resizer-right" title="Drag to resize"></div>
+      <!-- col 3: detail -->
+      <div class="detail-col" id="proxy-detail-col">
+        <div class="dtab-bar" id="dtabs">
+          <div class="dtab on" id="dt-rr"      onclick="setDTab('rr')">Request / Response</div>
+          <div class="dtab"    id="dt-findings" onclick="setDTab('findings')">Findings</div>
+          <!-- Send to AI popover — triggered by context menu, anchored to panel -->
+          <div id="send-ai-popover" style="display:none;position:absolute;right:8px;top:36px;z-index:200;
+               background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;padding:12px 14px;
+               width:280px;box-shadow:0 4px 20px rgba(0,0,0,0.5)">
+            <div style="font-size:11px;font-weight:600;color:var(--txt);margin-bottom:8px">Send to AI Scanner</div>
+            <textarea id="send-ai-note" placeholder="Optional note for the AI (e.g. 'test mass assignment on role field')"
+              style="width:100%;box-sizing:border-box;height:64px;resize:vertical;background:var(--bg);border:1px solid var(--bdr);
+                     color:var(--txt);border-radius:3px;font-family:inherit;font-size:11px;padding:5px 7px;margin-bottom:8px"></textarea>
+            <div style="display:flex;gap:6px;justify-content:flex-end">
+              <button class="tbtn" onclick="closeSendToAI()" style="font-size:10px">Cancel</button>
+              <button class="tbtn pri" onclick="confirmSendToAI()" style="font-size:10px">Queue</button>
+            </div>
+          </div>
+        </div>
+        <div class="detail-body" id="dbody">
+          <div class="empty" id="empty-msg">Select a request to inspect it</div>
+        </div>
+        <!-- Passive findings bar — shown only when selected entry has passive findings -->
+        <div id="passive-bar" style="display:none;position:absolute;bottom:0;left:0;right:0;
+             background:#1a1500;border-top:1px solid var(--yellow);padding:5px 10px;
+             font-size:10.5px;display:none;align-items:center;gap:8px;cursor:pointer;z-index:10"
+             onclick="setDTab('findings');renderDetail()">
+          <span style="color:var(--yellow)">&#9888;</span>
+          <span id="passive-bar-txt" style="color:var(--yellow)"></span>
+          <span style="color:var(--blue);margin-left:auto;text-decoration:underline;font-size:10px">View findings ▸</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Intercept panel -->
+    <div id="proxy-intercept" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+      <!-- Top: queue list -->
+      <div style="display:flex;flex-direction:column;flex:0 0 200px;border-bottom:3px solid var(--bdr);overflow:hidden">
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 10px;background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0">
+          <span style="font-size:10px;font-weight:600;color:var(--orange);text-transform:uppercase;letter-spacing:.4px">Queue</span>
+          <span id="iq-count" style="font-size:10px;color:var(--txt2)">0 pending</span>
+          <div class="sp"></div>
+          <label style="display:flex;align-items:center;gap:4px;font-size:10px;color:var(--txt2);cursor:pointer;white-space:nowrap"
+                 title="Also pause responses before returning them to the browser">
+            <input type="checkbox" id="intercept-resp-chk" style="accent-color:var(--acc)"
+                   onchange="interceptToggleResponse(this.checked)">
+            Intercept responses
+          </label>
+          <button class="tbtn" style="font-size:10px;padding:2px 8px" onclick="interceptForwardAll()">Forward All</button>
+        </div>
+        <div id="intercept-queue-list" style="flex:1;overflow-y:auto">
+          <div style="padding:20px;color:var(--txt2);font-size:11px;text-align:center">
+            Intercept is OFF — toggle the button above to start capturing requests.
+          </div>
+        </div>
+      </div>
+      <!-- Bottom: editor with Request / Response tabs -->
+      <div style="display:flex;flex-direction:column;flex:1;overflow:hidden">
+        <div style="display:flex;align-items:center;gap:0;padding:0;background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0">
+          <button id="ie-tab-req" class="dtab on" style="border-radius:0;border-right:1px solid var(--bdr)"
+                  onclick="_interceptSwitchTab('request')">Request</button>
+          <button id="ie-tab-resp" class="dtab" style="border-radius:0;border-right:1px solid var(--bdr)"
+                  onclick="_interceptSwitchTab('response')">Response</button>
+          <div class="sp"></div>
+          <span id="ie-title" style="font-size:10px;color:var(--txt2);padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px"></span>
+          <div class="sp"></div>
+          <button id="ie-drop-btn" class="tbtn" style="font-size:10px;padding:2px 8px;margin:3px 4px;background:#4a100020;color:#ff6b6b;border-color:#7a202060"
+                  onclick="interceptDrop()" disabled>Drop</button>
+          <button id="ie-fwd-btn" class="tbtn pri" style="font-size:10px;padding:2px 8px;margin:3px 8px 3px 0"
+                  onclick="interceptForward()" disabled>Forward</button>
+        </div>
+        <textarea id="intercept-raw" spellcheck="false"
+          style="flex:1;resize:none;background:var(--bg);border:none;outline:none;color:var(--txt);
+                 font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;
+                 padding:10px 14px;overflow:auto"
+          placeholder="Select a request above to edit its headers and body, then click Forward."></textarea>
+      </div>
+    </div>
+
+    <!-- Proxy Settings -->
+    <div id="proxy-settings" style="display:none;flex:1;overflow:hidden;">
+      <div class="settings-body">
+        <h2>Proxy Settings</h2>
+
+        <!-- Settings save/load bar -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--bdr)">
+          <span style="font-size:11px;color:var(--txt2);white-space:nowrap">Settings:</span>
+          <input id="inp-project-name" placeholder="settings name"
+                 style="width:160px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
+          <button class="tbtn pri" style="white-space:nowrap" onclick="saveProject()">Save</button>
+          <button class="tbtn" style="white-space:nowrap" onclick="document.getElementById('settings-file-input').click()">Import</button>
+          <select id="sel-preset" onchange="loadPreset(this)"
+                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px;cursor:pointer">
+            <option value="">Load preset...</option>
+          </select>
+        </div>
+
+        <!-- Include in scope -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Include in scope</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('include')">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">
+          Leave empty to record everything. Host/port/file: wildcards (<code style="color:var(--orange)">*.example.com</code>) or regex.
+        </p>
+        <div id="add-include-form" style="display:none;margin-bottom:4px"></div>
+        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:14px">
+          <table id="tbl-include" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-include"></tbody>
+          </table>
+          <div id="empty-include" style="font-size:11px;color:var(--green);padding:5px 8px">All URLs included (no filter active)</div>
+        </div>
+
+        <!-- Exclude from scope -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Exclude from scope</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('exclude')">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">Exclude rules take priority over include rules.</p>
+        <div id="add-exclude-form" style="display:none;margin-bottom:4px"></div>
+        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:18px">
+          <table id="tbl-exclude" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-exclude"></tbody>
+          </table>
+          <div id="empty-exclude" style="font-size:11px;color:var(--txt2);padding:5px 8px">No exclusions configured</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:14px">
+
+        <!-- Bypass + Hidden Ext side by side -->
+        <div style="display:flex;gap:20px">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+              <h3 style="margin:0">Bypass Domains</h3>
+            </div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Forwarded as-is — no MITM, no recording.</p>
+            <div style="display:flex;gap:5px;margin-bottom:5px">
+              <input id="inp-bypass" placeholder="e.g. accounts.google.com"
+                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addBypass()">Add</button>
+            </div>
+            <div id="list-bypass" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0"></div>
+          </div>
+
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+              <h3 style="margin:0">Hidden Extensions</h3>
+            </div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Not recorded in HTTP history.</p>
+            <div style="display:flex;gap:5px;margin-bottom:5px">
+              <input id="inp-ext" placeholder="e.g. .js or js"
+                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addExt()">Add</button>
+            </div>
+            <div id="list-ext" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0;display:flex;flex-wrap:wrap;gap:3px;align-content:flex-start"></div>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:14px 0">
+
+        <!-- Match & Replace -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Match and Replace</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddMrForm()">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">
+          Automatically rewrite requests and responses matching a regex. Applies to all proxied traffic (scanner probes excluded).
+        </p>
+        <div id="add-mr-form" style="display:none;margin-bottom:8px;padding:10px;border:1px solid var(--bdr);border-radius:3px;background:var(--bg2)">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Scope</label>
+              <select id="mr-scope" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+                <option value="request">Request</option>
+                <option value="response">Response</option>
+                <option value="both">Both</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Type</label>
+              <select id="mr-type" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+                <option value="header">Header</option>
+                <option value="body">Body</option>
+                <option value="url">URL</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Match (regex)</label>
+              <input id="mr-match" placeholder="e.g. Authorization: .*" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Replace</label>
+              <input id="mr-replace" placeholder="e.g. Authorization: Bearer token123" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+          </div>
+          <div style="margin-bottom:8px">
+            <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Comment (optional)</label>
+            <input id="mr-comment" placeholder="e.g. inject test auth token"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="tbtn" onclick="document.getElementById('add-mr-form').style.display='none'">Cancel</button>
+            <button class="tbtn pri" onclick="saveMrRule()">Add Rule</button>
+          </div>
+        </div>
+        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
+          <table id="tbl-mr" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="background:var(--bg3)">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Scope</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Type</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Match</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Replace</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Comment</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-mr"></tbody>
+          </table>
+          <div id="empty-mr" style="font-size:11px;color:var(--txt2);padding:6px 8px">No rules configured</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
+
+        <!-- ── Setup (formerly its own top-level tab) ── -->
+        <h2>Setup</h2>
+
+        <h3>AI Engine Status</h3>
+        <div id="setup-ai-status" style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                  padding:10px 14px;margin-bottom:16px;font-size:11px;line-height:1.8"></div>
+
+        <h3>1. Configure browser proxy</h3>
+        <p>Point HTTP and HTTPS proxy at:</p>
+        <div class="cblk" id="proxy-addr">Host: 127.0.0.1
+Port: 8080</div>
+        <p style="color:var(--txt2);font-size:11px">
+          Chrome/Edge: Settings → System → Open proxy settings → Manual proxy<br>
+          Firefox: Preferences → Network Settings → Manual proxy configuration
+        </p>
+
+        <h3>2. Install the CA certificate (once)</h3>
+        <p>Download and trust the CA so your browser accepts intercepted HTTPS:</p>
+        <a class="dlbtn" href="/ca.crt" download="dast-ai-ca.crt">Download CA Certificate</a>
+        <p style="color:var(--txt2);font-size:11px;margin-top:8px">
+          The certificate is stored at <code style="color:var(--orange)">~/.dast-ai/ca.crt</code>
+          and reused on every restart — you only need to install it once.
+        </p>
+
+        <h3>macOS (Chrome / Edge / Safari)</h3>
+        <div class="cblk">sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/Downloads/dast-ai-ca.crt</div>
+
+        <h3>Firefox (any OS)</h3>
+        <div class="cblk">about:preferences#privacy
+→ Certificates → View Certificates → Authorities
+→ Import → dast-ai-ca.crt
+→ check "Trust this CA to identify websites"</div>
+
+        <h3>Windows</h3>
+        <div class="cblk">certutil -addstore -f Root dast-ai-ca.crt</div>
+
+      </div>
+    </div>
+
+    <!-- Site map (formerly Target tab) -->
+    <div id="proxy-sitemap" style="display:none;flex:1;overflow:hidden;">
+
+      <!-- host tree -->
+      <div class="hosts-col" id="target-hosts-col">
+        <div class="hosts-hdr">Hosts</div>
+        <div style="padding:4px 10px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+          <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:var(--txt2);cursor:pointer"
+                 title="Show hosts outside configured scope">
+            <input type="checkbox" id="sm-chk-oos" style="accent-color:var(--acc)"
+                   onchange="renderSmHostList()">
+            Out-of-scope
+          </label>
+        </div>
+        <div class="hosts-list" id="sm-hosts-list"></div>
+      </div>
+      <div class="panel-resizer" id="target-resizer-left" title="Drag to resize"></div>
+
+      <!-- right side: contents table (top) + detail (bottom) -->
+      <div id="target-right-col" style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
+        <div style="flex:1;overflow-y:auto;border-bottom:3px solid var(--bdr);min-height:100px;">
+          <table>
+            <thead><tr>
+              <th class="cm">Method</th>
+              <th>Path</th>
+              <th class="cs">St</th>
+              <th class="cz">ms</th>
+            </tr></thead>
+            <tbody id="sm-tbody"></tbody>
+          </table>
+        </div>
+        <div style="height:40%;min-height:100px;display:flex;flex-direction:column;overflow:hidden;">
+          <div class="dtab-bar">
+            <div class="dtab on" id="sdt-rr"      onclick="setSmDTab('rr')">Request / Response</div>
+            <div class="dtab"    id="sdt-findings" onclick="setSmDTab('findings')">Findings</div>
+          </div>
+          <div class="detail-body" id="sm-detail-body">
+            <div class="empty">Select a request from the table above</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+
+    <!-- Issues: all findings grouped by host -->
+    <div id="proxy-issues" style="display:none;flex:1;overflow:hidden;flex-direction:column;">
+      <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--bg2);
+                  border-bottom:1px solid var(--bdr);flex-shrink:0;">
+        <div style="display:flex;gap:4px;">
+          <button id="issues-tab-all" class="tbtn" style="font-size:10px;padding:2px 10px;background:var(--acc);color:#000;border-color:var(--acc)" onclick="switchIssuesTab('all')">Findings</button>
+          <button id="issues-tab-fp" class="tbtn" style="font-size:10px;padding:2px 10px" onclick="switchIssuesTab('fp')">False Positives <span id="issues-fp-count" style="font-size:9px;opacity:.7"></span></button>
+        </div>
+        <span style="font-size:11px;color:var(--txt2);flex:1"></span>
+        <button class="tbtn" onclick="window.open('/api/export/sarif','_blank')" title="Download findings as SARIF 2.1.0 (GitHub/GitLab Security tab)">Download SARIF</button>
+        <button class="tbtn" onclick="openImportFindingsModal()" title="Import findings from external reports (JSON, Markdown, any format)">Import Findings</button>
+      </div>
+      <div class="issues-wrap" id="issues-wrap">
+        <div class="empty">No findings yet.\nScan requests to discover vulnerabilities.</div>
+      </div>
+      <div id="issues-pager" style="display:none;align-items:center;gap:6px;padding:6px 14px;
+           border-top:1px solid var(--bdr);background:var(--bg2);flex-shrink:0;font-size:11px">
+        <button class="tbtn" onclick="issuesPage(-1)">‹ Prev</button>
+        <span id="issues-page-lbl" style="color:var(--txt2)"></span>
+        <button class="tbtn" onclick="issuesPage(1)">Next ›</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ IMPORT FINDINGS MODAL ══ -->
+  <div id="import-findings-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);
+       z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;
+                width:620px;max-width:96vw;max-height:90vh;display:flex;flex-direction:column;
+                box-shadow:0 8px 40px rgba(0,0,0,.6);">
+      <div style="display:flex;align-items:center;padding:12px 16px;border-bottom:1px solid var(--bdr);">
+        <span style="font-size:13px;font-weight:600;flex:1">Import Findings from External Report</span>
+        <button class="tbtn" onclick="closeImportFindingsModal()" style="padding:2px 8px">✕</button>
+      </div>
+      <div style="padding:16px;overflow-y:auto;flex:1;">
+        <p style="font-size:11px;color:var(--txt2);margin:0 0 12px 0">
+          Paste or upload any security report — JSON, Markdown, scanner export, ZAP report, SAST output, or plain text.
+          The AI infers the endpoint path; findings are tested against every host already seen in the proxy.
+        </p>
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--txt2);display:block;margin-bottom:4px">
+            Hosts to test against
+            <span style="color:var(--txt3)">(from proxy history — select all that apply)</span>
+          </label>
+          <div id="import-hosts-list" style="display:flex;flex-wrap:wrap;gap:6px;min-height:26px">
+            <span style="font-size:10px;color:var(--txt3);font-style:italic">No hosts in proxy yet</span>
+          </div>
+        </div>
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--txt2);display:block;margin-bottom:4px">
+            Manual host override
+            <span style="color:var(--txt3)">(use when AI can't detect the right host, or no proxy history)</span>
+          </label>
+          <div style="display:flex;gap:6px;align-items:center">
+            <input id="import-manual-host" type="text"
+                   placeholder="https://api.example.com"
+                   style="flex:1;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:4px 8px;border-radius:3px;font-family:monospace;font-size:11px">
+            <button class="tbtn" onclick="importAddManualHost()" style="white-space:nowrap">Add host</button>
+          </div>
+          <div id="import-manual-host-list" style="display:flex;flex-wrap:wrap;gap:5px;margin-top:5px"></div>
+        </div>
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--txt2);display:block;margin-bottom:4px">Report file <span style="color:var(--txt3)">(or paste text below)</span></label>
+          <input type="file" id="import-file-picker" accept=".json,.md,.txt,.xml,.html,.csv"
+                 onchange="importFileSelected(this)"
+                 style="font-size:11px;color:var(--txt2);width:100%">
+        </div>
+        <div style="margin-bottom:10px">
+          <label style="font-size:11px;color:var(--txt2);display:block;margin-bottom:4px">Report content</label>
+          <textarea id="import-content" rows="12" placeholder="Paste JSON, Markdown, or any report text here..."
+                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                           padding:5px 9px;border-radius:3px;font-family:monospace;font-size:11px;
+                           resize:vertical;box-sizing:border-box;white-space:pre;overflow:auto"></textarea>
+        </div>
+        <div id="import-status" style="font-size:11px;color:var(--txt2);min-height:18px"></div>
+      </div>
+      <div style="display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--bdr);justify-content:flex-end;">
+        <button class="tbtn" onclick="closeImportFindingsModal()">Cancel</button>
+        <button class="tbtn pri" id="import-submit-btn" onclick="submitImportFindings()">Import &amp; Scan</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ BROWSE PANEL ══ -->
+  <div class="tpanel" id="panel-browse" style="flex-direction:column">
+    <div class="subtab-bar">
+      <div class="stab on" id="st-browse-manual"    onclick="switchBrowseSub('manual')">Manual Browse</div>
+      <div class="stab"    id="st-browse-crawl"     onclick="switchBrowseSub('crawl')">Crawl</div>
+      <div class="stab"    id="st-browse-discovery" onclick="switchBrowseSub('discovery')">Content Discovery</div>
+    </div>
+    <div id="browse-sub-manual" style="flex:1;overflow-y:auto;display:block">
+    <div class="settings-body">
+      <h2>Manual Browse</h2>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:16px">
+        Opens a Chromium window routed through the proxy. Browse the target manually —
+        every request is recorded and tagged with the session ID so you can scan exactly
+        what you visited.
+      </p>
+
+      <h3>Start URL (optional)</h3>
+      <input id="browse-url" placeholder="https://example.com/app/page"
+             style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                    padding:5px 9px;border-radius:3px;font-family:inherit;font-size:12px;margin-bottom:12px">
+
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:20px;flex-wrap:wrap">
+        <button class="tbtn pri" id="browse-start-btn" onclick="startBrowse()">Open Browser</button>
+        <button class="tbtn del" id="browse-stop-btn"  onclick="stopBrowse()" disabled>Close Browser</button>
+        <span id="browse-status" style="font-size:11px;color:var(--txt2)"></span>
+      </div>
+
+      <div id="browse-session-info" style="display:none">
+        <h3>Active Session</h3>
+        <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                    padding:10px 14px;margin-bottom:10px;font-size:11px">
+          <span style="color:var(--txt2)">Session ID: </span>
+          <span id="browse-session-id" style="color:var(--acc2);font-family:monospace"></span>
+          <span id="browse-req-count" style="color:var(--txt2);margin-left:12px"></span>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="tbtn" onclick="filterBrowseSession()">Show only this session</button>
+          <button class="tbtn pri" onclick="scanBrowseSession()">Scan this session</button>
+          <button class="tbtn" onclick="crawlFromBrowse()">Crawl from here</button>
+        </div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
+
+      <h3 style="margin:0 0 4px">Multi-User Testing (IDOR)</h3>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:14px">
+        Add 2 or more sessions — the AI scanner will automatically replay requests
+        across sessions to detect privilege escalation and cross-account data leaks.
+      </p>
+
+      <!-- Mode tabs -->
+      <div style="display:flex;gap:0;margin-bottom:14px;border:1px solid var(--bdr);border-radius:4px;overflow:hidden;width:fit-content">
+        <button id="mu-tab-browser" onclick="switchMuTab('browser')"
+                style="padding:5px 14px;font-size:11px;border:none;cursor:pointer;
+                       background:var(--acc);color:#fff">Named Browser</button>
+        <button id="mu-tab-creds" onclick="switchMuTab('creds')"
+                style="padding:5px 14px;font-size:11px;border:none;cursor:pointer;
+                       background:var(--bg2);color:var(--txt2);border-left:1px solid var(--bdr)">Credentials</button>
+      </div>
+
+      <!-- ── Named Browser mode ── -->
+      <div id="mu-panel-browser">
+        <p style="color:var(--txt2);font-size:11px;margin-bottom:10px">
+          Opens an isolated browser window per user. Each window has its own cookie store —
+          logging out in one never affects the other.
+        </p>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+          <input id="nb-name" placeholder="name (e.g. user_a)"
+                 style="width:120px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                        padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          <input id="nb-role" placeholder="role (e.g. member)"
+                 style="width:110px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                        padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          <input id="nb-url" placeholder="start URL (optional)"
+                 style="width:160px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                        padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          <button class="tbtn pri" onclick="openNamedBrowser()">Open Browser</button>
+        </div>
+        <!-- Active named browsers -->
+        <div id="named-browsers-list" style="font-size:11px;color:var(--txt2);margin-bottom:8px"></div>
+      </div>
+
+      <!-- ── Credentials mode ── -->
+      <div id="mu-panel-creds" style="display:none">
+        <p style="color:var(--txt2);font-size:11px;margin-bottom:10px">
+          Headless login — no browser window. Ideal for AI scans where you just need
+          cookies from a known username/password.
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+          <div>
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">Name</div>
+            <input id="cred-name" placeholder="e.g. admin"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          </div>
+          <div>
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">Role</div>
+            <input id="cred-role" placeholder="e.g. admin"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          </div>
+          <div style="grid-column:1/-1">
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">Login URL</div>
+            <input id="cred-url" placeholder="https://example.com/login"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          </div>
+          <div>
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">Username / Email</div>
+            <input id="cred-username" placeholder="user@example.com"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          </div>
+          <div>
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">Password</div>
+            <input id="cred-password" type="password" placeholder="••••••••"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                          padding:5px 8px;border-radius:4px;font-family:inherit;font-size:11px">
+          </div>
+        </div>
+        <!-- Advanced selectors (collapsed) -->
+        <details style="margin-bottom:10px">
+          <summary style="font-size:10px;color:var(--txt2);cursor:pointer;user-select:none">Advanced: custom field selectors</summary>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:8px">
+            <div>
+              <div style="font-size:10px;color:var(--txt2);margin-bottom:2px">Username selector</div>
+              <input id="cred-sel-user" placeholder="input[name=email]"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                            padding:4px 7px;border-radius:4px;font-family:monospace;font-size:10px">
+            </div>
+            <div>
+              <div style="font-size:10px;color:var(--txt2);margin-bottom:2px">Password selector</div>
+              <input id="cred-sel-pass" placeholder="input[type=password]"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                            padding:4px 7px;border-radius:4px;font-family:monospace;font-size:10px">
+            </div>
+            <div>
+              <div style="font-size:10px;color:var(--txt2);margin-bottom:2px">Submit selector</div>
+              <input id="cred-sel-submit" placeholder="button[type=submit]"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                            padding:4px 7px;border-radius:4px;font-family:monospace;font-size:10px">
+            </div>
+          </div>
+        </details>
+        <button class="tbtn pri" id="cred-login-btn" onclick="loginWithCredentials()">Login &amp; Save Session</button>
+        <span id="cred-status" style="margin-left:10px;font-size:11px;color:var(--txt2)"></span>
+      </div>
+
+      <!-- Saved sessions list (shared across both modes) -->
+      <div id="named-sessions-list" style="font-size:11px;color:var(--txt2);margin-top:14px">
+        No sessions saved yet.
+      </div>
+    </div>
+    </div><!-- /browse-sub-manual -->
+
+    <!-- ── Crawl (formerly its own top-level tab) ── -->
+    <div id="browse-sub-crawl" style="flex:1;overflow-y:auto;display:none">
+    <div class="settings-body">
+      <h2>SPA Crawler</h2>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:8px">
+        Opens a Chromium browser, navigates to the target URL, clicks through
+        interactive elements and records all API calls into the HTTP history for scanning.
+      </p>
+      <div id="crawl-cookie-status" style="display:flex;align-items:center;gap:8px;
+           padding:7px 10px;border-radius:4px;font-size:11px;margin-bottom:14px;
+           background:var(--bg2);border:1px solid var(--bdr)">
+        <span id="crawl-cookie-dot" style="width:8px;height:8px;border-radius:50%;
+              background:#666;display:inline-block;flex-shrink:0"></span>
+        <span id="crawl-cookie-label" style="color:var(--txt2)">Checking session cookies…</span>
+        <button class="tbtn" onclick="switchBrowseSub('manual')"
+                style="margin-left:auto;font-size:10px;padding:2px 8px">Browse &amp; Login</button>
+      </div>
+
+      <h3>Target URL</h3>
+      <input id="crawl-url" placeholder="https://example.com/app/page"
+             style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                    padding:5px 9px;border-radius:3px;font-family:inherit;font-size:12px;margin-bottom:12px">
+
+      <h3>Options</h3>
+      <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer">
+          <input type="checkbox" id="crawl-headless" checked style="accent-color:var(--acc)"> Headless
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt)">
+          Max clicks:
+          <input type="number" id="crawl-max-clicks" value="200" min="10" max="2000"
+                 style="width:70px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                        padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+        </label>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+        <button class="tbtn pri" id="crawl-start-btn" onclick="startCrawl()">Start Crawl</button>
+        <button class="tbtn del" id="crawl-stop-btn"  onclick="stopCrawl()" disabled>Stop</button>
+        <span id="crawl-live-stats" style="font-size:11px;color:var(--txt2)"></span>
+        <button class="tbtn" id="crawl-scan-btn" onclick="scanCrawled()" style="display:none">Scan crawled</button>
+        <button class="tbtn" onclick="viewCrawled()">View in history</button>
+      </div>
+
+      <h3>Log</h3>
+      <div id="crawl-log"
+           style="background:var(--bg);border:1px solid var(--bdr);border-radius:4px;
+                  padding:8px 12px;height:360px;overflow-y:auto;font-size:11px;line-height:1.7;
+                  color:var(--txt2);font-family:inherit;white-space:pre-wrap;"></div>
+    </div>
+    </div><!-- /browse-sub-crawl -->
+
+    <div id="browse-sub-discovery" style="flex:1;overflow-y:auto;display:none">
+    <div class="settings-body">
+      <h2>Content Discovery</h2>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:8px">
+        Forced browsing: probes a curated list of common directories, files, and
+        GraphQL endpoint paths against an in-scope host to surface endpoints nothing
+        links to. GET-only recon — hits appear in HTTP history (tagged "discovery")
+        and as review suggestions in the AI tab. The target must be in scope.
+      </p>
+
+      <h3>Target URL</h3>
+      <input id="disc-url" placeholder="https://example.com"
+             style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                    padding:5px 9px;border-radius:3px;font-family:inherit;font-size:12px;margin-bottom:12px">
+
+      <h3>Wordlists</h3>
+      <div style="display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer">
+          <input type="checkbox" id="disc-dirs" checked style="accent-color:var(--acc)"> Directories (~100)
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer">
+          <input type="checkbox" id="disc-files" checked style="accent-color:var(--acc)"> Files (~100)
+        </label>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer">
+          <input type="checkbox" id="disc-graphql" checked style="accent-color:var(--acc)"> GraphQL paths
+        </label>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap">
+        <button class="tbtn pri" id="disc-start-btn" onclick="startDiscovery()">Start Discovery</button>
+        <button class="tbtn del" id="disc-stop-btn"  onclick="stopDiscovery()" disabled>Stop</button>
+        <span id="disc-live-stats" style="font-size:11px;color:var(--txt2)"></span>
+      </div>
+
+      <h3>Hits</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:11px;margin-bottom:16px">
+        <thead>
+          <tr style="text-align:left;color:var(--txt2);border-bottom:1px solid var(--bdr)">
+            <th style="padding:4px 8px">Kind</th><th style="padding:4px 8px">Status</th>
+            <th style="padding:4px 8px">Path</th><th style="padding:4px 8px">Size</th>
+          </tr>
+        </thead>
+        <tbody id="disc-results"></tbody>
+      </table>
+
+      <h3>Log</h3>
+      <div id="disc-log"
+           style="background:var(--bg);border:1px solid var(--bdr);border-radius:4px;
+                  padding:8px 12px;height:280px;overflow-y:auto;font-size:11px;line-height:1.7;
+                  color:var(--txt2);font-family:inherit;white-space:pre-wrap;"></div>
+    </div>
+    </div><!-- /browse-sub-discovery -->
+  </div><!-- /panel-browse -->
+
+  <!-- ══ PLUGINS PANEL ══ -->
+  <!-- ══ AI PANEL ══ -->
+  <div class="tpanel" id="panel-ai" style="flex-direction:column">
+    <div class="subtab-bar">
+      <div class="stab on" id="st-ai-suggestions" onclick="switchAiSub('suggestions')">Suggestions</div>
+      <div class="stab"    id="st-ai-settings"    onclick="switchAiSub('settings')">Settings</div>
+    </div>
+
+    <!-- ── AI Suggestions sub-panel ── -->
+    <div id="ai-sub-suggestions" style="flex:1;overflow-y:auto;padding:18px 24px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+        <h2 style="margin:0">AI Suggestions</h2>
+        <div style="display:flex;align-items:center;gap:10px">
+          <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer"
+                 title="Auto-scan new suggestions as they arrive (enabled automatically in AI mode)">
+            <input type="checkbox" id="ai-auto-scan" style="accent-color:var(--green)" onchange="toggleAutoScan(this)">
+            Auto-scan
+          </label>
+          <button class="tbtn pri" id="ai-scan-all-btn" onclick="scanAllSuggestions()">Scan All</button>
+          <button class="tbtn" onclick="loadAiSuggestions()">Refresh</button>
+        </div>
+      </div>
+
+      <!-- Session intelligence summary -->
+      <div id="ai-intel-summary" style="margin-bottom:16px"></div>
+
+      <!-- Suggestions table -->
+      <div id="ai-suggestions-wrap">
+        <div style="color:var(--txt2);font-size:11px;padding:12px 0">No suggestions yet — the AI will populate this as it analyses traffic through the proxy.</div>
+      </div>
+      <div id="sugg-pager" style="display:none;align-items:center;gap:6px;padding:8px 0;font-size:11px">
+        <button class="tbtn" onclick="suggPage(-1)">‹ Prev</button>
+        <span id="sugg-page-lbl" style="color:var(--txt2)"></span>
+        <button class="tbtn" onclick="suggPage(1)">Next ›</button>
+      </div>
+    </div><!-- end ai-sub-suggestions -->
+
+    <!-- ── AI Settings sub-panel ── -->
+    <div id="ai-sub-settings" style="flex:1;overflow-y:auto;display:none">
+    <div class="settings-body" style="max-width:860px">
+
+      <h2>AI Settings</h2>
+
+      <!-- Provider selection -->
+      <h3 style="margin-bottom:4px">Provider</h3>
+      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below. Takes effect immediately.</p>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+        <select id="sc-ai-provider" onchange="onProviderChange()"
+                style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+          <option value="bedrock">AWS Bedrock (SSO / AWS credentials)</option>
+          <option value="anthropic">Anthropic API (api.anthropic.com)</option>
+          <option value="openai">OpenAI / compatible (api.openai.com)</option>
+        </select>
+      </div>
+      <!-- Anthropic credentials -->
+      <div id="provider-anthropic" style="display:none;margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Anthropic API key</p>
+            <input id="sc-anthropic-key" type="password" placeholder="sk-ant-..." autocomplete="off"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+            <p id="sc-anthropic-key-set" style="color:var(--green);font-size:10px;margin-top:3px;display:none">A key is configured. Leave blank to keep it.</p>
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Base URL (optional)</p>
+            <input id="sc-anthropic-url" type="text" placeholder="https://api.anthropic.com"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+        </div>
+      </div>
+      <!-- OpenAI credentials -->
+      <div id="provider-openai" style="display:none;margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">OpenAI API key</p>
+            <input id="sc-openai-key" type="password" placeholder="sk-..." autocomplete="off"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+            <p id="sc-openai-key-set" style="color:var(--green);font-size:10px;margin-top:3px;display:none">A key is configured. Leave blank to keep it.</p>
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Base URL (OpenAI-compatible)</p>
+            <input id="sc-openai-url" type="text" placeholder="https://api.openai.com/v1"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+        <button class="tbtn pri" onclick="saveProvider()">Apply Provider</button>
+        <span id="ai-provider-msg" style="font-size:11px;color:var(--green);display:none"></span>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:16px">
+
+      <!-- Model selection -->
+      <h3 style="margin-bottom:4px">Model</h3>
+      <p id="sc-model-hint" style="color:var(--txt2);font-size:10px;margin-bottom:8px">Model used for the LLM planner, validator, and adaptive mutator. For Bedrock, pick a preset; for Anthropic/OpenAI, type the model name. Takes effect on the next scan.</p>
+      <div style="margin-bottom:8px">
+        <input id="sc-model-freeform" type="text" placeholder="e.g. claude-opus-4-8 or gpt-4o"
+               style="display:none;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+        <select id="sc-model-id"
+                style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+        </select>
+        <button class="tbtn pri" onclick="saveAiModel()">Apply</button>
+        <span id="ai-model-msg" style="font-size:11px;color:var(--green);display:none"></span>
+      </div>
+      <!-- Tiered model overrides -->
+      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">
+        <strong style="color:var(--txt)">Tiered model overrides</strong> — use a faster model for low-stakes decisions (planning, baseline checks) and a more capable model for exploit validation. Leave blank to use the primary model for all stages.
+      </p>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px">
+        <div>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Fast model — planning &amp; baseline</p>
+          <select id="sc-fast-model-id"
+                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px;width:100%">
+            <option value="">(use primary model)</option>
+          </select>
+        </div>
+        <div>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Validation model — exploit proof</p>
+          <select id="sc-validation-model-id"
+                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px;width:100%">
+            <option value="">(use primary model)</option>
+          </select>
+        </div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- Scan Engine -->
+      <h3 style="margin-bottom:4px">Scan Engine</h3>
+      <div id="scan-config-form" style="margin-bottom:20px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Scan Workers</p>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Parallel endpoints scanned at once.</p>
+            <input id="sc-workers" type="number" min="1" max="20" value="2"
+                   style="width:80px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Probe Concurrency</p>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Simultaneous outgoing HTTP probes per scan.</p>
+            <input id="sc-probe-concurrency" type="number" min="1" max="20" value="3"
+                   style="width:80px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Passive Scanner</p>
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-passive-enabled" checked style="accent-color:var(--acc)">
+              Enable passive scanner (zero-request checks on every proxied response)
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-passive-ai" checked style="accent-color:var(--acc)">
+              Use AI validation for ambiguous passive findings
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-passive-aggressive" style="accent-color:var(--acc)">
+              Aggressive passive rules (higher coverage, more false positives)
+            </label>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Active Scan</p>
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-active-enabled" checked style="accent-color:var(--acc)">
+              Enable active agent scanning (sends probe requests to in-scope endpoints)
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-llm-planner" checked style="accent-color:var(--acc)">
+              Use LLM planner to select agents per endpoint
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-llm-validator" checked style="accent-color:var(--acc)">
+              Use LLM validator to confirm non-deterministic findings
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-discovery-llm-classify" style="accent-color:var(--acc)">
+              Use LLM to classify content-discovery hits (otherwise generic recon)
+            </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-probe-diff" style="accent-color:var(--acc)">
+              Use probe-diff pre-analysis (break/repair pairs classify injection context before agents run)
+            </label>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Validation Confidence Threshold</p>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Minimum confidence (0.0–1.0) required for the LLM validator to confirm a finding. Higher values reduce false positives.</p>
+          <div style="display:flex;align-items:center;gap:10px">
+            <input id="sc-confidence" type="range" min="0" max="1" step="0.05" value="0.5"
+                   style="width:180px;accent-color:var(--acc)"
+                   oninput="document.getElementById('sc-confidence-val').textContent = parseFloat(this.value).toFixed(2)">
+            <span id="sc-confidence-val" style="font-size:13px;font-weight:600;color:var(--txt);min-width:36px">0.50</span>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Scan Budget per Endpoint (seconds)</p>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Hard ceiling for a single endpoint scan. The coordinator sets a shorter adaptive budget automatically based on param count and prior findings — this is only the upper bound.</p>
+          <input id="sc-budget" type="number" min="30" max="900" value="300"
+                 style="width:80px;background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:4px;font-size:13px">
+          <span style="font-size:11px;color:var(--txt2);margin-left:6px">seconds</span>
+        </div>
+        <button class="tbtn pri" onclick="saveScanConfig()">Apply</button>
+        <span id="scan-config-msg" style="font-size:11px;color:var(--green);margin-left:10px;display:none"></span>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- App Context -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <h3 style="margin:0">App Context</h3>
+        <span style="font-size:10px;color:var(--txt2)">background synthesis — updates every 10 s after 15 requests</span>
+      </div>
+      <div id="ai-app-context" style="margin-bottom:24px">
+        <div style="color:var(--txt2);font-size:11px">No app context yet — requires 15+ requests through proxy.</div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- Threat Model -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <h3 style="margin:0">Threat Model</h3>
+        <span style="font-size:10px;color:var(--txt2)">architectural constraints — what cannot be exploited on this host</span>
+      </div>
+      <div id="ai-threat-models" style="margin-bottom:24px">
+        <div style="color:var(--txt2);font-size:11px">No threat model yet — requires 15+ requests through proxy.</div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- Activity log -->
+      <h3>Agent Activity Log</h3>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <button class="tbtn" onclick="loadAiLog()">Refresh</button>
+        <label style="font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="ai-log-autoreload" onchange="toggleAiLogAuto(this)">
+          Auto-refresh every 5s
+        </label>
+      </div>
+      <div id="ai-activity-log" style="max-height:480px;overflow-y:auto;
+           border:1px solid var(--bdr);border-radius:4px;background:var(--bg2);
+           font-size:11px;margin-bottom:24px">
+        <div style="color:var(--txt2);padding:10px 14px">No agent scans yet.</div>
+      </div>
+
+      <!-- Service graph -->
+      <h3>Service Graph</h3>
+      <div id="ai-service-graph" style="margin-bottom:24px"></div>
+
+      <!-- Payload sources -->
+      <h3>Payload Sources</h3>
+      <div id="ai-payload-sources" style="margin-bottom:20px"></div>
+
+    </div>
+    </div><!-- end ai-sub-settings -->
+  </div><!-- end panel-ai -->
+
+  <!-- ══ SCAN PANEL ══ -->
+  <!-- The scan queue is its own top-level tab: scanning is AI-driven but is not
+       only AI (queueing, workers, pause/cancel, replay), so it does not belong
+       nested inside the AI tab. -->
+  <div class="tpanel" id="panel-scan" style="flex-direction:column;overflow:hidden">
+
+    <!-- toolbar -->
+    <div style="display:flex;align-items:center;gap:8px;padding:8px 14px;
+                background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0;flex-wrap:wrap">
+      <button id="scan-pause-btn" class="tbtn pri" onclick="toggleScanPause()" style="min-width:90px">Pause</button>
+      <button class="tbtn" onclick="cancelAllPending()">Cancel pending</button>
+      <button class="tbtn" onclick="clearCompleted()">Clear completed</button>
+      <span id="scan-queue-summary" style="font-size:11px;color:var(--txt2);margin-left:6px"></span>
+      <label style="margin-left:auto;font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="scan-autoreload" onchange="toggleScanAuto(this)" checked style="accent-color:var(--acc)"> Auto-refresh
+      </label>
+      <button class="tbtn" onclick="loadScanQueue()">Refresh</button>
+    </div>
+
+    <!-- three sections side by side on wide screens, stacked on narrow -->
+    <div style="display:flex;flex:1;overflow:hidden;gap:0">
+
+      <!-- pending -->
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--bdr)">
+        <div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px;background:var(--bg2);
+                    border-bottom:1px solid var(--bdr);flex-shrink:0">
+          Pending <span id="scan-pending-count" style="color:var(--txt);margin-left:4px">0</span>
+        </div>
+        <div id="scan-pending-list" style="flex:1;overflow-y:auto;padding:6px 0"></div>
+      </div>
+
+      <!-- running -->
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;border-right:1px solid var(--bdr)">
+        <div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px;background:var(--bg2);
+                    border-bottom:1px solid var(--bdr);flex-shrink:0">
+          Running <span id="scan-running-count" style="color:var(--blue);margin-left:4px">0</span>
+        </div>
+        <div id="scan-running-list" style="flex:1;overflow-y:auto;padding:6px 0"></div>
+      </div>
+
+      <!-- completed -->
+      <div style="flex:1.4;min-width:0;display:flex;flex-direction:column">
+        <div style="padding:6px 12px;font-size:10px;font-weight:600;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px;background:var(--bg2);
+                    border-bottom:1px solid var(--bdr);flex-shrink:0">
+          Completed <span id="scan-completed-count" style="color:var(--txt);margin-left:4px">0</span>
+        </div>
+        <div id="scan-completed-list" style="flex:1;overflow-y:auto;padding:6px 0"></div>
+      </div>
+
+    </div>
+  </div><!-- end panel-scan -->
+
+  <!-- ══ PLUGINS PANEL ══ -->
+  <div class="tpanel" id="panel-plugins">
+    <div class="settings-body">
+      <h2>Plugins</h2>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:16px">
+        Built-in plugins live in <code style="color:var(--orange)">dast/plugins/</code>.
+        Drop your own <code style="color:var(--orange)">.py</code> files into
+        <code style="color:var(--orange)">~/.dast-ai/plugins/</code> — they load on next restart.
+        See <code style="color:var(--orange)">docs/PLUGINS.md</code> for the full guide.
+      </p>
+      <div id="plugin-list"></div>
+    </div>
+  </div>
+
+  <!-- ══ GRAPHQL PANEL ══ -->
+  <div class="tpanel" id="panel-graphql" style="flex-direction:column;overflow:hidden">
+    <div class="subtab-bar">
+      <div class="stab on" id="st-graphql-explorer" onclick="switchGraphqlSub('explorer')">Schema Explorer</div>
+      <div class="stab"    id="st-graphql-fuzzer"   onclick="switchGraphqlSub('fuzzer')">Fuzzer</div>
+    </div>
+
+    <!-- Schema Explorer + Query Builder (fused: one operation list, one editor) -->
+    <div id="graphql-sub-explorer" style="display:flex;flex:1;overflow:hidden">
+      <div data-rz="gql-explorer" style="width:320px;min-width:220px;flex-shrink:0;border-right:1px solid var(--bdr);
+                  display:flex;flex-direction:column;overflow:hidden">
+        <div style="padding:10px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+          <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">GraphQL endpoint</label>
+          <select id="gql-endpoint-select" onchange="gqlSelectEndpoint(this.value)"
+                  style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                         padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
+            <option value="">No endpoints discovered yet</option>
+          </select>
+          <label style="font-size:10px;color:var(--txt2);display:block;margin:10px 0 4px">
+            Headers/cookies for introspection + sending <span style="color:var(--txt3,var(--txt2))">(auto-filled, editable)</span>
+          </label>
+          <select id="gql-session-select" onchange="gqlLoadSessionHeaders(this.value)"
+                  style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                         padding:3px 6px;border-radius:3px;font-family:inherit;font-size:10px;margin-bottom:4px">
+            <option value="">Most recent captured request</option>
+          </select>
+          <textarea id="gql-headers" rows="3" placeholder="Cookie: ...&#10;Authorization: ..."
+                 style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                 padding:4px 6px;border-radius:3px;font-family:monospace;font-size:10px;resize:vertical"></textarea>
+          <button class="tbtn pri" style="margin-top:8px;width:100%" onclick="gqlReintrospect()"
+                  title="Sends a real introspection request to this endpoint — never automatic">Re-run introspection</button>
+          <div style="display:flex;gap:6px;margin-top:10px">
+            <input id="gql-manual-endpoint" placeholder="https://host/graphql" style="flex:1;background:var(--bg);
+                   border:1px solid var(--bdr);color:var(--txt);padding:4px 6px;border-radius:3px;
+                   font-family:inherit;font-size:10px" onkeydown="if(event.key==='Enter')gqlAddEndpointManually()">
+            <button class="tbtn" style="font-size:10px;padding:4px 8px" onclick="gqlAddEndpointManually()">Add</button>
+          </div>
+          <button class="tbtn" style="margin-top:6px;width:100%;font-size:10px" onclick="gqlRescanHistory()"
+                  title="Scans all already-captured HTTP history for GraphQL endpoints missed by live detection">Scan History</button>
+        </div>
+        <div style="display:flex;gap:6px;margin:8px 8px 0">
+          <input id="gql-op-filter" placeholder="Filter operations..." oninput="gqlFilterOpList()"
+                 style="flex:1;background:var(--bg);border:1px solid var(--bdr);
+                        color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
+          <select id="gql-op-kind-filter" onchange="gqlFilterOpList()"
+                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                         padding:4px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+            <option value="all">All</option>
+            <option value="query">Queries only</option>
+            <option value="mutation">Mutations only</option>
+          </select>
+        </div>
+        <div id="gql-op-list" style="flex:1;overflow-y:auto;padding:8px"></div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+        <div style="padding:8px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0;display:flex;gap:8px;align-items:center">
+          <span style="font-size:11px;color:var(--txt2)">Editable query + variables (JSON):</span>
+          <button class="tbtn" style="margin-left:auto" onclick="gqlSendToFuzzer()">Send to Fuzzer</button>
+          <button class="tbtn pri" onclick="gqlSendToRepeater()">Send to Repeater</button>
+        </div>
+        <textarea id="gql-editor" spellcheck="false" placeholder="Select an endpoint, then click an operation on the left to generate a query..."
+          style="flex:1;resize:none;background:var(--bg);border:none;border-bottom:1px solid var(--bdr);color:var(--txt);
+                 font-family:monospace;font-size:12px;padding:10px 14px;outline:none"
+          oninput="gqlUpdatePreview()"></textarea>
+        <div style="padding:4px 14px;font-size:10px;color:var(--txt2);background:var(--bg2);flex-shrink:0">Preview</div>
+        <pre id="gql-preview" style="flex:1;overflow:auto;margin:0;padding:10px 14px;font-family:monospace;font-size:12px;white-space:pre-wrap"></pre>
+      </div>
+    </div>
+
+    <!-- Fuzzer -->
+    <div id="graphql-sub-fuzzer" style="display:none;flex:1;overflow:hidden">
+      <div data-rz="gql-fuzzer" style="width:360px;min-width:260px;flex-shrink:0;border-right:1px solid var(--bdr);
+                  display:flex;flex-direction:column;overflow:hidden;padding:12px 14px;overflow-y:auto">
+        <div style="display:flex;gap:6px;margin-bottom:8px">
+          <button class="tbtn" style="flex:1" onclick="gqlFuzzLoadFromRepeater()" title="Load method/URL/headers/body from the active Repeater tab">Load from Repeater</button>
+        </div>
+        <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">Method</label>
+        <input id="gql-fuzz-method" value="POST" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+               padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px;margin-bottom:8px">
+        <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">URL</label>
+        <input id="gql-fuzz-url" placeholder="https://example.com/graphql" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+               padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px;margin-bottom:8px">
+        <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">Headers (one per line)</label>
+        <textarea id="gql-fuzz-headers" rows="3" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+               padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px;margin-bottom:8px;resize:vertical"></textarea>
+        <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">Body (JSON — query + variables)</label>
+        <textarea id="gql-fuzz-body" rows="6" oninput="gqlFuzzPreviewVars()" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+               padding:4px 8px;border-radius:3px;font-family:monospace;font-size:11px;margin-bottom:8px;resize:vertical"></textarea>
+        <div id="gql-fuzz-vars" style="font-size:10px;color:var(--txt2);margin-bottom:10px">No variables detected yet.</div>
+
+        <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:4px">Payload source</label>
+        <div style="display:flex;gap:12px;margin-bottom:8px;font-size:11px">
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="radio" name="gql-fuzz-payload-src" value="yaml" checked
+                   onchange="document.getElementById('gql-fuzz-custom-payloads').style.display='none'"> graphql.yaml
+          </label>
+          <label style="display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="radio" name="gql-fuzz-payload-src" value="custom"
+                   onchange="document.getElementById('gql-fuzz-custom-payloads').style.display='block'"> Custom
+          </label>
+        </div>
+        <textarea id="gql-fuzz-custom-payloads" rows="4" placeholder="One payload per line"
+               style="display:none;width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+               padding:4px 8px;border-radius:3px;font-family:monospace;font-size:11px;margin-bottom:8px;resize:vertical"></textarea>
+
+        <div style="display:flex;gap:8px;margin-top:4px">
+          <button class="tbtn pri" id="gql-fuzz-start-btn" style="flex:1" onclick="gqlFuzzStart()">Start</button>
+          <button class="tbtn del" id="gql-fuzz-stop-btn" style="flex:1" onclick="gqlFuzzStop()" disabled>Stop</button>
+        </div>
+        <div id="gql-fuzz-status" style="font-size:11px;color:var(--txt2);margin-top:8px">status: idle</div>
+        <div id="gql-fuzz-progress-bar" style="display:none;height:4px;background:var(--bg3);border-radius:2px;margin-top:6px;overflow:hidden">
+          <div id="gql-fuzz-progress-fill" style="height:100%;width:0%;background:var(--acc2)"></div>
+        </div>
+      </div>
+      <div style="flex:1;overflow:auto">
+        <table style="width:100%;border-collapse:collapse">
+          <thead>
+            <tr style="position:sticky;top:0;background:var(--bg2)">
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:40px">#</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:120px">Variable</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Payload</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:60px">Status</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:60px">ms</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:70px">Length</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:60px">Errors?</th>
+              <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:50px">Hit</th>
+            </tr>
+          </thead>
+          <tbody id="gql-fuzz-results-tbody">
+            <tr><td colspan="8" style="padding:12px 10px;color:var(--txt2);font-family:inherit">No results yet — load a request and click Start.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ REPEATER PANEL ══ -->
+  <div class="tpanel" id="panel-repeater" style="flex-direction:column;overflow:hidden">
+    <!-- tab strip -->
+    <div style="display:flex;align-items:center;background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0;overflow-x:auto;padding:0 8px;gap:2px" id="rep-tab-strip">
+      <!-- tabs injected by JS -->
+      <button class="tbtn" style="margin-left:auto;flex-shrink:0;font-size:11px;padding:4px 10px" onclick="repNewTab()" title="New empty tab">+ New</button>
+    </div>
+    <!-- tab content area — each tab's pane is shown/hidden -->
+    <div style="display:flex;flex-direction:column;flex:1;overflow:hidden" id="rep-tab-content"></div>
+  </div>
+
+  <!-- ══ INTRUDER PANEL ══ -->
+  <div class="tpanel" id="panel-intruder" style="flex-direction:column;overflow:hidden">
+    <!-- toolbar -->
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 14px;background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0;flex-wrap:wrap">
+      <select id="itr-method" style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px;width:90px">
+        <option>GET</option><option selected>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option><option>OPTIONS</option><option>HEAD</option>
+      </select>
+      <input id="itr-url" placeholder="https://example.com/api/endpoint" style="flex:1;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
+      <button class="tbtn" onclick="itrLoadFromRepeater()" title="Copy request from Repeater tab">Load from Repeater</button>
+      <button class="tbtn" onclick="itrClear()">Clear</button>
+    </div>
+
+    <!-- main split: editor left + config right -->
+    <div style="display:flex;flex:1;overflow:hidden;min-height:0">
+
+      <!-- LEFT: request editor -->
+      <div style="flex:1.2;display:flex;flex-direction:column;border-right:3px solid var(--bdr);overflow:hidden;min-width:0">
+        <!-- headers -->
+        <div style="padding:4px 14px;font-size:10px;color:var(--txt2);background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0">Headers (one per line):</div>
+        <textarea id="itr-headers" spellcheck="false"
+          style="flex:0 0 100px;resize:none;background:var(--bg);border:none;border-bottom:1px solid var(--bdr);color:var(--txt);font-family:monospace;font-size:11px;padding:8px 14px;outline:none"
+          placeholder="Content-Type: application/json&#10;Authorization: Bearer token"></textarea>
+        <!-- body -->
+        <div style="padding:4px 14px;font-size:10px;color:var(--txt2);background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0;display:flex;align-items:center;gap:8px">
+          <span>Body — use <code style="color:var(--orange)">§value§</code> to mark injection point:</span>
+          <button class="tbtn" style="font-size:10px;padding:2px 8px" onclick="itrMarkSelection()" title="Wrap selected text with §...§ injection markers">§ Mark selection §</button>
+        </div>
+        <textarea id="itr-body" spellcheck="false"
+          style="flex:1;resize:none;background:var(--bg);border:none;color:var(--txt);font-family:monospace;font-size:11px;padding:8px 14px;outline:none"
+          placeholder='{"query":"...", "variables":{"id":"§1§"}}'></textarea>
+      </div>
+
+      <!-- RIGHT: attack config -->
+      <div style="flex:0 0 300px;display:flex;flex-direction:column;overflow-y:auto;padding:12px 14px;gap:12px;background:var(--bg2)">
+
+        <!-- attack types -->
+        <div>
+          <div style="font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Attack Types</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px 10px;font-size:11px">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="sqli" checked style="accent-color:var(--acc)"> sqli</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="xss" checked style="accent-color:var(--acc)"> xss</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="ssrf" style="accent-color:var(--acc)"> ssrf</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="lfi" style="accent-color:var(--acc)"> lfi</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="ssti" style="accent-color:var(--acc)"> ssti</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="cmdi" style="accent-color:var(--acc)"> cmdi</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="llm_injection" checked style="accent-color:var(--acc)"> llm_injection</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="xxe" style="accent-color:var(--acc)"> xxe</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="nosql" style="accent-color:var(--acc)"> nosql</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="checkbox" class="itr-type-cb" value="prototype_pollution" style="accent-color:var(--acc)"> prototype_pollution</label>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:0">
+
+        <!-- payload source -->
+        <div>
+          <div style="font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">Payload Source</div>
+          <div style="display:flex;flex-direction:column;gap:5px;font-size:11px">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-payload-src" value="yaml" checked style="accent-color:var(--acc)"> YAML seeds (from payload library)</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-payload-src" value="custom" style="accent-color:var(--acc)"> Custom wordlist</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-payload-src" value="llm" style="accent-color:var(--acc)"> LLM-generated (AI creates payloads)</label>
+          </div>
+          <textarea id="itr-custom-payloads" rows="4" spellcheck="false"
+            style="margin-top:6px;width:100%;box-sizing:border-box;display:none;resize:vertical;
+                   background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   font-family:monospace;font-size:11px;padding:6px 8px;border-radius:3px;outline:none"
+            placeholder="One payload per line..."></textarea>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:0">
+
+        <!-- AI mode -->
+        <div>
+          <div style="font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:8px">AI Mode</div>
+          <div style="display:flex;flex-direction:column;gap:5px;font-size:11px">
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-ai-mode" value="full" checked style="accent-color:var(--acc)"> Full AI (planner + validator)</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-ai-mode" value="fuzzing" style="accent-color:var(--acc)"> Fuzzing (deterministic only, no LLM)</label>
+            <label style="display:flex;align-items:center;gap:5px;cursor:pointer"><input type="radio" name="itr-ai-mode" value="off" style="accent-color:var(--acc)"> Off (raw payloads, no agents)</label>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:0">
+
+        <!-- controls -->
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <div style="display:flex;gap:6px">
+            <button class="tbtn pri" id="itr-start-btn" onclick="itrStartAttack()" style="flex:1">&#9654; Start Attack</button>
+            <button class="tbtn" id="itr-stop-btn" onclick="itrStopAttack()" disabled style="flex:1">&#9632; Stop</button>
+          </div>
+          <div id="itr-status" style="font-size:10px;color:var(--txt2)">status: idle</div>
+          <div id="itr-progress-bar" style="height:3px;background:var(--bdr);border-radius:2px;display:none">
+            <div id="itr-progress-fill" style="height:100%;background:var(--acc);border-radius:2px;width:0%;transition:width .3s"></div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- results table -->
+    <div style="flex:0 0 260px;display:flex;flex-direction:column;border-top:3px solid var(--bdr);overflow:hidden">
+      <div style="padding:4px 10px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;background:var(--bg2);border-bottom:1px solid var(--bdr);flex-shrink:0">
+        Results <span id="itr-result-count" style="color:var(--txt);margin-left:4px">0</span>
+      </div>
+      <div style="flex:1;overflow:auto">
+        <table id="itr-results-table" style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">
+          <thead>
+            <tr style="background:var(--bg2);position:sticky;top:0;z-index:1">
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:40px;position:relative">#<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:220px;position:relative">Payload<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:60px;position:relative">Status<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:60px;position:relative">ms<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:70px;position:relative">Length<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr);width:40px;position:relative">Hit<div class="col-resizer"></div></th>
+              <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--txt2);border-bottom:1px solid var(--bdr)">Finding</th>
+            </tr>
+          </thead>
+          <tbody id="itr-results-tbody">
+            <tr><td colspan="7" style="padding:12px 10px;color:var(--txt2);font-family:inherit">No results yet — configure and start an attack above.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ LOGS PANEL ══ -->
+  <div class="tpanel" id="panel-logs">
+    <!-- toolbar -->
+    <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid var(--bdr);flex-shrink:0;flex-wrap:wrap">
+      <select id="log-filter-level" onchange="loadLogs()" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:3px 8px;border-radius:3px;font-size:11px">
+        <option value="no-warn">All (hide warnings)</option>
+        <option value="">All levels</option>
+        <option value="finding">Findings only</option>
+        <option value="info">Info</option>
+        <option value="warn">Warnings only</option>
+        <option value="error">Error</option>
+      </select>
+      <select id="log-filter-source" onchange="loadLogs()" style="background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:3px 8px;border-radius:3px;font-size:11px">
+        <option value="">All sources</option>
+        <option value="plugin">Plugin</option>
+        <option value="agent">Agent</option>
+        <option value="browser">Browser</option>
+        <option value="crawler">Crawler</option>
+        <option value="system">System</option>
+      </select>
+      <input id="log-filter-text" placeholder="Filter..." oninput="loadLogs()"
+             style="background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:3px 8px;border-radius:3px;font-size:11px;width:160px">
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--txt2);margin-left:auto;cursor:pointer">
+        <input type="checkbox" id="log-autoreload" onchange="toggleLogAuto(this)" style="accent-color:var(--acc)"> Auto
+      </label>
+      <button class="tbtn" onclick="loadLogs()">Refresh</button>
+      <button class="tbtn" onclick="clearLogs()">Clear</button>
+    </div>
+    <!-- table header -->
+    <div style="display:grid;grid-template-columns:80px 64px 70px 130px 1fr 200px;gap:0;
+                border-bottom:1px solid var(--bdr);background:var(--bg2);flex-shrink:0">
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">Time</div>
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">Source</div>
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">Level</div>
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">Plugin / Agent</div>
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">Message</div>
+      <div style="padding:4px 8px;font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">URL</div>
+    </div>
+    <!-- rows -->
+    <div id="log-body" style="overflow-y:auto;flex:1;font-size:11px;font-family:var(--font-mono,'monospace')">
+      <div style="color:var(--txt2);padding:14px 12px">No log events yet.</div>
+    </div>
+  </div>
+
+  <!-- ══ EXTRAS PANEL (H1 Validator / Code / FedRAMP / Interactions) ══ -->
+  <div class="tpanel" id="panel-extras" style="flex-direction:column;overflow:hidden">
+    <div class="subtab-bar">
+      <div class="stab on" id="st-extras-h1"           onclick="switchExtrasSub('h1')">H1 Validator</div>
+      <div class="stab"    id="st-extras-code"          onclick="switchExtrasSub('code')">Code</div>
+      <div class="stab"    id="st-extras-fedramp"       onclick="switchExtrasSub('fedramp')">FedRAMP</div>
+      <div class="stab"    id="st-extras-interactions"  onclick="switchExtrasSub('interactions')">Interactions</div>
+      <div class="stab"    id="st-extras-decoder"        onclick="switchExtrasSub('decoder')">Decoder</div>
+      <div class="stab"    id="st-extras-jwt"            onclick="switchExtrasSub('jwt')">JWT</div>
+    </div>
+    <div id="extras-sub-h1" style="flex:1;overflow:hidden;display:flex">
+    <div style="display:flex;height:100%;overflow:hidden">
+
+      <!-- LEFT: Submit form + job history -->
+      <div data-rz="extras-h1" style="width:420px;min-width:280px;flex-shrink:0;display:flex;flex-direction:column;
+                  border-right:1px solid var(--bdr);overflow:hidden">
+        <!-- Submit form -->
+        <div style="padding:12px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0;overflow-y:auto">
+          <div style="font-size:11px;font-weight:600;color:var(--acc2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">H1 Report Validator</div>
+
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:6px">Paste HackerOne report text:</div>
+          <textarea id="h1-report-text"
+            placeholder="Paste the full HackerOne report here — title, description, steps to reproduce, proof URL, payload..."
+            style="width:100%;height:180px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:8px;border-radius:3px;font-size:10px;font-family:inherit;resize:vertical;
+                   line-height:1.5"></textarea>
+
+          <div style="font-size:10px;color:var(--txt2);margin-top:8px;margin-bottom:4px">
+            Override URL <span style="color:var(--txt2)">(optional — if AI extraction is wrong)</span>
+          </div>
+          <input id="h1-override-url" placeholder="https://..." type="url"
+            style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
+
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">
+            Override domain <span style="color:var(--txt2)">(for DNS takeover checks)</span>
+          </div>
+          <input id="h1-override-domain" placeholder="sub.example.com"
+            style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
+
+          <!-- Image attachments -->
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">
+            Screenshots / attachments <span style="color:var(--txt2)">(from HackerOne report, max 4)</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;margin-bottom:10px">
+            <button class="tbtn" onclick="document.getElementById('h1-img-input').click()">Attach images</button>
+            <span id="h1-img-count" style="font-size:10px;color:var(--txt2)">No images</span>
+            <button class="tbtn" onclick="h1ClearImages()" id="h1-img-clear" style="display:none">Clear</button>
+          </div>
+          <input type="file" id="h1-img-input" accept="image/*" multiple style="display:none"
+                 onchange="h1AddImages(this)">
+
+          <div style="display:flex;gap:6px">
+            <button class="tbtn pri" onclick="h1Submit()" id="h1-submit-btn">Validate</button>
+            <span id="h1-submit-msg" style="font-size:10px;color:var(--txt2);align-self:center"></span>
+          </div>
+        </div>
+
+        <!-- Job history -->
+        <div style="flex:1;overflow-y:auto">
+          <div style="padding:6px 14px;font-size:10px;color:var(--txt2);border-bottom:1px solid var(--bdr);
+                      display:flex;align-items:center;gap:8px">
+            <span style="flex:1">Recent validations</span>
+            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="h1LoadJobs()">Refresh</button>
+          </div>
+          <div id="h1-job-list" style="font-size:11px"></div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Result detail -->
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+        <div id="h1-result-panel" style="flex:1;overflow-y:auto;padding:16px 20px">
+          <div style="color:var(--txt2);font-size:12px;text-align:center;padding:60px 20px">
+            Submit a HackerOne report to validate it.
+          </div>
+        </div>
+      </div>
+
+    </div>
+    </div>
+    <div id="extras-sub-code" style="flex:1;overflow:hidden;display:none">
+    <div style="display:flex;gap:0;height:100%;overflow:hidden">
+
+      <!-- Left: input + job list -->
+      <div data-rz="extras-code" style="width:340px;min-width:240px;border-right:1px solid var(--bdr);display:flex;flex-direction:column;flex-shrink:0">
+        <div style="padding:12px 12px 10px;border-bottom:1px solid var(--bdr)">
+          <div style="font-size:10px;font-weight:600;color:var(--txt2);letter-spacing:.5px;margin-bottom:8px">REGISTER SOURCE CODE</div>
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">The DAST scanner uses this code to find hidden params, protections, and vuln patterns.</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin:8px 0 4px">
+            <div style="font-size:10px;color:var(--txt2)">Repositories</div>
+            <button class="tbtn" onclick="codeAddSource()" style="font-size:9px;padding:1px 7px">+ Add</button>
+          </div>
+          <div id="code-sources-list" style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px"></div>
+          <input id="code-token-input" type="password" placeholder="GitLab token (private repos only)"
+            style="width:100%;box-sizing:border-box;background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-size:10px;margin-bottom:6px">
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:3px">
+            Target URLs
+            <span style="color:var(--txt3);font-size:9px"> — where to probe hypotheses. Add one per service when using multiple repos.</span>
+          </div>
+          <div style="display:flex;gap:4px;margin-bottom:4px">
+            <input id="code-target-url" type="text" placeholder="https://app.example.com (primary)"
+              style="flex:1;min-width:0;background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-size:10px">
+            <button class="tbtn" onclick="codeAddExtraUrl()" style="font-size:9px;padding:2px 7px;flex-shrink:0" title="Add another target URL for multi-service repos">+ Add</button>
+            <button class="tbtn" onclick="codeSetTarget()" style="font-size:9px;padding:2px 7px;flex-shrink:0" title="Save target URLs to this analysis">Set</button>
+          </div>
+          <div id="code-extra-urls" style="display:flex;flex-direction:column;gap:3px;margin-bottom:6px"></div>
+          <div style="display:flex;gap:6px">
+            <button class="tbtn pri" onclick="codeStartAnalysis()" id="code-load-btn" style="flex:1">Load &amp; Scan</button>
+            <button class="tbtn" onclick="codeEnrich()" id="code-enrich-btn" style="flex:1" title="Run AI endpoint extraction and hypothesis generation (uses LLM credits)">AI Enrich</button>
+          </div>
+          <div id="code-status-msg" style="font-size:9px;color:var(--txt2);margin-top:6px;min-height:14px"></div>
+        </div>
+
+        <!-- Search -->
+        <div style="padding:8px 12px;border-bottom:1px solid var(--bdr);flex-shrink:0">
+          <input id="code-search-input" type="text" placeholder="Search files by path or keyword..."
+            oninput="codeSearch(this.value)"
+            style="width:100%;box-sizing:border-box;background:var(--bg2);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-size:10px">
+          <div id="code-search-results" style="margin-top:4px;max-height:160px;overflow-y:auto"></div>
+        </div>
+
+        <div style="flex:1;overflow-y:auto">
+          <div style="padding:6px 12px 3px;font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.5px">History</div>
+          <div id="code-job-list" style="padding:0 0 6px"></div>
+        </div>
+      </div>
+
+      <!-- Right: results -->
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+
+        <!-- Tabs: Patterns / Endpoints / Hypotheses -->
+        <div style="display:flex;border-bottom:1px solid var(--bdr);background:var(--bg2);flex-shrink:0;align-items:center">
+          <div class="code-rtab on" id="code-rt-patterns" onclick="codeSelectTab('patterns')">Patterns</div>
+          <div class="code-rtab" id="code-rt-endpoints" onclick="codeSelectTab('endpoints')">Endpoints</div>
+          <div class="code-rtab" id="code-rt-hypotheses" onclick="codeSelectTab('hypotheses')">Hypotheses</div>
+          <div id="code-stats" style="margin-left:auto;padding:6px 14px;font-size:10px;color:var(--txt2)"></div>
+        </div>
+
+        <!-- Patterns table (shown first — available after Phase 1) -->
+        <div id="code-pane-patterns" style="flex:1;overflow:auto;display:block">
+          <div id="code-patterns-empty" style="padding:24px;color:var(--txt2);font-size:10px">Register a repository and click "Load &amp; Scan" to detect insecure code patterns.</div>
+          <table id="code-patterns-table" style="display:none;width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="background:var(--bg2);position:sticky;top:0">
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:70px">Severity</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Title</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">File</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:50px">Line</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Code</th>
+              </tr>
+            </thead>
+            <tbody id="code-patterns-body"></tbody>
+          </table>
+        </div>
+
+        <!-- Endpoints table (available after AI Enrich) -->
+        <div id="code-pane-endpoints" style="flex:1;overflow:auto;display:none">
+          <div id="code-endpoints-empty" style="padding:24px;color:var(--txt2);font-size:10px">Run "AI Enrich" after loading to extract HTTP endpoints from source code.</div>
+          <table id="code-endpoints-table" style="display:none;width:100%;border-collapse:collapse;font-size:10px">
+            <thead>
+              <tr style="background:var(--bg2);position:sticky;top:0">
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:60px">Method</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Path</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Controller</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr)">Params</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid var(--bdr);width:80px">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="code-endpoints-body"></tbody>
+          </table>
+        </div>
+
+        <!-- Hypotheses list (available after AI Enrich) -->
+        <div id="code-pane-hypotheses" style="flex:1;overflow:auto;display:none;flex-direction:column">
+          <div id="code-hypotheses-toolbar" style="display:none;padding:6px 8px;border-bottom:1px solid var(--bdr);background:var(--bg2);flex-shrink:0;gap:6px;align-items:center">
+            <button class="tbtn" onclick="codeValidateAllHypotheses()" style="font-size:10px;padding:3px 10px">Validate All</button>
+            <span id="code-hyp-count" style="font-size:10px;color:var(--txt2)"></span>
+          </div>
+          <div id="code-hypotheses-empty" style="padding:24px;color:var(--txt2);font-size:10px">Run "AI Enrich" after loading to generate vulnerability hypotheses.</div>
+          <div id="code-hypotheses-body" style="padding:8px;overflow:auto;flex:1"></div>
+        </div>
+
+      </div>
+    </div>
+    </div>
+    <div id="extras-sub-fedramp" style="flex:1;overflow:hidden;display:none">
+    <div class="settings-body" style="padding:16px 24px;overflow-y:auto">
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+        <h2 style="margin:0;font-size:16px">FedRAMP Penetration Test Assessment</h2>
+        <span id="fedramp-progress" style="font-size:var(--fs-sm);color:var(--txt2)"></span>
+        <div style="margin-left:auto;display:flex;gap:8px">
+          <button class="tbtn pri" onclick="fedrampRun()">Run Assessment</button>
+          <button class="tbtn" onclick="fedrampExport()">Export Report</button>
+          <button class="tbtn del" onclick="fedrampReset()">Reset</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;padding:10px 12px;background:var(--bg2);border:1px solid var(--bdr);border-radius:4px">
+        <label style="font-size:var(--fs-sm);color:var(--txt2);white-space:nowrap">Target hosts:</label>
+        <input id="fedramp-targets" type="text" placeholder="e.g. app.example.com, api.example.com"
+               style="flex:1;font-size:var(--fs-sm);background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit">
+        <span style="font-size:var(--fs-xs);color:var(--txt3)">Comma-separated. Leave blank to use all in-scope hosts.</span>
+      </div>
+      <p style="font-size:var(--fs-sm);color:var(--txt2);margin-bottom:16px;max-width:800px">
+        Checklist based on FedRAMP Penetration Test Guidance v4.0. Items marked <strong style="color:var(--green)">auto</strong>
+        are tested by Frieren DAST-AI agents. Items marked <strong style="color:var(--yellow)">manual</strong> require external testing
+        and manual sign-off. Click any item to expand details and add evidence notes.
+      </p>
+      <div id="fedramp-checklist"></div>
+    </div>
+    </div>
+    <div id="extras-sub-interactions" style="flex:1;overflow:hidden;display:none;flex-direction:column">
+
+    <!-- header bar -->
+    <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;
+                border-bottom:1px solid var(--bdr);flex-shrink:0;background:var(--bg2)">
+      <span style="font-size:11px;font-weight:600;color:var(--acc2);text-transform:uppercase;
+                   letter-spacing:.5px">Interactions</span>
+      <span id="interactions-badge" style="display:none;width:7px;height:7px;border-radius:50%;
+            background:var(--red);animation:pulse 1s infinite"></span>
+      <div class="sp"></div>
+      <button class="tbtn" onclick="interactionsRefresh(this)" title="Poll now for new callbacks">Refresh</button>
+      <button class="tbtn pri" onclick="interactionsCreate()">Generate URL</button>
+    </div>
+
+    <!-- two-column layout: sessions left, callbacks right -->
+    <div style="display:flex;flex:1;overflow:hidden">
+
+      <!-- LEFT: sessions table -->
+      <div data-rz="interactions-sessions" style="width:480px;min-width:280px;flex-shrink:0;display:flex;flex-direction:column;
+                  border-right:1px solid var(--bdr);overflow:hidden">
+        <div style="flex-shrink:0;padding:5px 10px;font-size:10px;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr)">
+          Active Sessions
+        </div>
+        <div style="flex:1;overflow-y:auto" id="interactions-session-list">
+          <div class="empty">No sessions yet — click Generate URL to start.</div>
+        </div>
+      </div>
+
+      <!-- RIGHT: callbacks panel -->
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+        <div style="flex-shrink:0;padding:5px 10px;font-size:10px;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
+                    display:flex;align-items:center;gap:8px">
+          <span id="interactions-cb-title">Callbacks</span>
+        </div>
+
+        <!-- callbacks table -->
+        <div style="flex:1;overflow-y:auto" id="interactions-cb-list">
+          <div class="empty" id="interactions-cb-empty">
+            Select a session to see its callbacks.
+          </div>
+        </div>
+
+        <!-- raw detail -->
+        <div id="interactions-raw-panel" style="display:none;flex-shrink:0;max-height:200px;
+             border-top:1px solid var(--bdr);overflow:auto;background:var(--bg)">
+          <div style="padding:4px 10px;font-size:10px;color:var(--txt2);
+                      border-bottom:1px solid var(--bdr);background:var(--bg2)">
+            Raw interaction
+          </div>
+          <pre id="interactions-raw-pre"
+               style="padding:8px 12px;font-size:10.5px;line-height:1.5;
+                      color:var(--orange);white-space:pre-wrap;word-break:break-word"></pre>
+        </div>
+      </div>
+
+    </div>
+    </div>
+
+    <!-- Decoder / Encoder — client-side transform toolbelt -->
+    <div id="extras-sub-decoder" style="flex:1;overflow:hidden;display:none">
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--bdr)">
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;color:var(--acc2);
+                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr)">Input</div>
+        <textarea id="dec-input" oninput="decoderRun()"
+          placeholder="Paste text to encode/decode..."
+          style="flex:1;width:100%;background:var(--bg);border:none;color:var(--txt);box-sizing:border-box;
+                 padding:10px 14px;font-size:11px;font-family:inherit;resize:none;line-height:1.5"></textarea>
+      </div>
+      <div style="width:190px;min-width:160px;flex-shrink:0;display:flex;flex-direction:column;
+                  overflow-y:auto;border-right:1px solid var(--bdr);padding:8px 0">
+        <div style="padding:2px 14px 8px;font-size:10px;font-weight:600;color:var(--txt2);
+                    text-transform:uppercase;letter-spacing:.5px">Transform</div>
+        <div id="dec-ops"></div>
+      </div>
+      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+        <div style="padding:8px 14px;font-size:10px;font-weight:600;color:var(--acc2);
+                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
+                    display:flex;align-items:center;gap:8px">
+          <span style="flex:1">Output</span>
+          <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="decoderCopy()">Copy</button>
+        </div>
+        <pre id="dec-output" style="flex:1;overflow:auto;margin:0;padding:10px 14px;
+                 font-size:11px;font-family:inherit;color:var(--orange);white-space:pre-wrap;word-break:break-all"></pre>
+      </div>
+    </div>
+
+    <!-- JWT editor — decode, edit, re-sign, send to Repeater -->
+    <div id="extras-sub-jwt" style="flex:1;overflow:hidden;display:none">
+        <div data-rz="extras-jwt" style="width:46%;min-width:340px;flex-shrink:0;display:flex;flex-direction:column;
+                    overflow-y:auto;border-right:1px solid var(--bdr);padding:12px 14px">
+          <div style="font-size:10px;font-weight:600;color:var(--acc2);text-transform:uppercase;
+                      letter-spacing:.5px;margin-bottom:8px">JWT Token</div>
+          <textarea id="jwt-input" oninput="jwtDecode()"
+            placeholder="Paste a JWT (eyJ...) to decode its header and payload"
+            style="width:100%;box-sizing:border-box;height:90px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:8px;border-radius:3px;font-size:10px;font-family:inherit;resize:vertical;line-height:1.4"></textarea>
+          <div id="jwt-decode-msg" style="font-size:10px;color:var(--txt2);margin:6px 0"></div>
+
+          <div style="font-size:10px;color:var(--txt2);margin-top:8px;margin-bottom:4px">Header (JSON)</div>
+          <textarea id="jwt-header"
+            style="width:100%;box-sizing:border-box;height:90px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:8px;border-radius:3px;font-size:10px;font-family:inherit;resize:vertical;line-height:1.4"></textarea>
+
+          <div style="font-size:10px;color:var(--txt2);margin-top:8px;margin-bottom:4px">Payload (JSON)</div>
+          <textarea id="jwt-payload"
+            style="width:100%;box-sizing:border-box;height:140px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:8px;border-radius:3px;font-size:10px;font-family:inherit;resize:vertical;line-height:1.4"></textarea>
+        </div>
+        <div style="flex:1;display:flex;flex-direction:column;overflow-y:auto;padding:12px 14px">
+          <div style="font-size:10px;font-weight:600;color:var(--acc2);text-transform:uppercase;
+                      letter-spacing:.5px;margin-bottom:8px">Re-sign</div>
+
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">Signing mode</div>
+          <select id="jwt-mode" onchange="jwtToggleSecret()"
+            style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                   padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
+            <option value="hs256">HS256 (HMAC secret)</option>
+            <option value="hs384">HS384 (HMAC secret)</option>
+            <option value="hs512">HS512 (HMAC secret)</option>
+            <option value="none">alg: none (unsigned — signature-strip attack)</option>
+          </select>
+
+          <div id="jwt-secret-row">
+            <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">HMAC secret</div>
+            <input id="jwt-secret" placeholder="secret"
+              style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                     padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
+          </div>
+
+          <div style="display:flex;gap:6px;margin:4px 0 10px">
+            <button class="tbtn pri" onclick="jwtBuild()">Build token</button>
+            <span id="jwt-build-msg" style="font-size:10px;color:var(--txt2);align-self:center"></span>
+          </div>
+
+          <div style="font-size:10px;font-weight:600;color:var(--acc2);text-transform:uppercase;
+                      letter-spacing:.5px;margin-bottom:6px;display:flex;align-items:center;gap:8px">
+            <span style="flex:1">Result</span>
+            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="jwtCopy()">Copy</button>
+            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="jwtToRepeater()">Send to Repeater</button>
+          </div>
+          <pre id="jwt-output" style="flex-shrink:0;margin:0;padding:10px 12px;background:var(--bg);
+                   border:1px solid var(--bdr);border-radius:3px;min-height:70px;
+                   font-size:10.5px;font-family:inherit;color:var(--orange);white-space:pre-wrap;word-break:break-all"></pre>
+        </div>
+    </div>
+  </div><!-- /panel-extras -->
+
+</div><!-- workspace -->
+
+<script src="/ui/js/10-state-core.js"></script>
+<script src="/ui/js/20-issues-import.js"></script>
+<script src="/ui/js/30-repeater-intruder.js"></script>
+<script src="/ui/js/40-graphql.js"></script>
+<script src="/ui/js/50-settings-fedramp-scan.js"></script>
+<script src="/ui/js/60-http-view.js"></script>
+<script src="/ui/js/65-browse.js"></script>
+<script src="/ui/js/70-logs-scan-plugins-crawl.js"></script>
+<script src="/ui/js/75-subtabs-ai-panel.js"></script>
+<script src="/ui/js/76-extras-decoder-jwt.js"></script>
+<script src="/ui/js/80-setup-status-sessions.js"></script>
+<script src="/ui/js/85-overview-scanconfig-provider.js"></script>
+<script src="/ui/js/90-h1-interactions.js"></script>
+<script src="/ui/js/95-code-analysis.js"></script>
+<script src="/ui/js/96-mode-intercept-mr.js"></script>
+<script src="/ui/js/99-bootstrap-ctxmenu.js"></script>
+
+<!-- Right-click context menu -->
+<div id="ctx-menu">
+  <div class="ctx-item" onclick="_ctxSendRepeater()">
+    <span class="ctx-icon">↗</span> Send to Repeater
+  </div>
+  <div class="ctx-item" onclick="_ctxSendIntruder()">
+    <span class="ctx-icon">⚡</span> Send to Intruder
+  </div>
+  <div class="ctx-item ctx-sep" onclick="_ctxSendAI()">
+    <span class="ctx-icon">▶</span> Scan with AI
+  </div>
+  <div class="ctx-item ctx-sep" onclick="_ctxCopyUrl()">
+    <span class="ctx-icon">⎘</span> Copy URL
+  </div>
+  <div class="ctx-item" onclick="_ctxCopyCurl()">
+    <span class="ctx-icon">⎘</span> Copy as cURL
+  </div>
+  <div class="ctx-item" onclick="_ctxReproduceBrowser()" title="Copies a link that replays this request as a real navigation (GET) or a form with an OK button (POST) — uses the browser's own session cookies">
+    <span class="ctx-icon">⎘</span> Copy Reproduce Link
+  </div>
+</div>
+</body>

@@ -1,0 +1,32 @@
+# Local File Inclusion / Path Traversal (CWE-22, CWE-98) — OWASP A01:2021
+attack_type: lfi
+aliases: [path_traversal]
+
+positive_examples:
+  - payload: "../../../../etc/passwd"
+    response_snippet: "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:..."
+    reasoning: >
+      The response contains the contents of /etc/passwd, proving the traversal
+      sequence escaped the intended directory and read an arbitrary system file.
+  - payload: "..\\..\\..\\windows\\win.ini"
+    response_snippet: "[fonts]\n[extensions]\n[mci extensions]"
+    reasoning: >
+      Windows win.ini contents in the response confirm directory traversal to a
+      known system file outside the web root.
+  - payload: "php://filter/convert.base64-encode/resource=index.php"
+    response_snippet: "PD9waHAgJGRiX3Bhc3N3b3JkID0gInN1cGVyc2VjcmV0Ijs..."
+    reasoning: >
+      A base64 blob decoding to PHP source proves a PHP wrapper leaked
+      server-side source code, a strong LFI-to-source-disclosure primitive.
+
+negative_examples:
+  - payload: "../../../../etc/passwd"
+    response_snippet: '{"error":"File not found","path":"/var/www/uploads/etc/passwd"}'
+    reasoning: >
+      The traversal was neutralised (path stayed inside the uploads directory)
+      and no file content was returned — a 404 is not file disclosure.
+  - payload: "../../../../etc/passwd%00.png"
+    response_snippet: "the literal string ../../../../etc/passwd rendered back in an HTML error page"
+    reasoning: >
+      The payload is only reflected as text in an error page, not interpreted as
+      a file path; no file contents means no inclusion occurred.

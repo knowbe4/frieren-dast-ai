@@ -1,0 +1,30 @@
+# Clickjacking protection checks — verifies that HTML responses include at
+# least one of the two accepted frame-embedding defences: the
+# X-Frame-Options header or a CSP frame-ancestors directive.
+# Covers OWASP A05 (Security Misconfiguration) / CWE-1021.
+#
+# Note: the clickjacking-no-frame-guard rule uses header_absent on
+# x-frame-options. The rule engine must additionally verify that the
+# content-security-policy header (if present) does not contain a
+# frame-ancestors directive before firing. This is indicated by the
+# csp_frame_ancestors_absent: true field below.
+
+rules:
+  - id: clickjacking-no-frame-guard
+    title: No Clickjacking Protection (Missing X-Frame-Options and CSP frame-ancestors)
+    severity: medium
+    cwe: CWE-1021
+    description: >
+      The HTML response does not include an X-Frame-Options header and the
+      Content-Security-Policy header (if present) does not specify a
+      frame-ancestors directive. The page can be embedded in an attacker-
+      controlled iframe, enabling clickjacking attacks.
+    match:
+      header_absent: x-frame-options
+      csp_frame_ancestors_absent: true
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: >-
+      Neither 'x-frame-options' nor a CSP 'frame-ancestors' directive is present
+    needs_ai_validation: false

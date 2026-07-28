@@ -1,0 +1,31 @@
+# JWT Attacks (CWE-347 Improper Signature Verification) — OWASP A02/A07:2021
+attack_type: jwt
+
+positive_examples:
+  - payload: "resign token with alg=none and no signature"
+    response_snippet: "200 OK, server accepted the unsigned token and honoured its claims"
+    reasoning: >
+      Accepting an alg=none token means the signature is not verified, so an
+      attacker can forge arbitrary claims (e.g. role=admin).
+  - payload: "change header alg RS256->HS256, sign with the public key as the HMAC secret"
+    response_snippet: "200 OK, token validated"
+    reasoning: >
+      An algorithm-confusion attack succeeded because the server used the public
+      key as an HMAC secret, letting an attacker forge valid tokens.
+  - payload: "modify payload role=user -> role=admin, keep original signature"
+    response_snippet: "200 OK, elevated access granted"
+    reasoning: >
+      The server honoured a tampered payload without re-validating the signature,
+      proving broken integrity checking.
+
+negative_examples:
+  - payload: "resign token with alg=none"
+    response_snippet: "401 Unauthorized {\"error\":\"unsupported alg\"}"
+    reasoning: >
+      The server rejects alg=none and enforces its expected algorithm, so the
+      forgery attempt fails — signature verification is intact.
+  - payload: "tamper with the payload, keep the old signature"
+    response_snippet: "401 Unauthorized {\"error\":\"invalid signature\"}"
+    reasoning: >
+      The signature check detected the modification and rejected the token, so
+      integrity is enforced and there is no bypass.

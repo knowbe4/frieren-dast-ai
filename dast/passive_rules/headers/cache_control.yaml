@@ -1,0 +1,22 @@
+# Cache-control checks — detects authenticated responses that are incorrectly
+# marked as cacheable, exposing sensitive data to shared caches.
+# Covers OWASP A02 (Cryptographic Failures) / CWE-525.
+
+rules:
+  - id: cacheable-response-with-auth
+    title: Authenticated Response May Be Cached
+    severity: medium
+    cwe: CWE-525
+    description: >
+      The request includes an Authorization header but the response Cache-Control
+      header does not contain 'no-store' or 'private'. Shared or browser caches
+      may store this authenticated response, exposing it to other users.
+    match:
+      request_header_present: authorization
+      header_value_not_regex: 'no-store|private'
+      header_name: cache-control
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Authenticated request but Cache-Control is '{value}' — response may be cached
+    needs_ai_validation: false

@@ -1,0 +1,49 @@
+{
+  "name": "dast-ai-desktop",
+  "version": "0.8.0",
+  "description": "Frieren DAST-AI desktop launcher — native window for the proxy + dashboard",
+  "main": "main.js",
+  "author": "Frieren DAST-AI contributors",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "setup-electron": "node scripts/setup-electron.js",
+    "test": "node --test \"tests/**/*.test.js\"",
+    "dist": "electron-builder --dir",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win portable",
+    "dist:linux": "electron-builder --linux AppImage"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "playwright": "^1.61.1"
+  },
+  "build": {
+    "appId": "com.frieren-dast-ai.desktop",
+    "productName": "Frieren DAST-AI",
+    "files": [
+      "main.js",
+      "loading.html",
+      "build/icon.png"
+    ],
+    "directories": {
+      "buildResources": "build"
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "target": ["dmg", "zip"]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": ["portable", "nsis"]
+    },
+    "linux": {
+      "icon": "build/icon.png",
+      "target": ["AppImage"],
+      "category": "Development"
+    }
+  }
+}

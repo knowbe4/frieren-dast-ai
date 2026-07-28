@@ -1,0 +1,28 @@
+# Sensitive Data / Secrets Exposure (CWE-200, CWE-798) — OWASP A02:2021
+# NOTE: the secrets agent usually confirms deterministically and bypasses the
+# LLM. These examples guide the validator for the ambiguous, LLM-routed cases.
+attack_type: sensitive_data
+
+positive_examples:
+  - payload: "GET /js/app.bundle.js (no injection — passive read)"
+    response_snippet: 'const AWS_SECRET = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";'
+    reasoning: >
+      A live-format AWS secret access key is exposed in a client-served asset,
+      granting an attacker direct access to cloud resources.
+  - payload: "GET /api/debug/config"
+    response_snippet: '{"db_password":"prod-4f2a9c","stripe_sk":"sk_live_51H..."}'
+    reasoning: >
+      Production database and payment-provider secrets are returned in a
+      reachable response, a high-impact credential disclosure.
+
+negative_examples:
+  - payload: "GET /js/app.bundle.js"
+    response_snippet: 'const API_URL = "https://api.example.com"; const VERSION = "1.4.2";'
+    reasoning: >
+      Public configuration (base URL, version) is not sensitive — no credential
+      or secret is exposed.
+  - payload: "response contains AKIAIOSFODNN7EXAMPLE"
+    response_snippet: "AKIAIOSFODNN7EXAMPLE (the AWS-published documentation example key)"
+    reasoning: >
+      This is the well-known example key from AWS docs, not a live credential, so
+      it carries no real exposure.

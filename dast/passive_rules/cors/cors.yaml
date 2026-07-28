@@ -1,0 +1,82 @@
+# CORS misconfiguration checks — detects overly permissive cross-origin
+# resource sharing policies that expose APIs to cross-site data theft.
+# Covers OWASP A05 (Security Misconfiguration) / CWE-942.
+#
+# Note: rules with cors_check: true require stateful comparison between the
+# request Origin header and the response Access-Control-Allow-Origin value.
+# The rule engine evaluates these as a special case.
+
+rules:
+  - id: cors-wildcard-with-credentials
+    title: CORS Wildcard Origin with Credentials Allowed
+    severity: medium
+    cwe: CWE-942
+    description: >
+      The server responds with Access-Control-Allow-Origin: * combined with
+      Access-Control-Allow-Credentials: true. Any origin can make credentialed
+      cross-origin requests, allowing full cross-site data theft.
+    match:
+      header_value_regex: '^\*$'
+      header_name: access-control-allow-origin
+      also_header_value: 'true'
+      also_header_name: access-control-allow-credentials
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Access-Control-Allow-Origin: * combined with Allow-Credentials: true
+      allows any origin to make credentialed cross-origin requests
+    needs_ai_validation: false
+
+  - id: cors-wildcard-origin
+    title: CORS Wildcard Origin Allowed
+    severity: low
+    cwe: CWE-942
+    description: >
+      The server responds with Access-Control-Allow-Origin: *, allowing any
+      origin to read this response. Acceptable for fully public resources
+      but problematic for authenticated or sensitive APIs. Without
+      Access-Control-Allow-Credentials: true this is not directly exploitable,
+      but warrants review on endpoints that serve authenticated content.
+    match:
+      header_value_regex: '^\*$'
+      header_name: access-control-allow-origin
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Access-Control-Allow-Origin: * allows any origin to read this response
+    needs_ai_validation: true
+    confirmed: false
+
+  - id: cors-reflected-origin-with-credentials
+    title: CORS Reflected Origin with Credentials Allowed
+    severity: medium
+    cwe: CWE-942
+    description: >
+      The server reflects the request Origin header in Access-Control-Allow-Origin
+      and also sets Access-Control-Allow-Credentials: true. Any origin can make
+      fully credentialed cross-origin requests to this endpoint.
+    match:
+      cors_check: true
+      cors_mode: reflected_with_credentials
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Server reflects Origin '{origin}' with Allow-Credentials: true
+    needs_ai_validation: false
+
+  - id: cors-null-origin
+    title: CORS Allows Null Origin
+    severity: medium
+    cwe: CWE-942
+    description: >
+      The server sets Access-Control-Allow-Origin: null. A null origin can be
+      triggered by sandboxed iframes on attacker-controlled pages, enabling
+      cross-origin data exfiltration.
+    match:
+      header_value_regex: '^null$'
+      header_name: access-control-allow-origin
+    conditions:
+      content_type: any
+    evidence_template: >-
+      Access-Control-Allow-Origin: null can be exploited via sandboxed iframes
+    needs_ai_validation: false

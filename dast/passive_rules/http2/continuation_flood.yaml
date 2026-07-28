@@ -1,0 +1,100 @@
+# HTTP/2 CONTINUATION Flood passive detection rules.
+#
+# The DAST-AI proxy operates at HTTP/1.1 level — it does not decode raw HTTP/2
+# frames from the wire. These rules detect vulnerable server versions from
+# response headers and fingerprint HTTP/2-capable servers for active probing.
+#
+# CVEs covered:
+#   CVE-2024-27316  Apache httpd 2.4.17–2.4.58
+#   CVE-2024-27919  Envoy 1.29.0–1.29.1
+#   CVE-2024-27983  Node.js (all active release lines before April 2024 patches)
+#   CVE-2023-45288  Go net/http (before go1.21.9 / go1.22.2)
+
+rules:
+  # ── Apache httpd vulnerable version ──────────────────────────────────────
+
+  - id: http2-apache-continuation-flood
+    title: Apache HTTP Server Potentially Vulnerable to HTTP/2 CONTINUATION Flood (CVE-2024-27316)
+    severity: high
+    cwe: CWE-400
+    description: >
+      The Server header indicates an Apache HTTP Server version in the range 2.4.17–2.4.58,
+      which is vulnerable to CVE-2024-27316 (HTTP/2 CONTINUATION Flood). An unauthenticated
+      attacker can send unlimited CONTINUATION frames on a single TCP connection, causing
+      unbounded memory buffering in nghttp2 and OOM crash. Fixed in Apache 2.4.59.
+    match:
+      header_value_regex: 'Apache/2\.4\.(1[7-9]|[2-4][0-9]|5[0-8])\b'
+      header_name: server
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Server header '{value}' indicates Apache HTTP Server in vulnerable range 2.4.17–2.4.58 (CVE-2024-27316). Upgrade to 2.4.59+."
+    needs_ai_validation: false
+    confirmed: false
+
+  # ── Envoy vulnerable version ──────────────────────────────────────────────
+
+  - id: http2-envoy-continuation-flood
+    title: Envoy Proxy Potentially Vulnerable to HTTP/2 CONTINUATION Flood (CVE-2024-27919)
+    severity: high
+    cwe: CWE-400
+    description: >
+      The Server or x-envoy-upstream-service-time header indicates an Envoy proxy.
+      Envoy 1.29.0 and 1.29.1 are vulnerable to CVE-2024-27919: the HTTP/2 codec does not
+      reset a request when header map limits are exceeded, allowing unlimited memory
+      consumption from CONTINUATION frame sequences. Fixed in Envoy 1.29.2.
+    match:
+      header_value_regex: 'envoy'
+      header_name_any:
+        - server
+        - x-envoy-upstream-service-time
+        - x-envoy-decorator-operation
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Envoy proxy detected via header '{header}: {value}' — verify version is not 1.29.0 or 1.29.1 (CVE-2024-27919)"
+    needs_ai_validation: false
+    confirmed: false
+
+  # ── Go/net/http vulnerable version ───────────────────────────────────────
+
+  - id: http2-go-continuation-flood
+    title: Go HTTP Server Potentially Vulnerable to HTTP/2 CPU Exhaustion (CVE-2023-45288)
+    severity: medium
+    cwe: CWE-400
+    description: >
+      The Server header indicates a Go HTTP server. Go net/http before go1.21.9 and go1.22.2
+      is vulnerable to CVE-2023-45288: HPACK state maintenance requires parsing all HEADERS
+      and CONTINUATION frames regardless of MaxHeaderBytes, enabling CPU exhaustion via
+      unlimited Huffman decoding. Fixed by adding a limit on excess header frames.
+    match:
+      header_value_regex: '^Go-http-client|^Go/[0-9]'
+      header_name: server
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Go HTTP server detected via 'server: {value}' — verify Go version is ≥1.21.9 or ≥1.22.2 (CVE-2023-45288)"
+    needs_ai_validation: false
+    confirmed: false
+
+  # ── HTTP/2 support detection (triggers active agent probe) ────────────────
+
+  - id: http2-capable-server
+    title: HTTP/2 Capable Server Detected — Schedule CONTINUATION Flood Probe
+    severity: info
+    cwe: CWE-400
+    description: >
+      The response was served over HTTP/2 (detected via Alt-Svc or HTTP/2 upgrade headers).
+      This server should be probed for HTTP/2 CONTINUATION Flood and Rapid Reset
+      vulnerabilities by the HTTP/2 agent. The passive scanner cannot inspect raw
+      HTTP/2 frames through the proxy — active probing via direct TCP+TLS is required.
+    match:
+      header_value_regex: 'h2'
+      header_name_any:
+        - alt-svc
+        - upgrade
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "HTTP/2 advertised via header '{header}: {value}' — HTTP/2 CONTINUATION Flood probe recommended"
+    needs_ai_validation: false

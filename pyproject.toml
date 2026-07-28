@@ -1,0 +1,63 @@
+[project]
+name = "dast-ai"
+version = "0.8.0"
+description = "AI-driven DAST: browser-based security testing with LLM feedback loops"
+requires-python = ">=3.12"
+dependencies = [
+    # Browser automation
+    "playwright>=1.44.0",
+    # HTTP
+    "httpx>=0.27.0",
+    "aiohttp>=3.9.0",
+    # AI (AWS Bedrock)
+    "boto3>=1.34.0",
+    "botocore>=1.34.0",
+    # Data
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "sqlalchemy>=2.0.0",
+    "aiosqlite>=0.20.0",
+    # CLI & output
+    "click>=8.1.0",
+    "rich>=13.7.0",
+    # Utilities
+    "python-dotenv>=1.0.0",
+    "structlog>=24.1.0",
+    "dnspython>=2.6.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=5.2.0",
+    "jinja2>=3.1.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "websockets>=12.0",
+    "cryptography>=42.0.0",
+    "pyyaml>=6.0.0",
+    "requests>=2.34.2",
+    # Tech-stack fingerprinting (passive — uses proxy-captured responses, no extra requests)
+    "wappalyzer>=2.0.0",
+    "msgpack>=1.1.2",
+]
+
+[project.scripts]
+dast-ai = "dast.cli:main"
+
+[tool.uv.sources]
+
+[tool.hatch.build.targets.wheel]
+packages = ["dast"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-mock>=3.14.0",
+    "respx>=0.21.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

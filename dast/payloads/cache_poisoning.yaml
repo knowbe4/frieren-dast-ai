@@ -1,0 +1,58 @@
+# Web cache poisoning probes — seed list for the cache-poisoning agent.
+#
+# The agent injects each header with a unique marker value and checks whether
+# the marker (a) reflects into the response and (b) survives into a second
+# request that does NOT carry the header (served from cache) — the proof of an
+# unkeyed input being cached. Every probe is sent against a UNIQUE cache-buster
+# URL so we only ever poison a key we alone request, never the shared page.
+#
+# {{MARKER}} is replaced at runtime with a per-probe unique token; {{COLLAB}}
+# with the collaborator base (host:port) for blind/stored variants.
+
+payloads:
+  # Unkeyed request headers commonly reflected into responses (rewritten links,
+  # redirects, absolute URLs). These are the classic cache-poisoning vectors.
+  unkeyed_headers:
+    - name: "X-Forwarded-Host"
+      value: "{{MARKER}}"
+    - name: "X-Forwarded-Scheme"
+      value: "http"
+    - name: "X-Forwarded-Proto"
+      value: "http"
+    - name: "X-Forwarded-Server"
+      value: "{{MARKER}}"
+    - name: "X-Host"
+      value: "{{MARKER}}"
+    - name: "X-Forwarded-For"
+      value: "{{MARKER}}"
+    - name: "X-Original-URL"
+      value: "/{{MARKER}}"
+    - name: "X-Rewrite-URL"
+      value: "/{{MARKER}}"
+    - name: "X-Forwarded-Port"
+      value: "{{MARKER}}"
+    - name: "Forwarded"
+      value: "host={{MARKER}}"
+
+  # Blind/stored variants: point the unkeyed header at the OAST collaborator so
+  # a cached response that later triggers a server-side fetch is observable.
+  blind_headers:
+    - name: "X-Forwarded-Host"
+      value: "{{COLLAB}}"
+
+# Response header names that indicate the response is cacheable / was cached.
+# The agent uses these as supporting (not sole) evidence.
+cache_indicator_headers:
+  - "x-cache"
+  - "x-cache-hits"
+  - "cf-cache-status"
+  - "age"
+  - "x-served-by"
+  - "x-varnish"
+  - "fastly-debug-digest"
+
+# Response Cache-Control / header signals that mean the response is NOT
+# cacheable — the agent bails early to avoid noise.
+non_cacheable_signals:
+  - "no-store"
+  - "private"

@@ -1,0 +1,31 @@
+# Cross-Site Scripting (CWE-79) — OWASP A03:2021 Injection
+attack_type: xss
+
+positive_examples:
+  - payload: "<script>alert(1)</script>"
+    response_snippet: "<div>Results for <script>alert(1)</script></div>  (Content-Type: text/html)"
+    reasoning: >
+      The payload is reflected unencoded inside an HTML response body, so a
+      browser parses and executes the injected script tag.
+  - payload: "\"><img src=x onerror=alert(document.domain)>"
+    response_snippet: "value=\"\"><img src=x onerror=alert(document.domain)>\" (attribute break-out in text/html)"
+    reasoning: >
+      The payload broke out of the attribute context into a new tag with an
+      event handler; headless-browser execution confirms real DOM XSS.
+  - payload: "<svg/onload=alert(1)>"
+    response_snippet: "stored in profile bio, rendered on /profile page as raw HTML for other users"
+    reasoning: >
+      A stored payload rendered unencoded on a page served to other users is
+      persistent XSS — highest impact, executes without any victim interaction with a link.
+
+negative_examples:
+  - payload: "<script>alert(1)</script>"
+    response_snippet: '{"name":"<script>alert(1)</script>"}  (Content-Type: application/json)'
+    reasoning: >
+      Reflection inside a JSON response body is never parsed as HTML by a
+      browser, so the script cannot execute — structurally impossible.
+  - payload: "<script>alert(1)</script>"
+    response_snippet: "&lt;script&gt;alert(1)&lt;/script&gt; (HTML-entity encoded in text/html)"
+    reasoning: >
+      The angle brackets are HTML-entity encoded on output, so the browser
+      renders inert text rather than executing a script — the encoding neutralises the payload.

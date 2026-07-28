@@ -1,0 +1,31 @@
+# NoSQL Injection (CWE-943) — OWASP A03:2021 Injection
+attack_type: nosql
+
+positive_examples:
+  - payload: '{"$ne": null}'
+    response_snippet: "login succeeded, returned session token for the first user in the collection"
+    reasoning: >
+      A MongoDB operator injected into the auth query bypassed the password
+      check by matching any non-null value — authentication bypass via NoSQLi.
+  - payload: '{"$gt": ""}'
+    response_snippet: "returned all 12,431 documents instead of the filtered subset"
+    reasoning: >
+      The $gt operator turned a scoped query into a match-all, dumping the full
+      collection — proves operator injection into the query document.
+  - payload: "'; return true; var x='"
+    response_snippet: "returned every record (JS $where predicate evaluated to true for all)"
+    reasoning: >
+      Server-side JavaScript in a $where clause evaluated attacker input as
+      code, returning all records — NoSQL/JS injection confirmed.
+
+negative_examples:
+  - payload: '{"$ne": null}'
+    response_snippet: '{"error":"Expected string, received object"}'
+    reasoning: >
+      The backend enforced a string type and rejected the object, so the
+      operator was never interpreted as a query operator — input validation held.
+  - payload: '{"$gt": ""}'
+    response_snippet: "0 results (query treated the whole JSON as a literal username string)"
+    reasoning: >
+      The payload was used as a literal value rather than parsed into operators,
+      so no injection occurred — the query behaved as a normal exact match.

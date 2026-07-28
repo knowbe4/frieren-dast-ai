@@ -1,0 +1,27 @@
+# Cross-Session IDOR (CWE-639) — OWASP A01:2021 Broken Access Control
+# Object belonging to session A is accessible from session B (two distinct users).
+attack_type: cross_session_idor
+
+positive_examples:
+  - payload: "session B replays a resource URL captured from session A: GET /api/orders/AC-9931"
+    response_snippet: "200 OK returning session A's order details in full to session B"
+    reasoning: >
+      A resource created under one authenticated session is fully readable from a
+      different user's session, proving objects are not bound to their owner.
+  - payload: "reuse session A's document token in session B: GET /files/doc?token=A1B2C3"
+    response_snippet: "200 OK, session B downloads a document uploaded by user A"
+    reasoning: >
+      The capability token is not tied to the session that created it, so any
+      authenticated user who obtains it reads another user's private file.
+
+negative_examples:
+  - payload: "session B replays session A's resource URL"
+    response_snippet: "403 Forbidden — resource is bound to the originating session/user"
+    reasoning: >
+      Access from the second session is denied; the object is correctly scoped
+      to its owner, so no cross-session exposure occurs.
+  - payload: "session B replays session A's URL after A logged out"
+    response_snippet: "401 Unauthorized — session A's reference expired with the session"
+    reasoning: >
+      The reference is only valid within its own live session and cannot be
+      replayed by another user, so there is no cross-session IDOR.

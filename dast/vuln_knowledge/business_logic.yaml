@@ -1,0 +1,32 @@
+# Business Logic Abuse — incl. Mass Assignment (CWE-915), price/quantity abuse,
+# workflow bypass, privilege escalation via extra fields — OWASP A04:2021
+attack_type: business_logic
+
+positive_examples:
+  - payload: 'POST /cart/checkout {"item":"X","quantity":-5,"price":100}'
+    response_snippet: '200 OK {"orderTotal":-500,"status":"confirmed"}'
+    reasoning: >
+      A negative quantity produced a negative total the server accepted, letting
+      an attacker manipulate the amount owed — logic flaw with financial impact.
+  - payload: 'PATCH /users/me {"email":"me@x.com","role":"admin"}'
+    response_snippet: '200 OK {"email":"me@x.com","role":"admin"}'
+    reasoning: >
+      A client-supplied role field the request should not control was persisted,
+      escalating privileges via mass assignment.
+  - payload: "replay POST /coupon/apply?code=SAVE50 five times on one order"
+    response_snippet: "discount stacked 5x, order total driven near zero"
+    reasoning: >
+      A single-use coupon applied repeatedly without server-side enforcement is a
+      workflow/limit bypass with direct monetary impact.
+
+negative_examples:
+  - payload: 'POST /cart/checkout {"quantity":-5}'
+    response_snippet: '400 Bad Request {"error":"quantity must be >= 1"}'
+    reasoning: >
+      The server validated the quantity and rejected the invalid value, so the
+      business rule is enforced — no logic flaw.
+  - payload: 'PATCH /users/me {"role":"admin"}'
+    response_snippet: '200 OK {"email":"me@x.com","role":"user"}  (role field ignored)'
+    reasoning: >
+      The server silently ignored the unauthorized field and kept the original
+      role, so no privilege escalation occurred despite the echo of other fields.

@@ -1,0 +1,308 @@
+# Security header checks — fires once per host on HTML responses.
+# Covers OWASP A05 (Security Misconfiguration) and related weaknesses.
+
+rules:
+  - id: missing-hsts
+    title: Missing HTTP Strict Transport Security (HSTS)
+    severity: medium
+    cwe: CWE-319
+    description: >
+      The Strict-Transport-Security header is absent, allowing browsers to
+      connect over plain HTTP and exposing the site to protocol downgrade attacks.
+    match:
+      header_absent: strict-transport-security
+    conditions:
+      content_type: html
+      scheme: https
+      one_per_host: true
+    evidence_template: "Header 'strict-transport-security' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: missing-csp
+    title: Missing Content Security Policy (CSP)
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy header is absent, leaving the application
+      without a defence-in-depth mechanism against XSS and data injection attacks.
+    match:
+      header_absent: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Header 'content-security-policy' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: missing-x-content-type-options
+    title: Missing X-Content-Type-Options Header
+    severity: low
+    cwe: CWE-693
+    description: >
+      The X-Content-Type-Options header is absent. Browsers may MIME-sniff
+      the content type, enabling content-sniffing attacks on uploaded files.
+    match:
+      header_absent: x-content-type-options
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Header 'x-content-type-options' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: missing-referrer-policy
+    title: Missing Referrer-Policy Header
+    severity: low
+    cwe: CWE-200
+    description: >
+      The Referrer-Policy header is absent. Sensitive URL fragments such as
+      tokens or session IDs may be leaked via the Referer header to third parties.
+    match:
+      header_absent: referrer-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Header 'referrer-policy' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: missing-permissions-policy
+    title: Missing Permissions-Policy Header
+    severity: low
+    cwe: CWE-693
+    description: >
+      The Permissions-Policy header is absent. The application does not restrict
+      access to powerful browser features such as camera, microphone, or geolocation.
+    match:
+      header_absent: permissions-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Header 'permissions-policy' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: missing-cache-control
+    title: Missing Cache-Control Header
+    severity: low
+    cwe: CWE-525
+    description: >
+      The Cache-Control header is absent on an HTML response. Browsers or
+      intermediary caches may store sensitive page content.
+    match:
+      header_absent: cache-control
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Header 'cache-control' not present in response at {path}"
+    needs_ai_validation: false
+
+  - id: csp-unsafe-inline
+    title: CSP Allows unsafe-inline
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy header permits 'unsafe-inline', which allows
+      arbitrary inline scripts and undermines XSS protection provided by CSP.
+    match:
+      header_value_regex: 'unsafe-inline'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy contains 'unsafe-inline': '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-unsafe-eval
+    title: CSP Allows unsafe-eval
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy header permits 'unsafe-eval', allowing dynamic
+      code evaluation via eval() and related functions, weakening XSS protections.
+    match:
+      header_value_regex: 'unsafe-eval'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy contains 'unsafe-eval': '{value}'"
+    needs_ai_validation: false
+
+  - id: hsts-short-max-age
+    title: HSTS max-age Too Short
+    severity: low
+    cwe: CWE-319
+    description: >
+      The Strict-Transport-Security max-age is less than one year (31536000 seconds).
+      A short max-age reduces the effectiveness of HSTS against protocol downgrade attacks.
+    match:
+      header_value_regex: 'max-age=([0-9]{1,6})\b'
+      header_name: strict-transport-security
+    conditions:
+      scheme: https
+      one_per_host: true
+    evidence_template: "Strict-Transport-Security max-age is below 31536000: '{value}'"
+    needs_ai_validation: false
+
+  - id: hsts-no-include-subdomains
+    title: HSTS Missing includeSubDomains
+    severity: low
+    cwe: CWE-319
+    description: >
+      The Strict-Transport-Security header is present but omits the
+      includeSubDomains directive, so subdomains are not protected against
+      protocol downgrade and cookie-injection attacks from an insecure origin.
+    match:
+      # HSTS value that does NOT contain includeSubDomains. The engine already
+      # compiles header_value_regex with re.IGNORECASE, so no inline flag is used.
+      header_value_regex: '^(?!.*includesubdomains).*max-age='
+      header_name: strict-transport-security
+    conditions:
+      scheme: https
+      one_per_host: true
+    evidence_template: "Strict-Transport-Security lacks includeSubDomains: '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-wildcard-script-src
+    title: CSP script-src Allows Wildcard Source
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy script-src (or default-src) directive contains a
+      bare wildcard '*', allowing scripts to be loaded from any origin. This
+      defeats the XSS-mitigation purpose of CSP.
+    match:
+      header_value_regex: '(?:script-src|default-src)[^;]*\s\*(?:\s|;|$)'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy allows a wildcard script source: '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-data-uri-script
+    title: "CSP Allows data: URI in script-src"
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy script-src directive allows the data: scheme,
+      letting an attacker execute arbitrary inline scripts encoded as data URIs
+      and bypass the policy.
+    match:
+      header_value_regex: '(?:script-src|default-src)[^;]*data:'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy allows data: in script-src: '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-http-source
+    title: "CSP Allows Insecure http: Source"
+    severity: medium
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy on an HTTPS page allowlists an http:// source,
+      permitting a network attacker to inject scripts/resources via a
+      man-in-the-middle downgrade.
+    match:
+      header_value_regex: '(?:script-src|default-src|style-src)[^;]*\bhttp://'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      scheme: https
+      one_per_host: true
+    evidence_template: "Content-Security-Policy allowlists an http:// source: '{value}'"
+    needs_ai_validation: false
+
+  - id: referrer-policy-unsafe
+    title: Unsafe Referrer-Policy (unsafe-url)
+    severity: low
+    cwe: CWE-200
+    description: >
+      The Referrer-Policy header is set to unsafe-url, causing the full URL
+      (including any tokens or session identifiers in the path/query) to be
+      sent as the Referer to third-party origins over any protocol.
+    match:
+      header_value_regex: 'unsafe-url'
+      header_name: referrer-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Referrer-Policy is set to unsafe-url: '{value}'"
+    needs_ai_validation: false
+
+  - id: x-frame-options-invalid
+    title: Invalid X-Frame-Options Value
+    severity: low
+    cwe: CWE-1021
+    description: >
+      The X-Frame-Options header is present but its value is neither DENY nor
+      SAMEORIGIN (for example the deprecated ALLOW-FROM directive). Modern
+      browsers ignore invalid values, leaving the page framable and exposed to
+      clickjacking.
+    match:
+      # X-Frame-Options value that is NOT exactly DENY or SAMEORIGIN
+      # (engine compiles with re.IGNORECASE already).
+      header_value_regex: '^(?!\s*(?:deny|sameorigin)\s*$).+'
+      header_name: x-frame-options
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "X-Frame-Options has an invalid/ineffective value: '{value}'"
+    needs_ai_validation: false
+
+  # ── Aggressive rules: CSP completeness (missing-directive) checks ──────────
+  # These rely on negative-lookahead regex and are more false-positive prone
+  # (a policy may legitimately rely on default-src / fetch directives). They
+  # are skipped unless aggressive passive scanning is enabled at runtime.
+  - id: csp-missing-object-src
+    title: CSP Missing object-src Directive
+    severity: low
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy defines neither object-src nor default-src.
+      Without object-src, plugins (Flash/Java applets, embedded objects) can be
+      loaded from any origin, enabling legacy content-injection attacks.
+    aggressive: true
+    match:
+      header_value_regex: '^(?!.*object-src)(?!.*default-src).+'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy has no object-src or default-src: '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-missing-base-uri
+    title: CSP Missing base-uri Directive
+    severity: low
+    cwe: CWE-693
+    description: >
+      The Content-Security-Policy does not restrict base-uri. An attacker who can
+      inject a <base> tag can redirect all relative URLs (including scripts) to an
+      attacker-controlled origin, bypassing other CSP restrictions.
+    aggressive: true
+    match:
+      header_value_regex: '^(?!.*base-uri).+'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy has no base-uri directive: '{value}'"
+    needs_ai_validation: false
+
+  - id: csp-missing-frame-ancestors
+    title: CSP Missing frame-ancestors Directive
+    severity: low
+    cwe: CWE-1021
+    description: >
+      The Content-Security-Policy does not set frame-ancestors. Without it the
+      page can be framed by any origin (clickjacking / xs-leaks), unless a
+      separate X-Frame-Options header compensates.
+    aggressive: true
+    match:
+      header_value_regex: '^(?!.*frame-ancestors).+'
+      header_name: content-security-policy
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Content-Security-Policy has no frame-ancestors directive: '{value}'"
+    needs_ai_validation: false

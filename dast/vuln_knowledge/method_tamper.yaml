@@ -1,0 +1,27 @@
+# HTTP Method Tampering / Verb-based Access Control Bypass (CWE-650, CWE-285)
+# OWASP A01:2021 Broken Access Control
+attack_type: method_tamper
+
+positive_examples:
+  - payload: "send HEAD or GET to an endpoint that only checks auth on POST"
+    response_snippet: "200 OK, the state-changing action executed via the unguarded verb"
+    reasoning: >
+      An access-control check bound only to POST was bypassed by using a
+      different verb the server still routes to the same handler.
+  - payload: "override with X-HTTP-Method-Override: DELETE on a POST endpoint"
+    response_snippet: "200 OK, resource deleted despite no DELETE authorization"
+    reasoning: >
+      A method-override header reached a privileged verb that lacked its own
+      authorization check — verb-tampering bypass.
+
+negative_examples:
+  - payload: "send PUT to a GET-only endpoint"
+    response_snippet: "405 Method Not Allowed"
+    reasoning: >
+      The server correctly rejects the unsupported method, so no alternate verb
+      reaches the handler — the routing enforces the allowed methods.
+  - payload: "X-HTTP-Method-Override: DELETE"
+    response_snippet: "200 OK, but the override header is ignored and only the real POST action runs"
+    reasoning: >
+      The override header has no effect and the privileged action does not run,
+      so there is no method-based bypass.

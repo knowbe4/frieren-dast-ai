@@ -1,0 +1,7 @@
+{
+  "id": "example",
+  "name": "Example Corp",
+  "scope_rules": [
+    {"enabled": true, "protocol": "https", "host": "^(.*\\.)?example\\.com$", "port": "443", "file": "", "kind": "include"}
+  ]
+}

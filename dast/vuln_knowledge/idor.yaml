@@ -1,0 +1,26 @@
+# Insecure Direct Object Reference (CWE-639) — OWASP A01:2021 Broken Access Control
+attack_type: idor
+
+positive_examples:
+  - payload: "GET /api/invoices/1002 (authenticated as the owner of invoice 1001)"
+    response_snippet: '200 OK {"id":1002,"customer":"Other Corp","total":48200,"card_last4":"7781"}'
+    reasoning: >
+      Incrementing the ID returned another tenant's invoice with sensitive data,
+      proving the endpoint does not scope objects to the authenticated user.
+  - payload: "GET /api/users/8842/profile (as user 8841)"
+    response_snippet: '200 OK with a different user''s email, phone, and address'
+    reasoning: >
+      The response contains PII belonging to a different user id than the caller,
+      confirming a missing ownership check (horizontal privilege escalation).
+
+negative_examples:
+  - payload: "GET /api/invoices/1002 (as owner of invoice 1001)"
+    response_snippet: "403 Forbidden {\"error\":\"not authorized for this resource\"}"
+    reasoning: >
+      The server enforced an ownership check and denied access to the other
+      object — the ID is direct but access control is present, so not IDOR.
+  - payload: "GET /api/invoices/1002 (as owner of invoice 1001)"
+    response_snippet: "404 Not Found (identical response whether or not the ID exists)"
+    reasoning: >
+      An indistinguishable 404 leaks nothing about other objects and returns no
+      cross-tenant data — no unauthorized object was disclosed.

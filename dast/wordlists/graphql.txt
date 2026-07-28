@@ -1,0 +1,95 @@
+# GraphQL endpoint paths (forced-browsing / endpoint fallback)
+#
+# Source: SecLists by Daniel Miessler et al. — https://github.com/danielmiessler/SecLists
+# File:   Discovery/Web-Content/graphql.txt
+# License: MIT (SecLists) — Copyright (c) 2018 Daniel Miessler
+# Subset:  endpoint paths only, fetched 2026-07-22. Static asset entries
+#          (*.css, *.js, *.min.css, *.min.js) removed — they are not endpoints.
+# Used by: dast/scanners/content_discovery.py via dast/wordlists/loader.py
+# One entry per line; blank lines and lines starting with '#' are ignored.
+___graphql
+altair
+api
+explorer
+graphiql
+graphiql/finland
+graphiql.php
+graphql
+graphql/api
+graphql/graphql
+graphql/console
+graphql-explorer
+graphql.php
+graphql/schema.json
+graphql/schema.xml
+graphql/schema.yaml
+playground
+subscriptions
+server/api/graphql
+api/graphql
+je/graphql
+graph
+v1/altair
+v1/explorer
+v1/graphiql
+v1/graphiql/finland
+v1/graphiql.php
+v1/graphql
+v1/graphql/console
+v1/graphql-explorer
+v1/graphql.php
+v1/graphql/schema.json
+v1/graphql/schema.xml
+v1/graphql/schema.yaml
+v1/playground
+v1/subscriptions
+v1/api/graphql
+v1/graph
+v2/altair
+v2/explorer
+v2/graphiql
+v2/graphiql/finland
+v2/graphiql.php
+v2/graphql
+v2/graphql/console
+v2/graphql-explorer
+v2/graphql.php
+v2/graphql/schema.json
+v2/graphql/schema.xml
+v2/graphql/schema.yaml
+v2/playground
+v2/subscriptions
+v2/api/graphql
+v2/graph
+v3/altair
+v3/explorer
+v3/graphiql
+v3/graphiql/finland
+v3/graphiql.php
+v3/graphql
+v3/graphql/console
+v3/graphql-explorer
+v3/graphql.php
+v3/graphql/schema.json
+v3/graphql/schema.xml
+v3/graphql/schema.yaml
+v3/playground
+v3/subscriptions
+v3/api/graphql
+v3/graph
+v4/altair
+v4/explorer
+v4/graphiql
+v4/graphiql/finland
+v4/graphiql.php
+v4/graphql
+v4/graphql/console
+v4/graphql-explorer
+v4/graphql.php
+v4/graphql/schema.json
+v4/graphql/schema.xml
+v4/graphql/schema.yaml
+v4/playground
+v4/subscriptions
+v4/api/graphql
+v4/graph

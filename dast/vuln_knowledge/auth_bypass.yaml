@@ -1,0 +1,31 @@
+# Authentication / Authorization Bypass (CWE-287, CWE-306) — OWASP A07:2021
+attack_type: auth_bypass
+
+positive_examples:
+  - payload: "GET /admin/users with the Authorization header removed"
+    response_snippet: "200 OK returning the full admin user list"
+    reasoning: >
+      A protected admin endpoint served sensitive data with no credentials,
+      proving authentication is not enforced (missing auth check).
+  - payload: "GET /admin/config with header X-Original-URL: /public"
+    response_snippet: "200 OK admin config, where the same request without the header returns 403"
+    reasoning: >
+      A path-override header tricked the access-control layer into treating an
+      admin path as public — a real authorization bypass.
+  - payload: "GET /admin (as a low-privilege user)"
+    response_snippet: "200 OK admin dashboard, normally restricted to role=admin"
+    reasoning: >
+      A standard user reached admin-only functionality, confirming broken
+      function-level authorization (vertical privilege escalation).
+
+negative_examples:
+  - payload: "GET /admin/users with the Authorization header removed"
+    response_snippet: "302 redirect to /login"
+    reasoning: >
+      The endpoint correctly rejected the unauthenticated request and redirected
+      to login — auth is enforced, so no bypass.
+  - payload: "GET /admin/config with X-Original-URL: /public"
+    response_snippet: "403 Forbidden (header ignored by the access-control layer)"
+    reasoning: >
+      The override header had no effect and access was still denied, so the
+      protection held and there is no bypass.

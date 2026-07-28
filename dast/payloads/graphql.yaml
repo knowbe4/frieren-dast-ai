@@ -1,0 +1,78 @@
+# GraphQL variable-fuzzing payloads — seed list for the GraphQL fuzzer
+# (dast/graphql/variable_fuzzer.py, driven from the GraphQL tab's Fuzzer sub-tab).
+#
+# These target GraphQL argument/variable values specifically — one variable
+# perturbed at a time, cross-producted against the other variables held at
+# their original captured values. Query-structure attacks (batching, alias
+# overloading, circular-query DoS) and IDOR are explicitly out of scope here;
+# see dast/plugins/graphql_analyzer.py and dast/agents/graphql_agent.py for those.
+#
+# Detection of SQL errors / stack traces / debug-info leakage in responses is
+# also owned by dast/plugins/graphql_analyzer.py — this fuzzer only records
+# status/length/errors-present per attempt, it does not classify vulnerability
+# type on its own.
+#
+# Note: the "oversized string" edge case is generated programmatically in
+# variable_fuzzer.py (e.g. "A" * 10000) rather than stored here as a literal.
+#
+# Safety policy (same as every other payload file in dast/payloads/): NO
+# destructive payloads — no DROP, TRUNCATE, DELETE without WHERE, UPDATE
+# without WHERE, or anything else that mutates/destroys data. Detection only.
+
+payloads:
+  sqli_style:
+    - "' OR 1=1--"
+    - "1' AND '1'='1"
+    - "\" OR \"\"=\""
+    - "' UNION SELECT NULL--"
+    - "1 OR 1=1"
+
+  nosql_style:
+    - '{"$ne": null}'
+    - '{"$gt": ""}'
+    - '{"$where": "1==1"}'
+    - '{"$regex": ".*"}'
+    - '{"$exists": true}'
+
+  cmdi_style:
+    - "; id"
+    - "| whoami"
+    - "$(whoami)"
+    - "`id`"
+    - "&& sleep 5"
+
+  edge_case_strings:
+    - ""
+    - "null"
+    - "こんにちは世界"
+    - "%00"
+    - "../../../etc/passwd"
+    - "<script>alert(1)</script>"
+
+  edge_case_numbers:
+    - "-1"
+    - "0"
+    - "999999999999999999999"
+    - "NaN"
+    - "Infinity"
+    - "-Infinity"
+    - "1.7976931348623157e+308"
+
+  edge_case_bool:
+    - "0"
+    - "1"
+    - "true"
+    - "false"
+    - "yes"
+
+  edge_case_enum:
+    - "INVALID_ENUM_VALUE"
+    - ""
+    - "null"
+
+  edge_case_object:
+    - "{}"
+    - "[]"
+    - "null"
+
+oversized_string_length: 10000

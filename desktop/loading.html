@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';" />
+  <title>Frieren DAST-AI</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #1a1a1a;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .box { text-align: center; }
+    .title {
+      font-size: 28px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+    .sub {
+      font-size: 14px;
+      color: #888;
+      margin-bottom: 28px;
+    }
+    .spinner {
+      width: 36px;
+      height: 36px;
+      margin: 0 auto;
+      border: 3px solid #333;
+      border-top-color: #4a9eff;
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="title">Frieren DAST-AI</div>
+    <div class="sub">Starting proxy and dashboard...</div>
+    <div class="spinner"></div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Prototype Pollution (CWE-1321) — OWASP A08:2021
+attack_type: prototype_pollution
+
+positive_examples:
+  - payload: '{"__proto__":{"isAdmin":true}}'
+    response_snippet: "subsequent requests report isAdmin=true for objects that never set it"
+    reasoning: >
+      A property injected onto Object.prototype leaked into unrelated objects,
+      proving server-side prototype pollution with an auth-relevant gadget.
+  - payload: "?constructor[prototype][polluted]=yes"
+    response_snippet: '{"__proto__ reflected":"polluted:yes on a fresh object"}'
+    reasoning: >
+      A newly created object inherited the injected property, confirming the
+      merge routine writes to the shared prototype.
+
+negative_examples:
+  - payload: '{"__proto__":{"isAdmin":true}}'
+    response_snippet: '{"user":{"__proto__":{"isAdmin":true}}}  (stored as an own property named __proto__)'
+    reasoning: >
+      The key was stored as a literal own property and did not affect any other
+      object's prototype, so no pollution took place.
+  - payload: '{"__proto__":{"polluted":true}}'
+    response_snippet: '400 Bad Request {"error":"forbidden key __proto__"}'
+    reasoning: >
+      The server rejected the dangerous key outright, so the prototype was never
+      modified — the input filter is effective.

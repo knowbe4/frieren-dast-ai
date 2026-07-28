@@ -1,0 +1,26 @@
+# CRLF Injection / HTTP Response Splitting (CWE-93, CWE-113) — OWASP A03:2021
+attack_type: crlf
+
+positive_examples:
+  - payload: "%0d%0aX-Injected:%20crlf-injected"
+    response_snippet: "response headers contain: X-Injected: crlf-injected"
+    reasoning: >
+      A CRLF sequence in user input produced a new response header the server
+      never sets, proving header injection (enabling cache poisoning / splitting).
+  - payload: "%0d%0aSet-Cookie:%20sessionid=attacker"
+    response_snippet: "Set-Cookie: sessionid=attacker present in the response"
+    reasoning: >
+      The injected Set-Cookie header was reflected into the response, letting an
+      attacker fixate a session cookie.
+
+negative_examples:
+  - payload: "%0d%0aX-Injected:%20crlf-injected"
+    response_snippet: "body contains the literal text %0d%0aX-Injected: crlf-injected"
+    reasoning: >
+      The CRLF is URL-encoded in the body and not interpreted as a header break,
+      so no header was injected — this is reflection, not CRLF injection.
+  - payload: "\\r\\nX-Injected: crlf"
+    response_snippet: "400 Bad Request (server rejected control characters in the value)"
+    reasoning: >
+      The server stripped or rejected the control characters before building the
+      response, so no header could be injected.

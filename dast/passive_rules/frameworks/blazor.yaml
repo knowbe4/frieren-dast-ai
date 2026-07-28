@@ -1,0 +1,242 @@
+# Blazor framework passive detection rules — fires on every proxied response.
+#
+# Covers:
+#   - Blazor WebAssembly fingerprinting (framework JS, blazor.boot.json)
+#   - Blazor Server fingerprinting (SignalR hub, circuit negotiation)
+#   - appsettings.json served to browser (sensitive config exposure)
+#   - Blazor WASM DLL/WASM bundle exposure
+#   - Blazor debug mode artefacts
+#   - SignalR WebSocket endpoint exposure
+
+rules:
+  # ── Fingerprinting ────────────────────────────────────────────────────────
+
+  - id: blazor-wasm-detected
+    title: Blazor WebAssembly Application Detected
+    severity: info
+    cwe: CWE-200
+    description: >
+      The response contains the Blazor WebAssembly framework JavaScript loader,
+      confirming this is a Blazor WASM application. Blazor WASM ships .NET
+      assemblies (DLLs) to the browser, which can be downloaded and decompiled
+      to expose client-side logic, hardcoded secrets, and API endpoints.
+    match:
+      body_regex: '_framework/blazor\.webassembly\.js|blazor\.boot\.json|_framework/dotnet\.'
+      body_max_scan_bytes: 32768
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Blazor WebAssembly detected — .NET assemblies are downloadable and decompilable"
+    needs_ai_validation: false
+
+  - id: blazor-server-detected
+    title: Blazor Server Application Detected
+    severity: info
+    cwe: CWE-200
+    description: >
+      The response contains the Blazor Server framework JavaScript, confirming
+      this is a Blazor Server application. Blazor Server communicates via
+      SignalR WebSocket (/_blazor hub) — this endpoint may be accessible without
+      full authentication and can leak server-side state.
+    match:
+      body_regex: '_framework/blazor\.server\.js|<script[^>]+src[^>]+blazor\.server\.js'
+      body_max_scan_bytes: 32768
+    conditions:
+      content_type: html
+      one_per_host: true
+    evidence_template: "Blazor Server detected — SignalR hub at /_blazor may be accessible unauthenticated"
+    needs_ai_validation: false
+
+  - id: blazor-boot-json-exposed
+    title: Blazor Boot Manifest Exposed (blazor.boot.json)
+    severity: medium
+    cwe: CWE-200
+    description: >
+      The blazor.boot.json manifest lists all .NET assemblies (DLLs and WASM
+      modules) loaded by the application. An attacker can use this list to
+      enumerate and download every assembly for offline decompilation, exposing
+      business logic, secrets, and internal API endpoints.
+    match:
+      path_regex: '_framework/blazor\.boot\.json$|_framework/blazor\.modules\.json$'
+    conditions:
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: "Blazor boot manifest accessible at {path} — lists all .NET assemblies"
+    needs_ai_validation: false
+
+  - id: blazor-dotnet-wasm-exposed
+    title: .NET WebAssembly Runtime Exposed
+    severity: low
+    cwe: CWE-200
+    description: >
+      The .NET WebAssembly runtime binary is being served. This is expected for
+      public Blazor WASM applications, but confirms the attack surface:
+      all loaded assemblies are accessible for download and decompilation.
+    match:
+      path_regex: '_framework/dotnet\.(native\.)?(wasm|js)$'
+    conditions:
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: ".NET WASM runtime accessible at {path} — Blazor WASM confirmed"
+    needs_ai_validation: false
+
+  # ── Sensitive configuration exposure ─────────────────────────────────────
+
+  - id: blazor-appsettings-exposed
+    title: Blazor appsettings.json Exposed to Browser
+    severity: high
+    cwe: CWE-200
+    description: >
+      The ASP.NET Core appsettings.json configuration file is accessible from
+      the browser. Blazor WASM ships a client-side copy of appsettings.json under
+      /_framework/. If the server-side file is also exposed, it may contain
+      database connection strings, API keys, JWT signing secrets, or cloud
+      credentials.
+    match:
+      path_regex: '(/_framework/appsettings|/appsettings)\.(json|Production\.json|Development\.json)$'
+      also_body_regex: '"ConnectionStrings"|"ApiKey"|"Secret"|"Password"|"Token"|"Key"'
+    conditions:
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: "Configuration file at {path} contains sensitive keys"
+    needs_ai_validation: true
+
+  - id: blazor-appsettings-accessible
+    title: Blazor appsettings.json Accessible (No Sensitive Keys Detected)
+    severity: medium
+    cwe: CWE-200
+    description: >
+      An ASP.NET Core appsettings.json file is accessible from the browser.
+      Even without obvious sensitive keys, this file reveals application
+      configuration, environment names, and service endpoints useful for
+      reconnaissance.
+    match:
+      path_regex: '(/_framework/appsettings|/appsettings)\.(json|Production\.json|Development\.json)$'
+    conditions:
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: "Configuration file accessible at {path}"
+    needs_ai_validation: false
+
+  # ── SignalR hub exposure ───────────────────────────────────────────────────
+
+  - id: blazor-signalr-hub-negotiate
+    title: Blazor SignalR Hub Negotiation Endpoint Accessible
+    severity: low
+    cwe: CWE-284
+    description: >
+      The SignalR hub negotiation endpoint (/_blazor/negotiate) responded
+      successfully. This endpoint is the entry point for Blazor Server
+      WebSocket connections. If accessible without authentication, an attacker
+      may attempt to establish a hub connection and invoke server-side methods.
+    match:
+      path_regex: '_blazor/negotiate'
+      also_body_regex: '"connectionId"|"connectionToken"|"negotiateVersion"'
+    conditions:
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: "SignalR negotiate endpoint at {path} responded — hub connection may be established unauthenticated"
+    needs_ai_validation: false
+
+  # ── Debug and development artefacts ──────────────────────────────────────
+
+  - id: blazor-debug-artefact
+    title: Blazor Debug/Development Build Artefacts Detected
+    severity: medium
+    cwe: CWE-215
+    description: >
+      The response contains Blazor debug or development mode artefacts.
+      Debug builds include symbol files (.pdb), unminified assemblies, and
+      verbose error messages that expose internal class names, file paths,
+      and stack traces.
+    match:
+      body_regex: '_framework/.*\.pdb$|blazor\.boot\.json.*"debugBuild":\s*true|Microsoft\.AspNetCore\.Components\.WebAssembly\.DevServer'
+      body_max_scan_bytes: 16384
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "Blazor debug/development artefact detected — debug build may be deployed to production"
+    needs_ai_validation: false
+
+  - id: blazor-unhandled-exception
+    title: Blazor Unhandled Exception Disclosure
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains a Blazor unhandled exception message,
+      potentially exposing stack traces, component names, and internal
+      .NET class paths.
+    match:
+      body_regex: 'blazor.*unhandled\s+exception|An\s+unhandled\s+exception\s+occurred.*Blazor|Microsoft\.AspNetCore\.Components\.ErrorBoundary'
+      body_max_scan_bytes: 16384
+    conditions:
+      content_type: html
+      one_per_host: false
+    evidence_template: "Blazor unhandled exception message detected — internal details may be exposed"
+    needs_ai_validation: true
+
+  # ── SignalR token in URL ──────────────────────────────────────────────────
+
+  - id: blazor-signalr-token-in-url
+    title: SignalR Bearer Token Exposed in URL Query String
+    severity: high
+    cwe: CWE-598
+    description: >
+      A SignalR WebSocket upgrade request passes a bearer access token as an
+      access_token query parameter in the URL. ASP.NET Core logs all request
+      URLs including query strings by default, so the token is written to
+      server logs, proxy logs, and any upstream infrastructure in cleartext.
+      An attacker with read access to logs can extract and replay the token.
+    match:
+      path_regex: '_blazor|signalr|hub'
+      also_body_regex: '"access_token"|access_token='
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: "SignalR request at {path} contains access_token in URL"
+    needs_ai_validation: false
+
+  # ── CRIME/BREACH compression risk ─────────────────────────────────────────
+
+  - id: blazor-server-no-frame-ancestors-csp
+    title: Blazor Server Missing frame-ancestors CSP (WebSocket Compression Risk)
+    severity: medium
+    cwe: CWE-311
+    description: >
+      Blazor Server enables WebSocket compression by default. Microsoft's
+      documented mitigation is to set a Content-Security-Policy with
+      frame-ancestors 'self' to prevent an attacker from embedding the app
+      in a cross-origin iframe and observing compressed response sizes
+      (CRIME/BREACH-style side-channel). This response loads blazor.server.js
+      but has no frame-ancestors directive.
+    match:
+      body_regex: '_framework/blazor\.server\.js|<script[^>]+src[^>]+blazor\.server\.js'
+      body_max_scan_bytes: 16384
+      csp_frame_ancestors_absent: true
+      header_absent: x-frame-options
+    conditions:
+      content_type: html
+      status_codes: [200]
+      one_per_host: true
+    evidence_template: "Blazor Server page at {path} lacks frame-ancestors CSP — WebSocket compression CRIME/BREACH risk"
+    needs_ai_validation: false
+
+  # ── .NET DLL in response body ─────────────────────────────────────────────
+
+  - id: blazor-dll-exposed
+    title: .NET Assembly (DLL) Directly Accessible
+    severity: medium
+    cwe: CWE-200
+    description: >
+      A .NET assembly (DLL) file is being served from the Blazor _framework
+      directory over HTTP. This file can be downloaded and decompiled using
+      tools like dnSpy or ILSpy to recover source code, hardcoded secrets,
+      internal API endpoints, and business logic. Only fires for paths under
+      _framework/ to avoid misidentifying unrelated WASM files.
+    match:
+      path_regex: '_framework/[^/]+\.(dll|wasm)$'
+    conditions:
+      status_codes: [200]
+      one_per_host: false
+    evidence_template: ".NET assembly accessible at {path} — decompilable to recover source code and secrets"
+    needs_ai_validation: false

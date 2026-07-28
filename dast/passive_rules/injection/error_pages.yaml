@@ -1,0 +1,180 @@
+# Error page and verbose exception checks — detects stack traces, SQL errors,
+# and other debug output that should never appear in production responses.
+# Covers OWASP A05 (Security Misconfiguration) / CWE-209.
+
+rules:
+  - id: stack-trace-exposure
+    title: Application Error / Stack Trace Exposure
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains a stack trace or verbose error message that
+      reveals internal file paths, class names, line numbers, or framework
+      internals, aiding attacker reconnaissance.
+    match:
+      body_regex: >-
+        Traceback \(most recent call last\)|at \w+\.\w+\([\w.]+:\d+\)|Exception in thread|java\.lang\.\w+Exception|System\.NullReferenceException|Fatal error:|ParseError:|Warning:.*on line \d+
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a stack trace or verbose error"
+    needs_ai_validation: true
+
+  - id: sql-error-exposure
+    title: SQL Error Message in Response
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains a database error message exposing SQL syntax,
+      table names, or query fragments, confirming a possible SQL injection
+      point and revealing database internals.
+    match:
+      body_regex: >-
+        You have an error in your SQL syntax|ORA-\d{5}:|Microsoft OLE DB Provider|SQLSTATE\[|pg_query\(\)|mysql_fetch|SQLiteException|Unclosed quotation mark|syntax error.*near
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Response contains a database error message"
+    needs_ai_validation: true
+
+  - id: php-error-exposure
+    title: PHP Error or Warning in Response
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains a PHP parse error, fatal error, or warning
+      block, revealing source file paths and line numbers.
+    match:
+      body_regex: '<b>Parse error</b>|<b>Fatal error</b>|<b>Warning</b>:.*in <b>.*\.php'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a PHP error or warning block"
+    needs_ai_validation: true
+
+  - id: xml-error-exposure
+    title: XML / JAXB Error in Response
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains an XML parsing or JAXB unmarshalling exception,
+      revealing internal class names and potentially processing logic.
+    match:
+      body_regex: 'org\.xml\.sax\.SAXParseException|javax\.xml\.bind|com\.sun\.xml'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Response contains an XML/JAXB exception message"
+    needs_ai_validation: true
+
+  - id: dotnet-error
+    title: ASP.NET Verbose Error Page
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response body contains an ASP.NET verbose error page, exposing the
+      application directory, stack trace, or configuration details to the
+      user's browser.
+    match:
+      body_regex: 'Server Error in.*Application\.|ASP\.NET is configured to show verbose error messages'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains an ASP.NET verbose error page"
+    needs_ai_validation: true
+
+  - id: werkzeug-debugger-console
+    title: Werkzeug Interactive Debugger Exposed
+    severity: high
+    cwe: CWE-489
+    description: >
+      The response is the Werkzeug (Flask) interactive debugger. When the PIN is
+      absent or guessable this debugger exposes an in-browser Python console,
+      allowing arbitrary remote code execution on the server. This must never be
+      reachable in production.
+    match:
+      body_regex: 'Werkzeug Debugger|The debugger caught an exception|__debugger__|werkzeug\.debug'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains the Werkzeug interactive debugger"
+    needs_ai_validation: true
+
+  - id: rails-better-errors
+    title: Rails Verbose Error / better_errors Page
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response is a Ruby on Rails development error page (better_errors or
+      the default exception view), exposing source snippets, a full backtrace,
+      and — with the web-console gem — an interactive REPL.
+    match:
+      body_regex: 'better_errors|BetterErrors|<title>Action Controller: Exception caught|web-console|actionpack \(\d'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a Rails verbose error page"
+    needs_ai_validation: true
+
+  - id: symfony-profiler
+    title: Symfony Profiler / Debug Toolbar Exposed
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response exposes the Symfony debug toolbar or web profiler, which
+      leaks routes, database queries, configuration, and request internals.
+      The profiler should be disabled outside the dev environment.
+    match:
+      body_regex: 'sf-toolbar|sf-minitoolbar|/_profiler/|Symfony\\Component\\HttpKernel\\Exception'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains the Symfony profiler / debug toolbar"
+    needs_ai_validation: true
+
+  - id: laravel-whoops
+    title: Laravel Whoops Verbose Error Page
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response is a Laravel/PHP Whoops error page (APP_DEBUG=true), exposing
+      source code, environment variables, and a full stack trace to the browser.
+    match:
+      body_regex: 'Whoops\\|Whoops, looks like something went wrong|class="Whoops|Illuminate\\'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: html
+    evidence_template: "Response contains a Laravel Whoops error page"
+    needs_ai_validation: true
+
+  - id: express-stack-trace
+    title: Node.js / Express Stack Trace Exposure
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response contains a Node.js/Express stack trace, revealing source file
+      paths, node_modules internals, and framework versions. Express should not
+      return stack traces when NODE_ENV=production.
+    match:
+      body_regex: 'at Object\.<anonymous>|at Module\._compile|node_modules[/\\].+?:\d+:\d+|at Layer\.handle'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Response contains a Node.js/Express stack trace"
+    needs_ai_validation: true
+
+  - id: go-panic
+    title: Go Runtime Panic Stack Trace
+    severity: medium
+    cwe: CWE-209
+    description: >
+      The response contains a Go runtime panic trace (goroutine dump), revealing
+      package paths, source file locations, and internal call stacks that aid
+      attacker reconnaissance.
+    match:
+      body_regex: 'goroutine \d+ \[running\]:|panic: .+\n\ngoroutine|runtime\.gopanic'
+      body_max_scan_bytes: 8192
+    conditions:
+      content_type: any
+    evidence_template: "Response contains a Go runtime panic trace"
+    needs_ai_validation: true

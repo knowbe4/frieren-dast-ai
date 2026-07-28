@@ -1,0 +1,31 @@
+# Server-Side Request Forgery (CWE-918) — OWASP A10:2021
+attack_type: ssrf
+
+positive_examples:
+  - payload: "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    response_snippet: '{"AccessKeyId":"ASIA...","SecretAccessKey":"...","Token":"..."}'
+    reasoning: >
+      The server fetched the cloud metadata endpoint and returned IAM
+      credentials — full SSRF with direct credential theft impact.
+  - payload: "http://oob-collab.example.com/ssrf-probe"
+    response_snippet: "out-of-band DNS + HTTP callback received from target's egress IP"
+    reasoning: >
+      An out-of-band callback originating from the target proves the server made
+      an attacker-controlled outbound request (blind SSRF confirmed).
+  - payload: "http://127.0.0.1:8080/admin"
+    response_snippet: "200 OK with internal admin dashboard HTML that is not reachable externally"
+    reasoning: >
+      The server returned content from an internal-only service, proving the
+      request was proxied to an internal host chosen by the attacker.
+
+negative_examples:
+  - payload: "http://169.254.169.254/latest/meta-data/"
+    response_snippet: "403 Forbidden — egress firewall blocked the request"
+    reasoning: >
+      The outbound request was blocked before reaching any internal resource;
+      an access-denied response is not exploitable SSRF.
+  - payload: "http://evil.example.com/x"
+    response_snippet: '{"url":"http://evil.example.com/x","status":"queued"}'
+    reasoning: >
+      The URL is merely stored/echoed back, not fetched — no callback and no
+      internal content returned means the server never dereferenced it.

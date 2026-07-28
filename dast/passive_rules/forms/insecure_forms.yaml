@@ -1,0 +1,42 @@
+# Insecure / mixed-content form checks — detects login and data-entry forms
+# that transmit credentials over cleartext or downgrade an HTTPS page.
+# Covers OWASP A02 (Cryptographic Failures) / A05 (Security Misconfiguration).
+#
+# Both rules use needs_ai_validation to avoid false positives on framework
+# SPA shells and templated markup where the "form" is inert.
+
+rules:
+  - id: password-form-over-http
+    title: Password Form Served Over HTTP
+    severity: high
+    cwe: CWE-319
+    description: >
+      An HTML page served over plain HTTP contains a password input field.
+      Credentials entered into this form are transmitted in cleartext and can be
+      intercepted by any network attacker (CWE-319).
+    match:
+      body_regex: '<input[^>]+type\s*=\s*["'']?password'
+      body_max_scan_bytes: 16384
+    conditions:
+      content_type: html
+      scheme: http
+    evidence_template: "HTTP page contains a password input field (cleartext credential submission)"
+    needs_ai_validation: true
+
+  - id: form-action-http-on-https-page
+    title: Form Posts to Insecure http:// Endpoint
+    severity: high
+    cwe: CWE-319
+    description: >
+      An HTML page served over HTTPS contains a form whose action attribute
+      points to an http:// URL. Submitting the form downgrades to cleartext,
+      exposing any submitted data (including credentials) to interception
+      (mixed-content credential post).
+    match:
+      body_regex: '<form[^>]+action\s*=\s*["'']?http://'
+      body_max_scan_bytes: 16384
+    conditions:
+      content_type: html
+      scheme: https
+    evidence_template: "HTTPS page has a form posting to an insecure http:// action"
+    needs_ai_validation: true

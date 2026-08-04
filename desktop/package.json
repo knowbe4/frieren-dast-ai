@@ -1,6 +1,6 @@
 {
   "name": "dast-ai-desktop",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Frieren DAST-AI desktop launcher — native window for the proxy + dashboard",
   "main": "main.js",
   "author": "Frieren DAST-AI contributors",

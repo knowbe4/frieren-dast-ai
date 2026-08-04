@@ -2,8 +2,8 @@
 
 > For Claude Code conventions, commands, and key files see [CLAUDE.md](../CLAUDE.md).
 
-**Version:** 0.8.0
-**Last Updated:** 2026-06-09
+**Version:** 0.8.1
+**Last Updated:** 2026-08-04
 
 ---
 

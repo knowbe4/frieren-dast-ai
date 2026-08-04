@@ -285,11 +285,15 @@ function _setCurrentSession(id, name) {
   if (id) {
     localStorage.setItem('dast-session-id', id);
     if (name) localStorage.setItem('dast-session-name', name);
+    // Stamp the owning proxy process so this session is only resumed by the
+    // same run (see reconcileSessionBoot). Set only on an explicit save/load.
+    if (_bootId) localStorage.setItem('dast-session-boot', _bootId);
     _showAutoSaveLabel(true);
     _maybeStartAutoSave();
   } else {
     localStorage.removeItem('dast-session-id');
     localStorage.removeItem('dast-session-name');
+    localStorage.removeItem('dast-session-boot');
   }
 }
 

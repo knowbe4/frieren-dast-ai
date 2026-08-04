@@ -2,6 +2,9 @@
 
 (function() {
   let _ctxId = null;
+  // Text selected when the menu opened. Captured here because clicking a menu
+  // item collapses the selection, so "Send to Decoder" could not read it later.
+  let _ctxSelText = '';
 
   function getMenu() { return document.getElementById('ctx-menu'); }
 
@@ -13,6 +16,8 @@
 
   function showMenu(x, y, entryId) {
     _ctxId = entryId;
+    try { _ctxSelText = (window.getSelection && window.getSelection().toString()) || ''; }
+    catch (_) { _ctxSelText = ''; }
     const m = getMenu();
     if (!m) return;
     m.classList.add('visible');
@@ -72,6 +77,24 @@
   };
   window._ctxSendIntruder = function() {
     if (_ctxId) { itrLoadEntry(_ctxId); hideMenu(); switchMain('intruder'); }
+  };
+  // Send the selected text (not the whole entry) to the Extras > Decoder tab.
+  // switchExtrasSub('decoder') runs decoderInit() against an empty input, so we
+  // set the value and re-run the transform afterwards.
+  window._ctxSendDecoder = function() {
+    const text = (_ctxSelText || '').trim();
+    hideMenu();
+    if (!text) {
+      if (window.showToast) showToast('Select some text first', true);
+      return;
+    }
+    switchMain('extras');
+    switchExtrasSub('decoder');
+    const input = document.getElementById('dec-input');
+    if (input) {
+      input.value = text;
+      if (typeof decoderRun === 'function') decoderRun();
+    }
   };
   window._ctxSendAI = function() {
     if (_ctxId) {

@@ -27,9 +27,14 @@ const appIcon = nativeImage.createFromPath(ICON_PATH);
 // ---------------------------------------------------------------------------
 // Config — overridable via environment
 // ---------------------------------------------------------------------------
-const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "8088", 10);
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || "8080", 10);
-const DASHBOARD_URL = `http://127.0.0.1:${DASHBOARD_PORT}`;
+// Preferred ports (env override or defaults). These are only a starting point:
+// resolvePorts() picks a free port if the preferred one is already taken, so a
+// stale backend left over from a previous run (or a second project on the same
+// machine) can never make us bind — or worse, silently attach to — a port we
+// don't own. Mutable because the resolved values may differ from the preferred.
+let DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "8088", 10);
+let PROXY_PORT = parseInt(process.env.PROXY_PORT || "8080", 10);
+let DASHBOARD_URL = `http://127.0.0.1:${DASHBOARD_PORT}`;
 // The backend lives one level up from desktop/. Run it via uv so the launcher
 // needs no bundled Python (Phase 1 assumes uv is installed on the machine).
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -39,6 +44,53 @@ let mainWindow = null;
 let tray = null;
 let backendReady = false;
 let isQuitting = false;
+
+// ---------------------------------------------------------------------------
+// Port resolution — never bind (or attach to) a port we don't own
+// ---------------------------------------------------------------------------
+// True only if we can bind the port ourselves right now. A port held by a
+// stale backend answers connections, so a plain "can I connect?" probe would
+// wrongly report it usable and we'd attach to that old process — exactly the
+// bug where the desktop showed a previous run's session.
+function isPortFree(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.once("error", () => resolve(false));
+    server.once("listening", () => server.close(() => resolve(true)));
+    server.listen(port, "127.0.0.1");
+  });
+}
+
+// Ask the OS for a free ephemeral port (bind to 0, read the assigned port).
+function getEphemeralPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address();
+      server.close(() => resolve(port));
+    });
+  });
+}
+
+// Return the preferred port if free, otherwise a free ephemeral one. `exclude`
+// guards against handing out the same port twice when both fall back.
+async function resolvePort(preferred, label, exclude = null) {
+  if (preferred !== exclude && (await isPortFree(preferred))) return preferred;
+  let port = await getEphemeralPort();
+  while (port === exclude) port = await getEphemeralPort();
+  console.log(
+    `[frieren-desktop] ${label} port ${preferred} is busy — using free port ${port} instead.`
+  );
+  return port;
+}
+
+// Resolve both ports before anything reads them, and rebuild DASHBOARD_URL.
+async function resolvePorts() {
+  PROXY_PORT = await resolvePort(PROXY_PORT, "proxy");
+  DASHBOARD_PORT = await resolvePort(DASHBOARD_PORT, "dashboard", PROXY_PORT);
+  DASHBOARD_URL = `http://127.0.0.1:${DASHBOARD_PORT}`;
+}
 
 // ---------------------------------------------------------------------------
 // Backend lifecycle
@@ -279,6 +331,10 @@ app.whenReady().then(async () => {
   if (process.platform === "darwin" && app.dock && !appIcon.isEmpty()) {
     app.dock.setIcon(appIcon);
   }
+
+  // Resolve free ports BEFORE createTray/createWindow/startBackend, all of
+  // which read PROXY_PORT/DASHBOARD_PORT/DASHBOARD_URL.
+  await resolvePorts();
 
   createTray();
   createWindow();

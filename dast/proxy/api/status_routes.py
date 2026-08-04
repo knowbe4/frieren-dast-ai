@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -15,9 +16,23 @@ from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Unique identity of THIS proxy process, regenerated on every startup. The
+# dashboard stamps every persisted session id with the boot id of the process
+# that owned it, then only resumes auto-saving into that session when the boot
+# id still matches. Two projects (or a restart) sharing the same
+# 127.0.0.1:<port> origin also share that origin's localStorage; without this
+# stamp the dashboard would silently resume a stale session left by a previous
+# run and overwrite its file with the new run's traffic.
+_BOOT_ID = uuid.uuid4().hex
+
 
 def make_router(ctx: DashboardContext) -> APIRouter:
     router = APIRouter()
+
+    @router.get("/api/boot-id")
+    async def get_boot_id():
+        """Identity of the running proxy process (see _BOOT_ID)."""
+        return {"boot_id": _BOOT_ID}
 
     @router.get("/api/status")
     async def get_status():

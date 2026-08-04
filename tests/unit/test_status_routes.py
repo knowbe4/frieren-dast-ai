@@ -71,3 +71,15 @@ def test_sticky_unavailable_flag_forces_offline_even_with_key(monkeypatch):
         assert body["ai_enabled"] is False
     finally:
         _reset_provider()
+
+
+def test_boot_id_is_returned_and_stable_within_process():
+    # The dashboard stamps every persisted session id with this value so a stale
+    # session from another run/project is never silently resumed. It must be a
+    # non-empty string and identical on every call within the same process.
+    client = _client()
+    first = client.get("/api/boot-id").json()
+    assert isinstance(first.get("boot_id"), str)
+    assert first["boot_id"]
+    second = client.get("/api/boot-id").json()
+    assert second["boot_id"] == first["boot_id"]

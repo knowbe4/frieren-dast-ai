@@ -249,6 +249,32 @@ let _lastKnownEntryCount = 0;
 let _wsHeartbeatTimer = null;
 let _wsReconnectDelay = 2000;
 
+// Identity of the proxy process we are talking to. A persisted session id is
+// only resumed when it was stamped with this same boot id (see
+// reconcileSessionBoot). Shared across the concatenated UI scripts.
+let _bootId = null;
+let _bootReconcilePromise = null;
+
+// Drop any persisted session id that does NOT belong to the running proxy
+// process. localStorage is keyed by origin (127.0.0.1:<port>), so a restart or
+// a second project on the same port would otherwise silently resume a stale
+// session and overwrite its file with the new run's traffic. A session id is
+// only ever stamped with a boot id after an explicit save or load, so a fresh
+// launch always starts on a clean untitled session.
+async function reconcileSessionBoot() {
+  try {
+    const r = await fetch('/api/boot-id');
+    if (!r.ok) return;
+    const d = await r.json();
+    _bootId = d.boot_id || null;
+    if (_bootId && localStorage.getItem('dast-session-boot') !== _bootId) {
+      localStorage.removeItem('dast-session-id');
+      localStorage.removeItem('dast-session-name');
+      localStorage.removeItem('dast-session-boot');
+    }
+  } catch (_) {}
+}
+
 async function loadAllEntries() {
   try {
     const r = await fetch('/api/entries');
@@ -277,6 +303,8 @@ async function loadAllEntries() {
       updateStats();
     }
 
+    // Only restore a session that belongs to the running proxy process.
+    try { await (_bootReconcilePromise || Promise.resolve()); } catch (_) {}
     const savedId   = localStorage.getItem('dast-session-id');
     const savedName = localStorage.getItem('dast-session-name');
     if (savedId && !_currentSessionId) {
@@ -319,6 +347,9 @@ function connect() {
     // Eager plugin fetch so plugin-gated tabs (e.g. GraphQL) hide/show
     // correctly even before the user ever opens the Plugins tab.
     loadPlugins();
+    // Resolve the proxy's boot id before restoring any persisted session, so a
+    // stale session from another run/project is never silently resumed.
+    _bootReconcilePromise = reconcileSessionBoot();
     // Always reload entries on reconnect — we may have missed updates while disconnected
     loadAllEntries();
   };

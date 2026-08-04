@@ -1,0 +1,23 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+scan-results/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.uv/
+.claude/
+
+# Electron desktop launcher
+desktop/node_modules/
+desktop/dist/
+desktop/build/icon-source.png
+
+# Per-organization scope presets — each org's own targets, not shared
+dast/scope_presets/*.json

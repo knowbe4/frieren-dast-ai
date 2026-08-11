@@ -17,6 +17,21 @@ Maintained and kept up to date by the KnowBe4 InfoSec team. Contributions are we
 fork, modify, or extend it however you like. If you fork or redistribute this project,
 please credit the official repository: https://github.com/knowbe4/frieren-dast-ai
 
+### Secret-scan guardrails
+
+This is a public repository. To keep internal data out of it, `make setup` installs
+git hooks that scan every commit and push:
+
+- **gitleaks** and a repo-specific internal-data guard run on each commit.
+- **trufflehog** (verified secrets) runs on push.
+- The same checks run server-side in CI (`.github/workflows/secret-scan.yml`).
+
+The hooks require `gitleaks` and `trufflehog` on your PATH — install once with
+`brew install gitleaks trufflehog` (gitleaks is also fetched automatically by the
+pre-commit framework). Run a full-repo scan any time with `make secrets-scan`.
+Never bypass the guards with `git commit --no-verify` — the push guard will still
+block the leak, and CI will fail the build.
+
 ## How it works
 
 ```

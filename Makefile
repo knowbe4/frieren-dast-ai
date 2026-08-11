@@ -1,4 +1,4 @@
-.PHONY: install setup sso sso-configure proxy validate test test-fast test-integration evals check lint help \
+.PHONY: install setup sso sso-configure proxy validate test test-fast test-integration evals check lint secrets-scan help \
         desktop desktop-install desktop-dist desktop-dist-mac desktop-dist-win desktop-dist-linux \
         desktop-test bump-version
 
@@ -10,19 +10,22 @@ export AWS_PROFILE
 # ---- Setup ----------------------------------------------------------------
 
 install:
-	@echo "[1/4] Installing Python dependencies..."
+	@echo "[1/5] Installing Python dependencies..."
 	uv sync
-	@echo "[2/4] Installing Playwright Chromium..."
+	@echo "[2/5] Installing Playwright Chromium..."
 	uv run playwright install chromium
-	@echo "[3/4] Checking .env..."
+	@echo "[3/5] Checking .env..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "  Created .env from .env.example — edit it to add your AWS credentials"; \
 	else \
 		echo "  .env already exists"; \
 	fi
-	@echo "[4/4] Verifying key imports..."
+	@echo "[4/5] Verifying key imports..."
 	uv run python -c "import playwright, boto3, fastapi, dns; print('  All imports OK')"
+	@echo "[5/5] Installing git secret-scan hooks (pre-commit + pre-push)..."
+	uv run pre-commit install --install-hooks
+	uv run pre-commit install --hook-type pre-push
 
 setup: install
 	@echo ""
@@ -169,6 +172,18 @@ lint:
 test-integration:
 	@echo "Running integration tests (proxy must already be running)..."
 	uv run python scripts/test_integration.py
+
+# ---- Secret scanning ------------------------------------------------------
+# On-demand full-repo scan for secrets / internal data. Runs the same checks as
+# the git hooks and CI. gitleaks and trufflehog must be installed
+# (brew install gitleaks trufflehog).
+secrets-scan:
+	@echo "Running gitleaks (full history)..."
+	gitleaks detect --config .gitleaks.toml --no-banner
+	@echo "Running trufflehog (verified secrets)..."
+	trufflehog git file://. --only-verified --fail --no-update --exclude-detectors=lob
+	@echo "Running internal-data guard on tracked files..."
+	git ls-files | xargs uv run python scripts/check_no_internal_data.py
 
 # ---- LLM evals ------------------------------------------------------------
 # Opt-in decision-quality harness for the planner + red-team validator. Calls

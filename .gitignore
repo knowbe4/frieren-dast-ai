@@ -21,3 +21,21 @@ desktop/build/icon-source.png
 
 # Per-organization scope presets — each org's own targets, not shared
 dast/scope_presets/*.json
+
+# ── Secret / internal-data guardrails (public repo) ─────────────────────────
+# Environment files (keep only the placeholder template)
+.env.*
+*.env
+!.env.example
+# Private keys and certificates — never commit
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+# DAST runtime output that must never land in-tree
+*.log
+.dast-ai/
+sessions/
+# OS / editor junk
+.DS_Store

@@ -1,0 +1,64 @@
+# gitleaks configuration for frieren-dast-ai (public repo).
+#
+# Purpose: block real secrets and internal AWS identifiers from being committed
+# or pushed. Runs in three places against this same config:
+#   - locally via .pre-commit-config.yaml (staged diff, on commit)
+#   - locally via pre-push (see scripts/check_no_internal_data.py companion guard)
+#   - in CI via .github/workflows/secret-scan.yml (full history)
+#
+# Verify: gitleaks detect --config .gitleaks.toml --no-banner
+
+title = "frieren-dast-ai secret scanning"
+
+# Inherit gitleaks' full built-in rule set: AWS keys, Anthropic sk-ant-*,
+# OpenAI sk-*, GitLab glpat-*, GitHub ghp_*, Slack xoxb-*, Google AIza*,
+# private keys, generic high-entropy assignments, etc.
+[extend]
+useDefault = true
+
+# ── Repo-specific rules ─────────────────────────────────────────────────────
+
+[[rules]]
+id = "bedrock-arn-real-account"
+description = "AWS Bedrock ARN carrying a real 12-digit account id (placeholder is allowlisted)"
+regex = '''arn:aws:bedrock:[a-z0-9-]+:[0-9]{12}:'''
+tags = ["aws", "internal", "arn"]
+
+[[rules]]
+id = "aws-account-id-in-arn"
+description = "AWS account id embedded in any ARN (placeholder is allowlisted)"
+regex = '''arn:aws:[a-z0-9-]+:[a-z0-9-]*:[0-9]{12}:'''
+tags = ["aws", "internal", "arn"]
+
+# ── Allowlist ────────────────────────────────────────────────────────────────
+# Kept deliberately tight. `regexes` suppress specific published-example values
+# everywhere (so a NEW real secret elsewhere is still caught). `paths` suppress
+# whole files that exist ONLY to hold scanner fixtures or generated hashes —
+# these files are not where a real credential would ever legitimately live.
+[allowlist]
+description = "Documentation examples, scanner test fixtures, and generated hashes"
+
+regexes = [
+  # AWS-published documentation example credentials (safe, non-secret)
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+  # Sample STS key inside the passive scanner's own detection regex/comment
+  '''ASIAZNBXTZ5JFYWWQKW4''',
+  # AWS documentation placeholder account id used in default ARNs
+  '''123456789012''',
+]
+
+paths = [
+  # Placeholder credential/ARN template
+  '''\.env\.example''',
+  # Fictitious sample scope preset
+  '''dast/scope_presets/example\.json\.example''',
+  # Scanner detection-rule fixtures (fake keys/tokens by design)
+  '''tests/unit/test_secrets_agent\.py''',
+  '''tests/unit/test_passive_scanner\.py''',
+  '''tests/unit/test_passive_rules_extended\.py''',
+  '''tests/unit/test_agent_logic\.py''',
+  '''dast/vuln_knowledge/sensitive_data\.yaml''',
+  # npm integrity hashes (sha512-...), not secrets
+  '''desktop/package-lock\.json''',
+]

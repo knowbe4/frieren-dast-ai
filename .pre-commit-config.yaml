@@ -1,0 +1,53 @@
+# Pre-commit guardrails to keep internal data out of the public repo.
+#
+# Install (done automatically by `make install`):
+#   uv run pre-commit install --install-hooks
+#   uv run pre-commit install --hook-type pre-push
+#
+# Run against the whole tree on demand:
+#   uv run pre-commit run --all-files
+#
+# gitleaks and the repo guard run on every commit; trufflehog (verified-only,
+# needs network) runs on push to keep commits fast. The repo guard also runs on
+# push, so a `git commit --no-verify` is still caught before reaching the remote.
+
+default_install_hook_types: [pre-commit, pre-push]
+
+repos:
+  # ── Secret scanning (fast, staged diff) ────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+        # Uses .gitleaks.toml at the repo root automatically.
+
+  # ── Standard hygiene hooks ─────────────────────────────────────────────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: detect-private-key
+        # Scanner test fixtures embed fake private keys by design.
+        exclude: '^tests/unit/(test_secrets_agent|test_passive_scanner)\.py$'
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+      - id: check-merge-conflict
+
+  # ── Repo-specific internal-data guard (local) ──────────────────────────────
+  - repo: local
+    hooks:
+      - id: no-internal-data
+        name: block internal / sensitive data
+        entry: python3 scripts/check_no_internal_data.py
+        language: system
+        pass_filenames: true
+        stages: [pre-commit, pre-push]
+
+      # Deeper verified-secret scan — only on push (needs network, slower).
+      - id: trufflehog
+        name: trufflehog verified secret scan
+        # Exclude the Lob detector: its verifier accepts any "test_"-prefixed
+        # string, so it flags this suite's test_* function names as secrets.
+        entry: trufflehog filesystem --only-verified --fail --no-update --exclude-detectors=lob
+        language: system
+        pass_filenames: true
+        stages: [pre-push]

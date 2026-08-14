@@ -196,6 +196,7 @@ async function loadScanConfig() {
     if (s('sc-ai-provider'))    s('sc-ai-provider').value    = c.ai_provider ?? 'bedrock';
     if (s('sc-anthropic-url'))  s('sc-anthropic-url').value  = c.anthropic_base_url ?? '';
     if (s('sc-openai-url'))     s('sc-openai-url').value     = c.openai_base_url ?? '';
+    if (s('sc-gateway-url'))    s('sc-gateway-url').value    = c.gateway_base_url ?? '';
     if (s('sc-anthropic-key-set')) s('sc-anthropic-key-set').style.display = c.anthropic_api_key_set ? 'block' : 'none';
     if (s('sc-openai-key-set'))    s('sc-openai-key-set').style.display    = c.openai_api_key_set ? 'block' : 'none';
     if (typeof onProviderChange === 'function') onProviderChange();
@@ -287,6 +288,7 @@ function onProviderChange() {
   const provider = g('sc-ai-provider') ? g('sc-ai-provider').value : 'bedrock';
   if (g('provider-anthropic')) g('provider-anthropic').style.display = provider === 'anthropic' ? 'block' : 'none';
   if (g('provider-openai'))    g('provider-openai').style.display    = provider === 'openai'    ? 'block' : 'none';
+  if (g('provider-gateway'))   g('provider-gateway').style.display   = provider === 'gateway'   ? 'block' : 'none';
   const isBedrock = provider === 'bedrock';
   if (g('sc-model-id'))       g('sc-model-id').style.display       = isBedrock ? '' : 'none';
   if (g('sc-model-freeform')) g('sc-model-freeform').style.display = isBedrock ? 'none' : '';
@@ -299,6 +301,7 @@ async function saveProvider() {
     ai_provider: provider,
     anthropic_base_url: g('sc-anthropic-url') ? g('sc-anthropic-url').value.trim() : '',
     openai_base_url:    g('sc-openai-url')    ? g('sc-openai-url').value.trim()    : '',
+    gateway_base_url:   g('sc-gateway-url')   ? g('sc-gateway-url').value.trim()   : '',
   };
   // Only send a key when the user typed one — an empty field keeps the existing
   // key server-side (the field is absent from the body, not blank).

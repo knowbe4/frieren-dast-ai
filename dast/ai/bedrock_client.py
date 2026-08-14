@@ -41,7 +41,7 @@ _fast_model_id: str = ""        # Haiku: planning, baseline, low-stakes decision
 _validation_model_id: str = ""  # Opus: red-team validation, complex exploitation proof
 
 # Active provider — which backend serves LLM calls. One of "bedrock",
-# "anthropic", "openai". Empty string means "use settings.ai_provider".
+# "anthropic", "openai", "gateway". Empty string means "use settings.ai_provider".
 # Set at runtime via set_provider() when the user changes it in the dashboard.
 _active_provider: str = ""
 
@@ -51,6 +51,10 @@ _anthropic_api_key: str = ""
 _anthropic_base_url: str = ""
 _openai_api_key: str = ""
 _openai_base_url: str = ""
+# The gateway authenticates via an OAuth JWT reused from the Claude Code CLI
+# session (macOS Keychain / GATEWAY_JWT), not an API key. Only its base URL is
+# configurable here; it is internal, so it lives in .env, never in config.py.
+_gateway_base_url: str = ""
 
 # Set when all retry attempts fail with ExpiredTokenException.
 # Causes the scan queue to pause until credentials are refreshed.
@@ -93,24 +97,28 @@ def set_provider(
     anthropic_base_url: str = "",
     openai_api_key: str = "",
     openai_base_url: str = "",
+    gateway_base_url: str = "",
 ) -> None:
     """
     Select the active LLM provider and its credentials/endpoint at runtime.
 
-    provider — "bedrock" (default), "anthropic", or "openai". Empty falls back
-    to settings.ai_provider. Only the fields relevant to the chosen provider are
-    used; each empty argument falls back to the corresponding settings value.
+    provider — "bedrock" (default), "anthropic", "openai", or "gateway". Empty
+    falls back to settings.ai_provider. Only the fields relevant to the chosen
+    provider are used; each empty argument falls back to the corresponding
+    settings value. The gateway takes no API key (it reuses the Claude Code CLI
+    OAuth session); only its base URL is configurable, and it stays in .env.
     Switching provider clears the cached Bedrock client so a later switch back to
     bedrock rebuilds cleanly, and re-enables AI (a prior provider may have been
     marked unavailable on expired AWS creds).
     """
     global _active_provider, _anthropic_api_key, _anthropic_base_url
-    global _openai_api_key, _openai_base_url
+    global _openai_api_key, _openai_base_url, _gateway_base_url
     _active_provider = (provider or "").strip().lower()
     _anthropic_api_key = anthropic_api_key or ""
     _anthropic_base_url = anthropic_base_url or ""
     _openai_api_key = openai_api_key or ""
     _openai_base_url = openai_base_url or ""
+    _gateway_base_url = gateway_base_url or ""
     _reset_client()
     mark_ai_available()
     logger.info("AI provider configured", provider=get_active_provider())
@@ -136,6 +144,11 @@ def provider_api_key_present() -> bool:
         return bool(_anthropic_api_key or settings.anthropic_api_key)
     if provider == "openai":
         return bool(_openai_api_key or settings.openai_api_key)
+    if provider == "gateway":
+        # The gateway has no API key — reachability means a usable CLI OAuth
+        # session (Keychain) or an explicit GATEWAY_JWT is available.
+        from dast.ai import gateway_auth
+        return gateway_auth.credentials_available()
     return False
 
 
@@ -275,6 +288,14 @@ def _invoke_external(
                     model_id=model,
                     api_key=_openai_api_key or (settings.openai_api_key or ""),
                     base_url=_openai_base_url or settings.openai_base_url,
+                )
+            if provider == "gateway":
+                return providers.invoke_gateway(
+                    body=body,
+                    model_id=model,
+                    # No API key: the gateway reuses the CLI OAuth session.
+                    api_key="",
+                    base_url=_gateway_base_url or settings.gateway_base_url,
                 )
             raise providers.ProviderError(f"Unknown AI provider: {provider}")
 

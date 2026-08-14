@@ -196,7 +196,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             _bc2.set_tiered_models(fast=fast, validation=validation)
         _provider_keys = (
             "ai_provider", "anthropic_api_key", "anthropic_base_url",
-            "openai_api_key", "openai_base_url",
+            "openai_api_key", "openai_base_url", "gateway_base_url",
         )
         if any(k in body for k in _provider_keys):
             from dast.ai import bedrock_client as _bc3
@@ -212,6 +212,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 anthropic_base_url=_scan_config.get("anthropic_base_url", ""),
                 openai_api_key=_scan_config.get("openai_api_key", ""),
                 openai_base_url=_scan_config.get("openai_base_url", ""),
+                gateway_base_url=_scan_config.get("gateway_base_url", ""),
             )
         if "scan_budget_seconds" in body:
             from dast.ai.coordinator import Coordinator as _Coord

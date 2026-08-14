@@ -209,3 +209,79 @@ def test_gateway_routes_invoke_json_to_openai(monkeypatch):
 def test_get_active_provider_defaults_to_bedrock(monkeypatch):
     monkeypatch.setattr(bedrock_client, "_active_provider", "")
     assert bedrock_client.get_active_provider() == "bedrock"
+
+
+# ── gateway provider ──────────────────────────────────────────────────────────
+
+def test_gateway_strips_temperature_and_disables_thinking(monkeypatch):
+    """invoke_gateway drops temperature/anthropic_version and disables thinking."""
+    from dast.ai import gateway_auth
+
+    sent: Dict[str, Any] = {}
+
+    class _FakeTransport:
+        def send(self, body, timeout=300):
+            sent.update(body)
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+    monkeypatch.setattr(gateway_auth, "get_shared_transport",
+                        lambda base_url="": _FakeTransport())
+
+    body = {
+        "anthropic_version": "bedrock-2023-05-31",
+        "temperature": 0,
+        "max_tokens": 100,
+        "system": "sys",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "emit_result", "description": "d", "input_schema": {}}],
+        "tool_choice": {"type": "tool", "name": "emit_result"},
+    }
+    result = providers.invoke_gateway(body, model_id="claude-sonnet-5",
+                                      api_key="", base_url="https://gw.example")
+
+    assert result == {"content": [{"type": "text", "text": "ok"}]}
+    # Server-side pinned / Bedrock-only keys removed; model injected; thinking off.
+    assert "temperature" not in sent
+    assert "anthropic_version" not in sent
+    assert sent["model"] == "claude-sonnet-5"
+    assert sent["thinking"] == {"type": "disabled"}
+    # Schema-forced tool machinery survives so structured output still works.
+    assert sent["tool_choice"] == {"type": "tool", "name": "emit_result"}
+
+
+def test_gateway_error_becomes_provider_error(monkeypatch):
+    from dast.ai import gateway_auth
+
+    def _boom(base_url=""):
+        raise gateway_auth.GatewayError("no session")
+
+    monkeypatch.setattr(gateway_auth, "get_shared_transport", _boom)
+    with pytest.raises(providers.ProviderError):
+        providers.invoke_gateway({"messages": []}, model_id="m",
+                                 api_key="", base_url="https://gw")
+
+
+def test_gateway_routes_invoke_json(monkeypatch):
+    """set_provider('gateway') routes invoke_json through the gateway provider."""
+    captured: Dict[str, Any] = {}
+
+    def _fake_gateway(body, model_id, api_key, base_url):
+        captured["body"] = body
+        captured["model_id"] = model_id
+        captured["base_url"] = base_url
+        return {"content": [{"type": "tool_use", "name": "emit_result", "input": {"routed": True}}]}
+
+    monkeypatch.setattr(providers, "invoke_gateway", _fake_gateway)
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "claude-sonnet-5")
+
+    try:
+        bedrock_client.set_provider(provider="gateway", gateway_base_url="https://gw.example")
+        schema = {"type": "object", "properties": {"routed": {"type": "boolean"}}}
+        result = bedrock_client.invoke_json("sys", "user", schema=schema)
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+    assert result == {"routed": True}
+    assert captured["model_id"] == "claude-sonnet-5"
+    assert captured["base_url"] == "https://gw.example"
+    assert captured["body"]["tool_choice"] == {"type": "tool", "name": "emit_result"}

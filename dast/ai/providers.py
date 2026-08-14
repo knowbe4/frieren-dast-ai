@@ -96,6 +96,48 @@ def invoke_anthropic(
     return response.json()
 
 
+# ── Claude apps gateway (Anthropic Messages API over OAuth JWT) ──────────────
+
+def invoke_gateway(
+    body: Dict[str, Any],
+    model_id: str,
+    api_key: str,
+    base_url: str,
+) -> Dict[str, Any]:
+    """
+    Send an Anthropic-style body to the internal Claude apps gateway and return
+    the response envelope verbatim (it is already Anthropic-shaped).
+
+    Auth is an OAuth bearer JWT reused from the Claude Code CLI session (macOS
+    Keychain) or an explicit ``GATEWAY_JWT`` — NOT the ``api_key`` argument, which
+    is unused here and kept only for a uniform provider signature. The gateway
+    pins temperature server-side and forces extended thinking ON unless we send
+    ``thinking: {"type": "disabled"}``; we disable it so short structured calls
+    still emit a usable text/tool block instead of spending the whole token budget
+    on thinking. The ``anthropic_version`` Bedrock key is dropped (the version goes
+    in a header, set by the transport).
+    """
+    from dast.ai import gateway_auth
+
+    payload = {
+        key: value
+        for key, value in body.items()
+        # temperature is pinned server-side (sending it is a 400); anthropic_version
+        # is a Bedrock-only wire key the direct API rejects.
+        if key not in ("anthropic_version", "temperature")
+    }
+    payload["model"] = model_id
+    # Disable extended thinking: the gateway forces it on by default, which would
+    # consume max_tokens and can leave no text/tool_use block for short calls.
+    payload["thinking"] = {"type": "disabled"}
+
+    try:
+        transport = gateway_auth.get_shared_transport(base_url=base_url)
+        return transport.send(payload)
+    except gateway_auth.GatewayError as exc:
+        raise ProviderError(f"Gateway: {exc}") from exc
+
+
 # ── OpenAI (and OpenAI-compatible) chat completions ──────────────────────────
 
 def _to_openai_request(body: Dict[str, Any], model_id: str) -> Dict[str, Any]:

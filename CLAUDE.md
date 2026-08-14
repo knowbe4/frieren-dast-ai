@@ -366,16 +366,27 @@ Never use `python3` directly. Never activate venv manually.
 - All AI calls go through `dast.ai.bedrock_client` — never call boto3 directly
 - `invoke_json()` for structured output, `invoke()` for free text
 - Multi-provider: the gateway dispatches to AWS Bedrock (default), the Anthropic
-  Messages API, or an OpenAI-compatible endpoint based on the active provider.
-  Every request is built Anthropic-shaped and every response is read
-  Anthropic-shaped; `dast/ai/providers.py` translates to/from OpenAI so callers
-  and the schema-forced tool-use path are provider-agnostic. Select at runtime
-  via `bedrock_client.set_provider(provider, keys...)` or `POST /api/scan-config`
-  (`ai_provider`, `anthropic_api_key`, `openai_api_key`, `*_base_url`). Configure
-  defaults via `.env`: `AI_PROVIDER`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`. For non-Bedrock providers `model_id`
-  is a plain model name (e.g. `claude-opus-4-8`, `gpt-4o`), not an ARN. API keys
-  are never echoed back by `GET /api/scan-config` (only `*_set` booleans).
+  Messages API, an OpenAI-compatible endpoint, or the internal Claude apps
+  gateway based on the active provider. Every request is built Anthropic-shaped
+  and every response is read Anthropic-shaped; `dast/ai/providers.py` translates
+  to/from OpenAI so callers and the schema-forced tool-use path are
+  provider-agnostic. Select at runtime via `bedrock_client.set_provider(provider,
+  keys...)` or `POST /api/scan-config` (`ai_provider`, `anthropic_api_key`,
+  `openai_api_key`, `*_base_url`, `gateway_base_url`). Configure defaults via
+  `.env`: `AI_PROVIDER`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `GATEWAY_BASE_URL`. For non-Bedrock
+  providers `model_id` is a plain model name (e.g. `claude-opus-4-8`, `gpt-4o`,
+  `claude-sonnet-5`), not an ARN. API keys are never echoed back by
+  `GET /api/scan-config` (only `*_set` booleans).
+- Gateway provider (`dast/ai/gateway_auth.py`): the internal Claude apps gateway
+  speaks the Anthropic Messages API over an OAuth JWT reused from the Claude Code
+  CLI session (macOS Keychain, service `Claude Code-credentials`; or an explicit
+  `GATEWAY_JWT` on Linux/CI). It takes NO API key. The gateway pins temperature
+  server-side and forces extended thinking on, so `invoke_gateway` strips
+  `temperature` and sends `thinking:{"type":"disabled"}`. The gateway hostname is
+  INTERNAL and lives ONLY in `.env` (`GATEWAY_BASE_URL`) — never a code default
+  (`config.py` ships an empty string); `scripts/check_no_internal_data.py` blocks
+  any `*.internal|corp|private.knowbe4.com` host from tracked files.
 - Prefer schema-forced output: pass `schema=` (a JSON Schema from `dast/ai/schemas.py`) to
   `invoke_json()` — the model is forced through a tool call, so malformed JSON is impossible.
   Without a schema, `invoke_json()` still parses text and self-repairs once on bad JSON.
@@ -469,6 +480,8 @@ make desktop-test
 - `dast/ai/fp_filter.py` — deterministic false-positive rules
 - `dast/ai/mutator.py` — adaptive payload mutator
 - `dast/ai/bedrock_client.py` — single LLM gateway (schema-forced output, temperature, prompt caching, tiered models)
+- `dast/ai/providers.py` — non-Bedrock provider adapters (Anthropic direct, OpenAI-compatible, internal gateway)
+- `dast/ai/gateway_auth.py` — Claude apps gateway auth (Keychain/OAuth JWT reuse + refresh; internal URL kept out of code)
 - `dast/ai/schemas.py` — JSON Schemas for structured LLM output (planner, baseline, mutator, red-team)
 - `dast/ai/prompt_safety.py` — structural prompt-injection defense (XML fencing of untrusted content)
 - `dast/vuln_knowledge/*.yaml` — per-attack-type vuln/not-vuln few-shot examples (consumed by red_team + mutator)
@@ -514,7 +527,7 @@ make desktop-test
 ## Environment Variables
 
 ```bash
-# AI provider — one of: bedrock (default), anthropic, openai
+# AI provider — one of: bedrock (default), anthropic, openai, gateway
 AI_PROVIDER=bedrock
 
 # Required for AI analysis when AI_PROVIDER=bedrock
@@ -530,9 +543,16 @@ ANTHROPIC_BASE_URL=           # default https://api.anthropic.com
 OPENAI_API_KEY=
 OPENAI_BASE_URL=              # default https://api.openai.com/v1
 
+# Required when AI_PROVIDER=gateway (internal Claude apps gateway; no API key —
+# auth reuses the Claude Code CLI OAuth session in the macOS Keychain).
+# GATEWAY_BASE_URL is an INTERNAL hostname: set it in .env only, never in code.
+GATEWAY_BASE_URL=             # internal gateway URL (no default)
+GATEWAY_JWT=                  # Linux/CI only: explicit bearer JWT (no Keychain)
+GATEWAY_KEYCHAIN_SERVICE=     # override CLI Keychain service (default "Claude Code-credentials")
+
 # Optional
 AWS_PROFILE=                  # auto-refreshes on ExpiredTokenException
-AI_MODEL_ID=                  # Bedrock: an ARN; anthropic/openai: a model name
+AI_MODEL_ID=                  # Bedrock: an ARN; anthropic/openai/gateway: a model name
 
 # Proxy
 PROXY_PORT=8080               # default

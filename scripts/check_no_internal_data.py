@@ -69,6 +69,13 @@ AWS_ACCESS_KEY_RE = re.compile(r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b")
 AWS_SECRET_ASSIGN_RE = re.compile(
     r"AWS_SECRET_ACCESS_KEY\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{20,})"
 )
+# Internal-only hostnames (e.g. the Claude apps gateway) must stay in .env, never
+# in a tracked file. Matches company internal/corp/private subdomains; does NOT
+# match public references like "github.com/knowbe4" or "*.example.com" placeholders.
+INTERNAL_HOSTNAME_RE = re.compile(
+    r"\b[a-z0-9][a-z0-9.-]*\.(?:internal|corp|private)\.knowbe4\.com\b",
+    re.IGNORECASE,
+)
 
 
 def _staged_files() -> list[str]:
@@ -133,6 +140,11 @@ def _check_content_rules(path: str) -> list[str]:
 
     if AWS_SECRET_ASSIGN_RE.search(text):
         violations.append(f"{path}: AWS_SECRET_ACCESS_KEY assigned a value")
+
+    for match in INTERNAL_HOSTNAME_RE.finditer(text):
+        violations.append(
+            f"{path}: internal hostname ({match.group(0)}) — keep it in .env, not in tracked files"
+        )
 
     return violations
 

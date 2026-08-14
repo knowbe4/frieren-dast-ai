@@ -941,13 +941,14 @@ Port: 8080</div>
 
       <!-- Provider selection -->
       <h3 style="margin-bottom:4px">Provider</h3>
-      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below. Takes effect immediately.</p>
+      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below; Gateway reuses the Claude Code CLI login (no key). Takes effect immediately.</p>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
         <select id="sc-ai-provider" onchange="onProviderChange()"
                 style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
           <option value="bedrock">AWS Bedrock (SSO / AWS credentials)</option>
           <option value="anthropic">Anthropic API (api.anthropic.com)</option>
           <option value="openai">OpenAI / compatible (api.openai.com)</option>
+          <option value="gateway">Claude apps gateway (CLI login)</option>
         </select>
       </div>
       <!-- Anthropic credentials -->
@@ -980,6 +981,15 @@ Port: 8080</div>
             <input id="sc-openai-url" type="text" placeholder="https://api.openai.com/v1"
                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
           </div>
+        </div>
+      </div>
+      <!-- Gateway settings (no API key — auth is the CLI OAuth session) -->
+      <div id="provider-gateway" style="display:none;margin-bottom:12px">
+        <div>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Gateway base URL</p>
+          <input id="sc-gateway-url" type="text" placeholder="set GATEWAY_BASE_URL in .env"
+                 style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          <p style="color:var(--txt2);font-size:10px;margin-top:4px">Authentication reuses your Claude Code CLI login (macOS Keychain); run <code>claude</code> then <code>/login</code> first. No API key is stored. The internal URL is read from <code>.env</code> and never committed.</p>
         </div>
       </div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">

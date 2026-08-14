@@ -63,6 +63,35 @@ def test_anthropic_provider_without_key_is_offline(monkeypatch):
         _reset_provider()
 
 
+def test_gateway_provider_online_when_credentials_available(monkeypatch):
+    # The gateway has no API key: reachability tracks a usable CLI OAuth session,
+    # and it must never probe AWS STS.
+    def _boom(*a, **k):
+        raise AssertionError("STS must not be probed for the gateway provider")
+
+    import boto3
+    monkeypatch.setattr(boto3, "Session", _boom)
+    from dast.ai import gateway_auth
+    monkeypatch.setattr(gateway_auth, "credentials_available", lambda: True)
+    bedrock_client.set_provider("gateway", gateway_base_url="https://gw.example")
+    try:
+        body = _client().get("/api/status").json()
+        assert body["ai_enabled"] is True
+    finally:
+        _reset_provider()
+
+
+def test_gateway_provider_offline_without_session(monkeypatch):
+    from dast.ai import gateway_auth
+    monkeypatch.setattr(gateway_auth, "credentials_available", lambda: False)
+    bedrock_client.set_provider("gateway", gateway_base_url="https://gw.example")
+    try:
+        body = _client().get("/api/status").json()
+        assert body["ai_enabled"] is False
+    finally:
+        _reset_provider()
+
+
 def test_sticky_unavailable_flag_forces_offline_even_with_key(monkeypatch):
     bedrock_client.set_provider("anthropic", anthropic_api_key="sk-ant-test")
     bedrock_client.mark_ai_unavailable()

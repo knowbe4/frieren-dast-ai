@@ -27,9 +27,11 @@ class Settings(BaseSettings):
     #   "anthropic" — Anthropic Messages API directly (uses anthropic_api_key)
     #   "openai"    — OpenAI-compatible chat completions (uses openai_api_key;
     #                 point openai_base_url at any compatible gateway if needed)
+    #   "gateway"   — internal Claude apps gateway (Anthropic Messages API over an
+    #                 OAuth JWT reused from the Claude Code CLI session; no API key)
     # The provider is selected at runtime; model_id is interpreted by whichever
     # provider is active (an ARN for Bedrock, a model name like
-    # "claude-opus-4-8" or "gpt-4o" for the direct APIs).
+    # "claude-opus-4-8" or "gpt-4o" for the direct APIs / gateway).
     ai_provider: str = "bedrock"
 
     # Anthropic direct API
@@ -39,6 +41,12 @@ class Settings(BaseSettings):
     # OpenAI (or OpenAI-compatible) API
     openai_api_key: Optional[str] = None
     openai_base_url: str = "https://api.openai.com/v1"
+
+    # Claude apps gateway — the base URL is an INTERNAL hostname, so it has NO
+    # default here (this repo is public). Set GATEWAY_BASE_URL in .env. Auth is
+    # an OAuth JWT reused from the Claude Code CLI session (macOS Keychain), or
+    # GATEWAY_JWT for headless/CI hosts — never an API key, never in this file.
+    gateway_base_url: str = ""
 
     # The single source of truth for the three named model tiers. Set these
     # via .env to your own Bedrock application-inference-profile ARNs (or

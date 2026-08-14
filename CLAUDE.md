@@ -596,5 +596,5 @@ Set `AWS_PROFILE` — credentials auto-refresh on `ExpiredTokenException`.
 
 ---
 
-**Last Updated:** 2026-08-04
-**Version:** 0.8.1
+**Last Updated:** 2026-08-14
+**Version:** 0.8.2

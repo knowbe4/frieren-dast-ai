@@ -15,24 +15,22 @@ Thread-safe. All mutating operations hold _lock.
 
 from __future__ import annotations
 
-import base64
-import json
 import threading
 import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
+from dast.utils.jwt import decode_segment
+
 
 # ── JWT helpers ──────────────────────────────────────────────────────────────
 
 def _decode_jwt_claims(token: str) -> Optional[dict]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        padding = 4 - len(parts[1]) % 4
-        payload = base64.urlsafe_b64decode(parts[1] + "=" * padding)
-        return json.loads(payload)
+        return decode_segment(parts[1])
     except Exception:
         return None
 

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Dict, List, Tuple
 
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.proxy.plugin_manager import log_event
+from dast.proxy.signalr import MZ_HEADER, SIGNALR_SEPARATOR, is_signalr_binary, read_varint
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -31,10 +32,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # SignalR text protocol record separator (0x1e)
-_SIGNALR_SEP = "\x1e"
+_SIGNALR_SEP = SIGNALR_SEPARATOR
 
 # MZ header — marks a Windows PE / .NET assembly
-_MZ_HEADER = b"\x4d\x5a"
+_MZ_HEADER = MZ_HEADER
 
 # Blazor WASM fingerprint patterns (response body)
 _WASM_BODY_RE = re.compile(
@@ -178,86 +179,70 @@ def _parse_blazor_request_body(raw: bytes) -> List[dict]:
     try:
         import msgpack as _mp
 
-        def _read_varint(data: bytes, pos: int):
-            result, shift = 0, 0
-            while pos < len(data):
-                b = data[pos]; pos += 1
-                result |= (b & 0x7f) << shift
-                if not (b & 0x80):
-                    return result, pos
-                shift += 7
-            return result, pos
-
         # Check if this looks like msgpack (varint + fixarray)
-        if len(raw) >= 2:
+        if is_signalr_binary(raw):
+            # Parse all frames
             pos = 0
-            for _ in range(5):
-                if pos >= len(raw): break
-                b = raw[pos]; pos += 1
-                if not (b & 0x80): break
-            if pos < len(raw) and 0x90 <= raw[pos] <= 0x9f:
-                # Parse all frames
-                pos = 0
-                while pos < len(raw):
-                    frame_len, pos = _read_varint(raw, pos)
-                    if frame_len == 0 or pos + frame_len > len(raw):
-                        break
-                    frame = raw[pos:pos+frame_len]; pos += frame_len
+            while pos < len(raw):
+                frame_len, pos = read_varint(raw, pos)
+                if frame_len == 0 or pos + frame_len > len(raw):
+                    break
+                frame = raw[pos:pos+frame_len]; pos += frame_len
+                try:
+                    msg = _mp.unpackb(frame, raw=False, strict_map_key=False)
+                except Exception:
+                    continue
+                if not isinstance(msg, (list, tuple)) or len(msg) < 5:
+                    continue
+                if msg[0] != 1:  # only Invocation type
+                    continue
+                target = msg[3] if len(msg) > 3 else ""
+                args = msg[4] if len(msg) > 4 else None
+
+                if target == "BeginInvokeDotNetFromJS" and isinstance(args, (list, tuple)) and len(args) >= 5:
+                    # args = [callId, assembly, method, dotNetObjectId, argsJson]
+                    args_json_str = args[4]
                     try:
-                        msg = _mp.unpackb(frame, raw=False, strict_map_key=False)
+                        event_args = json.loads(args_json_str) if isinstance(args_json_str, str) else args_json_str
                     except Exception:
                         continue
-                    if not isinstance(msg, (list, tuple)) or len(msg) < 5:
+                    if not isinstance(event_args, (list, tuple)):
                         continue
-                    if msg[0] != 1:  # only Invocation type
+
+                    # First element is the event descriptor
+                    descriptor = event_args[0] if event_args else {}
+                    if not isinstance(descriptor, dict):
                         continue
-                    target = msg[3] if len(msg) > 3 else ""
-                    args = msg[4] if len(msg) > 4 else None
 
-                    if target == "BeginInvokeDotNetFromJS" and isinstance(args, (list, tuple)) and len(args) >= 5:
-                        # args = [callId, assembly, method, dotNetObjectId, argsJson]
-                        args_json_str = args[4]
-                        try:
-                            event_args = json.loads(args_json_str) if isinstance(args_json_str, str) else args_json_str
-                        except Exception:
-                            continue
-                        if not isinstance(event_args, (list, tuple)):
-                            continue
+                    handler_id = descriptor.get("eventHandlerId")
+                    event_name = descriptor.get("eventName", "")
+                    if not isinstance(handler_id, int):
+                        continue
 
-                        # First element is the event descriptor
-                        descriptor = event_args[0] if event_args else {}
-                        if not isinstance(descriptor, dict):
-                            continue
+                    # Second element may contain input field values
+                    input_fields: List[str] = []
+                    if len(event_args) > 1 and isinstance(event_args[1], dict):
+                        event_data = event_args[1]
+                        # For change/input events, "value" is the user-typed content
+                        if "value" in event_data:
+                            input_fields.append("value")
+                        # For custom events, collect all string-valued keys
+                        for k, v in event_data.items():
+                            if isinstance(v, str) and k not in ("type",) and k not in input_fields:
+                                input_fields.append(k)
 
-                        handler_id = descriptor.get("eventHandlerId")
-                        event_name = descriptor.get("eventName", "")
-                        if not isinstance(handler_id, int):
-                            continue
-
-                        # Second element may contain input field values
-                        input_fields: List[str] = []
-                        if len(event_args) > 1 and isinstance(event_args[1], dict):
-                            event_data = event_args[1]
-                            # For change/input events, "value" is the user-typed content
-                            if "value" in event_data:
-                                input_fields.append("value")
-                            # For custom events, collect all string-valued keys
-                            for k, v in event_data.items():
-                                if isinstance(v, str) and k not in ("type",) and k not in input_fields:
-                                    input_fields.append(k)
-
-                        results.append({
-                            "handler_id": handler_id,
-                            "event_name": event_name,
-                            "component": "",
-                            "input_fields": input_fields,
-                        })
-                return results
+                    results.append({
+                        "handler_id": handler_id,
+                        "event_name": event_name,
+                        "component": "",
+                        "input_fields": input_fields,
+                    })
+            return results
     except ImportError:
         pass
 
     # ── text protocol (0x1e-delimited JSON) ──────────────────────────────
-    _SEP = "\x1e"
+    _SEP = SIGNALR_SEPARATOR
     try:
         text = raw.decode("utf-8", errors="replace")
     except Exception:

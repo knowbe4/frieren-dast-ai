@@ -667,13 +667,13 @@ async def _active_cors_probe(entry: "ProxyEntry", rule_id: str) -> Tuple[Optiona
 
 
 def _format_raw_request(entry: "ProxyEntry") -> str:
-    from dast.proxy.session_store import _format_raw_request as _ss_fmt_req
-    return _ss_fmt_req(entry)
+    from dast.proxy.http_format import _format_raw_request as _fmt_req
+    return _fmt_req(entry)
 
 
 def _format_raw_response(entry: "ProxyEntry") -> str:
-    from dast.proxy.session_store import _format_raw_response as _ss_fmt_resp
-    return _ss_fmt_resp(entry)
+    from dast.proxy.http_format import _format_raw_response as _fmt_resp
+    return _fmt_resp(entry)
 
 
 async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str = "") -> Tuple[Optional[bool], str]:

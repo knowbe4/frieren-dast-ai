@@ -16,41 +16,15 @@ from urllib.parse import urlparse
 
 from dast.proxy.service_graph import ServiceGraph
 from dast.discovery.engine import DiscoveryEngine
+# Re-exported for backward compatibility: raw HTTP evidence formatting now lives
+# in dast.proxy.http_format. Existing callers still import these names from here.
+from dast.proxy.http_format import _format_raw_request, _format_raw_response
+from dast.proxy.signalr import SIGNALR_SEPARATOR, is_signalr_binary, read_varint
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
-def _format_raw_request(entry: "ProxyEntry") -> str:
-    """Format a ProxyEntry's request as raw HTTP text (reusable by any caller)."""
-    parsed = urlparse(entry.url)
-    path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-    lines = [f"{entry.method} {path} HTTP/1.1", f"Host: {entry.host}"]
-    for k, v in (entry.request_headers or {}).items():
-        if k.lower() != "host":
-            lines.append(f"{k}: {v}")
-    lines.append("")
-    if entry.request_body:
-        lines.append(entry.request_body.decode("utf-8", errors="replace"))
-    return "\r\n".join(lines)
-
-
-def _format_raw_response(entry: "ProxyEntry") -> str:
-    """Format a ProxyEntry's response as raw HTTP text (reusable by any caller)."""
-    status = entry.response_status or 0
-    lines = [f"HTTP/1.1 {status}"]
-    for k, v in (entry.response_headers or {}).items():
-        if k.lower() == "set-cookie" and isinstance(v, list):
-            for cookie in v:
-                lines.append(f"set-cookie: {cookie}")
-        else:
-            lines.append(f"{k}: {v}")
-    lines.append("")
-    if entry.response_body:
-        lines.append(entry.response_body.decode("utf-8", errors="replace")[:4000])
-    return "\r\n".join(lines)
-
-_SIGNALR_SEP = "\x1e"
+_SIGNALR_SEP = SIGNALR_SEPARATOR
 
 
 def _annotate_blazor_args(target: str, args) -> str:
@@ -122,15 +96,7 @@ def _decode_msgpack_signalr(raw: bytes) -> str:
     except ImportError:
         return ""
 
-    def _read_varint(data: bytes, pos: int):
-        result, shift = 0, 0
-        while pos < len(data):
-            b = data[pos]; pos += 1
-            result |= (b & 0x7f) << shift
-            if not (b & 0x80):
-                return result, pos
-            shift += 7
-        return result, pos
+    _read_varint = read_varint
 
     def _unpack(payload: bytes):
         return _mp.unpackb(payload, raw=False, strict_map_key=False)
@@ -292,29 +258,7 @@ def _decode_signalr_body(raw: bytes) -> str:
     return ""
 
 
-def _is_signalr_binary(raw: bytes) -> bool:
-    """
-    Return True if this looks like SignalR binary (MessagePack) protocol.
-
-    SignalR binary frames: <varint-length><msgpack-fixarray>...
-    The varint can be 1-5 bytes (continuation bit 0x80 set on all but the last).
-    We skip varint bytes until we find one without 0x80, then check the next byte
-    is a msgpack fixarray (0x90-0x9f).
-    """
-    if len(raw) < 2:
-        return False
-    # Skip varint bytes (up to 5)
-    pos = 0
-    for _ in range(5):
-        if pos >= len(raw):
-            return False
-        b = raw[pos]; pos += 1
-        if not (b & 0x80):  # last varint byte
-            break
-    # pos now points to first byte after varint — should be msgpack fixarray
-    if pos < len(raw) and 0x90 <= raw[pos] <= 0x9f:
-        return True
-    return False
+_is_signalr_binary = is_signalr_binary
 
 
 def _is_signalr_body(raw: bytes) -> bool:

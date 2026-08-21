@@ -28,6 +28,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
+from dast.utils.jwt import b64url_encode_json, decode_jwt_claims, decode_jwt_header
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -162,35 +163,9 @@ _JWT_RE = re.compile(
 def _is_jwt(value: str) -> bool:
     return bool(_JWT_RE.match(str(value).strip()))
 
-def _decode_jwt_claims(token: str) -> Optional[dict]:
-    """
-    Decode JWT claims payload without verifying signature.
-    Returns dict of claims or None on failure.
-    """
-    import base64
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        # Add padding
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        payload_bytes = base64.urlsafe_b64decode(payload_b64)
-        return _json.loads(payload_bytes)
-    except Exception:
-        return None
-
-
-def _decode_jwt_header(token: str) -> Optional[dict]:
-    """Decode JWT header without verifying signature."""
-    import base64
-    try:
-        parts = token.split(".")
-        if not parts:
-            return None
-        hdr_b64 = parts[0] + "=" * (-len(parts[0]) % 4)
-        return _json.loads(base64.urlsafe_b64decode(hdr_b64))
-    except Exception:
-        return None
+# JWT decode helpers now live in dast.utils.jwt; aliased for in-module callers.
+_decode_jwt_claims = decode_jwt_claims
+_decode_jwt_header = decode_jwt_header
 
 
 def _build_jwt_alg_none(original_token: str, extra_claims: Optional[dict] = None) -> str:
@@ -198,20 +173,13 @@ def _build_jwt_alg_none(original_token: str, extra_claims: Optional[dict] = None
     Build an alg:none JWT preserving the original claims payload,
     optionally injecting extra claims (e.g. role: admin).
     """
-    import base64
-
-    def _b64(data: dict) -> str:
-        return base64.urlsafe_b64encode(
-            _json.dumps(data, separators=(",", ":")).encode()
-        ).rstrip(b"=").decode()
-
     claims = _decode_jwt_claims(original_token) or {}
     if extra_claims:
         claims.update(extra_claims)
 
     for variant_alg in ("none", "None", "NONE"):
         header = {"alg": variant_alg, "typ": "JWT"}
-        yield f"{_b64(header)}.{_b64(claims)}."
+        yield f"{b64url_encode_json(header)}.{b64url_encode_json(claims)}."
 
 
 def _jwt_probes(key: str, location: str, original_token: str = "") -> List[Dict[str, Any]]:
@@ -266,15 +234,8 @@ def _jwt_probes(key: str, location: str, original_token: str = "") -> List[Dict[
     #   c) For each URL-bearing field: build a token replacing that URL with OOB
     #   d) For header URL fields (jku, x5u): inject into header instead of claims
 
-    import base64
-
     _SSRF_URL = "https://collaborator.dast-ai.internal/jwt-ssrf"
     _URL_RE = re.compile(r'https?://[^\s"\'<>}\]){,]+', re.IGNORECASE)
-
-    def _b64url(d: dict) -> str:
-        return base64.urlsafe_b64encode(
-            _json.dumps(d, separators=(",", ":")).encode()
-        ).rstrip(b"=").decode()
 
     def _find_urls_in_value(val) -> List[str]:
         """Recursively find all http(s) URLs in a value (string, list, dict)."""
@@ -330,7 +291,7 @@ def _jwt_probes(key: str, location: str, original_token: str = "") -> List[Dict[
                 mod_claims.get(claim_key, original_url), original_url, _SSRF_URL
             )
 
-        ssrf_token = f"{_b64url(mod_header)}.{_b64url(mod_claims)}."
+        ssrf_token = f"{b64url_encode_json(mod_header)}.{b64url_encode_json(mod_claims)}."
         probes.append({
             "param_name": key,
             "param_location": location,
@@ -347,16 +308,10 @@ def _jwt_probes(key: str, location: str, original_token: str = "") -> List[Dict[
     # ── 3. kid injection (only if header has kid or alg suggests key lookup) ──
     if (header or {}).get("kid") is not None or alg in ("RS256", "RS384", "RS512", "ES256"):
         kid_payloads = get_payloads("jwt", "kid_injection")
-        import base64
-
-        def _b64url(d: dict) -> str:
-            return base64.urlsafe_b64encode(
-                _json.dumps(d, separators=(",", ":")).encode()
-            ).rstrip(b"=").decode()
 
         for kid_val in kid_payloads[:3]:
             kid_header = {"alg": "none", "typ": "JWT", "kid": kid_val}
-            kid_token = f"{_b64url(kid_header)}.{_b64url(claims or {'sub': 'test'})}."
+            kid_token = f"{b64url_encode_json(kid_header)}.{b64url_encode_json(claims or {'sub': 'test'})}."
             probes.append({
                 "param_name": key,
                 "param_location": location,

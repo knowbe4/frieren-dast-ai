@@ -355,10 +355,125 @@ async function fedrampReset() {
 
 // ── Setup ──────────────────────────────────────────────────────────────────
 
-function updateSetupPort() {
-  const p = parseInt(location.port) || 8088;
-  document.getElementById('proxy-addr').textContent = `Host: 127.0.0.1\nPort: ${p - 8}`;
+// Current proxy listener bind host/port, cached from /api/status so the editor
+// can preselect the right radio and prefill the port when opened.
+let _currentBindHost = '127.0.0.1';
+let _currentBindPort = null;
+
+function _isLoopbackHost(h) {
+  h = (h || '').trim().toLowerCase();
+  return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h.startsWith('127.');
 }
+
+// The host implied by the currently-selected radio ("" if incomplete).
+function _selectedBindHost() {
+  const mode = (document.querySelector('input[name="bind-mode"]:checked') || {}).value;
+  if (mode === 'loopback') return '127.0.0.1';
+  if (mode === 'all') return '0.0.0.0';
+  if (mode === 'specific') return (document.getElementById('bind-host-input').value || '').trim();
+  return '';
+}
+
+function _refreshBindHostWarning() {
+  const warn = document.getElementById('bind-host-warning');
+  if (!warn) return;
+  const h = _selectedBindHost();
+  if (h && !_isLoopbackHost(h)) {
+    warn.style.display = 'block';
+    warn.textContent = 'Warning: binding to ' + h + ' turns Frieren into an open proxy '
+      + 'reachable by other machines on the network. Only do this on a trusted network.';
+  } else {
+    warn.style.display = 'none';
+  }
+}
+
+function onBindModeChange() {
+  const input = document.getElementById('bind-host-input');
+  const specific = (document.querySelector('input[name="bind-mode"]:checked') || {}).value === 'specific';
+  if (input) { input.disabled = !specific; if (specific) input.focus(); }
+  _refreshBindHostWarning();
+}
+
+function openListenerEditor() {
+  const editor = document.getElementById('listener-editor');
+  if (!editor) return;
+  editor.style.display = 'block';
+  // Preselect the radio matching the current bind host.
+  const h = _currentBindHost;
+  let mode = 'specific';
+  if (h === '127.0.0.1' || h === '::1' || h === 'localhost') mode = 'loopback';
+  else if (h === '0.0.0.0' || h === '::') mode = 'all';
+  const radio = document.querySelector(`input[name="bind-mode"][value="${mode}"]`);
+  if (radio) radio.checked = true;
+  const input = document.getElementById('bind-host-input');
+  if (input) input.value = (mode === 'specific') ? h : '';
+  const portInput = document.getElementById('bind-port-input');
+  if (portInput) portInput.value = _currentBindPort || '';
+  onBindModeChange();
+}
+
+function closeListenerEditor() {
+  const editor = document.getElementById('listener-editor');
+  if (editor) editor.style.display = 'none';
+}
+
+async function updateSetupPort() {
+  const iface = document.getElementById('listener-interface');
+  if (!iface) return;
+  // Read the actual proxy listen host/port from the backend — the runner may bump
+  // the port via _find_free_port when 8080 is busy, and the bind host is
+  // user-configurable, so we must not guess from the URL.
+  let host = '127.0.0.1', port = null;
+  try {
+    const s = await (await fetch('/api/status')).json();
+    if (s && s.proxy_port) { host = s.proxy_host || host; port = s.proxy_port; }
+  } catch (e) { /* fall back below */ }
+  if (!port) port = (parseInt(location.port) || 8088) - 8;  // best-effort fallback
+  _currentBindHost = host;
+  _currentBindPort = port;
+  iface.textContent = `${host}:${port}`;
+}
+
+async function applyBindHost() {
+  const btn = document.getElementById('bind-host-apply');
+  const host = _selectedBindHost();
+  if (!host) { showToast('Enter a bind address'); return; }
+  const portRaw = (document.getElementById('bind-port-input') || {}).value;
+  const payload = { host };
+  if (portRaw !== undefined && String(portRaw).trim() !== '') {
+    const port = parseInt(portRaw, 10);
+    if (!(port >= 1 && port <= 65535)) { showToast('Port must be between 1 and 65535'); return; }
+    payload.port = port;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
+  try {
+    const r = await fetch('/api/settings/bind-host', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const res = await r.json();
+    if (!r.ok || res.error) {
+      showToast('Bind failed: ' + (res.error || 'unknown error'));
+    } else {
+      if (res.applied === false) showToast('Saved — applies on proxy restart');
+      else showToast(`Proxy now listening on ${res.host}:${res.port}`);
+      closeListenerEditor();
+    }
+    await updateSetupPort();
+  } catch (e) {
+    showToast('Bind failed: ' + e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Apply'; }
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('bind-host-apply');
+  const input = document.getElementById('bind-host-input');
+  if (btn) btn.addEventListener('click', applyBindHost);
+  if (input) input.addEventListener('keydown', (e) => { if (e.key === 'Enter') applyBindHost(); });
+});
 
 // ── scan ───────────────────────────────────────────────────────────────
 function toggleAll(chk) {

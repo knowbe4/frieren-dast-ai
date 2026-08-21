@@ -23,6 +23,8 @@ errors are raised to the gateway, which handles retry/backoff uniformly.
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List
 
 import httpx
@@ -94,6 +96,80 @@ def invoke_anthropic(
     # The Messages API response is already {"content": [...], "usage": {...}} —
     # exactly what _extract_text/_extract_tool_input read.
     return response.json()
+
+
+# ── Model discovery (list available models per provider) ────────────────────
+# Each returns a list of {"id": str, "label": str}. The id is what gets stored
+# as the model to invoke; the label is the human-readable name for the dropdown.
+# Raise ProviderError on failure so the caller can fall back to static presets.
+
+def list_anthropic_models(api_key: str, base_url: str) -> List[Dict[str, str]]:
+    """List models from the Anthropic Models API (GET /v1/models)."""
+    if not api_key:
+        raise ProviderError("Anthropic provider selected but no API key is configured")
+    url = base_url.rstrip("/") + "/v1/models?limit=100"
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+        response = client.get(url, headers=headers)
+    if response.status_code >= 400:
+        raise ProviderError(f"Anthropic models API {response.status_code}: {response.text[:300]}")
+    data = response.json().get("data", []) or []
+    return [
+        {"id": entry["id"], "label": entry.get("display_name") or entry["id"]}
+        for entry in data
+        if entry.get("id")
+    ]
+
+
+def list_openai_models(api_key: str, base_url: str) -> List[Dict[str, str]]:
+    """List models from the OpenAI (or OpenAI-compatible) API (GET /models)."""
+    if not api_key:
+        raise ProviderError("OpenAI provider selected but no API key is configured")
+    url = base_url.rstrip("/") + "/models"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+        response = client.get(url, headers=headers)
+    if response.status_code >= 400:
+        raise ProviderError(f"OpenAI models API {response.status_code}: {response.text[:300]}")
+    data = response.json().get("data", []) or []
+    model_ids = sorted(entry["id"] for entry in data if entry.get("id"))
+    return [{"id": model_id, "label": model_id} for model_id in model_ids]
+
+
+def list_gateway_models(base_url: str) -> List[Dict[str, str]]:
+    """
+    List models from the Claude apps gateway (GET /v1/models over the OAuth JWT).
+
+    The gateway mirrors the Anthropic Models API. Auth is the CLI-reused bearer
+    JWT, not an API key. Raises ProviderError if the gateway has no models
+    endpoint or the request fails, so the caller falls back to static presets.
+    """
+    from dast.ai import gateway_auth
+
+    try:
+        transport = gateway_auth.get_shared_transport(base_url=base_url)
+        token = transport._valid_token()
+        url = transport.base_url + "/v1/models?limit=100"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-version": "2023-06-01",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            payload = json.loads(resp.read())
+    except gateway_auth.GatewayError as exc:
+        raise ProviderError(f"Gateway: {exc}") from exc
+    except (urllib.error.URLError, ValueError) as exc:
+        raise ProviderError(f"Gateway models request failed: {exc}") from exc
+    data = payload.get("data", []) or []
+    return [
+        {"id": entry["id"], "label": entry.get("display_name") or entry["id"]}
+        for entry in data
+        if entry.get("id")
+    ]
 
 
 # ── Claude apps gateway (Anthropic Messages API over OAuth JWT) ──────────────

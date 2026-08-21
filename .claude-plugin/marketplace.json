@@ -1,0 +1,14 @@
+{
+  "name": "knowbe4-frieren",
+  "owner": {
+    "name": "KnowBe4",
+    "url": "https://github.com/knowbe4/frieren-dast-ai"
+  },
+  "plugins": [
+    {
+      "name": "frieren-dast",
+      "source": "./plugin",
+      "description": "Proxy-driven AI security-testing tools from Frieren DAST-AI, exposed to Claude over MCP for validating vulnerabilities."
+    }
+  ]
+}

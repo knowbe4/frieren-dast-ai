@@ -24,6 +24,8 @@ from dast.proxy.api.status_routes import make_router
 class _Ctx:
     status_cache: dict = field(default_factory=dict)
     status_cache_ts: list = field(default_factory=lambda: [0.0])
+    proxy_host: str = "127.0.0.1"
+    proxy_port: int = 8080
 
 
 def _client() -> TestClient:

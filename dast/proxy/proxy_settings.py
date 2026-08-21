@@ -208,6 +208,12 @@ class ProxySettings:
         #   enabled, scope ("request"|"response"|"both"), type ("header"|"body"|"url"),
         #   match (regex string — empty matches everything), replace (replacement string)
         self._match_replace: List[dict] = []
+        # Proxy listener bind host. "127.0.0.1" keeps the proxy loopback-only;
+        # a LAN IP or "0.0.0.0" exposes it to other machines (see set_bind_host).
+        self._bind_host: str = "127.0.0.1"
+        # Persisted proxy listener port. 0 = unset → use the runtime default
+        # (CLI --proxy-port / free-port fallback) instead of a saved value.
+        self._bind_port: int = 0
         _install_bundled_presets()
         self._load()
 
@@ -229,6 +235,11 @@ class ProxySettings:
                         _convert_old_scope_pattern(p) for p in data["scope"]
                     ]
                 self._match_replace = list(data.get("match_replace", []))
+                self._bind_host = str(data.get("bind_host", "127.0.0.1")) or "127.0.0.1"
+                try:
+                    self._bind_port = int(data.get("bind_port", 0) or 0)
+                except (TypeError, ValueError):
+                    self._bind_port = 0
         except Exception:
             pass
 
@@ -240,6 +251,8 @@ class ProxySettings:
                 "hidden_extensions": sorted(self._hidden_ext),
                 "scope_rules":       list(self._scope_rules),
                 "match_replace":     list(self._match_replace),
+                "bind_host":         self._bind_host,
+                "bind_port":         self._bind_port,
             }
         _SETTINGS_PATH.write_text(json.dumps(data, indent=2))
 
@@ -298,7 +311,32 @@ class ProxySettings:
                 "hidden_extensions": sorted(self._hidden_ext),
                 "scope_rules":       list(self._scope_rules),
                 "match_replace":     list(self._match_replace),
+                "bind_host":         self._bind_host,
+                "bind_port":         self._bind_port,
             }
+
+    # ── proxy bind host ─────────────────────────────────────────────────
+
+    def get_bind_host(self) -> str:
+        with self._lock:
+            return self._bind_host
+
+    def set_bind_host(self, host: str) -> None:
+        """Persist the proxy listener bind host. The caller is responsible for
+        validating the value and for restarting the listener to apply it."""
+        with self._lock:
+            self._bind_host = host or "127.0.0.1"
+        self._save()
+
+    def get_bind_port(self) -> int:
+        with self._lock:
+            return self._bind_port
+
+    def set_bind_port(self, port: int) -> None:
+        """Persist the proxy listener port (0 = unset → runtime default)."""
+        with self._lock:
+            self._bind_port = int(port or 0)
+        self._save()
 
     # ── match & replace ────────────────────────────────────────────────
 

@@ -341,6 +341,7 @@ function connect() {
     _wsReconnectDelay = 2000;  // reset backoff on successful connect
     _startHeartbeat();
     loadAiStatus();
+    startMcpStatusPolling();
     loadAppVersion();
     loadMode();
     interceptLoadStatus();

@@ -24,6 +24,9 @@
   <div class="sep"></div>
   <div id="ai-dot" style="width:7px;height:7px;border-radius:50%;background:#555"></div>
   <span id="ai-lbl" style="font-size:11px;color:var(--txt2)">AI checking...</span>
+  <div class="sep"></div>
+  <div id="mcp-dot" style="width:7px;height:7px;border-radius:50%;background:#555"></div>
+  <span id="mcp-lbl" style="font-size:11px;color:var(--txt2)" title="MCP server (dast-ai mcp) connection">MCP: off</span>
   <!-- session bar -->
   <span style="font-size:11px;color:var(--txt2)">Session:</span>
   <input id="session-name" value="Untitled session"
@@ -469,18 +472,80 @@
         <!-- ── Setup (formerly its own top-level tab) ── -->
         <h2>Setup</h2>
 
-        <h3>AI Engine Status</h3>
-        <div id="setup-ai-status" style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
-                  padding:10px 14px;margin-bottom:16px;font-size:11px;line-height:1.8"></div>
-
         <h3>1. Configure browser proxy</h3>
-        <p>Point HTTP and HTTPS proxy at:</p>
-        <div class="cblk" id="proxy-addr">Host: 127.0.0.1
-Port: 8080</div>
-        <p style="color:var(--txt2);font-size:11px">
+        <p style="color:var(--txt2);font-size:11px;margin:0 0 8px">
+          The proxy uses a listener to receive requests from your browser. Point your
+          browser's HTTP/HTTPS proxy at the interface shown below.
+        </p>
+
+        <!-- Proxy listener table (Burp-style) -->
+        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
+          <table style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="background:var(--bg3)">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:70px;padding:4px 8px;text-align:left;font-weight:500">Running</th>
+                <th style="padding:4px 8px;text-align:left;font-weight:500">Interface</th>
+                <th style="padding:4px 8px;text-align:left;font-weight:500;white-space:nowrap">Certificate</th>
+                <th style="width:70px;padding:4px 8px;text-align:right;font-weight:500"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-listeners">
+              <tr>
+                <td style="padding:6px 8px"><span id="listener-running" style="display:inline-flex;align-items:center;gap:6px">
+                  <span style="width:8px;height:8px;border-radius:50%;background:var(--green)"></span></span></td>
+                <td style="padding:6px 8px"><code id="listener-interface" style="color:var(--orange);font-size:12px">…</code></td>
+                <td style="padding:6px 8px;color:var(--txt2)">Per-host</td>
+                <td style="padding:6px 8px;text-align:right">
+                  <button class="tbtn" style="font-size:10px;padding:2px 10px" onclick="openListenerEditor()">Edit</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Edit listener editor (hidden until Edit clicked) -->
+        <div id="listener-editor" style="display:none;margin-top:8px;background:var(--bg2);
+             border:1px solid var(--bdr);border-radius:4px;padding:12px 14px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+            <label style="font-size:11px;color:var(--txt2)">Bind to port:</label>
+            <input id="bind-port-input" type="number" min="1" max="65535" placeholder="8080"
+                   style="width:100px;background:var(--bg1);border:1px solid var(--bdr);
+                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px">
+          </div>
+          <div style="font-size:11px;color:var(--txt2);margin-bottom:8px">Bind to address:</div>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="loopback" onchange="onBindModeChange()">
+            Loopback only <span style="color:var(--txt2)">(127.0.0.1 — this machine only)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="all" onchange="onBindModeChange()">
+            All interfaces <span style="color:var(--txt2)">(0.0.0.0 — reachable by other devices)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:2px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="specific" onchange="onBindModeChange()">
+            Specific address:
+            <input id="bind-host-input" type="text" placeholder="192.168.0.1"
+                   style="width:150px;background:var(--bg1);border:1px solid var(--bdr);
+                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px"
+                   oninput="_refreshBindHostWarning()">
+          </label>
+          <div id="bind-host-warning" style="display:none;font-size:11px;margin:8px 0 0;
+               color:var(--red);background:var(--bg1);border:1px solid var(--red);
+               border-radius:4px;padding:6px 10px"></div>
+          <div style="margin-top:10px;display:flex;gap:8px">
+            <button class="tbtn pri" id="bind-host-apply" style="font-size:11px;padding:3px 12px">Apply</button>
+            <button class="tbtn" style="font-size:11px;padding:3px 12px" onclick="closeListenerEditor()">Cancel</button>
+          </div>
+        </div>
+
+        <p style="color:var(--txt2);font-size:11px;margin-top:10px">
           Chrome/Edge: Settings → System → Open proxy settings → Manual proxy<br>
           Firefox: Preferences → Network Settings → Manual proxy configuration
         </p>
+
+        <h3>AI Engine Status</h3>
+        <div id="setup-ai-status" style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                  padding:10px 14px;margin-bottom:16px;font-size:11px;line-height:1.8"></div>
 
         <h3>2. Install the CA certificate (once)</h3>
         <p>Download and trust the CA so your browser accepts intercepted HTTPS:</p>
@@ -641,6 +706,7 @@ Port: 8080</div>
       <div class="stab on" id="st-browse-manual"    onclick="switchBrowseSub('manual')">Manual Browse</div>
       <div class="stab"    id="st-browse-crawl"     onclick="switchBrowseSub('crawl')">Crawl</div>
       <div class="stab"    id="st-browse-discovery" onclick="switchBrowseSub('discovery')">Content Discovery</div>
+      <div class="stab"    id="st-browse-logins"    onclick="switchBrowseSub('logins')">Logins</div>
     </div>
     <div id="browse-sub-manual" style="flex:1;overflow-y:auto;display:block">
     <div class="settings-body">
@@ -894,6 +960,86 @@ Port: 8080</div>
                   color:var(--txt2);font-family:inherit;white-space:pre-wrap;"></div>
     </div>
     </div><!-- /browse-sub-discovery -->
+
+    <div id="browse-sub-logins" style="flex:1;overflow-y:auto;display:none">
+    <div class="settings-body">
+      <h2>Login Profiles</h2>
+      <p style="color:var(--txt2);font-size:11px;margin-bottom:16px">
+        Saved per-site login configuration. Secrets are encrypted at rest. Activate a
+        profile to load its saved session into the proxy so scans run authenticated.
+        <span id="logins-crypto-warn" style="color:var(--bad);display:none">
+          &nbsp;Encryption unavailable — profiles cannot be saved.</span>
+      </p>
+
+      <div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap">
+        <!-- Profile list -->
+        <div style="flex:1;min-width:260px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <strong style="font-size:12px">Profiles</strong>
+            <button class="tbtn" onclick="loginNewProfile()">+ New</button>
+          </div>
+          <div id="logins-list" style="font-size:12px"></div>
+        </div>
+
+        <!-- Editor -->
+        <div style="flex:2;min-width:340px">
+          <div id="logins-editor" style="display:none">
+            <div style="display:flex;flex-direction:column;gap:8px;max-width:520px">
+              <label style="font-size:11px;color:var(--txt2)">Name
+                <input id="logins-name" class="tinput" style="width:100%" placeholder="Training App"></label>
+              <label style="font-size:11px;color:var(--txt2)">Host pattern
+                <input id="logins-host" class="tinput" style="width:100%" placeholder="*.knowbe4.com"></label>
+              <label style="font-size:11px;color:var(--txt2)">Auth URL
+                <input id="logins-authurl" class="tinput" style="width:100%" placeholder="https://training.knowbe4.com/login"></label>
+
+              <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
+                <strong style="font-size:11px">Credentials</strong>
+                <button class="tbtn" onclick="loginAddCred()">+ Add credential</button>
+              </div>
+              <div id="logins-creds"></div>
+
+              <div style="margin-top:12px;border-top:1px solid var(--bd);padding-top:12px">
+                <strong style="font-size:11px">Import active session (no login)</strong>
+                <p style="color:var(--txt2);font-size:10px;margin:4px 0">
+                  Paste a Cookie header, a Playwright storage_state JSON, or a bearer token.</p>
+                <input id="logins-cookie" class="tinput" style="width:100%;margin-bottom:4px" placeholder="Cookie header: sid=abc; csrf=xyz">
+                <input id="logins-token" class="tinput" style="width:100%;margin-bottom:4px" placeholder="Authorization token (Bearer ...)">
+                <textarea id="logins-storagestate" class="tinput" style="width:100%;height:60px" placeholder="storage_state JSON (optional)"></textarea>
+                <button class="tbtn" onclick="loginImportSession()" style="margin-top:4px">Import session</button>
+                <span id="logins-session-status" style="font-size:10px;margin-left:8px;color:var(--txt2)"></span>
+              </div>
+
+              <div style="margin-top:12px;border-top:1px solid var(--bd);padding-top:12px">
+                <strong style="font-size:11px">Login flow (record &amp; replay)</strong>
+                <p style="color:var(--txt2);font-size:10px;margin:4px 0">
+                  Record opens Frieren's browser — log in by hand and Frieren learns the
+                  steps (secrets are never captured). Replay re-runs the flow with a saved
+                  credential and pauses for you on a captcha.</p>
+                <div id="logins-flow-needhuman" style="display:none;background:var(--bad);color:#fff;padding:6px 10px;border-radius:4px;font-size:11px;margin-bottom:6px">
+                  Waiting for you — solve the challenge in the browser, then click Continue.
+                  <button class="tbtn" onclick="loginResumeFlow()" style="margin-left:8px">Continue</button>
+                </div>
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                  <button class="tbtn" id="logins-flow-record-btn" onclick="loginStartRecord()">Record login</button>
+                  <button class="tbtn" id="logins-flow-stop-btn" onclick="loginStopRecord()" style="display:none">Stop &amp; save flow</button>
+                  <button class="tbtn" id="logins-flow-cancel-btn" onclick="loginCancelRecord()" style="display:none">Cancel</button>
+                  <button class="tbtn" onclick="loginReplayFlow()">Replay flow</button>
+                  <span id="logins-flow-status" style="font-size:10px;color:var(--txt2)"></span>
+                </div>
+              </div>
+
+              <div style="margin-top:12px;display:flex;gap:8px">
+                <button class="tbtn primary" onclick="loginSaveProfile()">Save profile</button>
+                <button class="tbtn" onclick="loginActivateProfile()">Activate session</button>
+                <button class="tbtn" onclick="loginDeleteProfile()" style="color:var(--bad)">Delete</button>
+              </div>
+              <div id="logins-editor-status" style="font-size:11px;color:var(--txt2)"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    </div><!-- /browse-sub-logins -->
   </div><!-- /panel-browse -->
 
   <!-- ══ PLUGINS PANEL ══ -->
@@ -1004,7 +1150,11 @@ Port: 8080</div>
       <p id="sc-model-hint" style="color:var(--txt2);font-size:10px;margin-bottom:8px">Model used for the LLM planner, validator, and adaptive mutator. For Bedrock, pick a preset; for Anthropic/OpenAI, type the model name. Takes effect on the next scan.</p>
       <div style="margin-bottom:8px">
         <input id="sc-model-freeform" type="text" placeholder="e.g. claude-opus-4-8 or gpt-4o"
+               list="sc-model-list" autocomplete="off"
                style="display:none;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+        <!-- Populated from GET /api/ai/models for the active provider; the input
+             stays free-text so an unlisted model still works. -->
+        <datalist id="sc-model-list"></datalist>
       </div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
         <select id="sc-model-id"
@@ -1554,7 +1704,7 @@ Port: 8080</div>
   <!-- ══ EXTRAS PANEL (H1 Validator / Code / FedRAMP / Interactions) ══ -->
   <div class="tpanel" id="panel-extras" style="flex-direction:column;overflow:hidden">
     <div class="subtab-bar">
-      <div class="stab on" id="st-extras-h1"           onclick="switchExtrasSub('h1')">H1 Validator</div>
+      <div class="stab on" id="st-extras-h1"           onclick="switchExtrasSub('h1')">Vuln Validator</div>
       <div class="stab"    id="st-extras-code"          onclick="switchExtrasSub('code')">Code</div>
       <div class="stab"    id="st-extras-fedramp"       onclick="switchExtrasSub('fedramp')">FedRAMP</div>
       <div class="stab"    id="st-extras-interactions"  onclick="switchExtrasSub('interactions')">Interactions</div>
@@ -1569,9 +1719,20 @@ Port: 8080</div>
                   border-right:1px solid var(--bdr);overflow:hidden">
         <!-- Submit form -->
         <div style="padding:12px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0;overflow-y:auto">
-          <div style="font-size:11px;font-weight:600;color:var(--acc2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">H1 Report Validator</div>
+          <div style="font-size:11px;font-weight:600;color:var(--acc2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Vuln Validator</div>
 
-          <div style="font-size:10px;color:var(--txt2);margin-bottom:6px">Paste HackerOne report text:</div>
+          <!-- Manual (single-shot) vs AI (agentic reproduction) mode -->
+          <div style="display:flex;gap:0;margin-bottom:10px;border:1px solid var(--bdr);border-radius:4px;overflow:hidden">
+            <button id="vv-mode-manual" class="tbtn" onclick="vvSetMode('manual')"
+                    style="flex:1;border:none;border-radius:0;font-size:10px;padding:6px 8px">Manual</button>
+            <button id="vv-mode-ai" class="tbtn" onclick="vvSetMode('ai')"
+                    style="flex:1;border:none;border-radius:0;border-left:1px solid var(--bdr);font-size:10px;padding:6px 8px">AI (agentic)</button>
+          </div>
+          <div id="vv-mode-hint" style="font-size:10px;color:var(--txt2);margin-bottom:10px;line-height:1.4">
+            Single-shot reproduction: parse the report and validate it once.
+          </div>
+
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:6px">Paste vulnerability report text:</div>
           <textarea id="h1-report-text"
             placeholder="Paste the full HackerOne report here — title, description, steps to reproduce, proof URL, payload..."
             style="width:100%;height:180px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
@@ -1585,6 +1746,8 @@ Port: 8080</div>
             style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
                    padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
 
+          <!-- Manual-only inputs (the AI path takes only the report text + optional URL) -->
+          <div id="vv-manual-only">
           <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">
             Override domain <span style="color:var(--txt2)">(for DNS takeover checks)</span>
           </div>
@@ -1603,9 +1766,10 @@ Port: 8080</div>
           </div>
           <input type="file" id="h1-img-input" accept="image/*" multiple style="display:none"
                  onchange="h1AddImages(this)">
+          </div>
 
           <div style="display:flex;gap:6px">
-            <button class="tbtn pri" onclick="h1Submit()" id="h1-submit-btn">Validate</button>
+            <button class="tbtn pri" onclick="vvValidate()" id="h1-submit-btn">Validate</button>
             <span id="h1-submit-msg" style="font-size:10px;color:var(--txt2);align-self:center"></span>
           </div>
         </div>
@@ -1615,17 +1779,27 @@ Port: 8080</div>
           <div style="padding:6px 14px;font-size:10px;color:var(--txt2);border-bottom:1px solid var(--bdr);
                       display:flex;align-items:center;gap:8px">
             <span style="flex:1">Recent validations</span>
-            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="h1LoadJobs()">Refresh</button>
+            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="vvLoadJobs()">Refresh</button>
           </div>
           <div id="h1-job-list" style="font-size:11px"></div>
         </div>
       </div>
 
-      <!-- RIGHT: Result detail -->
-      <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+      <!-- RIGHT: Result detail (manual single-shot) -->
+      <div id="vv-manual-result" style="flex:1;display:flex;flex-direction:column;overflow:hidden">
         <div id="h1-result-panel" style="flex:1;overflow-y:auto;padding:16px 20px">
           <div style="color:var(--txt2);font-size:12px;text-align:center;padding:60px 20px">
-            Submit a HackerOne report to validate it.
+            Submit a report to validate it.
+          </div>
+        </div>
+      </div>
+
+      <!-- RIGHT: Live agent trace (AI mode) -->
+      <div id="vv-ai-result" style="flex:1;display:none;flex-direction:column;overflow:hidden">
+        <div id="vv-trace-panel" style="flex:1;overflow-y:auto;padding:16px 20px">
+          <div style="color:var(--txt2);font-size:12px;text-align:center;padding:60px 20px">
+            Paste a report and click Validate — the agent will try to reproduce it,
+            streaming each step here and pausing for you when it hits a wall.
           </div>
         </div>
       </div>
@@ -1920,12 +2094,15 @@ Port: 8080</div>
 <script src="/ui/js/50-settings-fedramp-scan.js"></script>
 <script src="/ui/js/60-http-view.js"></script>
 <script src="/ui/js/65-browse.js"></script>
+<script src="/ui/js/66-login-profiles.js"></script>
+<script src="/ui/js/67-mcp-approval.js"></script>
 <script src="/ui/js/70-logs-scan-plugins-crawl.js"></script>
 <script src="/ui/js/75-subtabs-ai-panel.js"></script>
 <script src="/ui/js/76-extras-decoder-jwt.js"></script>
 <script src="/ui/js/80-setup-status-sessions.js"></script>
 <script src="/ui/js/85-overview-scanconfig-provider.js"></script>
 <script src="/ui/js/90-h1-interactions.js"></script>
+<script src="/ui/js/91-vuln-validator.js"></script>
 <script src="/ui/js/95-code-analysis.js"></script>
 <script src="/ui/js/96-mode-intercept-mr.js"></script>
 <script src="/ui/js/99-bootstrap-ctxmenu.js"></script>

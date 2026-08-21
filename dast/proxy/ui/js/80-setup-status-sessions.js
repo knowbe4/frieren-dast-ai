@@ -155,6 +155,43 @@ async function loadAiStatus() {
   }
 }
 
+// ── MCP server status badge ────────────────────────────────────────────
+// The MCP server (`dast-ai mcp`) is a separate process that posts heartbeats
+// to the dashboard; this polls /api/mcp/status so the top-bar badge reflects
+// whether an MCP server is currently connected to this instance.
+let _mcpStatusTimer = null;
+
+async function loadMcpStatus() {
+  const dot = document.getElementById('mcp-dot');
+  const lbl = document.getElementById('mcp-lbl');
+  if (!dot || !lbl) return;
+  try {
+    const s = await fetch('/api/mcp/status').then(r => r.json());
+    if (s.connected) {
+      dot.style.background = 'var(--green)';
+      lbl.textContent = 'MCP: connected';
+      lbl.style.color = 'var(--txt)';
+      lbl.title = 'MCP server (dast-ai mcp) connected · last seen '
+                + Math.round(s.last_seen_seconds_ago || 0) + 's ago';
+    } else {
+      dot.style.background = '#555';
+      lbl.textContent = 'MCP: off';
+      lbl.style.color = 'var(--txt2)';
+      lbl.title = 'No MCP server connected. Start one with: uv run dast-ai mcp';
+    }
+  } catch (_) {
+    dot.style.background = '#555';
+    lbl.textContent = 'MCP: off';
+    lbl.style.color = 'var(--txt2)';
+  }
+}
+
+function startMcpStatusPolling() {
+  loadMcpStatus();
+  if (_mcpStatusTimer) clearInterval(_mcpStatusTimer);
+  _mcpStatusTimer = setInterval(loadMcpStatus, 10000);
+}
+
 // ── file picker handlers ───────────────────────────────────────────────
 
 async function onSessionFileSelected(event) {

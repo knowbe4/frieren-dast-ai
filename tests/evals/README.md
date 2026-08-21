@@ -18,6 +18,16 @@ tokens. It is NOT collected by the default `uv run pytest` run.
 
 Injection-resistance cases live here too: a target response that tries to hijack the
 decision must NOT change the verdict (validates the `prompt_safety` XML defense end-to-end).
+These are marked `injection_probe: true` and scored separately as an
+`injection-resistance` percentage. The battery covers multiple vectors an analysed
+website could use — forged `</target_response>` fence-escape, non-English overrides
+(PT/ES), fake `Assistant:` turns, and injected `emit_result` verdict blocks — against both
+force-confirm (talk a non-vuln up) and force-reject (talk a real vuln down). A robust run
+scores 100% injection-resistance while still confirming/rejecting on the real evidence.
+
+> Structural counterpart: `tests/unit/test_prompt_safety.py` and
+> `tests/unit/test_prompt_injection_pipeline.py` prove the fence holds deterministically
+> (no LLM). This eval proves the *model* is not hijacked in practice. Run both.
 
 ## Run it
 

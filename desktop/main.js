@@ -225,6 +225,17 @@ function createWindow() {
   mainWindow.loadFile(path.join(__dirname, "loading.html"));
   mainWindow.once("ready-to-show", () => mainWindow.show());
 
+  // Keyboard reload (F5 and Cmd/Ctrl+R). Works without an application menu and
+  // in packaged builds — before-input-event fires for every key the page sees.
+  mainWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") return;
+    const isCmdOrCtrlR = (input.meta || input.control) && input.key.toLowerCase() === "r";
+    if (input.key === "F5" || isCmdOrCtrlR) {
+      event.preventDefault();
+      reloadDashboard();
+    }
+  });
+
   // Open external links (docs, target apps) in the system browser, not in-app.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (!url.startsWith(DASHBOARD_URL)) {
@@ -270,6 +281,22 @@ function loadDashboard() {
   }
 }
 
+// Refresh the dashboard in the native window — the desktop equivalent of hitting
+// F5 / Cmd+R in a browser. Needed because the launcher sets no application menu,
+// so otherwise there is no way to re-fetch the page after, e.g., switching the
+// AI provider (the connection badge re-polls on its own, but a manual reload is
+// still the expected escape hatch). A plain reload re-fetches the current page;
+// if we somehow left the loading screen up, load the dashboard URL instead.
+function reloadDashboard() {
+  if (!mainWindow || !backendReady) return;
+  const currentUrl = mainWindow.webContents.getURL();
+  if (currentUrl.startsWith(DASHBOARD_URL)) {
+    mainWindow.webContents.reload();
+  } else {
+    mainWindow.loadURL(DASHBOARD_URL);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tray
 // ---------------------------------------------------------------------------
@@ -301,6 +328,12 @@ function rebuildTrayMenu() {
       label: "Open in system browser",
       enabled: backendReady,
       click: () => shell.openExternal(DASHBOARD_URL),
+    },
+    {
+      label: "Reload dashboard",
+      enabled: backendReady,
+      accelerator: "CmdOrCtrl+R",
+      click: () => reloadDashboard(),
     },
     { type: "separator" },
     {

@@ -152,6 +152,53 @@ def provider_api_key_present() -> bool:
     return False
 
 
+def list_models() -> Dict[str, Any]:
+    """
+    List the models available for the active provider, for the UI dropdowns.
+
+    Returns ``{"provider", "models": [{"id", "label"}], "source", "error"}``.
+    ``source`` is "live" when fetched from the provider's models API, or "preset"
+    when we fell back to the static named tiers (Bedrock always uses presets —
+    ARNs can't be enumerated without extra IAM perms and don't map to tiers; the
+    gateway falls back to presets when it exposes no models endpoint). Never
+    raises — a provider failure degrades to presets with an ``error`` message.
+    """
+    from dast.config import settings
+    from dast.ai import providers
+
+    provider = get_active_provider()
+    presets = settings.model_presets
+
+    if provider == "bedrock":
+        return {"provider": provider, "models": presets, "source": "preset", "error": ""}
+
+    try:
+        if provider == "anthropic":
+            models = providers.list_anthropic_models(
+                api_key=_anthropic_api_key or (settings.anthropic_api_key or ""),
+                base_url=_anthropic_base_url or settings.anthropic_base_url,
+            )
+        elif provider == "openai":
+            models = providers.list_openai_models(
+                api_key=_openai_api_key or (settings.openai_api_key or ""),
+                base_url=_openai_base_url or settings.openai_base_url,
+            )
+        elif provider == "gateway":
+            models = providers.list_gateway_models(
+                base_url=_gateway_base_url or settings.gateway_base_url,
+            )
+        else:
+            return {"provider": provider, "models": presets, "source": "preset",
+                    "error": f"Unknown provider: {provider}"}
+        if models:
+            return {"provider": provider, "models": models, "source": "live", "error": ""}
+        # Empty list — treat as no live catalogue; fall back to presets.
+        return {"provider": provider, "models": presets, "source": "preset", "error": ""}
+    except Exception as exc:
+        logger.warning("Model listing failed; using presets", provider=provider, error=str(exc))
+        return {"provider": provider, "models": presets, "source": "preset", "error": str(exc)[:200]}
+
+
 def get_active_model() -> str:
     from dast.config import settings
     return _active_model_id or settings.ai_model_id

@@ -115,6 +115,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 "ai_model_label": cfg.ai_model_label,
                 "aws_identity": aws_identity,
                 "ai_error": ai_error,
+                # Actual proxy listen host/port. The runner may bump either port
+                # via _find_free_port when the default is busy, so the UI must
+                # read the effective value here instead of guessing from the URL.
+                "proxy_host": ctx.proxy_host,
+                "proxy_port": ctx.proxy_port,
                 "attack_types": [
                     "xss", "sqli", "idor", "ssrf",
                     "open_redirect", "auth_bypass", "mass_assignment", "graphql_injection",
@@ -127,7 +132,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         except Exception as e:
             logger.error("AI status endpoint error", error=str(e))
             return JSONResponse({"ai_enabled": False, "ai_error": str(e), "ai_model": None,
-                                 "aws_identity": None, "attack_types": []}, status_code=200)
+                                 "aws_identity": None, "proxy_host": ctx.proxy_host,
+                                 "proxy_port": ctx.proxy_port, "attack_types": []}, status_code=200)
 
     @router.post("/api/ai/resume")
     async def resume_ai():
@@ -188,6 +194,39 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import bedrock_client as _bc
         paused = ctx.scan_queue_state.paused if ctx.scan_queue_state else False
         return {"available": _bc.is_ai_available(), "scan_queue_paused": paused}
+
+    @router.get("/api/ai/models")
+    async def ai_models():
+        """
+        List models for the active provider, for the Settings dropdowns. Runs the
+        (blocking) provider HTTP call in a thread so the event loop is not stalled.
+        Never errors out: falls back to static presets with an ``error`` message.
+        """
+        import asyncio
+        from dast.ai import bedrock_client as _bc
+        return await asyncio.get_running_loop().run_in_executor(None, _bc.list_models)
+
+    # MCP server liveness. The MCP process (`dast-ai mcp`) is separate from the
+    # dashboard and drives it over HTTP, so the dashboard only knows the MCP
+    # server is up if it posts a heartbeat. `_MCP_STALE_SECONDS` must exceed the
+    # MCP heartbeat interval so a single missed post doesn't flap the badge.
+    _MCP_STALE_SECONDS = 30.0
+
+    @router.post("/api/mcp/heartbeat")
+    async def mcp_heartbeat():
+        """Called periodically by the running MCP server to signal it is alive."""
+        import time as _t
+        ctx.mcp_last_heartbeat[0] = _t.time()
+        return {"ok": True}
+
+    @router.get("/api/mcp/status")
+    async def mcp_status():
+        """UI badge source: is an MCP server currently connected to this instance?"""
+        import time as _t
+        last = ctx.mcp_last_heartbeat[0]
+        age = _t.time() - last if last else None
+        connected = last > 0 and age is not None and age < _MCP_STALE_SECONDS
+        return {"connected": connected, "last_seen_seconds_ago": age}
 
     @router.websocket("/ws")
     async def websocket_endpoint(ws: WebSocket):
@@ -284,6 +323,8 @@ async def prefetch_ai_status(ctx: DashboardContext) -> None:
             "ai_model_label": cfg.ai_model_label,
             "aws_identity": aws_identity,
             "ai_error": None if ai_ok else f"AI not reachable for provider '{provider}'",
+            "proxy_host": ctx.proxy_host,
+            "proxy_port": ctx.proxy_port,
             "attack_types": [
                 "xss", "sqli", "idor", "ssrf",
                 "open_redirect", "auth_bypass", "mass_assignment", "graphql_injection",
@@ -300,6 +341,8 @@ async def prefetch_ai_status(ctx: DashboardContext) -> None:
             "ai_model": None,
             "aws_identity": None,
             "ai_error": str(exc).split("\n")[0],
+            "proxy_host": ctx.proxy_host,
+            "proxy_port": ctx.proxy_port,
             "attack_types": [],
         })
         ctx.status_cache_ts[0] = _time.monotonic()

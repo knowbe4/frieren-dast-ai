@@ -522,6 +522,8 @@ class TestProxySettingsMatchReplaceToDict:
         ps._bypass = set()
         ps._hidden_ext = set()
         ps._scope_rules = []
+        ps._bind_host = "127.0.0.1"
+        ps._bind_port = 0
         ps._match_replace = [
             {"enabled": True, "scope": "request", "type": "header",
              "match": "X-Old: .*", "replace": "X-New: value", "comment": ""},

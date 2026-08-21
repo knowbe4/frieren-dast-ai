@@ -204,6 +204,8 @@ def build_app(
     runner=None,
     intercept_store=None,
     discovery_queue: asyncio.Queue = None,
+    login_queue: asyncio.Queue = None,
+    proxy_host: str = "127.0.0.1",
 ) -> FastAPI:
     from dast.proxy.api.context import DashboardContext
     from dast.proxy.api.proxy_routes import make_router as proxy_router
@@ -222,6 +224,10 @@ def build_app(
     from dast.proxy.api.interactions_routes import make_router as interactions_router
     from dast.proxy.api.fedramp_routes import make_router as fedramp_router
     from dast.proxy.api.jwt_routes import make_router as jwt_router
+    from dast.proxy.api.profiles_routes import make_router as profiles_router
+    from dast.proxy.api.login_flow_routes import make_router as login_flow_router
+    from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
+    from dast.proxy.api.agent_triage_routes import make_router as agent_triage_router
 
     ctx = DashboardContext(
         store=store,
@@ -232,7 +238,9 @@ def build_app(
         plugin_manager=plugin_manager,
         browse_queue=browse_queue,
         discovery_queue=discovery_queue,
+        login_queue=login_queue,
         proxy_port=proxy_port,
+        proxy_host=proxy_host,
         scan_config=scan_config,
         scan_queue_state=scan_queue_state,
         runner=runner,
@@ -279,5 +287,9 @@ def build_app(
     app.include_router(interactions_router(ctx))
     app.include_router(fedramp_router(ctx))
     app.include_router(jwt_router(ctx))
+    app.include_router(profiles_router(ctx))
+    app.include_router(login_flow_router(ctx))
+    app.include_router(mcp_approval_router(ctx))
+    app.include_router(agent_triage_router(ctx))
 
     return app

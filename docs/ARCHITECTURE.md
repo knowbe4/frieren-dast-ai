@@ -587,6 +587,273 @@ dast/
 
 ---
 
+## Recon & Discovery Subsystems
+
+### Content Discovery (forced browsing)
+- `dast/wordlists/*.txt` — plain-text wordlists (SecLists-derived, MIT). Add a `<name>.txt`,
+  load via `load_wordlist("<name>")` (`dast/wordlists/loader.py`). Separate from
+  `dast/payloads/loader.py` (YAML-only).
+- `dast/scanners/content_discovery.py::run_content_discovery()` — GET-probes wordlist paths to
+  surface unlinked endpoints. Detection-only, no payloads. Reuses `active_checks._client()/
+  _send()` and gates EVERY URL through `ProxySettings.is_in_scope()` BEFORE probing (hard
+  safety guarantee). Soft-404 filtered via baseline probe. Driven by
+  `ProxyRunner._discovery_worker` off `discovery_queue`; `POST /api/discovery` re-checks scope.
+  Hits → `source="discovery"` sitemap + `source="content-discovery"` suggestions. Dir/file hits
+  are neutral `recon` (never infer vuln from path); GraphQL hits → `graphql_injection`. Opt-in
+  LLM refinement via `discovery_llm_classify` flag (default OFF). UI: Discovery tab → Content
+  Discovery sub-tab.
+
+### Param Mining (hidden-parameter discovery)
+- `dast/scanners/param_miner.py::run_param_mining()` — brute-forces unlinked param NAMES
+  against ONE in-scope request (query/form/JSON auto-detected). Parameter-side companion to
+  content_discovery. Wordlist `dast/wordlists/params.txt`. Detection-only (inert canary).
+  Signals, lowest-FP first: (1) reflection — each candidate gets a unique canary
+  (`dastpm7c1e<i>`); (2) behavior-change — status/length shift binary-searched to one name,
+  re-confirmed in isolation. Anti-FP: two baselines up front; unstable body length disables
+  length detection (status-only). `_BATCH_SIZE=25`, `_LENGTH_NOISE_BYTES=32`. Scope-gates every
+  URL; excludes existing params; `client=` reuses coordinator's client (never closes it).
+- AUTOMATIC, no UI tab. Two paths: (a) AI off — `ProxyRunner._attack_one` →
+  `_mine_params_for_entry` (inert probes only); hits → `source="param-discovery"` `recon`
+  suggestions. (b) AI on — planner's `mine_params` field (`PLANNER_SCHEMA`) →
+  `Coordinator._run_param_mining_pass` folds names onto `target.params` + sets
+  `target.param_mining_hint`. Miner failure leaves `target.params` intact.
+
+### Probe-Diffing (AI-native "Backslash Powered")
+- `dast/agents/probe_diff.py::run_probe_pairs()` — PURE PRIMITIVE, not a per-vuln agent.
+  Injects break/repair PAIRS into one param and diffs responses: `dast'`/`dast\'`,
+  `dast"`/`dast\"`, `dast\`/`dast\\`, `dast${{7*7}}`/`dast${{7*'7}}`, `dast{{7*7}}`/
+  `dast{{7*'7}}`. Non-destructive by construction. Returns `DiffSignature` (`has_signal`,
+  `divergent_labels`, `to_classifier_summary()`); diffs status, length (`>=32` floor),
+  HTML-structure hash, interpreter error, arith-eval marker (`49`), reflection. Scope-gates
+  every URL; `client=` reuses coordinator's client.
+- `dast/ai/probe_classifier.py::classify(signature)` → `ProbeVerdict` (injection_class,
+  context, confidence, recommended_agents). No LLM call when no signal; fences summary via
+  `wrap_untrusted(.., 'probe_signature')`; degrades to `_UNKNOWN` on error.
+  `PROBE_CLASSIFIER_SCHEMA` in schemas.py.
+- Wiring: `Coordinator.run(.., probe_diff=False)` → `_run_probe_diff_pass()` folds
+  `recommended_agents` into signal_map + sets `target.probe_diff_hint`. Opt-in default OFF:
+  `sc-probe-diff` checkbox → `POST /api/scan-config` → `runner._engine_config["probe_diff"]`.
+
+### Cache Poisoning (unkeyed-input detection)
+- `dast/agents/cache_poisoning_agent.py::CachePoisoningAgent` (`cache_poisoning`). Detects
+  poisoning via UNKEYED headers (`X-Forwarded-Host`, `X-Forwarded-Scheme`, `X-Host`,
+  `Forwarded`, ...) reflected into a cacheable response. GET-only; bails on non-cacheable
+  baseline. Two-request proof: (1) send header with unique marker → reflected?; (2) re-request
+  WITHOUT header → marker survives → unkeyed → CONFIRMED (`bypass_validation=True`, high).
+  Reflected-but-not-cached → unconfirmed medium for LLM validator.
+- SAFETY: every probe appends a unique cache-buster query param (`_cache_buster_url`), so both
+  requests map to a key only WE request — never poisons the real shared page. Config in
+  `dast/payloads/cache_poisoning.yaml`. Wiring:
+  `Coordinator._select_attack_types_for_params()` adds `cache_poisoning` for every GET
+  (no-canary; planner decides, agent self-gates on cacheability).
+
+### Scope Presets (per organization)
+- Drop a `<slug>.json` under `dast/scope_presets/` (gitignored, see `example.json.example`
+  for the schema) — auto-discovered at startup and written to `~/.dast-ai/projects/<slug>.json`
+  on first run if absent. No code changes and nothing organization-specific committed.
+- Users can also create/edit scope rules directly from the Proxy > Settings sub-tab without a preset file.
+
+## GraphQL Subsystem
+
+### Query Builder / Fuzzer
+- `dast/plugins/graphql_introspection.py` stores an extended compact schema per endpoint in
+  `store.graphql_schemas[endpoint]` (`mutations`/`queries` with arg `type`+`wrapper` and
+  `return_type`, `input_types`, `object_types`, `union_types`, `enum_types`). Superset of what
+  the findings importer reads — safe to extend, never remove keys. `_introspect(...)` is a
+  module-level function called ONLY from `POST /api/graphql/introspect` (never automatically).
+  `on_entry()` only catalogues endpoints seen on the wire; never sends an outbound
+  introspection request. `POST /api/graphql/rescan-history` catalogues from captured history.
+  Both introspect paths return the failure reason directly (Logs tab hides `warn` events).
+- `dast/graphql/query_builder.py` — pure functions (`build_argument_value`,
+  `build_selection_set`, `build_operation`), no I/O. Caps: `MAX_INPUT_DEPTH=3` (cycle
+  detection), `MAX_SELECTION_DEPTH=2`, `MAX_FIELDS_PER_LEVEL=15`. Always variable-based queries.
+- `dast/graphql/variable_fuzzer.py` — extracts variables from a captured request's JSON
+  `variables` (inline query-literal extraction NOT implemented — documented follow-up),
+  cross-products against payloads one variable at a time. No vuln classification here — that's
+  `graphql_analyzer.py`'s job on every proxied response.
+- GraphQL tab enabled/disabled via the `GraphQL Fuzzer` plugin (see Plugin-gated tab pattern).
+
+## Mutation & WAF
+
+### WAF Bypass
+- `dast/agents/block_detector.py` — central `detect_block(status, body, baseline_len)`
+  returns a `BlockVerdict`. Recognises a block from status codes AND from block-page
+  content signatures EVEN on HTTP 200 (a WAF hiding behind 200 used to be missed, so the
+  mutator gave up instead of attempting a bypass). Agents call it before the mutator and
+  feed `verdict.signal` into `self.observe("waf_block", ...)`.
+- Per-host bypass memory: when a payload succeeds after an earlier block, the agent
+  emits `self.observe("waf_bypass", payload=...)`; the coordinator records it via
+  `session_intelligence.record_scan_complete(bypass_payload=...)`. `HostIntel.to_mutator_hint()`
+  then offers that proven payload to the mutator FIRST on later endpoints of the same host.
+- All six mutator-using agents are wired to the central detector + per-host memory:
+  `sqli_agent`, `xss_agent`, `file_read_agent`, `ssrf_agent`, `discovery_agent` (SSTI),
+  `llm_injection_agent`. Each builds `tech_context` via `build_mutator_context()`, records
+  blocks with `detect_block()` → `observe("waf_block")`, and emits `observe("waf_bypass")`
+  when a payload succeeds after a prior block.
+
+## Reliability Guards
+
+### Host Reachability Circuit Breaker
+- `dast/scanners/active_checks.py` tracks consecutive connection failures per host
+  (DNS failure, connection refused, proxy 502/504) via `_HOST_FAILURE_STATE`
+- After `_HOST_DEAD_THRESHOLD` (5) consecutive failures the host is marked dead; all
+  further probes and scans to it short-circuit (`is_host_dead()`), so a dead host never
+  floods the history with status-less requests
+- A single real response resets the counter; `reset_host_reachability()` clears all state
+  and is called on `SessionStore.clear()` (network may have changed)
+- The scan worker skips queued entries for dead hosts with a "Host unreachable" log event
+- The SPA crawler also consults `is_host_dead()` before navigating (skips the 45s timeout)
+
+### Scan Reliability Guards
+- Scan-time dedup key is `(method, host, _normalise_path(path), operation)` — path
+  normalisation collapses UUIDs/numeric-IDs (`/users/{id}`), matching the enqueue-time
+  dedup so an endpoint isn't re-scanned once per distinct ID
+- Scan queue is bounded (`maxsize=5000`); the producer uses `put_nowait` and logs+skips on
+  `QueueFull` so a backed-up queue never stalls proxy ingestion
+- Probe-concurrency semaphore (`_PROBE_SEM`) is aligned to `max(probe_concurrency, workers)`
+  at scan-worker startup — more workers with a tiny probe budget yields little throughput
+- Session refresh worker gives up after `_MAX_REAUTH_FAILURES` (3) consecutive failures
+  (stale credentials); a success resets the counter — recover via a fresh Browse-tab login
+
+### Service Graph
+- `ServiceGraph` lives on `SessionStore` — access via `store.service_graph`
+- `SessionStore.complete_entry()` calls `service_graph.observe()` automatically
+- Layer 2: `CheckTarget` has optional `service_context` field — agents read it, never mutate it
+- Manual merge/split via `/api/service-graph/merge` and `/api/service-graph/split`
+
+## Validation Knowledge
+
+### Vulnerability Knowledge Base
+- `dast/vuln_knowledge/` — one YAML per attack_type with `positive_examples`
+  (1-3 real vulns) and `negative_examples` (1-2 look-alikes that are NOT vulns),
+  each with a one-line `reasoning`. Covers the top-20 web vulns.
+- Auto-discovered recursively (like passive rules); `loader.py` indexes by
+  `attack_type` and `aliases` (e.g. `path_traversal`→`lfi`, `llm_prompt_leak`→`llm_injection`)
+- Two consumers, both degrade gracefully to no-op when a type has no coverage:
+  - `red_team.validate()` — injects positive+negative via `format_examples_block()`
+    to sharpen the real-vs-look-alike verdict (fewer false positives)
+  - `mutator.next_payload()` — injects positive-only via `format_positive_examples()`
+    so payload discovery aims at the response signal that proves exploitation
+- Examples are our own trusted content — interpolated directly, NOT `wrap_untrusted()`
+- Add a vuln class: drop a new `<attack_type>.yaml` — no code changes
+
+### AI Triage Engine (HackerOne / pasted reports)
+- `dast/hackerone/parser.py::parse_report(text)` — regex first, LLM enrichment second
+  (SCHEMA-FORCED via `H1_PARSE_SCHEMA`, fast tier, text fenced with `wrap_untrusted(..,
+  "h1_report")`). Runs on a worker thread, so `_llm_enrich` calls `invoke_json`
+  SYNCHRONOUSLY — never `asyncio.get_running_loop()` (raised on the loopless thread;
+  regression-tested). Extracts `http_method`, `request_headers` (Authorization/Cookie DROPPED
+  — session supplies auth), `request_body`. LLM failure degrades to regex.
+- `dast/hackerone/validator.py::_validate_http` reproduces the report's ACTUAL request
+  (branches on method, sends body, merges headers with auth stripped). `payload_safety.make_safe`
+  gates BOTH URL and body — destructive payload substituted with safe variant, else nothing
+  sent (`needs_manual`). Verdict SCHEMA-FORCED via `H1_VERDICT_SCHEMA`; confirmed iff
+  `reproduced AND confidence >= 0.95`. `ValidationResult` carries `severity`.
+- `dast/proxy/api/hackerone_routes.py` — on `needs_auth`, `_try_profile_auth` matches a Phase-1
+  login profile and authenticates via `session/profile_reauth.reauth_from_profile` (flow replay
+  → saved-session fallback) before manual browser login. On `confirmed`, `_persist_finding`
+  creates a synthetic `source="agent"` entry + finding → dashboard → SARIF. Both best-effort.
+- Login profiles (encrypted, per-site) + flow recording/replay: `dast/profiles/` and
+  `dast/session/flow_replayer.py`.
+
+## Integration Layer
+
+### Manual Toolbelt (Decoder/Encoder + JWT editor)
+- Two Extras sub-tabs via `switchExtrasSub('decoder'|'jwt')` (75-subtabs-ai-panel.js); both in
+  `dast/proxy/ui/js/76-extras-decoder-jwt.js`.
+- **Decoder/Encoder** — CLIENT-SIDE ONLY, no backend. base64/base64url/URL/HTML/hex + JWT
+  decode. Ops are a pure `_DECODER_OPS` list; add a transform by appending one entry. Errors
+  render inline, never throw.
+- **JWT editor** — decode/edit/re-sign a token, send to Repeater. Modes HS256/384/512 +
+  `alg:none`. One backend touchpoint: `POST /api/jwt/build` (`dast/proxy/api/jwt_routes.py`)
+  reuses `jwt_tester._build_token()`; FORCES `header["alg"]` from the chosen mode, rejects
+  unsupported modes with 400.
+
+### Shared Tool Layer + MCP Server
+- `dast/tools/` — SINGLE source of truth for agent-callable capabilities. One definition, two
+  callers (internal agentic loop + external MCP server) dispatch through the same registry, so
+  capabilities never drift.
+  - `base.py` — `Tool` dataclass (`name`, `description`, `input_schema`, `handler`, `tags`) +
+    `_REGISTRY`; `register`/`get_tool`/`all_tools`. `run_tool(ctx, name, arguments)` NEVER
+    raises — unknown tool or handler exception → `{"ok": False, "error": ...}`. Every handler
+    returns `{"ok": bool, ...}`.
+  - `context.py` — `ToolContext` (`proxy_port`, `dashboard_port`, `store`, `settings`).
+    `is_in_scope(url)` returns False with no settings (safe default). Internal callers pass the
+    in-proc `store`; the MCP process reads over the dashboard HTTP API.
+  - Six built-in tools, each scope-gated via `ctx.is_in_scope()` BEFORE any request:
+    `send_request` (refuses destructive URL/body, offers safe variant), `get_history`,
+    `content_discovery`, `param_mining`, `triage_report`, `list_login_profiles` (read-only,
+    secret-free; activation NOT exposed).
+- `dast/mcp/` — exposes the tool layer over MCP (external Claude Desktop/Code drive a running
+  instance). `mcp` imported LAZILY in `run_stdio`; `tool_definitions()` is PURE (unit-testable
+  without runtime). Low-level `mcp.server.lowlevel.Server` with `on_list_tools`/`on_call_tool`
+  (`isError` from `ok`). Start: `uv run dast-ai mcp` (stdout IS the transport, no banner). Add a
+  tool: `register(Tool(...))` in a `dast/tools/*_tools.py`, import it in `__init__.py`.
+- MCP liveness badge: the MCP server posts `POST /api/mcp/heartbeat` every 10s (`_heartbeat_loop`
+  in `dast/mcp/server.py`); the dashboard tracks `ctx.mcp_last_heartbeat` and serves
+  `GET /api/mcp/status` (connected if a heartbeat arrived within 30s). The top-bar `mcp-dot`/
+  `mcp-lbl` badge polls it every 10s (`loadMcpStatus` in 80-setup-status-sessions.js). The two
+  processes are otherwise decoupled — a down dashboard just makes the heartbeat retry.
+
+### System Logs
+- Rolling 500-event buffer in `dast/proxy/plugin_manager._event_log`
+- Written by: `log_event(plugin, level, message, url, finding, source)` — call from anywhere
+- `source` values: `"plugin"`, `"agent"`, `"browser"`, `"crawler"`
+- Visible in Logs tab — 6-column table matching HTTP History layout
+- API: `GET /api/logs`, `POST /api/logs/clear`
+
+## Multi-Provider AI Gateway
+
+- All AI calls go through `dast.ai.bedrock_client`. The gateway dispatches to AWS Bedrock
+  (default), the Anthropic Messages API, an OpenAI-compatible endpoint, or the internal Claude
+  apps gateway based on the active provider. Every request is built Anthropic-shaped and read
+  Anthropic-shaped; `dast/ai/providers.py` translates to/from OpenAI so callers and the
+  schema-forced tool-use path are provider-agnostic. Select at runtime via
+  `bedrock_client.set_provider(provider, keys...)` or `POST /api/scan-config` (`ai_provider`,
+  `anthropic_api_key`, `openai_api_key`, `*_base_url`, `gateway_base_url`). Defaults via `.env`
+  (see Environment Variables in CLAUDE.md). For non-Bedrock providers `model_id` is a plain
+  model name (e.g. `claude-opus-4-8`, `gpt-4o`), not an ARN. API keys are never echoed back by
+  `GET /api/scan-config` (only `*_set` booleans).
+- Gateway provider (`dast/ai/gateway_auth.py`): the internal Claude apps gateway speaks the
+  Anthropic Messages API over an OAuth JWT reused from the Claude Code CLI session (macOS
+  Keychain, service `Claude Code-credentials`; or an explicit `GATEWAY_JWT` on Linux/CI). It
+  takes NO API key. The gateway pins temperature server-side and forces extended thinking on, so
+  `invoke_gateway` strips `temperature` and sends `thinking:{"type":"disabled"}`. The gateway
+  hostname is INTERNAL and lives ONLY in `.env` (`GATEWAY_BASE_URL`) — never a code default
+  (`config.py` ships an empty string); `scripts/check_no_internal_data.py` blocks any
+  `*.internal|corp|private.knowbe4.com` host from tracked files.
+- The `/api/ai/status` badge probes the ACTIVE provider (STS for bedrock; API-key presence for
+  anthropic/openai; `gateway_auth.credentials_available()` for gateway). The status is cached
+  5 min; `POST /api/scan-config` clears that cache on a provider switch so the badge re-probes.
+
+## Dashboard / UI Layout
+
+- Main tabs: Dashboard → Proxy → Discovery → AI → Scan → Plugins → GraphQL → Repeater → Intruder → Logs → Extras
+  - Proxy sub-tabs: HTTP history, Intercept, Site map, Issues, Settings (scope rules + Setup/CA cert)
+  - Discovery sub-tabs: Manual Browse, Crawl, Content Discovery
+  - AI sub-tabs: Suggestions, Settings (provider, model tiers, scan engine, activity log, service graph)
+  - Extras sub-tabs: H1 Validator, Code, FedRAMP, Interactions, Decoder, JWT
+- Top-bar badges: proxy connection (`ws-dot`), AI status (`ai-dot`), MCP status (`mcp-dot`).
+- HTTP history table supports column resize by dragging the border handle on each `<th>`
+- Save notifications (sessions, project settings) show the full file path
+- Scan engine settings (model, workers, concurrency, confidence threshold) live in AI tab;
+  applied at runtime via `POST /api/scan-config`; `GET /api/scan-config` returns current config
+- Overview dashboard auto-refreshes every 10 s; also refreshes on tab switch
+- Logs tab: filter by source, level, or text; red row tint for findings
+- GraphQL tab: fused Schema Explorer + Query Builder (endpoint picker + filterable operation
+  list on the left; schema-driven query/variables editor + Send to Repeater/Fuzzer on the
+  right; manual re-introspect + manual endpoint add in the same sidebar), plus a Fuzzer
+  (variable extraction + payload cross-product, run/poll/stop like Intruder). Explorer and
+  Builder were fused because picking an operation and re-running introspection both update the
+  same editor pane.
+- **Plugin-gated tab pattern**: a top-level tab's visibility can be tied to a plugin's enabled
+  state — frontend-only, no backend wiring. `loadPlugins()` calls a `_gql`-prefixed visibility
+  helper after fetching `/api/plugins`; called eagerly from `ws.onopen` (not just when the
+  Plugins tab is opened) so the tab hides/shows correctly from the first page load. See
+  `_gqlTabVisibility()` for the concrete example.
+
+---
+
 ## CI Mode (Planned)
 
 ```

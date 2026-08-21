@@ -159,14 +159,44 @@ async function loadOverview() {
 // presets (dast.config.settings.model_presets) — never hardcode a model
 // ARN/name in the UI.
 function populateModelPresets(presets) {
-  const primary = document.getElementById('sc-model-id');
-  const fast = document.getElementById('sc-fast-model-id');
-  const validation = document.getElementById('sc-validation-model-id');
-  if (primary) primary.innerHTML = presets.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
-  if (fast) fast.innerHTML = '<option value="">(use primary model)</option>' +
-    presets.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
-  if (validation) validation.innerHTML = '<option value="">(use primary model)</option>' +
-    presets.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
+  const opts = presets.map(p => `<option value="${p.id}">${p.label}</option>`).join('');
+  const setSelect = (elId, prefix) => {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    const prev = el.value;                       // preserve selection across repopulation
+    el.innerHTML = (prefix || '') + opts;
+    // Restore the prior value if it still exists among the new options.
+    if (prev && [...el.options].some(o => o.value === prev)) el.value = prev;
+  };
+  setSelect('sc-model-id', '');
+  setSelect('sc-fast-model-id', '<option value="">(use primary model)</option>');
+  setSelect('sc-validation-model-id', '<option value="">(use primary model)</option>');
+  // The free-text primary field (Anthropic/OpenAI/gateway) offers the same list
+  // as autocomplete suggestions via a <datalist>, while staying free-text.
+  const dl = document.getElementById('sc-model-list');
+  if (dl) dl.innerHTML = opts;
+}
+
+// Fetch the model catalogue for the ACTIVE provider and repopulate the dropdowns.
+// The backend returns provider-appropriate models (Anthropic/OpenAI/gateway live
+// APIs; Bedrock static presets), so the Fast/Validation dropdowns no longer show
+// Claude tiers when, e.g., OpenAI is selected. Falls back silently to whatever
+// presets loadScanConfig already placed if the endpoint is unreachable.
+async function loadProviderModels() {
+  try {
+    const r = await fetch('/api/ai/models');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (Array.isArray(data.models) && data.models.length) {
+      populateModelPresets(data.models);
+      // Re-apply saved tiered selections now that provider-specific options exist.
+      const cfg = await fetch('/api/scan-config').then(x => x.json()).catch(() => ({}));
+      const fast = document.getElementById('sc-fast-model-id');
+      const val  = document.getElementById('sc-validation-model-id');
+      if (fast && cfg.fast_model_id && [...fast.options].some(o => o.value === cfg.fast_model_id)) fast.value = cfg.fast_model_id;
+      if (val && cfg.validation_model_id && [...val.options].some(o => o.value === cfg.validation_model_id)) val.value = cfg.validation_model_id;
+    }
+  } catch (e) { console.error('loadProviderModels:', e); }
 }
 
 async function loadScanConfig() {
@@ -200,6 +230,8 @@ async function loadScanConfig() {
     if (s('sc-anthropic-key-set')) s('sc-anthropic-key-set').style.display = c.anthropic_api_key_set ? 'block' : 'none';
     if (s('sc-openai-key-set'))    s('sc-openai-key-set').style.display    = c.openai_api_key_set ? 'block' : 'none';
     if (typeof onProviderChange === 'function') onProviderChange();
+    // Replace the static Claude presets with the active provider's real catalogue.
+    loadProviderModels();
     if (s('sc-confidence')) {
       const v = c.confidence_threshold ?? 0.5;
       s('sc-confidence').value = v;
@@ -245,6 +277,8 @@ async function saveScanConfig() {
       msg.style.display = 'inline';
       setTimeout(() => { msg.style.display = 'none'; }, 2500);
     }
+    // Refresh the badge so an updated model/tier shows without a manual reload.
+    if (r.ok && typeof loadAiStatus === 'function') loadAiStatus();
   } catch(e) {
     console.error('saveScanConfig:', e);
   }
@@ -277,6 +311,8 @@ async function saveAiModel() {
   }
   msg.style.display = 'inline';
   setTimeout(() => { msg.style.display = 'none'; }, 2500);
+  // Refresh the badge so the new model label shows without a manual reload.
+  if (r.ok && typeof loadAiStatus === 'function') loadAiStatus();
 }
 
 // ── AI provider selection ─────────────────────────────────────────────
@@ -292,6 +328,9 @@ function onProviderChange() {
   const isBedrock = provider === 'bedrock';
   if (g('sc-model-id'))       g('sc-model-id').style.display       = isBedrock ? '' : 'none';
   if (g('sc-model-freeform')) g('sc-model-freeform').style.display = isBedrock ? 'none' : '';
+  // NOTE: do NOT refresh the model catalogue here — on a mere dropdown change the
+  // backend is still on the OLD provider (and may lack the new key), so listing
+  // would show stale models. The catalogue refreshes after "Apply Provider".
 }
 
 async function saveProvider() {
@@ -327,6 +366,14 @@ async function saveProvider() {
       if (g('sc-anthropic-key')) g('sc-anthropic-key').value = '';
       if (g('sc-openai-key'))    g('sc-openai-key').value = '';
       loadScanConfig();
+      // Re-poll the connection badge right away: the backend cleared its AI-status
+      // cache on the provider switch, so a fresh poll flips the badge to the new
+      // provider immediately instead of waiting for the next interval. This is the
+      // "auto-refresh on save" — no manual F5 needed (important in the desktop app).
+      if (typeof loadAiStatus === 'function') loadAiStatus();
+      if (typeof loadMcpStatus === 'function') loadMcpStatus();
+      // loadScanConfig() above already calls loadProviderModels(), so the now-active
+      // provider's catalogue (not the previous provider's) fills the dropdowns.
     }
   } catch(e) {
     console.error('saveProvider:', e);

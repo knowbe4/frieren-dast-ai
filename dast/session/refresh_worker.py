@@ -95,12 +95,14 @@ class SessionRefreshWorker:
         password: Optional[str],
         pool: "ContextPool",
         session_manager: "SessionManager",
+        proxy_port: Optional[int] = None,
     ) -> None:
         self._auth_url = auth_url
         self._username = username
         self._password = password
         self._pool = pool
         self._session_manager = session_manager
+        self._proxy_port = proxy_port
         self._signal_queue: asyncio.Queue = asyncio.Queue()
         self._last_reauth: float = 0.0
         self._consecutive_failures: int = 0
@@ -157,6 +159,11 @@ class SessionRefreshWorker:
     async def _reauth(self) -> None:
         from dast.session.auth_agent import AuthAgent
 
+        # Prefer an encrypted login profile (recorded flow → saved session) when one
+        # matches the auth host; only fall back to the single-form AuthAgent heuristic.
+        if await self._try_profile_reauth():
+            return
+
         try:
             async with self._pool.acquire() as ctx:
                 agent = AuthAgent(
@@ -184,6 +191,31 @@ class SessionRefreshWorker:
         except Exception as exc:
             logger.error("Session refresh: unexpected error during re-auth", error=str(exc))
             self._register_failure(f"Re-auth error: {exc}")
+
+    async def _try_profile_reauth(self) -> bool:
+        """Try re-auth via a matching login profile. Returns True on success."""
+        if not self._proxy_port:
+            return False
+        try:
+            from urllib.parse import urlparse
+            from dast.session.profile_reauth import reauth_from_profile
+
+            host = urlparse(self._auth_url).hostname or ""
+            state = await reauth_from_profile(host, self._proxy_port)
+            if not state:
+                return False
+            await self._pool.apply_auth_state(state)
+            self._consecutive_failures = 0
+            log_event(
+                "session_refresh", "info",
+                "Re-authentication successful via login profile — auth state refreshed",
+                source="plugin",
+            )
+            logger.info("Session refresh: profile re-auth succeeded", host=host)
+            return True
+        except Exception as exc:
+            logger.warning("Session refresh: profile re-auth error", error=str(exc))
+            return False
 
     def _register_failure(self, message: str) -> None:
         """Record a re-auth failure and trip the breaker at the threshold."""

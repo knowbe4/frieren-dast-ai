@@ -14,14 +14,15 @@ function switchExtrasSub(sub) {
 
 // ── Browse sub-tabs (Manual / Crawl) ─────────────────────────────────────
 function switchBrowseSub(sub) {
-  const panes = { manual: 'browse-sub-manual', crawl: 'browse-sub-crawl', discovery: 'browse-sub-discovery' };
-  const tabs  = { manual: 'st-browse-manual', crawl: 'st-browse-crawl', discovery: 'st-browse-discovery' };
+  const panes = { manual: 'browse-sub-manual', crawl: 'browse-sub-crawl', discovery: 'browse-sub-discovery', logins: 'browse-sub-logins' };
+  const tabs  = { manual: 'st-browse-manual', crawl: 'st-browse-crawl', discovery: 'st-browse-discovery', logins: 'st-browse-logins' };
   for (const [key, paneId] of Object.entries(panes)) {
     document.getElementById(paneId).style.display = (key === sub) ? 'block' : 'none';
     document.getElementById(tabs[key]).classList.toggle('on', key === sub);
   }
   if (sub === 'manual')      { loadNamedSessions(); loadNamedBrowsers(); }
   else if (sub === 'crawl')  updateCrawlCookieStatus();
+  else if (sub === 'logins') loadLoginProfiles();
 }
 
 // ── AI sub-tabs ────────────────────────────────────────────────────────

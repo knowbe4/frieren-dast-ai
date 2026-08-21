@@ -74,6 +74,11 @@ class ProxyServer:
         self._port = port
         self._intercept_store = intercept_store
         self._server: Optional[asyncio.Server] = None
+        # In-flight connection handler tasks. Tracked so stop() can cancel them:
+        # long-lived CONNECT tunnels never close on their own, and on Python 3.12+
+        # Server.wait_closed() blocks until every connection is gone — so without
+        # this, Ctrl+C would hang forever and leave the port bound.
+        self._conn_tasks: set[asyncio.Task] = set()
 
     async def start(self, max_port_attempts: int = 10) -> None:
         """
@@ -114,9 +119,19 @@ class ProxyServer:
         ) from last_error
 
     async def stop(self) -> None:
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
+        if not self._server:
+            return
+        self._server.close()
+        # Cancel any in-flight connections (open CONNECT tunnels would otherwise
+        # keep wait_closed() blocked forever) before waiting, with a hard ceiling
+        # so shutdown can never hang and strand the listening port.
+        for task in list(self._conn_tasks):
+            task.cancel()
+        try:
+            await asyncio.wait_for(self._server.wait_closed(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception) as exc:
+            logger.warning("Proxy listener close timed out", error=str(exc))
+        self._server = None
 
     # ------------------------------------------------------------------
     # Connection dispatcher
@@ -126,6 +141,9 @@ class ProxyServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peer = writer.get_extra_info("peername")
+        current = asyncio.current_task()
+        if current is not None:
+            self._conn_tasks.add(current)
         try:
             request_line = await reader.readline()
             if not request_line:
@@ -152,6 +170,8 @@ class ProxyServer:
         except Exception as e:
             logger.warning("Proxy connection error", peer=peer, error=str(e), exc_info=True)
         finally:
+            if current is not None:
+                self._conn_tasks.discard(current)
             try:
                 writer.close()
                 await writer.wait_closed()

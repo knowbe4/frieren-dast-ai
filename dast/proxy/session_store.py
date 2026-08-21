@@ -905,6 +905,35 @@ class SessionStore:
         self.named_sessions[name] = session
         return session
 
+    def import_playwright_cookies(self, playwright_cookies: List[dict]) -> int:
+        """Merge Playwright-shaped cookie dicts into the live per-host jar.
+
+        Used when activating a saved/imported login session so subsequent proxied
+        and scanned requests carry it. Cookies are keyed by their own ``domain``
+        (leading dot stripped) so host matching in get_cookies_for_host works.
+        Returns the number of cookies imported.
+        """
+        count = 0
+        with self._lock:
+            for c in playwright_cookies:
+                name = c.get("name", "")
+                if not name:
+                    continue
+                domain = (c.get("domain") or "").lstrip(".").lower()
+                if not domain:
+                    continue
+                jar = self._cookies.setdefault(domain, {})
+                jar[name] = {
+                    "name": name,
+                    "value": c.get("value", ""),
+                    "domain": domain,
+                    "path": c.get("path", "/"),
+                    "secure": bool(c.get("secure", False)),
+                    "httpOnly": bool(c.get("httpOnly", False)),
+                }
+                count += 1
+        return count
+
     def delete_named_session(self, name: str) -> bool:
         return self.named_sessions.pop(name, None) is not None
 

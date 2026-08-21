@@ -107,6 +107,7 @@ class ProxyRunner:
     def __init__(
         self,
         proxy_port: int = 8080,
+        proxy_host: str = "127.0.0.1",
         dashboard_port: int = 8088,
         workers: int = 4,
         iterations: int = 3,
@@ -119,6 +120,10 @@ class ProxyRunner:
         ai_model_id: str = "",
     ):
         self._proxy_port = proxy_port
+        self._proxy_host = proxy_host
+        # Live handle to the running proxy listener, so the bind host can be
+        # rebound at runtime (see restart_proxy_listener).
+        self._proxy_server: Optional["ProxyServer"] = None
         self._dashboard_port = dashboard_port
         self._workers = workers
         self._scan_sem: Optional[asyncio.Semaphore] = None
@@ -263,6 +268,7 @@ class ProxyRunner:
                 password=self._password,
                 pool=self._pool,
                 session_manager=session_mgr,
+                proxy_port=self._proxy_port,
             )
 
             async def _refresh_listener(entry) -> None:
@@ -288,9 +294,20 @@ class ProxyRunner:
         # (e.g. a previous instance still shutting down). The browser's manual
         # proxy setting is NOT auto-updated when this happens, so a fallback
         # here would silently break interception — surface it loudly.
+        # The persisted settings bind host (set via the Setup tab) is
+        # authoritative once configured; the constructor default (CLI/env) only
+        # applies on the very first run before anything is saved.
+        persisted_host = self._settings.get_bind_host() if self._settings else ""
+        if persisted_host:
+            self._proxy_host = persisted_host
+        persisted_port = self._settings.get_bind_port() if self._settings else 0
+        if persisted_port:
+            self._proxy_port = persisted_port
         requested_proxy_port = self._proxy_port
-        proxy = ProxyServer(self._store, self._ca, self._settings, port=self._proxy_port, intercept_store=self._intercept_store)
+        proxy = ProxyServer(self._store, self._ca, self._settings, host=self._proxy_host, port=self._proxy_port, intercept_store=self._intercept_store)
         await proxy.start()
+        self._proxy_server = proxy
+        self._proxy_host = proxy._host
         self._proxy_port = proxy._port
         if self._proxy_port != requested_proxy_port:
             logger.warning(
@@ -304,7 +321,7 @@ class ProxyRunner:
 
         logger.info(
             "Proxy ready",
-            proxy=f"http://127.0.0.1:{self._proxy_port}",
+            proxy=f"http://{self._proxy_host}:{self._proxy_port}",
             dashboard=f"http://127.0.0.1:{self._dashboard_port}",
             ca_cert=str(self._ca.ca_cert_path),
         )
@@ -313,7 +330,8 @@ class ProxyRunner:
         crawl_queue: asyncio.Queue = asyncio.Queue()
         browse_queue: asyncio.Queue = asyncio.Queue()
         discovery_queue: asyncio.Queue = asyncio.Queue()
-        app = build_app(self._store, self._scan_queue, self._ca, self._settings, crawl_queue, self._plugin_manager, browse_queue, self._proxy_port, scan_config=self._engine_config, scan_queue_state=self._scan_queue_state, runner=self, intercept_store=self._intercept_store, discovery_queue=discovery_queue)
+        login_queue: asyncio.Queue = asyncio.Queue()
+        app = build_app(self._store, self._scan_queue, self._ca, self._settings, crawl_queue, self._plugin_manager, browse_queue, self._proxy_port, scan_config=self._engine_config, scan_queue_state=self._scan_queue_state, runner=self, intercept_store=self._intercept_store, discovery_queue=discovery_queue, login_queue=login_queue, proxy_host=self._proxy_host)
         uv_config = uvicorn.Config(
             app,
             host="127.0.0.1",
@@ -338,27 +356,98 @@ class ProxyRunner:
                 await asyncio.sleep(0.1)
             webbrowser.open(f"http://127.0.0.1:{self._dashboard_port}")
 
-        gather_tasks = [
+        # Opening the browser is a one-shot side effect that returns immediately
+        # (and does nothing under DAST_DESKTOP=1). It must NOT gate shutdown, or
+        # its normal completion would tear the whole app down right after startup.
+        browser_task = asyncio.create_task(_open_browser())
+
+        # Long-lived tasks only: these loop forever, so the ONLY one that returns
+        # under normal operation is uvicorn's serve() — and only when it receives
+        # SIGINT (uvicorn installs its own handler, so Ctrl+C never reaches us as
+        # KeyboardInterrupt). A plain gather() would then keep waiting on the
+        # infinite workers, hanging the process and stranding the proxy port.
+        # Waiting on FIRST_COMPLETED lets uvicorn's graceful exit (or a worker
+        # crash) deterministically tear the rest down.
+        long_lived = [
             uv_server.serve(),
             self._scan_worker(config, session_mgr),
             self._crawl_worker(crawl_queue),
             self._discovery_worker(discovery_queue),
             self._browse_worker(browse_queue),
+            self._login_worker(login_queue),
             self._app_context_worker.run(),
             self._threat_model_worker.run(),
-            _open_browser(),
         ]
         if refresh_worker is not None:
-            gather_tasks.append(refresh_worker.run())
+            long_lived.append(refresh_worker.run())
 
+        tasks = [asyncio.create_task(coro) for coro in long_lived]
         try:
-            await asyncio.gather(*gather_tasks)
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, asyncio.CancelledError):
+                    logger.error("Proxy task exited with error", error=str(exc))
+            # Tell uvicorn to exit gracefully if a worker (not uvicorn) finished
+            # first, then cancel everything still pending.
+            uv_server.should_exit = True
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         finally:
+            browser_task.cancel()
+            await asyncio.gather(browser_task, return_exceptions=True)
             self._app_context_worker.stop()
             self._threat_model_worker.stop()
-            await proxy.stop()
+            if self._proxy_server is not None:
+                await self._proxy_server.stop()
             await self._pool.stop()
             await self._plugin_manager.teardown_all()
+
+    async def restart_proxy_listener(self, host: str, port: Optional[int] = None) -> dict:
+        """
+        Rebind the proxy listener to a new host/port without dropping the
+        dashboard, the scan session, or intercepted traffic (Burp-style listener
+        restart).
+
+        On failure to bind the requested address, the previous listener is
+        restored so the proxy is never left down. Returns a dict with ``ok`` and
+        the effective ``host``/``port`` (or ``error`` on failure).
+        """
+        if self._proxy_server is None:
+            return {"ok": False, "error": "proxy listener is not running"}
+
+        old_host, old_port = self._proxy_host, self._proxy_port
+        new_port = old_port if port is None else int(port)
+        if host == old_host and new_port == old_port:
+            return {"ok": True, "host": old_host, "port": old_port}
+
+        await self._proxy_server.stop()
+        new_server = ProxyServer(
+            self._store, self._ca, self._settings,
+            host=host, port=new_port, intercept_store=self._intercept_store,
+        )
+        try:
+            # Bind the exact requested port only (no free-port fallback here): a
+            # silent bump would leave the browser pointed at the wrong port.
+            await new_server.start(max_port_attempts=1)
+        except OSError as exc:
+            logger.warning("Proxy rebind failed, restoring previous listener",
+                           requested_host=host, error=str(exc))
+            restored = ProxyServer(
+                self._store, self._ca, self._settings,
+                host=old_host, port=old_port, intercept_store=self._intercept_store,
+            )
+            await restored.start()
+            self._proxy_server = restored
+            self._proxy_host, self._proxy_port = restored._host, restored._port
+            return {"ok": False, "error": str(exc),
+                    "host": self._proxy_host, "port": self._proxy_port}
+
+        self._proxy_server = new_server
+        self._proxy_host, self._proxy_port = new_server._host, new_server._port
+        logger.info("Proxy listener rebound", host=self._proxy_host, port=self._proxy_port)
+        return {"ok": True, "host": self._proxy_host, "port": self._proxy_port}
 
     async def _browse_worker(self, browse_queue: asyncio.Queue) -> None:
         from dast.proxy.browse_session import BrowseSession, login_with_credentials
@@ -501,6 +590,109 @@ class ProxyRunner:
                     log_event("browser", "error",
                               f'Credentials login for "{name}" error: {exc}', source="browser")
                     job.get("result_cb", lambda *_: None)(False, str(exc), 0)
+
+    async def _login_worker(self, login_queue: asyncio.Queue) -> None:
+        """Drive login-flow recording (visible browser) and replay jobs.
+
+        Recording opens a visible, proxy-routed BrowseSession with the DOM recorder
+        installed; the analyst logs in by hand and the session's steps are captured.
+        Replay re-executes a saved LoginFlow, pausing for a human on captcha/MFA.
+        """
+        from dast.proxy.browse_session import BrowseSession
+        from dast.proxy.plugin_manager import log_event
+        from dast.session.flow_replayer import replay_login_flow
+
+        _record_session: Optional[BrowseSession] = None
+
+        while True:
+            job = await login_queue.get()
+            action = job.get("action")
+
+            # ── start recording a login flow ────────────────────────────────
+            if action == "start_record":
+                try:
+                    if _record_session and _record_session.running:
+                        await _record_session.stop()
+                    session = BrowseSession(
+                        proxy_port=self._proxy_port,
+                        on_stop=lambda: None,
+                    )
+                    await session.start(start_url=job.get("url"), headless=False, record=True)
+                    _record_session = session
+                    log_event("browser", "info", "Login-flow recording started",
+                              url=job.get("url", ""), source="browser")
+                    job.get("result_cb", lambda *_: None)(True, "", session.session_id)
+                except Exception as exc:
+                    log_event("browser", "error",
+                              f"Login-flow recording failed to start: {exc}", source="browser")
+                    job.get("result_cb", lambda *_: None)(False, str(exc), "")
+                continue
+
+            # ── stop recording, return flow + captured session ──────────────
+            if action == "stop_record":
+                if not _record_session:
+                    job.get("result_cb", lambda *_: None)(False, "no recording in progress", {})
+                    continue
+                try:
+                    flow = _record_session.stop_recording()
+                    cookies = await _record_session.get_playwright_cookies()
+                    storage_state = await _record_session.get_storage_state()
+                    await _record_session.stop()
+                    log_event("browser", "info",
+                              f"Login-flow recording stopped — {len(flow.get('steps', []))} step(s)",
+                              source="browser")
+                    job.get("result_cb", lambda *_: None)(True, "", {
+                        "flow": flow, "cookies": cookies, "storage_state": storage_state,
+                    })
+                except Exception as exc:
+                    log_event("browser", "error",
+                              f"Login-flow recording stop failed: {exc}", source="browser")
+                    job.get("result_cb", lambda *_: None)(False, str(exc), {})
+                finally:
+                    _record_session = None
+                continue
+
+            # ── cancel recording without saving ─────────────────────────────
+            if action == "cancel_record":
+                if _record_session:
+                    try:
+                        await _record_session.stop()
+                    except Exception:
+                        pass
+                    _record_session = None
+                    log_event("browser", "info", "Login-flow recording cancelled", source="browser")
+                job.get("result_cb", lambda *_: None)(True, "")
+                continue
+
+            # ── replay a saved flow (headed, human-in-loop on captcha) ──────
+            if action == "replay":
+                from dast.profiles.flow import LoginFlow
+                try:
+                    flow = LoginFlow.from_dict(job.get("flow", {}))
+                    result = await replay_login_flow(
+                        proxy_port=self._proxy_port,
+                        flow=flow,
+                        username=job.get("username", ""),
+                        password=job.get("password", ""),
+                        headless=job.get("headless", False),
+                        on_pause=job.get("on_pause"),
+                        resume_event=job.get("resume_event"),
+                    )
+                    log_event(
+                        "browser",
+                        "info" if result.get("success") else "warn",
+                        f"Login-flow replay {'succeeded' if result.get('success') else 'failed'}"
+                        + (f": {result.get('error')}" if result.get("error") else ""),
+                        source="browser",
+                    )
+                    job.get("result_cb", lambda *_: None)(result)
+                except Exception as exc:
+                    log_event("browser", "error",
+                              f"Login-flow replay error: {exc}", source="browser")
+                    job.get("result_cb", lambda *_: None)(
+                        {"success": False, "error": str(exc)}
+                    )
+                continue
 
     async def _crawl_worker(self, crawl_queue: asyncio.Queue) -> None:
         from dast.proxy.spa_crawler import SpaCrawler

@@ -706,6 +706,10 @@ def verify(
 
 @main.command()
 @click.option("--proxy-port", default=8080, show_default=True, help="Proxy port (configure in your browser)")
+@click.option("--proxy-host", default="127.0.0.1", show_default=True,
+              help="Proxy bind host. Use a LAN IP or 0.0.0.0 to accept connections "
+                   "from other devices (open proxy — only on trusted networks). "
+                   "Overridden by a bind host saved in the Setup tab.")
 @click.option("--dashboard-port", default=8088, show_default=True, help="Dashboard port")
 @click.option("--auth-url", default=None, help="Login page URL (pre-authenticates the scan pool)")
 @click.option("--username", default=None, help="Login username")
@@ -716,7 +720,7 @@ def verify(
 @click.option("--output-dir", default="./scan-results", show_default=True, help="Output directory")
 @click.option("--attack-types", default=None, help="Comma-separated attack types (default: all)")
 def proxy(
-    proxy_port, dashboard_port,
+    proxy_port, proxy_host, dashboard_port,
     auth_url, username, password,
     workers, iterations, confidence, output_dir, attack_types,
 ):
@@ -750,7 +754,7 @@ def proxy(
     set_log_file(_log_file)
 
     console.print(f"\n[bold cyan]Frieren DAST-AI proxy[/bold cyan]")
-    console.print(f"  Proxy:     [bold]127.0.0.1:{proxy_port}[/bold]  ← set in browser proxy settings")
+    console.print(f"  Proxy:     [bold]{proxy_host}:{proxy_port}[/bold]  ← set in browser proxy settings")
     console.print(f"  Dashboard: [bold]http://127.0.0.1:{dashboard_port}[/bold]  ← opens automatically")
     console.print(f"  CA cert:   [dim]{_ca.ca_cert_path}[/dim]")
     console.print(f"  Log file:  [dim]{_log_file}[/dim]")
@@ -761,6 +765,7 @@ def proxy(
 
     runner = ProxyRunner(
         proxy_port=proxy_port,
+        proxy_host=proxy_host,
         dashboard_port=dashboard_port,
         workers=workers,
         iterations=iterations,
@@ -777,6 +782,33 @@ def proxy(
         asyncio.run(runner.run())
     except KeyboardInterrupt:
         console.print("\n[yellow]Proxy stopped[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# mcp — expose the shared tool layer over the Model Context Protocol (stdio)
+# ---------------------------------------------------------------------------
+
+@main.command()
+@click.option("--proxy-port", default=8080, show_default=True, help="Proxy port of the running Frieren instance")
+@click.option("--dashboard-port", default=8088, show_default=True, help="Dashboard port of the running Frieren instance")
+def mcp(proxy_port, dashboard_port):
+    """
+    Start the MCP server (stdio) exposing Frieren's tool layer to AI clients.
+
+    Drives an ALREADY-RUNNING Frieren instance: sends traffic through its proxy
+    port and reads live state via its dashboard API. Start `dast-ai proxy` first,
+    then register this command as an MCP server in your client (e.g. Claude
+    Desktop/Code). Tools: send_request (out-of-scope targets prompt the dashboard
+    operator for approval), get_history, get_findings, content_discovery,
+    param_mining, triage_report, list_login_profiles, oob_generate/oob_poll (blind
+    OOB detection), and url/base64/html encode+decode — all scope- and
+    payload-safety-gated.
+    """
+    from dast.mcp import run_stdio
+
+    # No console banner: stdout is the MCP transport and must carry only protocol
+    # frames. Logs go to structlog (stderr / log file).
+    asyncio.run(run_stdio(proxy_port=proxy_port, dashboard_port=dashboard_port))
 
 
 if __name__ == "__main__":

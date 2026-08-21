@@ -356,6 +356,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         store._notify(entry)
         return {"ok": True}
 
+    @router.get("/api/findings")
+    async def list_findings():
+        """Flat list of every in-scope finding joined with its entry context.
+
+        Returns the full finding objects (unlike /api/overview's trimmed
+        recent_findings) so the get_findings tool has one clean HTTP source.
+        """
+        from dast.tools.findings_tools import flatten_findings
+        entry_dicts = [e.to_dict() for e in store.in_scope_entries()]
+        return flatten_findings(entry_dicts)
+
     @router.get("/api/export/sarif")
     async def export_sarif():
         from dast.report.sarif import build_sarif

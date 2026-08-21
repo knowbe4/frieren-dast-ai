@@ -36,6 +36,8 @@ dependencies = [
     # Tech-stack fingerprinting (passive — uses proxy-captured responses, no extra requests)
     "wappalyzer>=2.0.0",
     "msgpack>=1.1.2",
+    # MCP server (dast-ai mcp) — exposes the shared tool layer to external AI clients
+    "mcp>=1.0.0",
 ]
 
 [project.scripts]

@@ -129,7 +129,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         asyncio.create_task(
             _run_validation(
                 job_id, report_text, override_url, override_domain,
-                images_b64, ctx.proxy_port, _jobs,
+                images_b64, ctx.proxy_port, _jobs, ctx,
             )
         )
 
@@ -233,6 +233,7 @@ async def _run_validation(
     images_b64: list[str],
     proxy_port: int,
     jobs: Dict[str, Any],
+    ctx: Optional[DashboardContext] = None,
 ) -> None:
     from dast.proxy.plugin_manager import log_event
     job = jobs[job_id]
@@ -288,6 +289,21 @@ async def _run_validation(
         job["result"] = result
 
         if result.status == "needs_auth":
+            # Try to auto-authenticate via a matching Phase-1 login profile
+            # (replay the recorded flow, else the saved session) before asking
+            # the analyst to log in manually.
+            auto_cookies = await _try_profile_auth(report, proxy_port)
+            if auto_cookies:
+                log_event(
+                    "h1-validator", "info",
+                    f"Auto-authenticated via login profile ({len(auto_cookies)} cookies); re-validating",
+                    url=report.proof_url, source="agent",
+                )
+                job["status"] = "validating"
+                result = await validate(report, proxy_port=proxy_port, cookies=auto_cookies)
+                job["result"] = result
+
+        if result.status == "needs_auth":
             job["status"] = "needs_auth"
             log_event(
                 "h1-validator", "warn",
@@ -323,6 +339,10 @@ async def _run_validation(
         job["status"] = result.status
         job["finished_at"] = time.time()
 
+        # Persist a confirmed triage as a dashboard finding (flows to SARIF).
+        if result.status == "confirmed" and ctx is not None:
+            _persist_finding(ctx, report, result)
+
         log_event(
             "h1-validator",
             "finding" if result.status == "confirmed" else "info",
@@ -344,6 +364,63 @@ async def _run_validation(
             payload=job.get("payload", ""),
             evidence=f"Internal error: {str(exc)[:300]}",
         )
+
+
+def _persist_finding(ctx: DashboardContext, report: Any, result: Any) -> None:
+    """Persist a confirmed H1 triage as a dashboard finding (also flows to SARIF).
+
+    Thin delegator to ``dast.hackerone.persistence.persist_confirmed_finding`` so
+    the single-shot validator and the agentic Vuln Validator persist identically.
+    Best-effort — a failure here must never fail the triage job.
+    """
+    if not result.proof_url:
+        return
+    from dast.hackerone.persistence import persist_confirmed_finding
+
+    persist_confirmed_finding(
+        getattr(ctx, "store", None),
+        method=getattr(report, "http_method", "") or "GET",
+        url=result.proof_url,
+        request_headers=dict(getattr(report, "request_headers", {}) or {}),
+        request_body=getattr(report, "request_body", "") or "",
+        vuln_type=report.vuln_type,
+        severity=result.severity or "high",
+        evidence=result.evidence or "",
+        reasoning=result.reasoning or "",
+        payload=report.payload or "",
+        source="h1-triage",
+    )
+
+
+async def _try_profile_auth(report: Any, proxy_port: int) -> Dict[str, str]:
+    """Attempt profile-based auto-authentication for the report's target host.
+
+    Resolves a matching login profile and replays its flow (or falls back to the
+    saved session), returning a ``{name: value}`` cookie map for re-validation.
+    Returns an empty dict when no profile matches or auth fails — the caller then
+    falls back to the manual browser login. Never raises.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        from dast.session.profile_reauth import reauth_from_profile
+
+        host = urlparse(report.proof_url or report.target_url or "").hostname or ""
+        if not host:
+            return {}
+        storage_state = await reauth_from_profile(host, proxy_port)
+        if not storage_state:
+            return {}
+        cookies: Dict[str, str] = {}
+        for cookie in storage_state.get("cookies", []) or []:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if name and value is not None:
+                cookies[name] = value
+        return cookies
+    except Exception as exc:
+        logger.warning("H1 profile auto-auth failed", error=str(exc))
+        return {}
 
 
 async def _analyse_images(images_b64: list[str], report_text: str) -> str:

@@ -1,0 +1,23 @@
+{
+  "name": "frieren-dast",
+  "description": "Proxy-driven AI security-testing tools from Frieren DAST-AI, exposed to Claude over MCP for validating vulnerabilities. Drives an already-running Frieren instance (start `dast-ai proxy` first).",
+  "version": "0.8.2",
+  "author": {
+    "name": "KnowBe4",
+    "url": "https://github.com/knowbe4/frieren-dast-ai"
+  },
+  "homepage": "https://github.com/knowbe4/frieren-dast-ai",
+  "repository": "https://github.com/knowbe4/frieren-dast-ai",
+  "keywords": ["security", "dast", "mcp", "proxy", "vulnerability"],
+  "mcpServers": {
+    "frieren-dast": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/knowbe4/frieren-dast-ai",
+        "dast-ai",
+        "mcp"
+      ]
+    }
+  }
+}

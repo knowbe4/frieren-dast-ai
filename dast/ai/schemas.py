@@ -116,6 +116,134 @@ RED_TEAM_SCHEMA: Dict[str, Any] = {
     "required": ["confirmed", "confidence", "exploit_scenario", "reasoning"],
 }
 
+# HackerOne report parser — dast/hackerone/parser.py _llm_enrich()
+# Structured extraction from free-form report text. Extends the legacy field set
+# with the full HTTP request (method/headers/body) so POST/PUT/JSON PoCs can be
+# reproduced faithfully, not just GET proof URLs.
+H1_PARSE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "vuln_type": {
+            "type": "string",
+            "description": "One of: xss, sqli, ssrf, idor, csrf, open_redirect, ssti, rce, lfi, xxe, auth_bypass, business_logic, privilege_escalation, info_disclosure, dns_takeover, other.",
+        },
+        "proof_url": {
+            "type": "string",
+            "description": "Vulnerable TARGET URL (the org's own host). NEVER an attacker/OOB listener (oastify/interactsh/ngrok) or a reference/doc URL (medium/owasp/github). Empty if unknown.",
+        },
+        "payload": {
+            "type": "string",
+            "description": "Exact attack string injected, URL-decoded. For SSRF: the OOB/callback URL used as input. Empty if none.",
+        },
+        "target_url": {
+            "type": "string",
+            "description": "Base URL of the vulnerable endpoint with no query params, else empty.",
+        },
+        "http_method": {
+            "type": "string",
+            "description": "HTTP method of the reproducing request (GET/POST/PUT/PATCH/DELETE). Default GET if the report shows no explicit method.",
+        },
+        "request_headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Request headers required to reproduce (e.g. Content-Type). Exclude Authorization/Cookie — those come from the active session. Empty object if none.",
+        },
+        "request_body": {
+            "type": "string",
+            "description": "Raw request body for POST/PUT/PATCH PoCs (JSON or form-encoded), verbatim from the report. Empty for GET or when absent.",
+        },
+        "summary": {
+            "type": "string",
+            "description": "One sentence: what is vulnerable, on which host, and the impact.",
+        },
+    },
+    "required": ["vuln_type", "proof_url", "payload", "target_url", "summary"],
+}
+
+# HackerOne reproduction verdict — dast/hackerone/validator.py schema-forced verdict.
+H1_VERDICT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reproduced": {
+            "type": "boolean",
+            "description": "True only if the reproduced evidence shows the vulnerability is real and exploitable on the target.",
+        },
+        "confidence": {
+            "type": "number",
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Actual certainty the report reproduces, from the observed evidence alone.",
+        },
+        "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"],
+            "description": "Severity of the confirmed issue; 'info' if not reproduced.",
+        },
+        "exploit_scenario": {
+            "type": "string",
+            "description": "One sentence: how an attacker exploits this given the reproduced evidence.",
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "One sentence: why the report was reproduced or rejected, referencing the observed response evidence.",
+        },
+    },
+    "required": ["reproduced", "confidence", "severity", "exploit_scenario", "reasoning"],
+}
+
+# Agentic triage loop — dast/ai/triage_agent.py run_triage_agent()
+# One turn of the loop. JSON Schema cannot express discriminated-union required
+# fields (a "call_tool" step needs tool_name; an "ask_human" step needs question;
+# a "finish" step needs verdict), so only the two always-present fields are
+# required here and the per-action fields are validated in Python (a malformed
+# step is re-prompted, never crashes the loop).
+TRIAGE_AGENT_STEP_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "thought": {
+            "type": "string",
+            "description": "One or two sentences: what the last observation showed and what you will do next and why.",
+        },
+        "action": {
+            "type": "string",
+            "enum": ["call_tool", "ask_human", "finish"],
+            "description": "call_tool = run a Frieren tool; ask_human = block for a typed operator answer; finish = end with a verdict.",
+        },
+        "tool_name": {
+            "type": "string",
+            "description": "Required when action=call_tool: the exact registered tool name (e.g. send_request, get_history, triage_report).",
+        },
+        "tool_args": {
+            "type": "object",
+            "description": "Required when action=call_tool: the tool's arguments, matching that tool's input schema.",
+            "additionalProperties": True,
+        },
+        "question": {
+            "type": "string",
+            "description": "Required when action=ask_human: a single concrete question for the operator (a value you cannot derive, or an authorization).",
+        },
+        "verdict": {
+            "type": "string",
+            "enum": ["confirmed", "not_confirmed", "needs_manual"],
+            "description": "Required when action=finish: the reproduction verdict.",
+        },
+        "severity": {
+            "type": "string",
+            "enum": ["info", "low", "medium", "high", "critical"],
+            "description": "When action=finish and verdict=confirmed: severity of the confirmed issue.",
+        },
+        "evidence": {
+            "type": "string",
+            "description": "When action=finish: the concrete observed evidence supporting the verdict (response snippets, status codes, diffs).",
+        },
+        "reasoning": {
+            "type": "string",
+            "description": "When action=finish: one sentence tying the observed evidence to the verdict.",
+        },
+    },
+    "required": ["thought", "action"],
+}
+
 # Probe-diff classifier — dast/ai/probe_classifier.py _SYSTEM / classify()
 PROBE_CLASSIFIER_SCHEMA: Dict[str, Any] = {
     "type": "object",

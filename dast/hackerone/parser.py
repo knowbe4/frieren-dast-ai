@@ -85,14 +85,15 @@ Rules for proof_url and target_url:
 - payload: the actual attack string injected, not a reference or description.
 - For SSRF: payload is the OOB/callback URL used as input to the vulnerable parameter.
 
-Respond ONLY with valid JSON:
-{
-  "vuln_type": "<xss|sqli|ssrf|idor|csrf|open_redirect|ssti|rce|lfi|xxe|auth_bypass|business_logic|dns_takeover|other>",
-  "proof_url": "<vulnerable target URL — the org's own host — NOT attacker/OOB/reference URLs>",
-  "payload": "<exact attack payload, URL-decoded, else empty string>",
-  "target_url": "<base URL of the vulnerable endpoint, no query params, else empty string>",
-  "summary": "<one sentence: what is vulnerable, on which host, and what is the impact>"
-}
+Rules for the reproducing HTTP request:
+- http_method: the method the PoC uses (GET/POST/PUT/PATCH/DELETE). Default GET when the
+  report shows no explicit method or curl command.
+- request_headers: only headers needed to reproduce (e.g. Content-Type). NEVER include
+  Authorization or Cookie — the active session supplies those.
+- request_body: the raw body for POST/PUT/PATCH PoCs, verbatim (JSON or form-encoded);
+  empty for GET.
+
+Extract the structured fields into the provided tool schema.
 """
 
 
@@ -105,6 +106,10 @@ class H1Report:
     summary: str = ""
     raw_text: str = ""
     all_urls: list[str] = field(default_factory=list)
+    # Structured request for faithful reproduction (POST/PUT/JSON PoCs, not GET-only).
+    http_method: str = "GET"
+    request_headers: dict = field(default_factory=dict)
+    request_body: str = ""
 
 
 def parse_report(text: str) -> H1Report:
@@ -283,9 +288,14 @@ def _llm_enrich(report: H1Report, text: str) -> None:
     The LLM receives the full report text and the regex-extracted values
     so it can confirm or override them. This is the primary extraction
     path — regex is just a fast pre-fill that the LLM can correct.
+
+    Runs SYNCHRONOUSLY — ``bedrock_client.invoke_json`` is a blocking gateway
+    call and ``parse_report`` is invoked from a worker thread with no event loop.
+    (The previous ``asyncio.get_running_loop().run_until_complete`` path always
+    raised RuntimeError off the loop, so LLM enrichment silently never ran.)
     """
-    import asyncio
     from dast.ai import bedrock_client
+    from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 
     # Give the LLM what regex already found so it can confirm or override
     pre_fill = (
@@ -295,19 +305,19 @@ def _llm_enrich(report: H1Report, text: str) -> None:
         f"  target_url: {report.target_url or '(empty)'}\n"
         f"  payload: {report.payload or '(empty)'}\n\n"
     )
-    user = f"{pre_fill}Full report text:\n\n{text[:3000]}"
+    # The report text is untrusted attacker-supplied content — fence it structurally.
+    fenced = wrap_untrusted(text[:3000], "h1_report")
+    user = f"{pre_fill}Full report text:\n\n{fenced}"
 
-    loop = asyncio.get_running_loop()
-    result = loop.run_until_complete(
-        asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: bedrock_client.invoke_json(
-                system=_SYSTEM_PARSE,
-                user=user,
-                model_id=bedrock_client.get_fast_model(),
-                max_tokens=512,
-            ),
-        )
+    from dast.ai.schemas import H1_PARSE_SCHEMA
+
+    result = bedrock_client.invoke_json(
+        system=_SYSTEM_PARSE + "\n\n" + UNTRUSTED_CONTENT_DIRECTIVE,
+        user=user,
+        model_id=bedrock_client.get_fast_model(),
+        max_tokens=768,
+        temperature=0,
+        schema=H1_PARSE_SCHEMA,
     )
 
     # LLM output always wins — it has full context
@@ -316,6 +326,9 @@ def _llm_enrich(report: H1Report, text: str) -> None:
     llm_payload   = str(result.get("payload", "")).strip()
     llm_target    = str(result.get("target_url", "")).strip()
     llm_summary   = str(result.get("summary", "")).strip()
+    llm_method    = str(result.get("http_method", "")).strip().upper()
+    llm_body      = str(result.get("request_body", "")).strip()
+    llm_headers   = result.get("request_headers", {})
 
     if llm_vuln_type and llm_vuln_type != "unknown":
         report.vuln_type = llm_vuln_type
@@ -327,3 +340,14 @@ def _llm_enrich(report: H1Report, text: str) -> None:
         report.target_url = llm_target
     if llm_summary:
         report.summary = llm_summary
+    if llm_method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        report.http_method = llm_method
+    if llm_body:
+        report.request_body = llm_body
+    if isinstance(llm_headers, dict):
+        # Never let the report override the session's auth — those come from the
+        # active login profile / named session, not attacker-supplied text.
+        report.request_headers = {
+            str(k): str(v) for k, v in llm_headers.items()
+            if str(k).lower() not in ("authorization", "cookie")
+        }

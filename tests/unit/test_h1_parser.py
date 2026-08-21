@@ -193,3 +193,52 @@ class TestUrlWithQuotedPayload:
         assert _cwe_for_type("workflow_bypass") == "CWE-841"
         assert _cwe_for_type("mass_assignment") == "CWE-915"
         assert _cwe_for_type("unknown_type") == "CWE-840"
+
+
+class TestLLMEnrichment:
+    """The LLM enrichment path must actually run (the asyncio bug is fixed)."""
+
+    def test_llm_enrichment_runs_and_overrides(self, monkeypatch):
+        captured = {}
+
+        def fake_invoke_json(system, user, **kwargs):
+            captured["schema"] = kwargs.get("schema")
+            captured["user"] = user
+            return {
+                "vuln_type": "idor",
+                "proof_url": "https://api.acme-corp.com/v1/users/42",
+                "payload": "42",
+                "target_url": "https://api.acme-corp.com/v1/users/42",
+                "http_method": "POST",
+                "request_headers": {"Content-Type": "application/json",
+                                    "Authorization": "Bearer x", "Cookie": "s=1"},
+                "request_body": '{"id": 42}',
+                "summary": "IDOR on the users endpoint.",
+            }
+
+        monkeypatch.setattr(
+            "dast.ai.bedrock_client.invoke_json", fake_invoke_json
+        )
+        r = parse_report("Some report mentioning an object reference bug.")
+        # LLM output wins over regex.
+        assert r.vuln_type == "idor"
+        assert r.proof_url == "https://api.acme-corp.com/v1/users/42"
+        assert r.http_method == "POST"
+        assert r.request_body == '{"id": 42}'
+        # Auth headers from the report are dropped (session supplies them).
+        assert "Authorization" not in r.request_headers
+        assert "Cookie" not in r.request_headers
+        assert r.request_headers.get("Content-Type") == "application/json"
+        # A schema was passed (forced structured output) and the report was fenced.
+        assert captured["schema"] is not None
+        assert "h1_report" in captured["user"]
+
+    def test_llm_failure_degrades_to_regex(self, monkeypatch):
+        def boom(*a, **k):
+            raise RuntimeError("no creds")
+
+        monkeypatch.setattr("dast.ai.bedrock_client.invoke_json", boom)
+        r = parse_report(_XSS_REPORT)
+        # Regex extraction survives an LLM failure.
+        assert r.vuln_type == "xss"
+        assert r.proof_url.startswith("https://us1.esi.acme-corp.com/")

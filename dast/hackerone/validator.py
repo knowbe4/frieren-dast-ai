@@ -156,6 +156,7 @@ class ValidationResult:
     payload: str
     evidence: str = ""
     reasoning: str = ""
+    severity: str = ""           # info|low|medium|high|critical (from the schema verdict)
     screenshot_b64: str = ""     # base64 PNG from Playwright on confirmation
     raw_request: str = ""
     raw_response: str = ""
@@ -745,6 +746,12 @@ async def _validate_http(
     from dast.hackerone import payload_safety
     checks_run.append("payload_safety")
     send_url = proof_url
+    # Honor the method/body extracted from the report so POST/PUT/JSON PoCs
+    # reproduce faithfully, not just GET proof URLs.
+    method = (report.http_method or "GET").upper()
+    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+        method = "GET"
+    send_body = report.request_body or ""
     safety = payload_safety.make_safe(report.payload or proof_url, report.vuln_type)
     if safety.is_destructive:
         if not safety.safe_variant:
@@ -768,11 +775,16 @@ async def _validate_http(
                 checks_run=checks_run,
                 duration_ms=int((time.monotonic() - t0) * 1000),
             )
-        # Substitute the safe variant into the URL where the payload appears.
+        # Substitute the safe variant wherever the payload appears — URL and/or
+        # request body (a POST/PUT PoC carries its payload in the body).
         send_url = _substitute_payload_in_url(proof_url, report.payload, safety.safe_variant)
-        if send_url == proof_url and report.payload:
-            # Could not locate the payload in the URL to replace it — do not risk
-            # sending the destructive original.
+        body_substituted = False
+        if send_body and report.payload and report.payload in send_body:
+            send_body = send_body.replace(report.payload, safety.safe_variant)
+            body_substituted = True
+        if report.payload and send_url == proof_url and not body_substituted:
+            # Could not locate the payload in the URL or body to replace it — do
+            # not risk sending the destructive original.
             return ValidationResult(
                 job_id=job_id, status="needs_manual",
                 vuln_type=report.vuln_type, proof_url=proof_url, payload=report.payload,
@@ -780,8 +792,8 @@ async def _validate_http(
                     vuln_type=report.vuln_type, proof_url=proof_url, payload=report.payload,
                     reason=(
                         f"Auto-validation was blocked for safety: {safety.reason}. The payload "
-                        "could not be located in the proof URL to substitute a non-destructive "
-                        "probe, so nothing was sent."
+                        "could not be located in the proof URL or request body to substitute a "
+                        "non-destructive probe, so nothing was sent."
                     ),
                     observed="Nothing was sent to the target (the destructive payload was withheld).",
                 ),
@@ -796,16 +808,28 @@ async def _validate_http(
         cookies = _sanitise_cookies(cookies or {})
         proxy_url = f"http://127.0.0.1:{proxy_port}"
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        headers = {}
+        headers: Dict[str, str] = {}
+        # Merge report-supplied headers (Authorization/Cookie already stripped by
+        # the parser — the active session supplies auth).
+        for header_name, header_value in (report.request_headers or {}).items():
+            if header_name.lower() in ("authorization", "cookie"):
+                continue
+            headers[header_name] = header_value
         if cookie_header:
             headers["Cookie"] = cookie_header
+
+        # Only carry a body for methods that take one.
+        request_body = send_body if method in ("POST", "PUT", "PATCH", "DELETE") else ""
 
         async with httpx.AsyncClient(
             proxy=proxy_url, verify=False, follow_redirects=True,
             timeout=15, headers=headers,
         ) as client:
             checks_run.append("http_request")
-            resp = await client.get(send_url)
+            resp = await client.request(
+                method, send_url,
+                content=request_body.encode("utf-8") if request_body else None,
+            )
 
         body = resp.text
         status = resp.status_code
@@ -827,12 +851,17 @@ async def _validate_http(
                 duration_ms=int((time.monotonic() - t0) * 1000),
             )
 
-        raw_req = f"GET {send_url} HTTP/1.1\n"
+        raw_req_lines = [f"{method} {send_url} HTTP/1.1"]
+        raw_req_lines += [f"{k}: {v}" for k, v in headers.items()]
+        raw_req = "\n".join(raw_req_lines) + "\n"
+        if request_body:
+            raw_req += "\n" + request_body[:2000]
         raw_resp = f"HTTP/1.1 {status}\n" + "\n".join(f"{k}: {v}" for k, v in resp.headers.items()) + "\n\n" + body[:3000]
 
         checks_run.append("response_analysis")
-        reasoning = await _llm_analyse_response(report, body[:3000], status)
-        confirmed, label = _parse_llm_verdict(reasoning)
+        # Schema-forced verdict: the model is forced through H1_VERDICT_SCHEMA so
+        # the reproduced/confidence/severity fields are always valid and typed.
+        confirmed, label, severity = await _llm_verdict_http(report, body[:3000], status)
 
         if confirmed:
             result_evidence = label
@@ -852,6 +881,7 @@ async def _validate_http(
             status="confirmed" if confirmed else "needs_manual",
             vuln_type=report.vuln_type, proof_url=proof_url, payload=report.payload,
             evidence=result_evidence,
+            severity=severity if confirmed else "",
             raw_request=raw_req[:2000],
             raw_response=raw_resp[:4000],
             checks_run=checks_run,
@@ -1343,6 +1373,55 @@ def _parse_llm_verdict(text: str, confidence_threshold: int = 95) -> tuple[bool,
     confirmed = verdict == "confirmed" and confidence >= confidence_threshold
     label = f"[{confidence}% confidence] {reasoning}"
     return confirmed, label
+
+
+async def _llm_verdict_http(
+    report: H1Report, body: str, status_code: int, confidence_threshold: float = 0.95
+) -> tuple[bool, str, str]:
+    """Schema-forced reproduction verdict for the generic HTTP path.
+
+    Returns (reproduced, label, severity). Unlike the free-text
+    ``_parse_llm_verdict`` regex path, the model is forced through
+    H1_VERDICT_SCHEMA so the verdict is always a valid, typed object. Degrades to
+    (False, "", "") on any LLM failure.
+    """
+    try:
+        from dast.ai import bedrock_client
+        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+        from dast.ai.schemas import H1_VERDICT_SCHEMA
+
+        user = (
+            f"Vuln type: {report.vuln_type}\n"
+            f"Proof URL: {_sanitize_for_prompt(report.proof_url, 300)}\n"
+            f"Method: {report.http_method}\n"
+            f"Payload: {_sanitize_for_prompt(report.payload, 200)}\n"
+            f"Report summary: {_sanitize_for_prompt(report.summary or report.raw_text[:400], 400)}\n\n"
+            f"HTTP response status: {status_code}\n"
+            "Response body:\n"
+            + wrap_untrusted(body[:2000], "http_response")
+        )
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: bedrock_client.invoke_json(
+                system=_SYSTEM_ANALYSE + "\n\n" + UNTRUSTED_CONTENT_DIRECTIVE,
+                user=user,
+                model_id=bedrock_client.get_fast_model(),
+                max_tokens=384, temperature=0,
+                schema=H1_VERDICT_SCHEMA,
+            ),
+        )
+        reproduced = bool(result.get("reproduced"))
+        confidence = float(result.get("confidence", 0.0) or 0.0)
+        severity = str(result.get("severity", "info"))
+        reasoning = str(result.get("reasoning", "")).strip()
+        confirmed = reproduced and confidence >= confidence_threshold
+        label = f"[{int(confidence * 100)}% confidence, {severity}] {reasoning}"
+        return confirmed, label, severity
+    except Exception as exc:
+        logger.debug("H1 schema verdict failed", error=str(exc))
+        return False, "", ""
 
 
 async def _llm_analyse_response(report: H1Report, body: str, status_code: int) -> str:

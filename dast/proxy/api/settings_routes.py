@@ -4,10 +4,36 @@ Settings routes: proxy settings, scope rules, bypass, extensions, projects, scan
 
 from __future__ import annotations
 
+import ipaddress
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from dast.proxy.api.context import DashboardContext
+
+
+def _normalize_bind_host(raw: str) -> tuple[str | None, str | None, bool]:
+    """
+    Validate and normalize a proxy bind host.
+
+    Returns (host, error, is_loopback). ``host`` is None when invalid.
+    Accepts "localhost", any literal IPv4/IPv6 address, and the wildcards
+    "0.0.0.0"/"::". Hostnames other than localhost are rejected because the
+    listener binds a socket, not a name — an unresolvable name would fail to
+    bind and strand the proxy.
+    """
+    host = (raw or "").strip()
+    if not host:
+        return None, "host required", False
+    if host.lower() == "localhost":
+        return "127.0.0.1", None, True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return None, f"'{host}' is not a valid IP address (or 'localhost')", False
+    # Wildcard binds (0.0.0.0 / ::) are not loopback — they expose every interface.
+    is_loopback = addr.is_loopback
+    return host, None, is_loopback
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:
@@ -69,6 +95,49 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "settings not available"}, status_code=503)
         found = settings.delete_project(project_id)
         return {"ok": found}
+
+    @router.get("/api/settings/bind-host")
+    async def get_bind_host():
+        host = settings.get_bind_host() if settings else "127.0.0.1"
+        _, _, is_loopback = _normalize_bind_host(host)
+        return {"host": host, "port": ctx.proxy_port, "is_loopback": is_loopback}
+
+    @router.post("/api/settings/bind-host")
+    async def set_bind_host(body: dict):
+        host, error, is_loopback = _normalize_bind_host(str(body.get("host", "")))
+        if error:
+            return JSONResponse({"error": error}, status_code=400)
+        # Optional port change. Absent/None keeps the current port.
+        port = body.get("port")
+        if port is not None and str(port) != "":
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": f"'{body.get('port')}' is not a valid port"}, status_code=400)
+            if not (1 <= port <= 65535):
+                return JSONResponse({"error": "port must be between 1 and 65535"}, status_code=400)
+        else:
+            port = None
+        # Persist first so the choice survives a restart even if no runner is
+        # attached (e.g. settings edited before the proxy is up).
+        if settings is not None:
+            settings.set_bind_host(host)
+            if port is not None:
+                settings.set_bind_port(port)
+        if ctx.runner is None:
+            return {"ok": True, "host": host, "port": port or ctx.proxy_port,
+                    "is_loopback": is_loopback, "applied": False,
+                    "note": "saved — will apply when the proxy restarts"}
+        result = await ctx.runner.restart_proxy_listener(host, port)
+        if result.get("ok"):
+            ctx.proxy_host = result["host"]
+            ctx.proxy_port = result["port"]
+        # Refresh the cached /api/status payload so the Setup tab reflects the new
+        # listener immediately instead of the stale (5-min TTL) host/port.
+        if ctx.status_cache:
+            ctx.status_cache["proxy_host"] = ctx.proxy_host
+            ctx.status_cache["proxy_port"] = ctx.proxy_port
+        return {**result, "is_loopback": is_loopback, "applied": bool(result.get("ok"))}
 
     @router.post("/api/settings/bypass")
     async def add_bypass(body: dict):
@@ -214,6 +283,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 openai_base_url=_scan_config.get("openai_base_url", ""),
                 gateway_base_url=_scan_config.get("gateway_base_url", ""),
             )
+            # Invalidate the AI-status cache (5-min TTL) so the connection badge
+            # re-probes the just-selected provider on the next poll instead of
+            # showing the previous provider's stale "connected/not connected".
+            ctx.status_cache.clear()
+            ctx.status_cache_ts[0] = 0.0
         if "scan_budget_seconds" in body:
             from dast.ai.coordinator import Coordinator as _Coord
             budget = max(30, min(900, int(body["scan_budget_seconds"])))

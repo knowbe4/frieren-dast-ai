@@ -35,8 +35,17 @@ class BrowseSession:
         self.name: Optional[str] = name
         self.session_id: str = str(uuid.uuid4())[:8]
         self.running: bool   = False
+        # Login-flow recording (Phase 2): raw DOM events captured in-page.
+        self._recording: bool = False
+        self._recorded_steps: List[dict] = []
+        self.recorded_start_url: str = ""
 
-    async def start(self, start_url: Optional[str] = None, headless: bool = False) -> None:
+    async def start(
+        self,
+        start_url: Optional[str] = None,
+        headless: bool = False,
+        record: bool = False,
+    ) -> None:
         from playwright.async_api import async_playwright
 
         self._pw_ctx = async_playwright()
@@ -59,7 +68,16 @@ class BrowseSession:
             viewport={"width": 1440, "height": 900},
             no_viewport=not headless,
         )
+
+        # Install the DOM recorder BEFORE the first page so every navigation is
+        # instrumented. Secrets are classified in-page and never sent back.
+        if record:
+            await self._install_recorder()
+
         page = await self._context.new_page()
+
+        if record:
+            page.on("framenavigated", self._on_framenavigated)
 
         if start_url:
             try:
@@ -73,6 +91,47 @@ class BrowseSession:
 
         self._browser.on("disconnected", self._handle_close)
 
+    # ── Login-flow recording ────────────────────────────────────────────────
+    async def _install_recorder(self) -> None:
+        """Expose the record binding + inject the DOM listener into every page."""
+        from dast.profiles.flow import RECORDER_INIT_SCRIPT
+
+        self._recording = True
+        self._recorded_steps = []
+        self.recorded_start_url = ""
+
+        async def _record_step(_source, step: dict) -> None:
+            try:
+                if self._recording and isinstance(step, dict):
+                    self._recorded_steps.append(dict(step))
+            except Exception as exc:
+                logger.debug("recorder step capture failed", error=str(exc))
+
+        await self._context.expose_binding("__dastRecordStep", _record_step)
+        await self._context.add_init_script(RECORDER_INIT_SCRIPT)
+
+    def _on_framenavigated(self, frame) -> None:
+        """Capture the first main-frame URL as the flow's start_url."""
+        try:
+            if not self._recording or self.recorded_start_url:
+                return
+            if frame == frame.page.main_frame:
+                self.recorded_start_url = frame.url or ""
+        except Exception as exc:
+            logger.debug("recorder navigation capture failed", error=str(exc))
+
+    def stop_recording(self) -> dict:
+        """Stop recording and return the coalesced LoginFlow as a dict."""
+        from dast.profiles.flow import LoginFlow, coalesce_recorded_steps
+
+        self._recording = False
+        steps = coalesce_recorded_steps(self._recorded_steps)
+        flow = LoginFlow(steps=steps, start_url=self.recorded_start_url)
+        logger.info(
+            "login flow recorded", session_id=self.session_id, steps=len(steps)
+        )
+        return flow.to_dict()
+
     async def get_playwright_cookies(self) -> List[dict]:
         """Return cookies directly from the Playwright context (isolated, not the proxy jar)."""
         if not self._context:
@@ -81,6 +140,15 @@ class BrowseSession:
             return await self._context.cookies()
         except Exception:
             return []
+
+    async def get_storage_state(self) -> Optional[dict]:
+        """Return the Playwright storage_state (cookies + origins) for session save."""
+        if not self._context:
+            return None
+        try:
+            return await self._context.storage_state()
+        except Exception:
+            return None
 
     def _handle_close(self, *_) -> None:
         self.running = False

@@ -167,7 +167,7 @@ lint:
 	@echo "Linting UI (JS syntax + duplicate declarations)..."
 	node scripts/lint_ui.js
 	@echo "Linting Python (ruff: dead code, unused imports/locals — see [tool.ruff] in pyproject.toml)..."
-	uv run ruff check dast/ tests/
+	uv run ruff check .
 	@echo "Linting Python (imports)..."
 	uv run python -c "from dast.proxy.runner import ProxyRunner; from dast.proxy.api.browser_routes import make_router; from dast.proxy.api.proxy_routes import make_router; print('  Python imports OK')"
 

@@ -34,6 +34,7 @@ from urllib.parse import urlparse, urlunparse
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
+from dast.proxy.signalr import MZ_HEADER, SIGNALR_SEPARATOR, encode_varint
 from dast.scanners.active_checks import _fmt_http_pair, _send
 from dast.utils.logger import get_logger
 
@@ -45,10 +46,10 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 # SignalR text-protocol record separator
-_SIGNALR_SEP = "\x1e"
+_SIGNALR_SEP = SIGNALR_SEPARATOR
 
 # MZ header — confirms a .NET PE assembly
-_MZ_HEADER = b"\x4d\x5a"
+_MZ_HEADER = MZ_HEADER
 
 # Patterns that confirm a Blazor application
 _BLAZOR_WASM_RE = re.compile(
@@ -1109,13 +1110,7 @@ class BlazorAgent(VulnAgent):
 
         def _mp_frame(obj) -> bytes:
             payload = msgpack.packb(obj, use_bin_type=True)
-            n, varint = len(payload), b""
-            while True:
-                b = n & 0x7f; n >>= 7
-                varint += bytes([b | (0x80 if n else 0)])
-                if not n:
-                    break
-            return varint + payload
+            return encode_varint(len(payload)) + payload
 
         # ── 2. Handshake (blazorpack) ─────────────────────────────────────
         handshake = json.dumps({"protocol": "blazorpack", "version": 1}) + _SIGNALR_SEP

@@ -15,9 +15,6 @@ Tests performed (payloads from jwt.yaml):
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac as _hmac
 import json
 import re
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -27,6 +24,9 @@ import httpx
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.proxy.plugin_manager import log_event
+# JWT/base64url primitives live in dast.utils.jwt. Re-exported under the local
+# underscore names below for backward compatibility (tests import them here).
+from dast.utils.jwt import b64url_decode, b64url_encode, build_token, decode_jwt
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
@@ -34,45 +34,12 @@ if TYPE_CHECKING:
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.([A-Za-z0-9_-]*)")
 
 
-# ── JWT encoding helpers ───────────────────────────────────────────────────
+# ── JWT encoding helpers (thin aliases over dast.utils.jwt) ─────────────────
 
-def _b64url_decode(s: str) -> bytes:
-    s = s.replace("-", "+").replace("_", "/")
-    padding = 4 - len(s) % 4
-    if padding != 4:
-        s += "=" * padding
-    return base64.b64decode(s)
-
-
-def _b64url_encode(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
-
-
-def _decode_jwt(token: str) -> Optional[Tuple[dict, dict]]:
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        header = json.loads(_b64url_decode(parts[0]))
-        payload = json.loads(_b64url_decode(parts[1]))
-        return header, payload
-    except Exception:
-        return None
-
-
-def _build_token(header: dict, payload: dict, secret: Optional[str] = None) -> str:
-    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
-    p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
-    signing_input = f"{h}.{p}".encode()
-    if secret is None:
-        sig = ""
-    else:
-        alg = header.get("alg", "HS256")
-        hash_fn = {"HS256": hashlib.sha256, "HS384": hashlib.sha384, "HS512": hashlib.sha512}.get(
-            alg, hashlib.sha256
-        )
-        sig = _b64url_encode(_hmac.new(secret.encode(), signing_input, hash_fn).digest())
-    return f"{h}.{p}.{sig}"
+_b64url_decode = b64url_decode
+_b64url_encode = b64url_encode
+_decode_jwt = decode_jwt
+_build_token = build_token
 
 
 def _find_jwt(headers: dict) -> Optional[Tuple[str, str, str]]:

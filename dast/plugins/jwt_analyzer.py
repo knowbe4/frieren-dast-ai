@@ -11,12 +11,11 @@ Checks:
 
 from __future__ import annotations
 
-import base64
-import json
 import re
 from typing import TYPE_CHECKING, Optional
 
 from dast.proxy.plugin_base import ProxyPlugin
+from dast.utils.jwt import decode_segment
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
@@ -29,8 +28,7 @@ _PII_KEYS = {"email", "mail", "phone", "mobile", "ssn", "name", "username", "dob
 
 def _b64_decode(s: str) -> Optional[dict]:
     try:
-        padded = s + "=" * (-len(s) % 4)
-        return json.loads(base64.urlsafe_b64decode(padded))
+        return decode_segment(s)
     except Exception:
         return None
 

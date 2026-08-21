@@ -93,12 +93,30 @@ class XxeAgent(VulnAgent):
 
         logger.info("xxe: testing %s%s", target.url, " (CT forced to XML)" if _switched_ct else "")
 
+        # Payload group names must match dast/payloads/xxe.yaml exactly.
+        # NOTE: the "ssrf_internal" group is intentionally not loaded here — its
+        # payloads reflect internal-service responses (cloud metadata, localhost)
+        # that need a dedicated signature matcher, not the file-read regex. Wiring
+        # XXE-driven SSRF detection is tracked as a separate follow-up.
         file_read_payloads = get_payloads("xxe", "basic_file_read") or []
-        oob_payloads = get_payloads("xxe", "oob_exfiltration") or []
-        parameter_payloads = get_payloads("xxe", "parameter_entities") or []
+        oob_dtd_payloads = get_payloads("xxe", "oob_dtd") or []
+        parameter_payloads = get_payloads("xxe", "parameter_entity") or []
+        cdata_payloads = get_payloads("xxe", "cdata_bypass") or []
 
-        # Phase 1: Inline file read
-        for payload in file_read_payloads[:6]:
+        # Split by delivery model: payloads carrying the CALLBACK_URL placeholder
+        # exfiltrate out-of-band (need a collaborator); the rest reflect the file
+        # content inline in the response body.
+        inline_payloads = [
+            payload for payload in (file_read_payloads + parameter_payloads)
+            if "CALLBACK_URL" not in str(payload)
+        ]
+        oob_payloads = [
+            payload for payload in (oob_dtd_payloads + parameter_payloads + cdata_payloads)
+            if "CALLBACK_URL" in str(payload)
+        ]
+
+        # Phase 1: Inline file read (basic entities + inline parameter-entity variants)
+        for payload in inline_payloads[:10]:
             payload = str(payload).strip()
             if not payload:
                 continue
@@ -162,8 +180,8 @@ class XxeAgent(VulnAgent):
         # Phase 2: OOB exfiltration via collaborator
         if collaborator and collaborator.url:
             collab_url = collaborator.url
-            for payload_template in oob_payloads[:4]:
-                payload = str(payload_template).replace("{{CALLBACK_URL}}", collab_url)
+            for payload_template in oob_payloads[:6]:
+                payload = str(payload_template).replace("CALLBACK_URL", collab_url)
                 if collab_url not in payload:
                     continue
 

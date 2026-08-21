@@ -200,6 +200,49 @@ class CmdiAgent(VulnAgent):
                     ))
                     return findings
 
+            # Phase 3: WAF bypass — encoding, whitespace (IFS), and separator
+            # variants that still execute `id`, detected via the same output /
+            # shell-error signatures as Phase 1. Runs after the direct probes so
+            # it only fires when a naive payload was filtered.
+            for payload in bypass_payloads[:12]:
+                payload = str(payload)
+                url = _inject_query(target.url, param_name, payload)
+                resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+                if not resp:
+                    continue
+                body = resp.text[:4000]
+
+                # Skip if payload is just echoed back without executing
+                if payload in body and not _CMDI_OUTPUT_RE.search(body):
+                    continue
+
+                if _CMDI_OUTPUT_RE.search(body) and not _CMDI_OUTPUT_RE.search(baseline_body):
+                    raw_req, raw_resp = _fmt_http_pair(resp)
+                    log_event("agent", "finding",
+                              f"CMDi WAF bypass confirmed: {param_name} on {target.url}",
+                              url=target.url, finding="Command Injection", source="agent")
+                    findings.append(AgentFinding(
+                        title="OS Command Injection — WAF Bypass",
+                        severity="critical",
+                        cwe="CWE-78",
+                        attack_type="cmdi",
+                        evidence=(
+                            f"Parameter '{param_name}' with bypass payload '{payload}' returned "
+                            f"command output after direct payloads were filtered: "
+                            f"'{_CMDI_OUTPUT_RE.search(body).group(0)}'\n\n"
+                            f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                        ),
+                        confirmed=True,
+                        payload=payload,
+                        parameter=param_name,
+                        url=target.url,
+                        request_method=target.method,
+                        bypass_validation=True,
+                        raw_request=raw_req,
+                        raw_response=raw_resp[:2000],
+                    ))
+                    return findings
+
         return findings
 
 

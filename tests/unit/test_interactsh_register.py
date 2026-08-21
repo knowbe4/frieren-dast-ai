@@ -15,7 +15,6 @@ import asyncio
 from unittest.mock import patch
 
 import httpx
-import pytest
 
 from dast.config import Settings
 from dast.utils.interactsh import InteractshSession

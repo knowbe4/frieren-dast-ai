@@ -5,8 +5,6 @@ deduplication, body_preview, noise filtering.
 
 from __future__ import annotations
 
-import time
-import pytest
 
 from dast.proxy.session_store import SessionStore, ProxyEntry
 

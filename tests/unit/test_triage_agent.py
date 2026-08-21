@@ -214,8 +214,8 @@ async def test_out_of_scope_triggers_approve_allow_once(monkeypatch):
         seen.append((kind, payload.get("host")))
         return {"decision": "allow_once"}
 
-    verdict = await _run(_report(), monkeypatch, wait_for_human=human,
-                         ctx=_FakeCtx(in_scope=False))
+    await _run(_report(), monkeypatch, wait_for_human=human,
+               ctx=_FakeCtx(in_scope=False))
 
     assert ("approve", "out.example") in seen
     assert len(calls) == 1                        # dispatched after approval
@@ -232,8 +232,8 @@ async def test_out_of_scope_denied_does_not_dispatch(monkeypatch):
     _install_llm(monkeypatch, steps)
     calls = _install_tools(monkeypatch)
 
-    verdict = await _run(_report(), monkeypatch, wait_for_human=_deny_human,
-                         ctx=_FakeCtx(in_scope=False))
+    await _run(_report(), monkeypatch, wait_for_human=_deny_human,
+               ctx=_FakeCtx(in_scope=False))
     assert calls == []                            # denied, never sent
 
 
@@ -257,8 +257,8 @@ async def test_always_host_relaxes_scope_for_rest_of_run(monkeypatch):
             approve_count["n"] += 1
         return {"decision": "always_host"}
 
-    verdict = await _run(_report(), monkeypatch, wait_for_human=human,
-                         ctx=_FakeCtx(in_scope=False))
+    await _run(_report(), monkeypatch, wait_for_human=human,
+               ctx=_FakeCtx(in_scope=False))
 
     assert approve_count["n"] == 1                # second call to same host not paused
     assert len(calls) == 2
@@ -290,7 +290,7 @@ async def test_auth_wall_pause_applies_session_cookie(monkeypatch):
             return {"cookies": {"session": "abc"}}
         return {"text": "(no response)"}
 
-    verdict = await _run(_report(), monkeypatch, wait_for_human=human)
+    await _run(_report(), monkeypatch, wait_for_human=human)
 
     assert "auth" in seen
     # The re-attempt carried the operator-supplied session cookie.

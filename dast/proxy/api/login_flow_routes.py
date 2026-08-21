@@ -18,7 +18,6 @@ event over /ws/login and blocks until POST /api/login-flow/resume fires.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse

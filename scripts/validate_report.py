@@ -155,7 +155,7 @@ async def _capture_cookies_via_browser(target: str, headless: bool = False,
                 notified = True
                 print("[*] App loading... waiting for activity to settle", file=sys.stderr)
         else:
-            print(f"[warn] Timeout — capturing what was collected so far", file=sys.stderr)
+            print("[warn] Timeout — capturing what was collected so far", file=sys.stderr)
 
         # Allow manual override: if nothing was detected, ask user to confirm
         if not observed_api_paths:
@@ -351,10 +351,10 @@ def _parse_with_retry(raw_text: str):
     Parse findings with LLM. If JSON is malformed (LLM failed to escape special
     chars in payload strings), retry with a prompt that asks for simpler output.
     """
-    from dast.importers.dast_importer import parse_findings, _preprocess, _PARSE_SYSTEM, _MAX_CONTENT_CHARS
+    from dast.importers.dast_importer import parse_findings, _preprocess, _MAX_CONTENT_CHARS
     from dast.ai import bedrock_client
     from dast.importers.dast_importer import NormalisedFinding, _normalise_severity
-    import re, json as _json
+    import json as _json
 
     # First attempt — normal path
     findings = parse_findings(raw_text)
@@ -381,7 +381,6 @@ No markdown fence, no explanation.
 """
     processed = _preprocess(raw_text)
     try:
-        loop = asyncio.get_event_loop()
         raw = bedrock_client.invoke(
             system=_SIMPLE_SYSTEM,
             user=f"Report:\n{processed[:_MAX_CONTENT_CHARS]}",
@@ -537,7 +536,6 @@ def _generate_targeted_payloads(nf, resolved_url: str, auth_headers: dict) -> li
     """
     from dast.code_analysis import lookup_code_for_path
     from dast.ai import bedrock_client
-    import json as _json
 
     parsed = urlparse(resolved_url)
     path = parsed.path
@@ -685,7 +683,7 @@ async def _run_finding(nf, resolved_url, auth_headers, browse_entries, confidenc
 
 
 async def main(args: argparse.Namespace) -> int:
-    from dast.importers.dast_importer import parse_findings, resolve_url
+    from dast.importers.dast_importer import resolve_url
 
     report_path = Path(args.report)
     if not report_path.exists():

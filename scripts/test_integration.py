@@ -11,9 +11,7 @@ in the HTTP history and host sidebar.
 """
 
 import asyncio
-import json
 import sys
-import time
 import httpx
 from playwright.async_api import async_playwright
 

@@ -12,7 +12,7 @@ import re
 import socket
 import webbrowser
 from datetime import datetime, timezone
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import uvicorn
 
@@ -23,6 +23,9 @@ from dast.proxy.dashboard_server import build_app
 from dast.proxy.proxy_server import ProxyServer
 from dast.proxy.session_store import ProxyEntry, SessionStore
 from dast.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from dast.ai.agent_base import AgentFinding
 
 logger = get_logger(__name__)
 
@@ -713,7 +716,7 @@ class ProxyRunner:
             _active_stop = stop_event
             log_cb = job.get("log_cb") or (lambda m: None)
             target_url = job.get("url", "")
-            log_event("crawler", "info", f"Crawl started", url=target_url, source="crawler")
+            log_event("crawler", "info", "Crawl started", url=target_url, source="crawler")
 
             crawler = SpaCrawler(self._store, log_cb, stop_event, proxy_port=self._proxy_port)
             try:
@@ -738,9 +741,6 @@ class ProxyRunner:
         Mirrors _crawl_worker: one job at a time, a stop job sets a cancel flag.
         All HTTP + scope safety lives in content_discovery.run_content_discovery.
         """
-        import time
-        import uuid
-        from urllib.parse import urlparse
 
         from dast.proxy.plugin_manager import log_event
         from dast.scanners.content_discovery import run_content_discovery
@@ -1145,7 +1145,7 @@ class ProxyRunner:
                     # Set a terminal scan_result so status polling (e.g. code-hypothesis
                     # validation) stops reporting "scanning" forever — a skip is terminal.
                     self._store.add_finding(entry_id, {}, "safe")
-                    qs.finish(entry_id, 0, "skipped", f"Duplicate — same endpoint+operation already scanned this session")
+                    qs.finish(entry_id, 0, "skipped", "Duplicate — same endpoint+operation already scanned this session")
                     return
                 _scanned_keys.add(scan_key)
 

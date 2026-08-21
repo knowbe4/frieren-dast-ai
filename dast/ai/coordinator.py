@@ -656,7 +656,7 @@ class Coordinator:
         # session cookies) that are validated before any business logic runs.
         # Injecting SQL/LFI/XSS payloads into them produces only 302/400 noise.
         if _is_auth_endpoint(target.url):
-            _log_reason = f"Skipping scan — auth/SSO endpoint detected by path"
+            _log_reason = "Skipping scan — auth/SSO endpoint detected by path"
             from dast.proxy.plugin_manager import log_event as _le_auth
             _le_auth("coordinator", "info", _log_reason, url=target.url, source="agent")
             logger.debug("Coordinator early abort: auth endpoint by path", url=target.url)
@@ -1421,8 +1421,8 @@ class Coordinator:
                 )
             else:
                 restrict_note = (
-                    f"\nNo canary signals detected. Canary probes found no injection signal on any"
-                    f" parameter. Only select secrets and non-injection agents.\n"
+                    "\nNo canary signals detected. Canary probes found no injection signal on any"
+                    " parameter. Only select secrets and non-injection agents.\n"
                 )
 
         baseline_section = ""

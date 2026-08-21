@@ -60,8 +60,24 @@ dev = [
     "respx>=0.21.0",
     # Secret-scanning / internal-data guardrails (see .pre-commit-config.yaml)
     "pre-commit>=4.0.0",
+    # Linting: dead code, unused imports/locals (see [tool.ruff] below)
+    "ruff>=0.6.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+# Lenient line length: this pass targets dead code / unused imports, not reformatting.
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# High-signal, low-noise gate focused on correctness and dead code, not restyling:
+#   F   = all pyflakes (F401 unused import, F811 redefinition, F841 unused local,
+#         F821 undefined name, F541 f-string without placeholder)
+#   E9  = syntax errors
+# Deliberately excludes E4 (import formatting) and E7 (semicolons / multi-statement
+# lines) which are part of this codebase's existing style, and E501 line-length.
+select = ["F", "E9"]

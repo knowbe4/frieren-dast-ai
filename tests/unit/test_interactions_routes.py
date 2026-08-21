@@ -10,7 +10,6 @@ Guarantees the stop-vs-delete distinction that the UI relies on:
 
 from __future__ import annotations
 
-import asyncio
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient

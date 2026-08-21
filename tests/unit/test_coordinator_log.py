@@ -6,7 +6,6 @@ AI/Bedrock calls are mocked — no AWS credentials required.
 
 from __future__ import annotations
 
-import asyncio
 import collections
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch

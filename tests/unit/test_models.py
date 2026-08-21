@@ -1,12 +1,9 @@
 """Unit tests for core data models."""
 
 from dast.models import (
-    AttackPayload,
     Endpoint,
     EndpointParameter,
-    Finding,
     HttpRequest,
-    HttpResponse,
     Severity,
     AttackVerdict,
 )

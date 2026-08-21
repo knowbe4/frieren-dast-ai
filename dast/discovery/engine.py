@@ -196,10 +196,6 @@ class DiscoveryEngine:
     def context_for_host(self, host: str) -> Optional[DiscoveryContext]:
         return self._contexts.get(host)
 
-    def all_contexts(self) -> Dict[str, DiscoveryContext]:
-        with self._lock:
-            return dict(self._contexts)
-
     # ── internals ──────────────────────────────────────────────────────
 
     def _get_or_create(self, host: str) -> DiscoveryContext:

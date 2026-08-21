@@ -14,9 +14,7 @@ Covers:
 
 from __future__ import annotations
 
-import json
 
-import pytest
 
 from dast.proxy.session_store import SessionStore, _format_raw_request, _format_raw_response
 from dast.report.sarif import build_sarif, _make_rule_id, _cwe_uri

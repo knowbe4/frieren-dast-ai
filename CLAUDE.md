@@ -51,6 +51,24 @@ Never use `python3` directly. Never activate a venv manually.
 
 ## Extension Recipes (how to add X — no code changes beyond the drop-in)
 
+**Agent vs Plugin — which do I write?** The `dast/agents/` and `dast/plugins/` folders stay
+flat and are two different extension points, not a category split:
+- **Agent** (`dast/agents/*_agent.py`) — an AI-coordinated *active* vuln probe. Subclasses
+  `VulnAgent`, is `Coordinator.register()`-ed and imported in `agents/__init__.py` (explicit
+  discovery), runs inside the scan pipeline, injects payloads, and needs the full
+  request/response context. Files here that are *not* agents (`block_detector.py`,
+  `payload_filter.py`, `probe_diff.py`) are shared agent infrastructure — they intentionally
+  omit the `_agent` suffix; do not add new non-agent modules here without that reason.
+- **Plugin** (`dast/plugins/*.py`) — a proxy-lifecycle hook. Subclasses `ProxyPlugin`
+  (`dast/proxy/plugin_base.py`), auto-discovered by `glob("*.py")` over `dast/plugins/` and
+  `~/.dast-ai/plugins/` (drop-a-file, no registration), and driven by `on_entry()` (passive) or
+  `on_active_probe()` (active). Filename is free-form (descriptive noun); discovery is by class,
+  not name — but note several plugins are imported by module name elsewhere, so renaming an
+  existing one means updating those call sites.
+
+Rule of thumb: needs the coordinator/LLM plan and payload filtering → agent; reacts to raw
+proxy traffic on every entry → plugin.
+
 - **Vuln agent** — new file in `dast/agents/` subclassing `VulnAgent`; call
   `get_filtered_payloads(attack_type, target)` (not `get_payloads()` directly); load extra
   payloads from `dast/payloads/*.yaml` via `loader.py`; `Coordinator.register(YourAgent)` at the
@@ -127,7 +145,8 @@ make desktop-test                         # desktop launcher e2e (real Electron 
 
 - `dast/proxy/runner.py` — starts proxy + dashboard + scan worker
 - `dast/proxy/session_store.py` — intercepted entries, cookie jar, service graph
-- `dast/proxy/dashboard_server.py` — FastAPI app + all API routes + HTML/JS
+- `dast/proxy/dashboard_server.py` — FastAPI app assembly + router wiring (routes live in
+  `dast/proxy/api/*_routes.py`); UI is external static files in `dast/proxy/ui/`
 - `dast/ai/coordinator.py` — LLM coordinator (canary + planner + validator dispatch)
 - `dast/ai/red_team.py` / `fp_filter.py` — Red-Team Validator + deterministic FP rules
 - `dast/ai/mutator.py` — adaptive payload mutator

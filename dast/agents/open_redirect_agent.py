@@ -54,20 +54,6 @@ _META_REFRESH_RE = re.compile(
 )
 
 
-def _is_redirect_to_canary(resp: "httpx.Response") -> bool:
-    """Return True if the response redirects to our canary host."""
-    location = resp.headers.get("location", "")
-    if _LOCATION_RE.search(location):
-        return True
-    refresh = resp.headers.get("refresh", "")
-    if _LOCATION_RE.search(refresh):
-        return True
-    # Check final URL after redirect following (httpx stores in resp.url)
-    final_url = str(getattr(resp, "url", ""))
-    if _CANARY_HOST in final_url:
-        return True
-    return False
-
 
 def _meta_refresh_to_canary(body: str) -> bool:
     """Return True if the HTML body has a meta-refresh pointing to our canary."""

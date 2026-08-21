@@ -83,17 +83,6 @@ class DiscoveryContext:
     call_edges: List[CallEdge] = field(default_factory=list)
     openapi_schema: Optional[dict] = None   # raw parsed OpenAPI dict if found
 
-    def param_call_sources(self, url: str, param_name: str) -> List[CallEdge]:
-        """Return edges that feed param_name into url — helps agents prioritize."""
-        return [
-            e for e in self.call_edges
-            if e.target_url == url and e.target_param == param_name
-        ]
-
-    def undiscovered_endpoints(self, seen_paths: set) -> List[ApiEndpoint]:
-        """Return API endpoints the proxy has not yet seen."""
-        return [ep for ep in self.api_endpoints if ep.path not in seen_paths]
-
     def to_agent_summary(self) -> str:
         """
         Compact text summary injected into agent prompts.

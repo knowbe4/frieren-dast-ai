@@ -5,7 +5,7 @@ Unit tests for dast.proxy.auth_headers.extract_auth_headers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict
 
 from dast.proxy.auth_headers import extract_auth_headers
 

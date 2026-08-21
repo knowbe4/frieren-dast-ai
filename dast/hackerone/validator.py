@@ -657,9 +657,6 @@ async def _validate_xss(
                 report, page_content[:3000], resp.status if resp else 0,
             )
             _llm_confirmed, label = _parse_llm_verdict(reasoning)
-            nav_note = ""
-            if navigated_hosts:
-                nav_note = f" Observed navigations: {', '.join(dict.fromkeys(navigated_hosts))}."
 
             observed = ""
             if navigated_hosts:

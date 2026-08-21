@@ -174,10 +174,6 @@ class TrafficGraph:
         with self._lock:
             return [e for e in self._edges.values() if e.target_url == url]
 
-    def all_edges(self) -> List[CallEdge]:
-        with self._lock:
-            return list(self._edges.values())
-
     # ── internals ──────────────────────────────────────────────────────
 
     def _index_value(self, idx: _ValueIndex, data, url: str, depth: int) -> None:

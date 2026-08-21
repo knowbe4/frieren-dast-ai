@@ -134,7 +134,6 @@ class AuthAgent(VulnAgent):
         # or changes a 401/403 to a successful response with meaningful body.
         baseline_resp = await _send(client, target.method, target.url, target.headers, target.body)
         baseline_status = baseline_resp.status_code if baseline_resp else None
-        baseline_len = len(baseline_resp.text) if baseline_resp else 0
 
         # Only run bypass probes when the baseline is a protected response
         if baseline_status not in (401, 403):

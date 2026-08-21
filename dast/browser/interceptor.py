@@ -14,6 +14,9 @@ from urllib.parse import urlparse
 from playwright.async_api import BrowserContext, Request, Response, Route
 
 from dast.models import HttpRequest, HttpResponse, Interaction
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 _NOISE_DOMAINS = {
@@ -131,7 +134,8 @@ class NetworkInterceptor:
 
             await route.fulfill(response=response)
 
-        except Exception as e:
+        except Exception as exc:
+            logger.debug("interceptor: route handling failed, continuing", error=str(exc))
             await route.continue_()
 
     def _is_in_scope(self, netloc: str, path: str = "") -> bool:
@@ -157,7 +161,3 @@ class NetworkInterceptor:
         result = list(self._interactions)
         self._interactions.clear()
         return result
-
-    def peek(self) -> List[Interaction]:
-        """Return interactions without clearing."""
-        return list(self._interactions)

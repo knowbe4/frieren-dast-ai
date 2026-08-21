@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -266,7 +266,6 @@ class TestPassiveScannerConfirmed:
 
     def _make_entry(self, **kwargs):
         from dataclasses import dataclass as dc, field as f
-        from typing import Dict, Optional
 
         @dc
         class E:

@@ -91,6 +91,30 @@ async def test_time_based_blind_detected(monkeypatch):
     assert "Time-Based Blind" in findings[0].title
 
 
+# ── regression: WAF-bypass payloads are exercised and detected ───────────────
+# Guards against the "bypass" payload group being loaded but never fed to a
+# probe loop (Phase 3 was documented but unimplemented).
+
+@pytest.mark.asyncio
+async def test_waf_bypass_detected_when_direct_payloads_filtered():
+    target = _target()
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        # Simulate a WAF: direct output/blind payloads are filtered (clean
+        # response), but an IFS/encoding bypass variant still executes `id`.
+        if payload and ("${IFS}" in payload or "$IFS" in payload or "%0a" in payload or "%00" in payload):
+            return _resp(200, "uid=0(root) gid=0(root) groups=0(root)")
+        return _resp(200, "filtered")
+
+    with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
+        findings = await CmdiAgent().run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert "WAF Bypass" in findings[0].title
+    assert findings[0].cwe == "CWE-78"
+    assert findings[0].confirmed is True
+
+
 # ── negative: clean response ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

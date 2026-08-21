@@ -276,9 +276,6 @@ def _jwt_probes(key: str, location: str, original_token: str = "") -> List[Dict[
             _json.dumps(d, separators=(",", ":")).encode()
         ).rstrip(b"=").decode()
 
-    def _b64url_str(s: str) -> str:
-        return base64.urlsafe_b64encode(s.encode()).rstrip(b"=").decode()
-
     def _find_urls_in_value(val) -> List[str]:
         """Recursively find all http(s) URLs in a value (string, list, dict)."""
         found = []

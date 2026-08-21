@@ -16,7 +16,7 @@ import hmac as _hmac
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from dast.plugins.jwt_tester import _b64url_decode, _b64url_encode, _decode_jwt
+from dast.plugins.jwt_tester import _b64url_encode, _decode_jwt
 from dast.proxy.api.jwt_routes import make_router
 
 

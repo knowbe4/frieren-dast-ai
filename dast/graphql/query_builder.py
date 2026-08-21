@@ -64,10 +64,6 @@ def _is_list_wrapper(wrapper: Optional[str]) -> bool:
     return wrapper in ("LIST", "NON_NULL_LIST", "LIST_OF_NON_NULL", "NON_NULL_LIST_OF_NON_NULL")
 
 
-def _is_required_wrapper(wrapper: Optional[str]) -> bool:
-    return wrapper in ("NON_NULL", "NON_NULL_LIST", "NON_NULL_LIST_OF_NON_NULL")
-
-
 def _gql_type_string(bare_type: str, wrapper: Optional[str]) -> str:
     """Render a GraphQL type reference string for a $var declaration, e.g. '[ID!]!'."""
     if wrapper == "NON_NULL":

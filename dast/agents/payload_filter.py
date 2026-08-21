@@ -284,7 +284,3 @@ def get_filtered_payloads(attack_type: str, target: "CheckTarget") -> List[str]:
                 seen.add(p)
                 payloads.append(p)
     return payloads
-
-
-def supported_attack_types() -> List[str]:
-    return list(_SELECTORS.keys())

@@ -7,7 +7,7 @@ Tests use the data-driven rule engine rather than the old per-check functions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import pytest

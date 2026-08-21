@@ -183,7 +183,7 @@ def browse(
         Path(output_dir) / f"session-{ts}.json"
     )
 
-    console.print(f"\n[bold cyan]Frieren DAST-AI browse[/bold cyan]" + (f" — {target}" if target else ""))
+    console.print("\n[bold cyan]Frieren DAST-AI browse[/bold cyan]" + (f" — {target}" if target else ""))
     if not target:
         console.print("[dim]Free roam: navigate to any app. All domains you visit are captured.[/dim]")
     elif live:
@@ -243,7 +243,7 @@ def browse(
     effective_target = target or _target_from_endpoints(endpoints)
 
     if then_attack:
-        console.print(f"\n[bold cyan]Starting attack phase...[/bold cyan]")
+        console.print("\n[bold cyan]Starting attack phase...[/bold cyan]")
         _run_attack_on_endpoints(
             endpoints=endpoints,
             target=effective_target,
@@ -753,15 +753,15 @@ def proxy(
     _log_file = _log_dir / f"proxy_{_session_ts}.log"
     set_log_file(_log_file)
 
-    console.print(f"\n[bold cyan]Frieren DAST-AI proxy[/bold cyan]")
+    console.print("\n[bold cyan]Frieren DAST-AI proxy[/bold cyan]")
     console.print(f"  Proxy:     [bold]{proxy_host}:{proxy_port}[/bold]  ← set in browser proxy settings")
     console.print(f"  Dashboard: [bold]http://127.0.0.1:{dashboard_port}[/bold]  ← opens automatically")
     console.print(f"  CA cert:   [dim]{_ca.ca_cert_path}[/dim]")
     console.print(f"  Log file:  [dim]{_log_file}[/dim]")
-    console.print(f"  [dim]Install the CA cert once to intercept HTTPS — see Setup tab in dashboard.[/dim]")
-    console.print(f"  [dim]If either port above is already in use, the proxy falls back to the next"
-                  f" free one and prints a WARNING below — watch for it.[/dim]")
-    console.print(f"  [dim]Press Ctrl+C to stop.[/dim]\n")
+    console.print("  [dim]Install the CA cert once to intercept HTTPS — see Setup tab in dashboard.[/dim]")
+    console.print("  [dim]If either port above is already in use, the proxy falls back to the next"
+                  " free one and prints a WARNING below — watch for it.[/dim]")
+    console.print("  [dim]Press Ctrl+C to stop.[/dim]\n")
 
     runner = ProxyRunner(
         proxy_port=proxy_port,

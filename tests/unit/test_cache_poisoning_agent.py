@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from dast.agents import cache_poisoning_agent as cp
 
@@ -146,7 +145,6 @@ def test_confirmed_cache_poisoning():
         fake_send._cached_marker = marker
         return _resp(body=f"<html>host dastcp{marker}q</html>".encode())
 
-    settings = MagicMock()
     with patch.object(cp, "_send", new=AsyncMock(side_effect=fake_send)):
         findings = _run(agent.run(_target(), MagicMock()))
 

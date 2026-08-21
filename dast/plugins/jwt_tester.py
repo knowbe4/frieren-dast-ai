@@ -241,9 +241,6 @@ class JwtTesterPlugin(ProxyPlugin):
                     return None
 
             def _finding(title, severity, cwe, evidence, payload_str, resp):
-                req_lines = f"{entry.method} {entry.url}\n" + "\n".join(
-                    f"{k}: {v}" for k, v in forward_headers.items()
-                )
                 resp_snippet = resp.text[:500] if resp else ""
                 store.add_finding(entry.id, {
                     "title": title,

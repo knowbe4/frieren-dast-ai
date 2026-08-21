@@ -39,7 +39,6 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         req_headers = entry.request_headers
-        resp_headers = entry.response_headers
 
         has_cl  = _has_header(req_headers, "content-length")
         has_te  = _has_header(req_headers, "transfer-encoding")

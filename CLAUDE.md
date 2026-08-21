@@ -127,7 +127,8 @@ make desktop-test                         # desktop launcher e2e (real Electron 
 
 - `dast/proxy/runner.py` — starts proxy + dashboard + scan worker
 - `dast/proxy/session_store.py` — intercepted entries, cookie jar, service graph
-- `dast/proxy/dashboard_server.py` — FastAPI app + all API routes + HTML/JS
+- `dast/proxy/dashboard_server.py` — FastAPI app assembly + router wiring (routes live in
+  `dast/proxy/api/*_routes.py`); UI is external static files in `dast/proxy/ui/`
 - `dast/ai/coordinator.py` — LLM coordinator (canary + planner + validator dispatch)
 - `dast/ai/red_team.py` / `fp_filter.py` — Red-Team Validator + deterministic FP rules
 - `dast/ai/mutator.py` — adaptive payload mutator

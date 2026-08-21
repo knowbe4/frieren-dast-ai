@@ -22,6 +22,7 @@ import asyncio
 import base64
 import secrets
 import uuid
+from typing import Optional
 from urllib.parse import urlparse
 
 from dast.utils.logger import get_logger

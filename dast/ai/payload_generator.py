@@ -13,6 +13,9 @@ from typing import List, Optional
 
 from dast.ai import bedrock_client
 from dast.models import AttackAttempt, AttackPayload, Endpoint
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _SYSTEM_PAYLOAD_GEN = """\
 You are an expert web application penetration tester.
@@ -71,7 +74,8 @@ Generate up to 10 payloads, prioritized by likelihood of success."""
                 rationale=str(item.get("rationale", "")),
             ))
         return payloads
-    except Exception as e:
+    except Exception as exc:
+        logger.warning("AI payload generation failed", error=str(exc))
         return []
 
 
@@ -83,7 +87,6 @@ def mutate_payload(
     Given a previous attack attempt and its response, generate a mutated payload.
     Returns None if the AI determines no further mutation is worthwhile.
     """
-    req = previous_attempt.request
     resp = previous_attempt.response
 
     user = f"""Previous attempt (iteration {iteration}):

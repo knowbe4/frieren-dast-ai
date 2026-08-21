@@ -202,10 +202,6 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
         has_csrf = bool(
             csrf_headers & {"x-csrf-token", "x-xsrf-token", "x-requested-with"}
         )
-        origin = entry.request_headers.get("origin", "")
-        has_content_type_json = "application/json" in entry.request_headers.get(
-            "content-type", ""
-        ).lower()
         if is_mutation and not has_csrf and entry.status_code == 200:
             # Simple requests with content-type: application/json are not CSRF-safe by default
             findings.append({
@@ -214,10 +210,10 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
                 "cwe": "CWE-352",
                 "attack_type": "graphql",
                 "evidence": (
-                    f"GraphQL mutation submitted without a CSRF token header "
-                    f"(no X-CSRF-Token / X-XSRF-Token / X-Requested-With). "
-                    f"If the endpoint accepts cookies for auth, cross-origin mutation "
-                    f"may be possible from an attacker-controlled page."
+                    "GraphQL mutation submitted without a CSRF token header "
+                    "(no X-CSRF-Token / X-XSRF-Token / X-Requested-With). "
+                    "If the endpoint accepts cookies for auth, cross-origin mutation "
+                    "may be possible from an attacker-controlled page."
                 ),
                 "confirmed": False,
                 "validated_by": ["passive"],

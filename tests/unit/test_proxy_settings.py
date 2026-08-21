@@ -8,7 +8,6 @@ Tests run in-process and never touch the filesystem (settings are not saved).
 from __future__ import annotations
 
 import pytest
-from unittest.mock import patch
 
 from dast.proxy.proxy_settings import ProxySettings, _matches_field, _rule_matches_url
 

@@ -18,7 +18,6 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-import pytest
 
 
 # ── shared helpers (mirror tests/unit/test_passive_rules_extended.py) ────────

@@ -299,16 +299,6 @@ async def _introspect(
         return error
 
 
-def _auth_headers_from_entry(entry: "ProxyEntry") -> dict:
-    return {
-        k: v for k, v in entry.request_headers.items()
-        if k.lower() in (
-            "cookie", "authorization", "x-csrf-token", "x-xsrf-token",
-            "x-requested-with", "x-auth-token",
-        )
-    }
-
-
 def catalogue_endpoint(endpoint: str, store: "SessionStore") -> bool:
     """
     Record `endpoint` as a known GraphQL endpoint if not already known — never

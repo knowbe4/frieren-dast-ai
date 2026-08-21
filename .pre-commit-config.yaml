@@ -32,6 +32,18 @@ repos:
         args: ["--maxkb=1024"]
       - id: check-merge-conflict
 
+  # ── Python lint gate (ruff: dead code, unused imports/locals) ──────────────
+  # Local hook via uv so the pinned dev-dependency version is used (no drift
+  # against a separately-pinned pre-commit rev). Config lives in pyproject.toml.
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff (F/E9 lint gate)
+        entry: uv run ruff check
+        language: system
+        types: [python]
+        require_serial: true
+
   # ── Repo-specific internal-data guard (local) ──────────────────────────────
   - repo: local
     hooks:

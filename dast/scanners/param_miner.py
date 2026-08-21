@@ -39,7 +39,7 @@ re-tests the now-enriched endpoint.
 from __future__ import annotations
 
 import json
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from dast.scanners.active_checks import (

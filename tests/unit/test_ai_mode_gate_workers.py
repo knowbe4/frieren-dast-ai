@@ -15,7 +15,6 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import List
 
-import pytest
 
 from dast.discovery.app_context import AppContextWorker
 from dast.discovery.threat_model import ThreatModelWorker

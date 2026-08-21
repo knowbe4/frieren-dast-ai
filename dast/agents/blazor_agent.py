@@ -254,7 +254,7 @@ class BlazorAgent(VulnAgent):
         logger.info("Blazor boot manifest accessible", url=manifest_url)
         log_event(
             "blazor", "finding",
-            f"blazor.boot.json accessible — assembly list exposed",
+            "blazor.boot.json accessible — assembly list exposed",
             url=manifest_url, finding="Blazor Boot Manifest", source="agent",
         )
 
@@ -264,7 +264,6 @@ class BlazorAgent(VulnAgent):
         #           The underlying content is still a .NET PE assembly (not native WASM).
         dll_names: List[str] = []
         wasm_names: List[str] = []
-        dotnet_version: str = "unknown"
         try:
             manifest = resp.json()
             resources = manifest.get("resources", {})
@@ -280,9 +279,6 @@ class BlazorAgent(VulnAgent):
                     # Webcil-wrapped assemblies in .NET 8+ have .wasm extension
                     # but are distinguishable from the runtime by not starting with "dotnet"
                     wasm_names.append(k)
-            # Detect .NET version hint from config key
-            config = manifest.get("config", [])
-            dotnet_version = "8+" if wasm_names and not dll_names else ("6-7" if dll_names else "unknown")
         except Exception:
             pass
 
@@ -1130,29 +1126,10 @@ class BlazorAgent(VulnAgent):
         # → SessionIntelligence). Fall back to a seed range if none are available yet.
         observed_ids: List[int] = []
         observed_input_fields: List[str] = []
-        if target.service_context and hasattr(target, "_session_intel_ref"):
-            pass  # not wired this way — use session_intelligence directly
-        try:
-            # session_intelligence is passed to run_active_checks and stored on the
-            # coordinator run context. Access via the collaborator service if available.
-            if collaborator and hasattr(collaborator, "_session_intelligence"):
-                si = collaborator._session_intelligence
-            else:
-                # Fallback: access via the global store reference on the entry host
-                from dast.proxy.session_store import SessionStore as _SS
-                si = None
-                for obj in _SS.__subclasses__():
-                    pass  # not reliable — use the hint approach below
-                si = None
-        except Exception:
-            si = None
 
-        # Better path: session_intelligence is passed into run_active_checks and
-        # forwarded to agents via CheckTarget.app_profile_hint (text) — but for
-        # structured data we need to access it differently.
-        # The coordinator passes it in as a kwarg; access via the target's hint.
-        # For now extract from the hint string if the plugin already serialised it,
-        # otherwise fall back to parsing the app_profile_hint text.
+        # Observed handler IDs / input fields are surfaced by BlazorDetectorPlugin
+        # (via SessionIntelligence) and forwarded to agents as serialised text on
+        # CheckTarget.app_profile_hint. Parse them out of that hint.
         hint = target.app_profile_hint or ""
         for m in re.finditer(r"blazor_handler_ids?:\s*([\d,\s]+)", hint, re.IGNORECASE):
             for tok in m.group(1).split(","):
@@ -1286,7 +1263,7 @@ class BlazorAgent(VulnAgent):
             if ptype == "xss" and (payload_str in body_str or "DAST_BLAZOR_XSS" in body_str):
                 log_event(
                     "blazor", "finding",
-                    f"Blazor XSS via DispatchEventAsync — payload reflected in hub response",
+                    "Blazor XSS via DispatchEventAsync — payload reflected in hub response",
                     url=hub_url, finding="Blazor SignalR XSS", source="agent",
                 )
                 findings.append(AgentFinding(

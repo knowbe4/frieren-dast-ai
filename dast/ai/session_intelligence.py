@@ -561,11 +561,6 @@ class SessionIntelligence:
             if bypass_payload:
                 intel.record_bypass(attack_type, bypass_payload)
 
-    def record_graphql_endpoint(self, host: str, endpoint_path: str) -> None:
-        intel = self.get(host)
-        with self._lock:
-            intel.graphql_endpoints.add(endpoint_path)
-
     def all_hosts(self) -> List[str]:
         with self._lock:
             return list(self._hosts.keys())

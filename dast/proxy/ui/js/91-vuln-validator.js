@@ -15,11 +15,9 @@ function vvSetMode(mode) {
   _vvMode = mode === 'ai' ? 'ai' : 'manual';
   const isAi = _vvMode === 'ai';
 
-  // Toggle the segmented control's active button.
-  const mBtn = document.getElementById('vv-mode-manual');
-  const aBtn = document.getElementById('vv-mode-ai');
-  if (mBtn) mBtn.classList.toggle('pri', !isAi);
-  if (aBtn) aBtn.classList.toggle('pri', isAi);
+  // Keep the opt-in checkbox in sync (vvSetMode may be called programmatically).
+  const cb = document.getElementById('vv-use-ai');
+  if (cb) cb.checked = isAi;
 
   // Swap the right-hand panel and hide manual-only inputs in AI mode.
   const manualResult = document.getElementById('vv-manual-result');
@@ -412,9 +410,9 @@ function vvEnsurePulse() {
   document.head.appendChild(s);
 }
 
-// Default the segmented control to Manual on load. This script is included near
-// the end of <body>, so DOMContentLoaded may already have fired — apply directly
-// in that case, otherwise wait for it.
+// Default to single-shot (AI opt-in unchecked) on load. This script is included
+// near the end of <body>, so DOMContentLoaded may already have fired — apply
+// directly in that case, otherwise wait for it.
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => vvSetMode('manual'));
 } else {

@@ -1721,13 +1721,13 @@
         <div style="padding:12px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0;overflow-y:auto">
           <div style="font-size:11px;font-weight:600;color:var(--acc2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Vuln Validator</div>
 
-          <!-- Manual (single-shot) vs AI (agentic reproduction) mode -->
-          <div style="display:flex;gap:0;margin-bottom:10px;border:1px solid var(--bdr);border-radius:4px;overflow:hidden">
-            <button id="vv-mode-manual" class="tbtn" onclick="vvSetMode('manual')"
-                    style="flex:1;border:none;border-radius:0;font-size:10px;padding:6px 8px">Manual</button>
-            <button id="vv-mode-ai" class="tbtn" onclick="vvSetMode('ai')"
-                    style="flex:1;border:none;border-radius:0;border-left:1px solid var(--bdr);font-size:10px;padding:6px 8px">AI (agentic)</button>
-          </div>
+          <!-- AI agentic validation is an opt-in; unchecked runs a single-shot validation. -->
+          <label id="vv-ai-toggle" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;
+                 cursor:pointer;user-select:none;font-size:11px;color:var(--txt)">
+            <input type="checkbox" id="vv-use-ai" onchange="vvSetMode(this.checked ? 'ai' : 'manual')"
+                   style="cursor:pointer;margin:0">
+            <span>Use AI agentic reproduction</span>
+          </label>
           <div id="vv-mode-hint" style="font-size:10px;color:var(--txt2);margin-bottom:10px;line-height:1.4">
             Single-shot reproduction: parse the report and validate it once.
           </div>
@@ -2000,7 +2000,11 @@
     <div id="extras-sub-decoder" style="flex:1;overflow:hidden;display:none">
       <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;border-right:1px solid var(--bdr)">
         <div style="padding:8px 14px;font-size:10px;font-weight:600;color:var(--acc2);
-                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr)">Input</div>
+                    text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
+                    display:flex;align-items:center;gap:8px">
+          <span style="flex:1">Input</span>
+          <span id="dec-in-len" style="font-weight:400;color:var(--txt2);text-transform:none;letter-spacing:0"></span>
+        </div>
         <textarea id="dec-input" oninput="decoderRun()"
           placeholder="Paste text to encode/decode..."
           style="flex:1;width:100%;background:var(--bg);border:none;color:var(--txt);box-sizing:border-box;
@@ -2017,6 +2021,9 @@
                     text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--bdr);
                     display:flex;align-items:center;gap:8px">
           <span style="flex:1">Output</span>
+          <span id="dec-out-len" style="font-weight:400;color:var(--txt2);text-transform:none;letter-spacing:0"></span>
+          <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="decoderUseOutputAsInput()"
+                  title="Feed the output back into the input to chain transforms">Use as input</button>
           <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="decoderCopy()">Copy</button>
         </div>
         <pre id="dec-output" style="flex:1;overflow:auto;margin:0;padding:10px 14px;

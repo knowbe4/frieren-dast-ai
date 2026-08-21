@@ -62,6 +62,11 @@ html, body { height: 100%; font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Se
 .stab:hover { color: var(--txt); background: var(--bg4); }
 .stab.on { background: var(--bg4); color: var(--txt); }
 
+/* DECODER transform picker */
+.dec-op { padding: 5px 20px; font-size: 11px; cursor: pointer; color: var(--txt); user-select: none; }
+.dec-op:hover { background: var(--bg4); }
+.dec-op.on { background: var(--bg3); color: var(--orange); }
+
 /* WORKSPACE */
 #workspace { display: flex; height: calc(100vh - 70px); overflow: hidden; }
 .tpanel { display: none; flex: 1; flex-direction: column; overflow: hidden; }

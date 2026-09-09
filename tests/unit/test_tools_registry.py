@@ -33,7 +33,7 @@ class _Scope:
 def test_registry_lists_builtin_tools():
     names = {t.name for t in tools.all_tools()}
     assert {"send_request", "get_history", "content_discovery",
-            "param_mining", "triage_report", "list_login_profiles",
+            "param_mining", "triage_report", "validate_chain", "list_login_profiles",
             "get_findings", "oob_generate", "oob_poll",
             "url_encode", "url_decode", "base64_encode", "base64_decode",
             "html_encode", "html_decode"} <= names
@@ -358,6 +358,27 @@ async def test_send_request_out_of_scope_allowed_by_approval(monkeypatch):
     result = await run_tool(ctx, "send_request", {"url": "https://newtarget.example.com/x"})
     assert result["ok"] is True
     assert result["status"] == 200
+
+
+# ── validate_chain scope + args ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_validate_chain_requires_input():
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "validate_chain", {})
+    assert result["ok"] is False
+    assert "chain" in result["error"] and "report_text" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_validate_chain_out_of_scope_blocked():
+    # store set (in-process) so no interactive approval is attempted.
+    ctx = ToolContext(store=object(), settings=_Scope(False))
+    spec = {"name": "c", "vuln_type": "x",
+            "steps": [{"name": "s", "url": "https://evil.example.com/x"}]}
+    result = await run_tool(ctx, "validate_chain", {"chain": spec})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
 
 
 # ── MCP conversion (pure, no mcp import) ────────────────────────────────────────

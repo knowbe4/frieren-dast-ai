@@ -15,6 +15,7 @@ from dast.tools.base import Tool, all_tools, get_tool, register, run_tool
 from dast.tools.context import ToolContext
 
 # Import side effects register the built-in tools.
+from dast.tools import chain_tools as _chain_tools  # noqa: F401
 from dast.tools import encoding_tools as _encoding_tools  # noqa: F401
 from dast.tools import findings_tools as _findings_tools  # noqa: F401
 from dast.tools import history_tools as _history_tools  # noqa: F401

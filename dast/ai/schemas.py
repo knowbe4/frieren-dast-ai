@@ -274,3 +274,71 @@ PROBE_CLASSIFIER_SCHEMA: Dict[str, Any] = {
     },
     "required": ["injection_class", "context", "confidence", "recommended_agents", "reasoning"],
 }
+
+# Attack-chain planner — dast/chains/planner.py plan_chain().
+# Turns a free-text multi-step report into an executable chain spec. The step
+# fields mirror dast/chains/models.py (ChainStep/Extractor/Assertion) so the
+# planner output feeds ChainEngine.run() directly.
+ATTACK_CHAIN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Short slug for the chain, e.g. 'guest-token-cdn-access'."},
+        "description": {"type": "string", "description": "One sentence: what the chain proves and why it is a vulnerability."},
+        "vuln_type": {
+            "type": "string",
+            "description": "Best-fit category: broken_access_control, business_logic, auth_bypass, idor, info_disclosure, or attack_chain if none fit.",
+        },
+        "steps": {
+            "type": "array",
+            "description": "Ordered requests. Earlier steps bind variables/cookies that later steps consume via {{var}} templates. Include a final CONTROL step (send_cookies:[] or without the key credential) that is expected to FAIL, proving the credential is what defeats the check.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Human label for the step, e.g. 'bootstrap' or 'control-no-cookies'."},
+                    "method": {"type": "string", "description": "HTTP method. Default GET."},
+                    "url": {"type": "string", "description": "Absolute URL on the target host. May contain {{var}} placeholders bound by earlier steps."},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Request headers; may use {{var}} (e.g. Authorization: Bearer {{jwt}})."},
+                    "body": {"type": "string", "description": "Request body for POST/PUT (e.g. a GraphQL query). May use {{var}}. Empty otherwise."},
+                    "send_cookies": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Cookie names to send. Omit to send all harvested cookies; use an EMPTY array for a control step that must send none.",
+                    },
+                    "max_range_bytes": {"type": "integer", "description": "When fetching content, cap the response to this many bytes (adds a Range header) so validation never pulls a full asset. Use a small value like 64."},
+                    "extract": {
+                        "type": "array",
+                        "description": "Bind data out of this step's response for later steps.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "description": "json | regex | set_cookie | b64json | jwt_claim."},
+                                "var": {"type": "string", "description": "Variable name to bind."},
+                                "expr": {"type": "string", "description": "json/b64json/jwt_claim: dotted path (key, key[0], key[*]). regex: pattern (group 1 wins). set_cookie: cookie name."},
+                                "from": {"type": "string", "description": "Source: body (default), header:<Name>, or var:<name>."},
+                            },
+                            "required": ["kind", "var"],
+                        },
+                    },
+                    "assertions": {
+                        "type": "array",
+                        "description": "Conditions that must hold for the step to pass.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {"type": "string", "description": "status_eq | status_in | header_contains | body_contains | body_not_contains | var_present | var_contains | var_equals."},
+                                "value": {"description": "Operand for status_eq / var_equals."},
+                                "values": {"type": "array", "description": "Operand for status_in."},
+                                "name": {"type": "string", "description": "Header name for header_contains."},
+                                "needle": {"type": "string", "description": "Substring for *_contains."},
+                                "var": {"type": "string", "description": "Variable name for var_* assertions."},
+                            },
+                            "required": ["kind"],
+                        },
+                    },
+                },
+                "required": ["name", "url"],
+            },
+        },
+    },
+    "required": ["name", "vuln_type", "steps"],
+}

@@ -27,7 +27,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.payloads.loader import get_payloads, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_query, _inject_multipart, _send
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_query, _inject_multipart, _send
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -399,6 +399,12 @@ class LlmInjectionAgent(VulnAgent):
                 except Exception as exc:
                     logger.debug("failed to inject payload into JSON body; sending raw payload", error=str(exc))
             return await _send(client, target.method, target.url, target.headers, payload)
+        elif location == "header":
+            headers = _inject_header(target.headers, param["name"], payload)
+            return await _send(client, target.method, target.url, headers, target.body)
+        elif location == "cookie":
+            headers = _inject_cookie(target.headers, param["name"], payload)
+            return await _send(client, target.method, target.url, headers, target.body)
         return None
 
 

@@ -17,6 +17,8 @@ from dast.scanners.active_checks import (
     _HostConcurrencyLimiter,
     _HostScanGate,
     _inject_body,
+    _inject_cookie,
+    _inject_header,
     _inject_path,
     _inject_query,
     check_xss,
@@ -381,6 +383,73 @@ class TestEntryToCheckTarget:
 
     def test_connect_returns_none(self):
         entry = _fake_entry(method="CONNECT", url="https://example.com:443")
+        assert _entry_to_check_target(entry) is None
+
+
+class TestHeaderInjection:
+    def test_overwrites_existing_header_case_insensitive(self):
+        result = _inject_header({"User-Agent": "curl", "Host": "h"}, "user-agent", "PAYLOAD")
+        # only one User-Agent survives, with the payload value; Host is untouched
+        assert result.get("user-agent") == "PAYLOAD"
+        assert result["Host"] == "h"
+        assert sum(1 for k in result if k.lower() == "user-agent") == 1
+
+    def test_adds_missing_header(self):
+        result = _inject_header({"Host": "h"}, "X-Forwarded-For", "127.0.0.1")
+        assert result["X-Forwarded-For"] == "127.0.0.1"
+
+    def test_cookie_replaces_only_target_cookie(self):
+        result = _inject_cookie({"Cookie": "pref=dark; sid=abc; lang=en"}, "pref", "PAYLOAD")
+        assert result["Cookie"] == "pref=PAYLOAD; sid=abc; lang=en"
+
+    def test_cookie_appended_when_absent(self):
+        result = _inject_cookie({"Cookie": "sid=abc"}, "tracking", "PAYLOAD")
+        assert "tracking=PAYLOAD" in result["Cookie"]
+        assert "sid=abc" in result["Cookie"]
+
+
+class TestHeaderCookieEntrypoints:
+    def test_fuzzable_header_becomes_param(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"User-Agent": "Mozilla", "Host": "example.com"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        header_params = [p for p in target.params if p["location"] == "header"]
+        assert any(p["name"] == "User-Agent" for p in header_params)
+
+    def test_structural_headers_never_fuzzed(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"Host": "example.com", "Content-Length": "0",
+                                     "Authorization": "Bearer x", "Accept-Encoding": "gzip"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        header_names = {p["name"].lower() for p in target.params if p["location"] == "header"}
+        assert header_names.isdisjoint({"host", "content-length", "authorization", "accept-encoding"})
+
+    def test_custom_x_header_is_fuzzed(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"X-Custom-Tenant": "acme"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        assert any(p["name"] == "X-Custom-Tenant" and p["location"] == "header"
+                   for p in target.params)
+
+    def test_cookies_become_params_but_session_cookie_skipped(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"Cookie": "sessionid=secret; theme=dark"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        cookie_params = {p["name"] for p in target.params if p["location"] == "cookie"}
+        assert "theme" in cookie_params
+        assert "sessionid" not in cookie_params
+
+    def test_paramless_get_not_resurrected_by_headers(self):
+        # A static-asset-style GET with no query/body params stays skipped even
+        # though it carries a fuzzable User-Agent — header fuzzing augments real
+        # endpoints, it does not resurrect every paramless GET.
+        entry = _fake_entry(method="GET", url="https://example.com/app.js",
+                            headers={"User-Agent": "Mozilla"})
+        entry.path = "/app.js"
         assert _entry_to_check_target(entry) is None
 
 

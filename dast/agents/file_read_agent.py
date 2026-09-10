@@ -13,7 +13,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_query, _send
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -88,6 +88,12 @@ class FileReadAgent(VulnAgent):
             elif param["location"].startswith("multipart_"):
                 raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
                 resp = await _send(client, target.method, target.url, target.headers, raw)
+            elif param["location"] == "header":
+                headers = _inject_header(target.headers, param["name"], payload)
+                resp = await _send(client, target.method, target.url, headers, target.body)
+            elif param["location"] == "cookie":
+                headers = _inject_cookie(target.headers, param["name"], payload)
+                resp = await _send(client, target.method, target.url, headers, target.body)
             else:
                 continue
 

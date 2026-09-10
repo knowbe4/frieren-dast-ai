@@ -285,6 +285,57 @@ def _inject_body(body: str, param: str, value: str, content_type: str,
     return "&".join(f"{k}={v}" for k, v in pairs.items())
 
 
+def _inject_header(headers: Dict[str, str], name: str, value: str) -> Dict[str, str]:
+    """
+    Return a copy of ``headers`` with header ``name`` set to ``value``.
+
+    Header injection point: many apps trust request headers (User-Agent, Referer,
+    X-Forwarded-For, ...) and pass them unsanitised into SQL, templates, logs or
+    the response. Replacing the header value with a payload turns it into a
+    first-class fuzzable entrypoint. Matching is case-insensitive so the existing
+    header (whatever its original casing) is overwritten rather than duplicated.
+    """
+    new_headers = {key: val for key, val in headers.items() if key.lower() != name.lower()}
+    new_headers[name] = value
+    return new_headers
+
+
+def _inject_cookie(headers: Dict[str, str], name: str, value: str) -> Dict[str, str]:
+    """
+    Return a copy of ``headers`` with cookie ``name`` in the Cookie header set to
+    ``value``, preserving every other cookie.
+
+    Cookie values are a classic injection entrypoint (SQLi/XSS via a tracking or
+    preference cookie). Only the target cookie's value is replaced; the rest of
+    the jar is left intact so the session/auth cookies keep working.
+    """
+    cookie_header = ""
+    other_headers: Dict[str, str] = {}
+    for key, val in headers.items():
+        if key.lower() == "cookie":
+            cookie_header = val
+        else:
+            other_headers[key] = val
+
+    pairs: List[tuple[str, str]] = []
+    replaced = False
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        cookie_name, _, cookie_value = part.partition("=")
+        if cookie_name.strip() == name:
+            pairs.append((name, value))
+            replaced = True
+        else:
+            pairs.append((cookie_name.strip(), cookie_value))
+    if not replaced:
+        pairs.append((name, value))
+
+    other_headers["Cookie"] = "; ".join(f"{cookie_name}={cookie_value}" for cookie_name, cookie_value in pairs)
+    return other_headers
+
+
 def prepend_import_payloads(
     base_payloads: List[str],
     param_name: str,

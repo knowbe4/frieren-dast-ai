@@ -87,6 +87,14 @@ function _buildHttpEvidenceDetails(f) {
       <button class="tbtn" style="font-size:9px;padding:1px 6px;margin-left:auto;color:#4caf50;border-color:#2a5a2a"
         onclick="repLoadRaw(${JSON.stringify(f.probe_request || f.raw_request)})">Send Probe to Repeater</button>
     </div>
+    ${(f.extracted_data && Object.keys(f.extracted_data).length) ? `<div style="margin-top:6px">
+      <div style="font-size:9px;color:#4caf50;margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">Extracted Data (read-only)</div>
+      <div style="display:flex;flex-wrap:wrap;gap:5px">
+        ${Object.entries(f.extracted_data).map(([k, v]) =>
+          `<span style="font-size:10px;padding:2px 7px;background:#0a2a0a;border:1px solid #2a5a2a;border-radius:3px;color:#8ef79a">
+            <b style="color:#4caf50">${esc(k)}</b>: ${esc(String(v))}</span>`).join('')}
+      </div>
+    </div>` : ''}
     ${f.probe_request ? `<div style="margin-top:6px">
       <div style="font-size:9px;color:#4caf50;margin-bottom:2px;text-transform:uppercase;letter-spacing:.4px">Probe Request</div>
       <pre style="margin:0;padding:8px;background:#0a1500;border:1px solid #2a5a2a;border-radius:3px;

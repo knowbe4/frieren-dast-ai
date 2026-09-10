@@ -211,6 +211,12 @@ class SessionStore:
         self.active_suggestions: List[dict] = []
         # When True, new suggestions are automatically queued for scan
         self.auto_scan_suggestions: bool = False
+        # Taint marker correlation — unique benign markers injected at each entry
+        # point, then correlated against every observed response so cross-endpoint
+        # data flows (stored XSS, second-order injection) surface even when the
+        # input and output points are different requests.
+        from dast.scanners.taint import TaintStore
+        self.taint_store = TaintStore()
         # GraphQL schemas discovered via introspection — keyed by endpoint URL.
         # Populated by the graphql_introspection plugin; read by the findings importer
         # to build correct query/mutation bodies when importing reports.

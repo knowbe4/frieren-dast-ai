@@ -24,8 +24,10 @@ from dast.scanners.active_checks import (
     check_xss,
     check_sqli,
     check_open_redirect,
+    seed_taint_markers,
     zero_delay_variant,
 )
+from dast.scanners.taint import _MARKER_RE, TaintStore
 from dast.proxy.runner import _entry_to_check_target
 
 
@@ -598,3 +600,69 @@ class TestCheckOpenRedirect:
         async with httpx.AsyncClient() as client:
             findings = await check_open_redirect(target, client)
         assert findings == []
+
+
+# ── taint marker seeding ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestSeedTaintMarkers:
+    @respx.mock
+    async def test_seeds_one_marker_per_entry_point(self):
+        target = CheckTarget(
+            method="POST",
+            url="https://example.com/comment",
+            headers={"content-type": "application/json", "user-agent": "orig",
+                     "cookie": "pref=blue"},
+            body='{"text":"hi"}',
+            params=[
+                {"name": "q", "location": "query", "value": "x"},
+                {"name": "text", "location": "body", "value": "hi"},
+                {"name": "user-agent", "location": "header", "value": "orig"},
+                {"name": "pref", "location": "cookie", "value": "blue"},
+            ],
+        )
+        route = respx.route(host="example.com").mock(
+            return_value=httpx.Response(200, text="ok")
+        )
+        store = TaintStore()
+        async with httpx.AsyncClient() as client:
+            seeded = await seed_taint_markers(target, client, store)
+
+        assert seeded == 4
+        assert route.call_count == 4
+
+        # Each request carries a marker in the location it targets.
+        sent = {}
+        for call in route.calls:
+            request = call.request
+            body_text = request.content.decode("utf-8", errors="replace")
+            haystack = f"{request.url} {dict(request.headers)} {body_text}"
+            match = _MARKER_RE.search(haystack)
+            assert match, f"no marker found in request: {haystack}"
+            sent[match.group(0)] = request
+
+        # Every minted marker is registered and correctly attributed to its source
+        # parameter — proven end-to-end by scanning a different endpoint for it.
+        located_params = set()
+        for token in sent:
+            hits = store.find_hits("https://example.com/other-page", token)
+            assert len(hits) == 1
+            assert hits[0].is_cross_location is True
+            located_params.add(hits[0].marker.source_param)
+        assert located_params == {"q", "text", "user-agent", "pref"}
+
+    @respx.mock
+    async def test_no_params_seeds_nothing(self):
+        target = CheckTarget(method="GET", url="https://example.com/", headers={},
+                             body=None, params=[])
+        store = TaintStore()
+        async with httpx.AsyncClient() as client:
+            assert await seed_taint_markers(target, client, store) == 0
+
+    async def test_none_store_is_noop(self):
+        target = CheckTarget(
+            method="GET", url="https://example.com/", headers={}, body=None,
+            params=[{"name": "q", "location": "query", "value": "x"}],
+        )
+        async with httpx.AsyncClient() as client:
+            assert await seed_taint_markers(target, client, None) == 0

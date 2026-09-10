@@ -1387,6 +1387,81 @@ async def check_idor(target: CheckTarget, client: httpx.AsyncClient) -> List[Act
     return findings
 
 
+# ── taint marker seeding ─────────────────────────────────────────────────────
+
+async def _inject_and_send(
+    target: CheckTarget,
+    client: httpx.AsyncClient,
+    param: dict,
+    value: str,
+) -> "Optional[httpx.Response]":
+    """
+    Inject `value` into a single parameter (dispatching on its location) and send
+    the request. Central dispatch shared by taint seeding; mirrors the per-location
+    handling agents perform when probing.
+    """
+    location = param.get("location", "query")
+    if location == "query":
+        url = _inject_query(target.url, param["name"], value)
+        return await _send(client, target.method, url, target.headers, target.body)
+    if location in ("body", "body_graphql"):
+        body = _inject_body(
+            target.body or "", param["name"], value,
+            target.headers.get("content-type", ""),
+            location=location,
+        )
+        return await _send(client, target.method, target.url, target.headers, body)
+    if location.startswith("multipart_"):
+        raw = _inject_multipart(target.raw_body or b"", param["name"], value)
+        return await _send(client, target.method, target.url, target.headers, raw)
+    if location == "header":
+        headers = _inject_header(target.headers, param["name"], value)
+        return await _send(client, target.method, target.url, headers, target.body)
+    if location == "cookie":
+        headers = _inject_cookie(target.headers, param["name"], value)
+        return await _send(client, target.method, target.url, headers, target.body)
+    return None
+
+
+async def seed_taint_markers(
+    target: CheckTarget,
+    client: httpx.AsyncClient,
+    taint_store: Optional[object],
+) -> int:
+    """
+    Inject one unique benign marker per entry point of this endpoint.
+
+    Each parameter (query, body, header, cookie, multipart) gets its own marker so
+    that when a marker later surfaces in some other response the correlator knows
+    exactly which input point flowed to that output point. The marker is plain
+    alphanumeric — no attack payload — so it maximises persistence (a WAF has no
+    reason to block it) and is safe to store. The passive taint correlator picks up
+    any cross-endpoint surfacing on subsequent traffic.
+
+    Returns the number of markers successfully sent.
+    """
+    if taint_store is None or not target.params:
+        return 0
+
+    seeded = 0
+    for param in target.params:
+        location = param.get("location", "query")
+        token = taint_store.mint(target.url, param["name"], location, target.method)
+        try:
+            response = await _inject_and_send(target, client, param, token)
+        except Exception as exc:
+            logger.debug(
+                "Taint seed send failed",
+                url=target.url, param=param.get("name"), error=str(exc),
+            )
+            continue
+        if response is not None:
+            seeded += 1
+    if seeded:
+        logger.info("Taint markers seeded", url=target.url, count=seeded)
+    return seeded
+
+
 # ── orchestrator ────────────────────────────────────────────────────────────
 
 async def run_active_checks(
@@ -1398,6 +1473,7 @@ async def run_active_checks(
     session_intelligence: Optional[object] = None,
     budget_seconds: Optional[float] = None,
     probe_diff: bool = False,
+    taint_store: Optional[object] = None,
 ):
     """
     Run all active checks against a single endpoint via the Coordinator.
@@ -1419,6 +1495,14 @@ async def run_active_checks(
         return []
 
     async with _client(proxy_url, timeout) as client:
+        # Seed unique taint markers into every entry point before attacking, so
+        # cross-endpoint data flows (stored/second-order) can be correlated as the
+        # markers surface on later traffic. Best-effort — never block the scan.
+        if taint_store is not None:
+            try:
+                await seed_taint_markers(target, client, taint_store)
+            except Exception as exc:
+                logger.warning("Taint seeding failed", url=target.url, error=str(exc))
         async with CollaboratorService() as collaborator:
             return await Coordinator.run(
                 target, client, collaborator,

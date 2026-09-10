@@ -185,12 +185,16 @@ class XssAgent(VulnAgent):
         tried: set = set()
 
         # Capture baseline (clean) request/response before any payload injection.
+        # The baseline body length feeds detect_block's size-collapse heuristic so a
+        # silent WAF (200 stub replacing a rich response) is recognised as a block.
         baseline_raw_request = ""
         baseline_raw_response = ""
+        baseline_body_len: Optional[int] = None
         try:
             baseline_resp, _ = await self._send_probe(target, client, param, param.get("value", "test"))
             if baseline_resp is not None:
                 baseline_raw_request, baseline_raw_response = _fmt_http_pair(baseline_resp)
+                baseline_body_len = len(baseline_resp.text)
         except Exception as exc:
             logger.debug("failed to capture XSS baseline request/response", error=str(exc))
 
@@ -302,7 +306,7 @@ class XssAgent(VulnAgent):
             if iteration < len(seed_payloads) - 1:
                 continue
 
-            verdict = detect_block(resp.status_code, body_text)
+            verdict = detect_block(resp.status_code, body_text, baseline_len=baseline_body_len)
             if verdict.is_block:
                 block_seen = True
                 self.observe("waf_block", payload=payload, signal=verdict.signal)

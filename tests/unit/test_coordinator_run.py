@@ -438,12 +438,16 @@ class TestAdaptiveBudget:
         host_intel.confirmed_vulns = {}
         assert Coordinator._adaptive_budget(_target(), host_intel) == 180.0
 
-    def test_all_types_ineffective_gets_45s(self):
+    def test_all_types_ineffective_deprioritized_but_not_starved(self):
+        # Host-level "ineffective" is a mild deprioritization (below the 150s
+        # normal ceiling), NOT a starve: the one endpoint actually vulnerable to a
+        # blind/time-based type inherits the host penalty, so 45s used to time out
+        # a real command injection before its SLEEP probes could confirm.
         host_intel = MagicMock()
         host_intel.effective_attack_types = set()
         host_intel.ineffective_attack_types = {"sqli"}
         host_intel.confirmed_vulns = {}
-        assert Coordinator._adaptive_budget(_target(), host_intel) == 45.0
+        assert Coordinator._adaptive_budget(_target(), host_intel) == 120.0
 
     def test_many_params_scales_and_caps_at_180s(self):
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(30)]

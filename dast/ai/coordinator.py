@@ -553,10 +553,22 @@ class Coordinator:
         if confirmed_vulns:
             return 180.0
 
-        # All known attack types are ineffective — don't spend much time
+        # Host-level learning says the attack types tried so far were ineffective
+        # ON OTHER ENDPOINTS of this host. Deprioritize, but do NOT starve: a type
+        # is marked ineffective for the whole host as soon as it finds nothing on
+        # any one endpoint, yet the ONE endpoint that IS vulnerable to that type
+        # then inherits the penalty. This bites blind/time-based classes hardest —
+        # they emit no signal anywhere except their own vulnerable endpoint, so
+        # they are always "ineffective" host-wide, and the old 45s starved the
+        # exact scan that needed the most time (several ~5s SLEEP probes, run late
+        # after planning, under concurrent-scan contention). Observed on DVWA
+        # /exec/: cmdi marked ineffective from earlier endpoints, /exec/ capped at
+        # 45s, the agent started ~30s in and timed out before confirming a real
+        # command injection. Keep it below the normal 150s ceiling as a mild
+        # deprioritization, but high enough for a contended time-based sweep.
         all_types_ineffective = ineffective and not effective
         if all_types_ineffective:
-            return 45.0
+            return 120.0
 
         # Scale with param count, capped
         if num_params > 10:

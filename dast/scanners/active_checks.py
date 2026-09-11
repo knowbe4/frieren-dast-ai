@@ -357,17 +357,39 @@ async def _record_success(hostname: str) -> None:
 # wasting the whole scan budget. We track consecutive connection failures per host
 # and, once the threshold is hit, short-circuit all further probes to that host.
 _HOST_FAILURE_STATE: Dict[str, int] = {}   # hostname -> consecutive connection-failure count
-_HOST_DEAD: set = set()                     # hostnames confirmed unreachable this session
+_HOST_DEAD: set = set()                     # hostnames confirmed unreachable (breaker open)
+_HOST_DEAD_AT: Dict[str, float] = {}        # hostname -> monotonic time the breaker tripped
 _HOST_FAILURE_LOCK = asyncio.Lock()
 
 # Consecutive connection failures before a host is declared unreachable. Small
 # enough to stop the flood fast, large enough to tolerate a transient blip.
 _HOST_DEAD_THRESHOLD = 5
 
+# Once tripped, a host is retried after this cooldown rather than staying dead
+# for the whole session. A transient overload (a burst of proxy 502s, a briefly
+# saturated local target) must not silently disable active scanning of a host
+# that has since recovered — the earlier permanent breaker was a sticky
+# false-negative source. If the host is still down, the next few probes re-trip
+# the breaker at negligible cost.
+_HOST_DEAD_COOLDOWN_SECONDS = 120.0
+
 
 def is_host_dead(hostname: str) -> bool:
-    """True if this host was declared unreachable this session (breaker open)."""
-    return hostname in _HOST_DEAD
+    """True if this host's breaker is currently open.
+
+    The breaker self-heals: once the cooldown since it tripped has elapsed, the
+    host is given another chance (state cleared) and probing resumes.
+    """
+    if hostname not in _HOST_DEAD:
+        return False
+    tripped_at = _HOST_DEAD_AT.get(hostname)
+    if tripped_at is not None and (time.monotonic() - tripped_at) >= _HOST_DEAD_COOLDOWN_SECONDS:
+        _HOST_DEAD.discard(hostname)
+        _HOST_DEAD_AT.pop(hostname, None)
+        _HOST_FAILURE_STATE.pop(hostname, None)
+        logger.info("Host breaker cooldown elapsed — re-enabling probes", host=hostname)
+        return False
+    return True
 
 
 async def _record_connection_failure(hostname: str) -> bool:
@@ -382,9 +404,11 @@ async def _record_connection_failure(hostname: str) -> bool:
         _HOST_FAILURE_STATE[hostname] = count
         if count >= _HOST_DEAD_THRESHOLD:
             _HOST_DEAD.add(hostname)
+            _HOST_DEAD_AT[hostname] = time.monotonic()
             logger.warning(
                 "Host unreachable — circuit breaker open, skipping further probes",
                 host=hostname, consecutive_failures=count,
+                cooldown_s=_HOST_DEAD_COOLDOWN_SECONDS,
             )
             return True
     return False
@@ -401,6 +425,7 @@ def reset_host_reachability() -> None:
     """Clear all reachability state — call at the start of a fresh scan session."""
     _HOST_FAILURE_STATE.clear()
     _HOST_DEAD.clear()
+    _HOST_DEAD_AT.clear()
 
 
 # Statuses the MITM proxy returns when it cannot reach the upstream host —
@@ -479,11 +504,25 @@ async def _send(
             # reachable — reset the connection-failure counter.
             await _record_host_reachable(hostname)
             return resp
-        except Exception as e:
-            # Connection-level failure (DNS, refused, timeout). Count it toward
-            # the breaker so a dead host stops the scan instead of spinning.
-            logger.debug("Active check request failed", url=url, error=str(e))
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as e:
+            # True connection-level failure: DNS failure, connection refused,
+            # connect timeout, or the MITM proxy could not reach upstream. The
+            # host is unreachable — count it toward the breaker so a dead host
+            # stops the scan instead of spinning.
+            logger.debug("Active check connection failed", url=url, error=str(e))
             await _record_connection_failure(hostname)
+            return None
+        except Exception as e:
+            # The connection was established but the exchange did not complete
+            # (read/pool/write timeout, protocol error, socket read error). A
+            # read timeout in particular is EXPECTED for time-based blind probes
+            # (SLEEP/WAITFOR payloads) and proves the host is reachable — it must
+            # NOT trip the breaker, or a slow endpoint would silently disable all
+            # further active scanning of a perfectly live host. Treat it as a
+            # reachable-but-slow response: reset the failure counter, drop this
+            # probe's result.
+            logger.debug("Active check request failed (host still reachable)", url=url, error=str(e))
+            await _record_host_reachable(hostname)
             return None
 
 

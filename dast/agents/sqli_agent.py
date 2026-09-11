@@ -9,7 +9,6 @@ targeting the specific WAF or filter observed in the response.
 from __future__ import annotations
 
 import re
-import time
 from typing import TYPE_CHECKING, List, Optional
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
@@ -17,7 +16,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -343,11 +342,12 @@ class SqliAgent(VulnAgent):
         param: dict,
         payload: str,
     ):
-        """Send one probe and return (elapsed_ms, response). Used by the time-based
-        detector to measure a probe against a control sampled under the same load."""
-        t0 = time.monotonic()
+        """Send one probe and return (server_elapsed_ms, response). Uses httpx's
+        `.elapsed` (server round-trip only) rather than wall-clock, so time spent
+        waiting to acquire the shared probe semaphore under concurrent load does not
+        pollute the measurement — see active_checks.response_elapsed_ms."""
         resp = await self._send_probe(target, client, param, payload)
-        return (time.monotonic() - t0) * 1000, resp
+        return response_elapsed_ms(resp), resp
 
     async def _send_probe(
         self,

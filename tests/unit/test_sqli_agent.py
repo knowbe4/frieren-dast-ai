@@ -8,6 +8,7 @@ and never touch the LLM gateway.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
@@ -31,6 +32,10 @@ def _resp(status=200, text="", elapsed=None):
     m = MagicMock()
     m.status_code = status
     m.text = text
+    # Time-based detection reads server round-trip via resp.elapsed.total_seconds()
+    # (see active_checks.response_elapsed_ms), not wall-clock. Model it as a real
+    # timedelta so a slow SLEEP response can be simulated deterministically.
+    m.elapsed = timedelta(seconds=elapsed if elapsed is not None else 0.0)
     return m
 
 
@@ -185,25 +190,23 @@ async def test_clean_response_no_finding():
 
 
 # ── time-based blind ────────────────────────────────────────────────────────
-# Real (small) delays are used instead of mocking time.monotonic, since the
-# exact call count to monotonic() is an implementation detail we shouldn't
-# have to track — a fast baseline vs. an artificially slow probe response is
-# enough to exercise the "must be slower than baseline, not just over an
-# absolute threshold" logic with a tiny, fast-running threshold.
+# Detection compares each SLEEP probe against an adjacent CLEAN control using the
+# server round-trip (resp.elapsed), not wall-clock — so contention while waiting
+# for the probe semaphore cannot mask the signal. Simulate by giving SLEEP
+# responses a large .elapsed and control responses a small one.
 
 @pytest.mark.asyncio
 async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_threshold():
-    import asyncio
     target = _target()
 
     async def fake_send(client, method, url, headers, body):
         if "SLEEP" in unquote(url) or "WAITFOR" in unquote(url) or "pg_sleep" in unquote(url):
-            await asyncio.sleep(0.08)
-        return _resp(200, "ok")
+            return _resp(200, "ok", elapsed=5.0)   # SLEEP executed server-side
+        return _resp(200, "ok", elapsed=0.05)      # clean adjacent control
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
         finding = await SqliAgent()._probe_time_based(
-            target, MagicMock(), target.params[0], threshold_ms=50,
+            target, MagicMock(), target.params[0], threshold_ms=4500,
         )
 
     assert finding is not None
@@ -216,7 +219,9 @@ async def test_time_based_blind_not_detected_within_baseline():
     target = _target()
 
     async def fake_send(client, method, url, headers, body):
-        return _resp(200, "ok")
+        # Every request is uniformly slow (loaded endpoint), but the SLEEP adds
+        # nothing over the control — the delta stays below threshold, no finding.
+        return _resp(200, "ok", elapsed=3.0)
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
         finding = await SqliAgent()._probe_time_based(

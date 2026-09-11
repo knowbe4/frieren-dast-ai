@@ -526,6 +526,27 @@ async def _send(
             return None
 
 
+def response_elapsed_ms(resp: "Optional[httpx.Response]") -> float:
+    """Server round-trip time of a response in milliseconds.
+
+    httpx measures `.elapsed` from the moment the request is written to when the
+    response is fully read — entirely inside the `_PROBE_SEM` critical section and
+    after the per-host probe delay. It therefore excludes the time an agent spent
+    waiting to ACQUIRE the (small, 3-slot) probe semaphore, which under concurrent
+    multi-agent load can dominate wall-clock timing and swamp the ~5s signal a
+    time-based blind probe is trying to measure. Time-based detectors must compare
+    this, not wall-clock, so a SLEEP that executed server-side is not masked by
+    queue contention. Returns 0.0 when no response (timeout/connection failure) or
+    when `.elapsed` is not yet populated.
+    """
+    if resp is None:
+        return 0.0
+    try:
+        return resp.elapsed.total_seconds() * 1000
+    except (RuntimeError, AttributeError):
+        return 0.0
+
+
 def get_rate_limit_state() -> Dict[str, float]:
     """Return current rate limit multipliers per host — for dashboard display."""
     return dict(_RATE_LIMIT_STATE)

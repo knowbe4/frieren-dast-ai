@@ -6,7 +6,7 @@ dast.agents.cmdi_agent._send.
 
 from __future__ import annotations
 
-import asyncio
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,10 +25,14 @@ def _target(url="https://example.com/ping?host=example.com", method="GET", param
     )
 
 
-def _resp(status=200, text=""):
+def _resp(status=200, text="", elapsed=0.0):
     m = MagicMock()
     m.status_code = status
     m.text = text
+    # Time-based detection reads server round-trip via resp.elapsed.total_seconds()
+    # (active_checks.response_elapsed_ms), not wall-clock. Model it as a real
+    # timedelta so a slow SLEEP response is simulated deterministically.
+    m.elapsed = timedelta(seconds=elapsed)
     return m
 
 
@@ -73,16 +77,15 @@ async def test_shell_error_disclosure_detected():
 # ── positive: time-based blind ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_time_based_blind_detected(monkeypatch):
+async def test_time_based_blind_detected():
     target = _target()
-    # Force a small threshold and sleep duration so the test runs fast while
-    # still exercising the "slower than baseline" comparison.
-    monkeypatch.setattr("dast.agents.cmdi_agent._TIME_THRESHOLD_S", 0.05)
 
     async def fake_send(client, method, url, headers, body, payload=None):
+        # The `sleep` payload adds server-side delay over the adjacent control;
+        # detection compares resp.elapsed (server round-trip), not wall-clock.
         if payload and "sleep" in payload:
-            await asyncio.sleep(0.08)
-        return _resp(200, "ping ok")
+            return _resp(200, "ping ok", elapsed=4.5)
+        return _resp(200, "ping ok", elapsed=0.05)
 
     with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
         findings = await CmdiAgent().run(target, MagicMock())

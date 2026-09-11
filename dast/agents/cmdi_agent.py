@@ -13,14 +13,13 @@ Safety: max 5s delay, detection only (id/whoami), no destructive commands.
 from __future__ import annotations
 
 import re
-import time
 from typing import TYPE_CHECKING, List, Optional
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
+from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -77,10 +76,11 @@ class CmdiAgent(VulnAgent):
 
         logger.info("cmdi: testing %d param(s) on %s", len(params), target.url)
 
-        # Measure baseline response time
-        t0 = time.time()
+        # Baseline response captured for content diffing in the output phases. The
+        # time-based phase does NOT rely on this single baseline for timing — it
+        # pairs each SLEEP probe with an adjacent control instead (see
+        # _probe_time_based), which is robust to ambient-load drift.
         baseline = await _send(client, target.method, target.url, target.headers, target.body)
-        baseline_time = time.time() - t0
         if not baseline:
             return []
         baseline_body = baseline.text[:4000]
@@ -131,7 +131,7 @@ class CmdiAgent(VulnAgent):
             if not param_name:
                 continue
             finding = await self._probe_time_based(
-                target, client, param_name, unix_blind[:4], baseline_time
+                target, client, param_name, unix_blind[:4]
             )
             if finding:
                 return [finding]
@@ -269,11 +269,14 @@ class CmdiAgent(VulnAgent):
         param_name: str,
         value: str,
     ) -> tuple[float, Optional["httpx.Response"]]:
-        """Inject `value` into `param_name` and return (elapsed_seconds, response)."""
+        """Inject `value` into `param_name` and return (server_elapsed_s, response).
+
+        Uses httpx's `.elapsed` (server round-trip only) rather than wall-clock, so
+        time waiting to acquire the shared probe semaphore under concurrent load
+        does not pollute timing — see active_checks.response_elapsed_ms."""
         url = _inject_query(target.url, param_name, value)
-        t0 = time.time()
         resp = await _send(client, target.method, url, target.headers, target.body, payload=value)
-        return time.time() - t0, resp
+        return response_elapsed_ms(resp) / 1000.0, resp
 
     async def _probe_time_based(
         self,
@@ -281,7 +284,6 @@ class CmdiAgent(VulnAgent):
         client: "httpx.AsyncClient",
         param_name: str,
         payloads: List[str],
-        baseline_time: float,
     ) -> Optional[AgentFinding]:
         """Phase 2: time-based blind — inject `sleep N` variants and confirm the
         response is >threshold slower than an ADJACENT control. The expensive phase

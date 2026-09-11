@@ -204,16 +204,44 @@ def get_active_model() -> str:
     return _active_model_id or settings.ai_model_id
 
 
+def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
+    """Return ``tier_model_id`` only if it is valid for the active provider.
+
+    The tiered model IDs (fast/validation) default to Bedrock ARNs (from
+    ``settings.anthropic_default_*_model``) and are applied at startup regardless
+    of provider. When the active provider is NOT Bedrock (gateway/anthropic/
+    openai), a Bedrock ARN is not a model that provider accepts — the gateway
+    rejects it with ``HTTP 400: ... not in your role's availableModels
+    allowlist``, which silently degrades every planner/canary/baseline/red-team
+    call that uses a tier helper. That produces flaky detection (a vuln is found
+    only when the code path happens to use the active model). Guard against it:
+    when a tier holds a Bedrock ARN but the provider is non-Bedrock, ignore it and
+    fall back to the active model (a provider-appropriate name).
+    """
+    if not tier_model_id:
+        return ""
+    provider = get_active_provider()
+    if provider != "bedrock" and tier_model_id.startswith("arn:aws:"):
+        logger.warning(
+            "Ignoring Bedrock ARN configured for tier under non-Bedrock provider",
+            tier=tier_name, provider=provider,
+        )
+        return ""
+    return tier_model_id
+
+
 def get_fast_model() -> str:
     """Return the model to use for fast, low-stakes decisions (planning, baseline).
-    Falls back to active model if no fast model configured."""
-    return _fast_model_id or get_active_model()
+    Falls back to active model if no fast model configured (or the configured one
+    is not valid for the active provider)."""
+    return _usable_tier_model(_fast_model_id, "fast") or get_active_model()
 
 
 def get_validation_model() -> str:
     """Return the model to use for high-stakes validation (red-team exploit proof).
-    Falls back to active model if no validation model configured."""
-    return _validation_model_id or get_active_model()
+    Falls back to active model if no validation model configured (or the configured
+    one is not valid for the active provider)."""
+    return _usable_tier_model(_validation_model_id, "validation") or get_active_model()
 
 
 def get_client():

@@ -562,9 +562,14 @@ class Coordinator:
         if num_params > 10:
             return min(60.0 * ((num_params // 5) + 1), 180.0)
 
-        # Simple GET with few params and no prior intel → quick pass
+        # Simple GET with few params and no prior intel → quicker pass, but still
+        # enough for the selected agents plus LLM validation to actually finish.
+        # 45s was too tight: multi-agent runs (blind/time-based probes + red-team
+        # validation) routinely timed out mid-flight and, before the timeout path
+        # preserved partial results, discarded a genuinely-injectable endpoint as
+        # "safe". 75s lets the common case complete.
         if target.method == "GET" and num_params <= 3 and not effective:
-            return 45.0
+            return 75.0
 
         return 90.0
 
@@ -601,24 +606,33 @@ class Coordinator:
         else:
             effective_budget = budget_seconds
 
+        # Shared collector so findings already CONFIRMED before the deadline
+        # survive a timeout instead of being thrown away. _run_inner extends this
+        # the moment validation finalises the confirmed set; on timeout we return
+        # whatever was confirmed rather than an empty list (which had marked a
+        # genuinely-vulnerable endpoint "safe").
+        collected: List[AgentFinding] = []
         try:
             return await asyncio.wait_for(
                 cls._run_inner(
                     target, client, collaborator, use_llm_planner,
                     model_id, confidence_threshold, session_intelligence,
-                    probe_diff,
+                    probe_diff, collected,
                 ),
                 timeout=effective_budget,
             )
         except asyncio.TimeoutError:
             from dast.proxy.plugin_manager import log_event as _le
+            kept = len(collected)
             _le(
                 "coordinator", "warn",
-                f"Scan budget exceeded ({effective_budget:.0f}s) — partial results discarded",
+                f"Scan budget exceeded ({effective_budget:.0f}s) — "
+                f"kept {kept} confirmed finding(s) validated before the deadline",
                 url=target.url, source="agent",
             )
-            logger.warning("Coordinator scan timed out", url=target.url, budget_s=effective_budget)
-            return []
+            logger.warning("Coordinator scan timed out", url=target.url,
+                           budget_s=effective_budget, kept_findings=kept)
+            return list(collected)
 
     @classmethod
     async def _run_inner(
@@ -631,6 +645,7 @@ class Coordinator:
         confidence_threshold: float = 0.5,
         session_intelligence: Optional[object] = None,
         probe_diff: bool = False,
+        collected: Optional[List[AgentFinding]] = None,
     ) -> List[AgentFinding]:
         from urllib.parse import urlparse as _urlparse
         _parsed_url = _urlparse(target.url)
@@ -939,6 +954,12 @@ class Coordinator:
             if result:
                 confirmed.append(finding)
         confirmed.extend(deterministic)
+
+        # Publish the confirmed set to the shared collector so a later timeout
+        # (during writeback / outcome logging below) still returns these.
+        if collected is not None:
+            collected.clear()
+            collected.extend(confirmed)
 
         # Write back scan results to session intelligence
         if host_intel is not None and session_intelligence is not None:
@@ -1491,11 +1512,22 @@ class Coordinator:
         confidence_threshold: float = 0.5,
     ) -> bool:
         from dast.ai import red_team
-        confirmed, _confidence, _reasoning = await red_team.validate(
+        confirmed, confidence, reasoning = await red_team.validate(
             finding,
             target,
             model_id=model_id,
             confidence_threshold=confidence_threshold,
             app_profile_hint=getattr(target, "app_profile_hint", "") or "",
         )
+        # Log the verdict — especially rejections. Without this, a real finding
+        # the agent raised but the validator dropped ("raw=N confirmed=0") is a
+        # black box, and there is no way to tell a correct FP-rejection from a
+        # false negative. warning on reject (actionable), debug on confirm.
+        if confirmed:
+            logger.debug("Finding confirmed by validator", title=finding.title,
+                         attack_type=finding.attack_type, confidence=confidence)
+        else:
+            logger.warning("Finding rejected by validator", title=finding.title,
+                           attack_type=finding.attack_type, confidence=confidence,
+                           reason=(reasoning or "")[:300])
         return confirmed

@@ -67,3 +67,38 @@ class TestListModels:
         result = bedrock_client.list_models()  # must not raise
         assert result["source"] == "preset"
         assert "network down" in result["error"]
+
+
+_BEDROCK_ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+
+
+class TestTierModelProviderGuard:
+    """A Bedrock ARN configured for a tier must never be sent to a non-Bedrock
+    provider — the gateway rejects ARNs with HTTP 400, silently degrading every
+    tier-helper AI call (flaky detection). It must fall back to the active model."""
+
+    def teardown_method(self):
+        bedrock_client.set_tiered_models("", "")
+        bedrock_client.set_active_model("")
+
+    def test_bedrock_keeps_arn_tiers(self):
+        bedrock_client.set_provider("bedrock")
+        bedrock_client.set_tiered_models(fast=_BEDROCK_ARN, validation=_BEDROCK_ARN)
+        assert bedrock_client.get_fast_model() == _BEDROCK_ARN
+        assert bedrock_client.get_validation_model() == _BEDROCK_ARN
+
+    def test_gateway_drops_arn_tier_falls_back_to_active_model(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        bedrock_client.set_tiered_models(fast=_BEDROCK_ARN, validation=_BEDROCK_ARN)
+        # Both tier helpers must resolve to the gateway model name, not the ARN.
+        assert bedrock_client.get_fast_model() == "claude-sonnet-5"
+        assert bedrock_client.get_validation_model() == "claude-sonnet-5"
+
+    def test_gateway_keeps_provider_appropriate_tier_name(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        bedrock_client.set_tiered_models(fast="claude-haiku-4-5", validation="claude-opus-5")
+        # A real model NAME for the provider is honoured, not overridden.
+        assert bedrock_client.get_fast_model() == "claude-haiku-4-5"
+        assert bedrock_client.get_validation_model() == "claude-opus-5"

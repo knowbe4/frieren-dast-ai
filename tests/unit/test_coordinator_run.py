@@ -114,6 +114,37 @@ async def test_run_completes_within_explicit_budget():
     assert len(_activity_log) == 1
 
 
+@pytest.mark.asyncio
+async def test_run_preserves_findings_confirmed_before_timeout():
+    # Findings validated before the deadline must survive a timeout instead of
+    # being discarded (which had marked genuinely-vulnerable endpoints "safe").
+    kept = _finding(title="SQL Injection", attack_type="_preserve_test")
+
+    class _NoopAgent(VulnAgent):
+        name = "Noop"
+        attack_type = "_preserve_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    async def _fake_inner(target, client, collaborator, use_llm_planner,
+                          model_id, confidence_threshold, session_intelligence,
+                          probe_diff, collected):
+        # Simulate: validation finalised one confirmed finding into the shared
+        # collector, then the run stalls (e.g. slow write-back) and times out.
+        collected.append(kept)
+        await asyncio.sleep(10)
+        return collected
+
+    with _Registry():
+        Coordinator.register(_NoopAgent)
+        with patch.object(Coordinator, "_run_inner", new=_fake_inner):
+            result = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.05)
+
+    assert len(result) == 1
+    assert result[0].title == "SQL Injection"
+
+
 # ── early aborts ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -378,9 +409,12 @@ class TestAdaptiveBudget:
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(30)]
         assert Coordinator._adaptive_budget(_target(params=params), None) == 180.0
 
-    def test_simple_get_no_intel_gets_45s(self):
+    def test_simple_get_no_intel_gets_75s(self):
+        # A simple GET gets a quicker budget than a normal endpoint, but still
+        # enough for the selected agents plus LLM validation to finish (45s was
+        # too tight and timed out mid-scan, discarding real findings).
         target = _target(method="GET", params=[{"name": "q", "location": "query", "value": "x"}])
-        assert Coordinator._adaptive_budget(target, None) == 45.0
+        assert Coordinator._adaptive_budget(target, None) == 75.0
 
     def test_normal_endpoint_gets_90s(self):
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(5)]

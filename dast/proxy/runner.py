@@ -155,7 +155,10 @@ class ProxyRunner:
         # Shared mutable config — dashboard reads/writes this same dict at runtime
         self._engine_config: dict = {
             "workers": workers,
-            "probe_concurrency": 3,
+            # Concurrent probes PER endpoint scan (the global pool is this x workers,
+            # see _scan_worker). 4 gives time-based blind probes enough throughput to
+            # confirm within budget even when several endpoints scan at once.
+            "probe_concurrency": 4,
             "passive_enabled": True,
             "passive_ai": True,
             "active_enabled": True,
@@ -1051,7 +1054,7 @@ class ProxyRunner:
         # and an injectable endpoint is forfeited to timeout (the root cause of flaky
         # blind-SQLi / cmdi detection). Scale the global pool by worker count so each
         # concurrent scan gets its full probe budget instead of fighting for one slot.
-        per_scan_probe_concurrency = max(1, int(self._engine_config.get("probe_concurrency", 3) or 3))
+        per_scan_probe_concurrency = max(1, int(self._engine_config.get("probe_concurrency", 4) or 4))
         global_probe_slots = per_scan_probe_concurrency * self._workers
         _ac._PROBE_SEM = asyncio.Semaphore(global_probe_slots)
         logger.info(

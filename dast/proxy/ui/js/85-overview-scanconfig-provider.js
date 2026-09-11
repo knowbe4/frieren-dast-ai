@@ -206,7 +206,7 @@ async function loadScanConfig() {
     const c = await r.json();
     const s = v => document.getElementById(v);
     if (s('sc-workers'))           s('sc-workers').value           = c.workers            ?? 2;
-    if (s('sc-probe-concurrency')) s('sc-probe-concurrency').value = c.probe_concurrency  ?? 3;
+    if (s('sc-probe-concurrency')) s('sc-probe-concurrency').value = c.probe_concurrency  ?? 4;
     if (s('sc-passive-enabled'))   s('sc-passive-enabled').checked = c.passive_enabled    ?? true;
     if (s('sc-passive-ai'))        s('sc-passive-ai').checked      = c.passive_ai         ?? true;
     if (s('sc-passive-aggressive')) s('sc-passive-aggressive').checked = c.passive_aggressive_rules ?? false;
@@ -249,7 +249,7 @@ async function saveScanConfig() {
   const modelId = currentModelId();
   const body = {
     workers:              parseInt(v('sc-workers', 2))           || 2,
-    probe_concurrency:    parseInt(v('sc-probe-concurrency', 3)) || 3,
+    probe_concurrency:    parseInt(v('sc-probe-concurrency', 4)) || 4,
     passive_enabled:      chk('sc-passive-enabled', true),
     passive_ai:           chk('sc-passive-ai', true),
     passive_aggressive_rules: chk('sc-passive-aggressive', false),

@@ -159,18 +159,31 @@ class SqliAgent(VulnAgent):
                     probe_response=probe_response,
                 )
 
-            if iteration < len(seed) - 1:
-                continue
-
-            # Record WAF/filter signal before calling the mutator. The central
-            # detector catches block pages even on HTTP 200, so a WAF that hides
-            # behind a 200 still surfaces as a bypass opportunity for the mutator.
+            # Record WAF/filter signal on EVERY seed response (not just the last),
+            # so a block on any seed is seen. The central detector catches block
+            # pages even on HTTP 200, so a WAF that hides behind a 200 still
+            # surfaces as a bypass opportunity for the mutator.
             verdict = detect_block(resp.status_code, resp.text)
-            if verdict.is_block:
+            if verdict.is_block and not block_seen:
                 block_seen = True
                 self.observe("waf_block", payload=payload, signal=verdict.signal)
             if verdict.is_rate_limit:
                 self.observe("rate_limit", signal="429 Too Many Requests")
+
+            if iteration < len(seed) - 1:
+                continue
+
+            # The LLM mutator is a WAF-BYPASS tool: it only helps when a defence
+            # actually blocked a payload. If no block was observed, obfuscating a
+            # payload that produced no SQL error will not produce one either —
+            # mutating here just burns the per-endpoint budget and starves the
+            # time-based blind probe that runs next (observed on DVWA sqli_blind:
+            # the error-based mutator grind on 'id' consumed the whole budget and
+            # the SLEEP probes that detect blind injection never ran, so the
+            # endpoint was forfeited to timeout despite being injectable). So only
+            # mutate after a block; otherwise stop and let time-based blind run.
+            if not block_seen:
+                break
 
             mutation = await next_payload(
                 attack_type="sqli",
@@ -251,6 +264,14 @@ class SqliAgent(VulnAgent):
                 )
 
             if resp is not None and iteration >= len(seed) - 1:
+                # Only drive the (very expensive: ~5s/probe) time-based mutator
+                # when a WAF actually blocked the standard SLEEP seeds. With no
+                # block, an obfuscated SLEEP is no more likely to land than the
+                # plain one, and each mutated probe costs another full delay —
+                # grinding here forfeits the endpoint to the per-endpoint budget.
+                verdict = detect_block(resp.status_code, resp.text)
+                if not verdict.is_block:
+                    break
                 mutation = await next_payload(
                     attack_type="sqli",
                     original_payload=payload,

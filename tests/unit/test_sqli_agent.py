@@ -129,6 +129,46 @@ async def test_error_based_short_circuits_after_first_param_confirms():
     assert probed_params == ["id"]
 
 
+# ── error-based mutator must NOT grind without a WAF block ──────────────────
+
+@pytest.mark.asyncio
+async def test_error_based_does_not_mutate_without_block(monkeypatch):
+    """On an endpoint with no WAF block, the error-based phase must exhaust its
+    seed payloads and STOP without ever calling the LLM mutator. The mutator is a
+    WAF-bypass tool; invoking it when nothing was blocked burns the per-endpoint
+    budget and starves the time-based blind probe that follows. Regression for
+    DVWA sqli_blind timing out to "safe": the error-based mutator ground on 'id'
+    (a 404 differential is NOT a block) and the SLEEP probes never ran."""
+    target = _target(params=[{"name": "id", "location": "query", "value": "1"}])
+
+    async def fake_send(client, method, url, headers, body):
+        # Injecting into 'id' returns a 404 (a differential, but NOT a WAF block);
+        # baseline is a clean 200. No SQL error signature anywhere.
+        if "id=1" not in unquote(url):
+            return _resp(404, "Not Found")
+        return _resp(200, '{"ok": true}')
+
+    mutator_calls = {"n": 0}
+    async def counting_next_payload(*a, **k):
+        mutator_calls["n"] += 1
+        return None
+    monkeypatch.setattr("dast.agents.sqli_agent.next_payload", counting_next_payload)
+
+    agent = SqliAgent()
+    # Time-based must still get to run (it is the only detector for blind SQLi).
+    async def fake_time_based(*a, **k):
+        return None
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(agent, "_probe_time_based", side_effect=fake_time_based) as tb:
+        findings = await agent.run(target, MagicMock())
+
+    assert findings == []
+    # The mutator must never have been called — no block was observed.
+    assert mutator_calls["n"] == 0
+    # And control must have reached the time-based blind fallback.
+    assert tb.called
+
+
 # ── negative: clean response ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

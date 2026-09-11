@@ -228,50 +228,87 @@ class SqliAgent(VulnAgent):
         payloads_to_try = prepend_import_payloads(list(seed), param["name"], "sqli", target)
         tried: set = set()
         mutation_iteration = 0
-
-        # Send one baseline request to measure normal response time and capture
-        # the clean request/response pair as evidence. The probe must be at least
-        # threshold_ms SLOWER than baseline — not just exceed threshold_ms absolute —
-        # otherwise a naturally slow endpoint (e.g. 3 s) triggers on a 5 s SLEEP payload.
-        baseline_raw_request = ""
-        baseline_raw_response = ""
-        baseline_elapsed_ms = 0.0
-        try:
-            t_base0 = time.monotonic()
-            baseline_resp = await self._send_probe(target, client, param, param.get("value", "1"))
-            baseline_elapsed_ms = (time.monotonic() - t_base0) * 1000
-            if baseline_resp is not None:
-                baseline_raw_request, baseline_raw_response = _fmt_http_pair(baseline_resp)
-        except Exception:
-            pass
+        clean_value = param.get("value", "1")
 
         for iteration, payload in enumerate(payloads_to_try):
             if payload in tried:
                 continue
             tried.add(payload)
 
-            t0 = time.monotonic()
-            resp = await self._send_probe(target, client, param, payload)
-            elapsed_ms = (time.monotonic() - t0) * 1000
+            # Time-based blind detection compares the SLEEP probe against a control
+            # request measured IMMEDIATELY BEFORE it — not against a single baseline
+            # sampled once at the start. Under the concurrent multi-agent load on a
+            # single endpoint (many agents probing through the same proxy), a plain
+            # localhost request can take several seconds, and that ambient latency
+            # drifts burst to burst. A stale start-baseline of ~5.7s made the
+            # required delay ~10.2s, so a safety-capped 5s SLEEP (which DID execute)
+            # never cleared the bar and a real blind injection was missed. An
+            # adjacent control shares the same ambient load as its probe, so the
+            # delta isolates the injected sleep regardless of absolute contention.
+            control_ms, _ = await self._timed_send(target, client, param, clean_value)
+            probe_ms, resp = await self._timed_send(target, client, param, payload)
 
-            if resp is not None and elapsed_ms >= (baseline_elapsed_ms + threshold_ms):
-                probe_request, probe_response = _fmt_http_pair(resp)
-                return AgentFinding(
-                    title="SQL Injection (Time-Based Blind)",
-                    severity="critical",
-                    cwe="CWE-89",
-                    attack_type="sqli",
-                    evidence=f"Response delayed {elapsed_ms:.0f}ms with 5s SLEEP in '{param['name']}'",
-                    payload=payload,
-                    parameter=param["name"],
-                    url=target.url,
-                    request_method=target.method,
-                    bypass_validation=True,
-                    raw_request=baseline_raw_request,
-                    raw_response=baseline_raw_response,
-                    probe_request=probe_request,
-                    probe_response=probe_response,
+            delta_ms = probe_ms - control_ms
+            # A real SLEEP also has to show up in ABSOLUTE terms (the probe itself
+            # must be at least ~sleep-duration long) so a control that happened to
+            # be anomalously fast cannot manufacture a large delta from noise.
+            candidate = (
+                resp is not None
+                and delta_ms >= threshold_ms
+                and probe_ms >= threshold_ms
+            )
+            logger.debug(
+                "SQLi time-based probe",
+                param=param["name"],
+                payload=payload,
+                control_ms=round(control_ms),
+                probe_ms=round(probe_ms),
+                delta_ms=round(delta_ms),
+                threshold_ms=threshold_ms,
+                resp=None if resp is None else resp.status_code,
+                candidate=candidate,
+            )
+
+            if candidate:
+                # Re-confirm with a second control/probe pair: ambient load spikes
+                # are transient and rarely reproduce, but an injected SLEEP does
+                # every time. Only confirm when the delay holds on the re-test.
+                control2_ms, _ = await self._timed_send(target, client, param, clean_value)
+                probe2_ms, resp2 = await self._timed_send(target, client, param, payload)
+                delta2_ms = probe2_ms - control2_ms
+                confirmed = (
+                    resp2 is not None
+                    and delta2_ms >= threshold_ms
+                    and probe2_ms >= threshold_ms
                 )
+                logger.debug(
+                    "SQLi time-based re-confirm",
+                    param=param["name"], payload=payload,
+                    control_ms=round(control2_ms), probe_ms=round(probe2_ms),
+                    delta_ms=round(delta2_ms), confirmed=confirmed,
+                )
+                if confirmed:
+                    confirm_resp = resp2 if resp2 is not None else resp
+                    probe_request, probe_response = _fmt_http_pair(confirm_resp)
+                    return AgentFinding(
+                        title="SQL Injection (Time-Based Blind)",
+                        severity="critical",
+                        cwe="CWE-89",
+                        attack_type="sqli",
+                        evidence=(
+                            f"Response to '{param['name']}' delayed {delta_ms:.0f}ms then "
+                            f"{delta2_ms:.0f}ms over an adjacent control with a 5s SLEEP payload "
+                            f"(control ~{control_ms:.0f}/{control2_ms:.0f}ms) — the delay reproduced, "
+                            f"confirming server-side execution independent of ambient load"
+                        ),
+                        payload=payload,
+                        parameter=param["name"],
+                        url=target.url,
+                        request_method=target.method,
+                        bypass_validation=True,
+                        probe_request=probe_request,
+                        probe_response=probe_response,
+                    )
 
             if resp is not None and iteration >= len(seed) - 1:
                 # Only drive the (very expensive: ~5s/probe) time-based mutator
@@ -298,6 +335,19 @@ class SqliAgent(VulnAgent):
                 payloads_to_try.append(mutation.payload)
 
         return None
+
+    async def _timed_send(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+        payload: str,
+    ):
+        """Send one probe and return (elapsed_ms, response). Used by the time-based
+        detector to measure a probe against a control sampled under the same load."""
+        t0 = time.monotonic()
+        resp = await self._send_probe(target, client, param, payload)
+        return (time.monotonic() - t0) * 1000, resp
 
     async def _send_probe(
         self,

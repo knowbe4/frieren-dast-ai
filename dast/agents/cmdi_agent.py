@@ -92,158 +92,273 @@ class CmdiAgent(VulnAgent):
         ]
         bypass_payloads = get_payloads("cmdi", "bypass") or []
 
-        for param in params[:5]:
+        probe_params = params[:5]
+
+        # Run the FAST content-based phases (output reflection + WAF-bypass output,
+        # both a handful of quick requests) across EVERY param before the expensive
+        # time-based blind phase (4 x ~5s sleeps per param). The injectable param is
+        # not necessarily first — with header/cookie entrypoints expanded into the
+        # param list, a real one (e.g. DVWA `ip`) can sit behind several
+        # non-injectable ones. If each of those ran its 20s sleep sweep first, the
+        # shared per-endpoint budget would be exhausted before the injectable
+        # param's instant `;id` output check ever ran, forfeiting a confirmable
+        # command injection to timeout (observed on DVWA /exec/: budget spent on
+        # blind sleeps, kept_findings=0). Doing all the cheap output checks first
+        # confirms output-reflected CMDi regardless of param ordering; time-based
+        # blind is the last resort only when nothing reflected.
+        for param in probe_params:
             param_name = param.get("name", "")
             if not param_name:
                 continue
+            finding = await self._probe_output(
+                target, client, param_name, unix_basic[:8], baseline_body
+            )
+            if finding:
+                return [finding]
 
-            # Phase 1: Output-based detection
-            for payload in unix_basic[:8]:
-                payload = str(payload)
-                url = _inject_query(target.url, param_name, payload)
-                resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
-                if not resp:
-                    continue
-                body = resp.text[:4000]
+        for param in probe_params:
+            param_name = param.get("name", "")
+            if not param_name:
+                continue
+            finding = await self._probe_bypass_output(
+                target, client, param_name, bypass_payloads[:12], baseline_body
+            )
+            if finding:
+                return [finding]
 
-                # Skip if payload is just echoed back
-                if payload in body and not _CMDI_OUTPUT_RE.search(body):
-                    continue
-
-                if _CMDI_OUTPUT_RE.search(body):
-                    # Verify it's not in the baseline
-                    if _CMDI_OUTPUT_RE.search(baseline_body):
-                        continue
-                    raw_req, raw_resp = _fmt_http_pair(resp)
-                    log_event("agent", "finding",
-                              f"CMDi output confirmed: {param_name} on {target.url}",
-                              url=target.url, finding="Command Injection", source="agent")
-                    findings.append(AgentFinding(
-                        title="OS Command Injection — Output Reflected",
-                        severity="critical",
-                        cwe="CWE-78",
-                        attack_type="cmdi",
-                        evidence=(
-                            f"Parameter '{param_name}' with payload '{payload}' returned "
-                            f"command output in response: '{_CMDI_OUTPUT_RE.search(body).group(0)}'\n\n"
-                            f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
-                        ),
-                        confirmed=True,
-                        payload=payload,
-                        parameter=param_name,
-                        url=target.url,
-                        request_method=target.method,
-                        bypass_validation=True,
-                        raw_request=raw_req,
-                        raw_response=raw_resp[:2000],
-                    ))
-                    return findings
-
-                # Shell error pattern
-                if _SHELL_ERROR_RE.search(body) and not _SHELL_ERROR_RE.search(baseline_body):
-                    raw_req, raw_resp = _fmt_http_pair(resp)
-                    findings.append(AgentFinding(
-                        title="OS Command Injection — Shell Error Disclosure",
-                        severity="high",
-                        cwe="CWE-78",
-                        attack_type="cmdi",
-                        evidence=(
-                            f"Parameter '{param_name}' with payload '{payload}' triggered "
-                            f"a shell error: '{_SHELL_ERROR_RE.search(body).group(0)}'. "
-                            f"This confirms the parameter is passed to a shell command.\n\n"
-                            f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
-                        ),
-                        confirmed=True,
-                        payload=payload,
-                        parameter=param_name,
-                        url=target.url,
-                        request_method=target.method,
-                        raw_request=raw_req,
-                        raw_response=raw_resp[:2000],
-                    ))
-                    return findings
-
-            # Phase 2: Time-based blind
-            for payload in unix_blind[:4]:
-                payload = str(payload)
-                url = _inject_query(target.url, param_name, payload)
-                t0 = time.time()
-                resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
-                elapsed = time.time() - t0
-                if not resp:
-                    continue
-
-                if elapsed > baseline_time + _TIME_THRESHOLD_S:
-                    raw_req, raw_resp = _fmt_http_pair(resp)
-                    log_event("agent", "finding",
-                              f"CMDi blind: {param_name} delayed {elapsed:.1f}s on {target.url}",
-                              url=target.url, finding="Blind CMDi", source="agent")
-                    findings.append(AgentFinding(
-                        title="OS Command Injection — Time-Based Blind",
-                        severity="critical",
-                        cwe="CWE-78",
-                        attack_type="cmdi",
-                        evidence=(
-                            f"Parameter '{param_name}' with payload '{payload}' caused a "
-                            f"{elapsed:.1f}s delay (baseline: {baseline_time:.1f}s). "
-                            f"The {_SLEEP_DURATION}s sleep was executed server-side.\n\n"
-                            f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
-                        ),
-                        confirmed=True,
-                        payload=payload,
-                        parameter=param_name,
-                        url=target.url,
-                        request_method=target.method,
-                        bypass_validation=True,
-                        raw_request=raw_req,
-                        raw_response=raw_resp[:2000],
-                    ))
-                    return findings
-
-            # Phase 3: WAF bypass — encoding, whitespace (IFS), and separator
-            # variants that still execute `id`, detected via the same output /
-            # shell-error signatures as Phase 1. Runs after the direct probes so
-            # it only fires when a naive payload was filtered.
-            for payload in bypass_payloads[:12]:
-                payload = str(payload)
-                url = _inject_query(target.url, param_name, payload)
-                resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
-                if not resp:
-                    continue
-                body = resp.text[:4000]
-
-                # Skip if payload is just echoed back without executing
-                if payload in body and not _CMDI_OUTPUT_RE.search(body):
-                    continue
-
-                if _CMDI_OUTPUT_RE.search(body) and not _CMDI_OUTPUT_RE.search(baseline_body):
-                    raw_req, raw_resp = _fmt_http_pair(resp)
-                    log_event("agent", "finding",
-                              f"CMDi WAF bypass confirmed: {param_name} on {target.url}",
-                              url=target.url, finding="Command Injection", source="agent")
-                    findings.append(AgentFinding(
-                        title="OS Command Injection — WAF Bypass",
-                        severity="critical",
-                        cwe="CWE-78",
-                        attack_type="cmdi",
-                        evidence=(
-                            f"Parameter '{param_name}' with bypass payload '{payload}' returned "
-                            f"command output after direct payloads were filtered: "
-                            f"'{_CMDI_OUTPUT_RE.search(body).group(0)}'\n\n"
-                            f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
-                        ),
-                        confirmed=True,
-                        payload=payload,
-                        parameter=param_name,
-                        url=target.url,
-                        request_method=target.method,
-                        bypass_validation=True,
-                        raw_request=raw_req,
-                        raw_response=raw_resp[:2000],
-                    ))
-                    return findings
+        for param in probe_params:
+            param_name = param.get("name", "")
+            if not param_name:
+                continue
+            finding = await self._probe_time_based(
+                target, client, param_name, unix_blind[:4], baseline_time
+            )
+            if finding:
+                return [finding]
 
         return findings
+
+    async def _probe_output(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param_name: str,
+        payloads: List[str],
+        baseline_body: str,
+    ) -> Optional[AgentFinding]:
+        """Phase 1: inject `id`/`whoami` variants and look for command output or a
+        shell-error disclosure directly in the response (no delay involved)."""
+        for payload in payloads:
+            payload = str(payload)
+            url = _inject_query(target.url, param_name, payload)
+            resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+            if not resp:
+                continue
+            body = resp.text[:4000]
+
+            # Skip if payload is just echoed back
+            if payload in body and not _CMDI_OUTPUT_RE.search(body):
+                continue
+
+            if _CMDI_OUTPUT_RE.search(body):
+                # Verify it's not in the baseline
+                if _CMDI_OUTPUT_RE.search(baseline_body):
+                    continue
+                raw_req, raw_resp = _fmt_http_pair(resp)
+                log_event("agent", "finding",
+                          f"CMDi output confirmed: {param_name} on {target.url}",
+                          url=target.url, finding="Command Injection", source="agent")
+                return AgentFinding(
+                    title="OS Command Injection — Output Reflected",
+                    severity="critical",
+                    cwe="CWE-78",
+                    attack_type="cmdi",
+                    evidence=(
+                        f"Parameter '{param_name}' with payload '{payload}' returned "
+                        f"command output in response: '{_CMDI_OUTPUT_RE.search(body).group(0)}'\n\n"
+                        f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                    ),
+                    confirmed=True,
+                    payload=payload,
+                    parameter=param_name,
+                    url=target.url,
+                    request_method=target.method,
+                    bypass_validation=True,
+                    raw_request=raw_req,
+                    raw_response=raw_resp[:2000],
+                )
+
+            # Shell error pattern
+            if _SHELL_ERROR_RE.search(body) and not _SHELL_ERROR_RE.search(baseline_body):
+                raw_req, raw_resp = _fmt_http_pair(resp)
+                return AgentFinding(
+                    title="OS Command Injection — Shell Error Disclosure",
+                    severity="high",
+                    cwe="CWE-78",
+                    attack_type="cmdi",
+                    evidence=(
+                        f"Parameter '{param_name}' with payload '{payload}' triggered "
+                        f"a shell error: '{_SHELL_ERROR_RE.search(body).group(0)}'. "
+                        f"This confirms the parameter is passed to a shell command.\n\n"
+                        f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                    ),
+                    confirmed=True,
+                    payload=payload,
+                    parameter=param_name,
+                    url=target.url,
+                    request_method=target.method,
+                    raw_request=raw_req,
+                    raw_response=raw_resp[:2000],
+                )
+        return None
+
+    async def _probe_bypass_output(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param_name: str,
+        payloads: List[str],
+        baseline_body: str,
+    ) -> Optional[AgentFinding]:
+        """Phase 3: encoding / whitespace (IFS) / alternative-separator variants
+        that still execute `id`, detected via the same output signature. Runs after
+        the direct output probes so it only matters when a naive payload was filtered."""
+        for payload in payloads:
+            payload = str(payload)
+            url = _inject_query(target.url, param_name, payload)
+            resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+            if not resp:
+                continue
+            body = resp.text[:4000]
+
+            # Skip if payload is just echoed back without executing
+            if payload in body and not _CMDI_OUTPUT_RE.search(body):
+                continue
+
+            if _CMDI_OUTPUT_RE.search(body) and not _CMDI_OUTPUT_RE.search(baseline_body):
+                raw_req, raw_resp = _fmt_http_pair(resp)
+                log_event("agent", "finding",
+                          f"CMDi WAF bypass confirmed: {param_name} on {target.url}",
+                          url=target.url, finding="Command Injection", source="agent")
+                return AgentFinding(
+                    title="OS Command Injection — WAF Bypass",
+                    severity="critical",
+                    cwe="CWE-78",
+                    attack_type="cmdi",
+                    evidence=(
+                        f"Parameter '{param_name}' with bypass payload '{payload}' returned "
+                        f"command output after direct payloads were filtered: "
+                        f"'{_CMDI_OUTPUT_RE.search(body).group(0)}'\n\n"
+                        f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                    ),
+                    confirmed=True,
+                    payload=payload,
+                    parameter=param_name,
+                    url=target.url,
+                    request_method=target.method,
+                    bypass_validation=True,
+                    raw_request=raw_req,
+                    raw_response=raw_resp[:2000],
+                )
+        return None
+
+    async def _timed_send(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param_name: str,
+        value: str,
+    ) -> tuple[float, Optional["httpx.Response"]]:
+        """Inject `value` into `param_name` and return (elapsed_seconds, response)."""
+        url = _inject_query(target.url, param_name, value)
+        t0 = time.time()
+        resp = await _send(client, target.method, url, target.headers, target.body, payload=value)
+        return time.time() - t0, resp
+
+    async def _probe_time_based(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param_name: str,
+        payloads: List[str],
+        baseline_time: float,
+    ) -> Optional[AgentFinding]:
+        """Phase 2: time-based blind — inject `sleep N` variants and confirm the
+        response is >threshold slower than an ADJACENT control. The expensive phase
+        (each probe costs a full ~5s delay), so it runs last, only when nothing
+        reflected.
+
+        Rather than comparing against the single baseline measured once at scan
+        start, each SLEEP probe is paired with a clean control request sent right
+        before it. Under concurrent multi-agent load on one endpoint, a plain
+        request can itself take several seconds and that ambient latency drifts
+        burst to burst; a stale start baseline then makes the required delay
+        unreachable by a safety-capped sleep, missing a real blind injection. The
+        adjacent control shares the probe's ambient load, so the delta isolates the
+        injected sleep. A second control/probe pair re-confirms: load spikes are
+        transient, an injected sleep reproduces every time."""
+        for payload in payloads:
+            payload = str(payload)
+
+            control_s, _ = await self._timed_send(target, client, param_name, "1")
+            probe_s, resp = await self._timed_send(target, client, param_name, payload)
+            delta_s = probe_s - control_s
+            candidate = (
+                resp is not None
+                and delta_s >= _TIME_THRESHOLD_S
+                and probe_s >= _TIME_THRESHOLD_S
+            )
+            logger.debug(
+                "cmdi time-based probe", param=param_name, payload=payload,
+                control_s=round(control_s, 2), probe_s=round(probe_s, 2),
+                delta_s=round(delta_s, 2), candidate=candidate,
+            )
+            if not candidate:
+                continue
+
+            control2_s, _ = await self._timed_send(target, client, param_name, "1")
+            probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
+            delta2_s = probe2_s - control2_s
+            confirmed = (
+                resp2 is not None
+                and delta2_s >= _TIME_THRESHOLD_S
+                and probe2_s >= _TIME_THRESHOLD_S
+            )
+            logger.debug(
+                "cmdi time-based re-confirm", param=param_name, payload=payload,
+                control_s=round(control2_s, 2), probe_s=round(probe2_s, 2),
+                delta_s=round(delta2_s, 2), confirmed=confirmed,
+            )
+            if not confirmed:
+                continue
+
+            confirm_resp = resp2 if resp2 is not None else resp
+            raw_req, raw_resp = _fmt_http_pair(confirm_resp)
+            log_event("agent", "finding",
+                      f"CMDi blind: {param_name} delayed {delta_s:.1f}s (x2) on {target.url}",
+                      url=target.url, finding="Blind CMDi", source="agent")
+            return AgentFinding(
+                title="OS Command Injection — Time-Based Blind",
+                severity="critical",
+                cwe="CWE-78",
+                attack_type="cmdi",
+                evidence=(
+                    f"Parameter '{param_name}' with payload '{payload}' delayed the response "
+                    f"{delta_s:.1f}s then {delta2_s:.1f}s over an adjacent control "
+                    f"(control ~{control_s:.1f}/{control2_s:.1f}s). The {_SLEEP_DURATION}s sleep "
+                    f"reproduced server-side independent of ambient load.\n\n"
+                    f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                ),
+                confirmed=True,
+                payload=payload,
+                parameter=param_name,
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=raw_req,
+                raw_response=raw_resp[:2000],
+            )
+        return None
 
 
 Coordinator.register(CmdiAgent)

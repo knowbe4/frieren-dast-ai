@@ -192,10 +192,29 @@ class ProxyBench:
         # enqueue hundreds of stale duplicates and never drain within the budget.
         driven_paths = {ep["path"] for ep in self.spec.get("endpoints", [])}
         entries = self._scoped_entries()
-        ids = [
-            str(e["id"]) for e in entries
-            if e.get("path") in driven_paths and str(e.get("id")) not in pre_existing_ids
-        ]
+        # Enqueue at most ONE entry per (method, path). Driving an endpoint — plus
+        # any redirect/retry the proxy captures — can leave several near-identical
+        # entries for the same path in history; scanning all of them re-runs the
+        # full multi-agent pipeline on duplicates of the same target. That does not
+        # measure detection any better, but it multiplies the number of concurrent
+        # scans fighting for the shared probe-concurrency pool, so time-based blind
+        # probes (SLEEP/WAITFOR) starve and genuinely-injectable endpoints time out
+        # non-deterministically (recall swung 40-80% run to run purely on how many
+        # duplicate captures happened to exist). One representative per endpoint
+        # keeps the load deterministic and the benchmark a clean per-endpoint TP/FP
+        # measurement.
+        seen_targets: Set[str] = set()
+        ids: List[str] = []
+        for entry in entries:
+            if entry.get("path") not in driven_paths:
+                continue
+            if str(entry.get("id")) in pre_existing_ids:
+                continue
+            target_key = f"{entry.get('method')} {entry.get('path')}"
+            if target_key in seen_targets:
+                continue
+            seen_targets.add(target_key)
+            ids.append(str(entry["id"]))
         if not ids:
             logger.warning("Bench: no newly intercepted entries matched the driven endpoints")
             return []

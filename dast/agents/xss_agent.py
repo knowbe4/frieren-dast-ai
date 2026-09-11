@@ -202,12 +202,22 @@ class XssAgent(VulnAgent):
                     confirm_url or target.url, self._proxy_port
                 )
 
-                # Extract response snippet around the reflection point
-                match = _REFLECTED_RE.search(body_text)
-                snippet = ""
-                if match:
-                    start = max(0, match.start() - 80)
-                    snippet = body_text[start:match.end() + 80].strip()
+                # Extract the response snippet around the ACTUAL reflection
+                # point. Anchor on where the tagged payload landed — a generic
+                # _REFLECTED_RE match can sit in unrelated page chrome
+                # (header/nav), producing a snippet with no trace of the
+                # payload. This snippet is the validator's only
+                # target-controlled evidence, so it must contain the reflection.
+                reflect_index = body_text.find(tagged)
+                if reflect_index == -1:
+                    # Payload partially transformed — fall back to the marker.
+                    reflect_index = body_text.find(_param_marker(param["name"]))
+                if reflect_index == -1:
+                    match = _REFLECTED_RE.search(body_text)
+                    reflect_index = match.start() if match else 0
+                snippet_start = max(0, reflect_index - 80)
+                snippet_end = min(len(body_text), reflect_index + len(tagged) + 80)
+                snippet = body_text[snippet_start:snippet_end].strip()
 
                 # The probe with payload is the exploit proof.
                 probe_request, probe_response = _fmt_http_pair(resp)
@@ -218,16 +228,21 @@ class XssAgent(VulnAgent):
                     "timeout":    "browser timed out loading the page",
                 }.get(browser_reason, browser_reason)
 
+                # A compact view of the reflected region, so the evidence
+                # string itself carries proof the payload rendered unencoded.
+                reflected_context = " ".join(snippet.split())[:200]
                 if browser_confirmed:
                     evidence = (
                         f"Payload reflected unencoded and JS executed in browser "
-                        f"(status {resp.status_code}) — parameter '{param['name']}'"
+                        f"(status {resp.status_code}) — parameter '{param['name']}'. "
+                        f"Reflected context: {reflected_context}"
                     )
                 else:
                     evidence = (
                         f"Payload reflected unencoded (status {resp.status_code}) — "
                         f"{_reason_label}. "
-                        f"Parameter '{param['name']}' — manual review recommended."
+                        f"Parameter '{param['name']}' — manual review recommended. "
+                        f"Reflected context: {reflected_context}"
                     )
 
                 return AgentFinding(

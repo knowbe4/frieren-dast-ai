@@ -69,21 +69,22 @@ class SqliAgent(VulnAgent):
                     )
 
         # Error-based first, across every parameter — this is the fastest and
-        # most reliable confirmation and completes in a few requests. Time-based
-        # blind probing (5s sleeps per payload, per parameter) is expensive and
-        # can exhaust the per-endpoint scan budget; run it only as a fallback
-        # when error-based confirmed nothing anywhere on the endpoint. A single
-        # confirmed injection already proves the endpoint is vulnerable, so
-        # there is no need to keep the (slow) blind probes running once we have
-        # one — that only risks the whole agent timing out and forfeiting the
-        # finding it already has.
+        # most reliable confirmation and completes in a few requests. A single
+        # confirmed injection already proves the endpoint is vulnerable, so we
+        # RETURN on the first error-based hit and do NOT keep probing the other
+        # parameters. This matters for the whole scan, not just tidiness: probing
+        # a non-injectable parameter exhausts its seed payloads and then drives
+        # the LLM mutator (a slow gateway round-trip per round), which can take
+        # tens of seconds. The coordinator publishes findings per agent as it
+        # RETURNS, under a shared per-endpoint budget; grinding a dead parameter
+        # after we already have a confirmed finding delays the return until the
+        # budget expires and forfeits the finding we already had. (Observed on
+        # DVWA sqli: id confirmed in <1s, but the mutator grind on the
+        # non-injectable Submit param blew the budget -> endpoint marked "safe".)
         for param in target.params:
             finding = await self._probe_error_based(target, client, param, error_re, tech_context)
             if finding:
-                findings.append(finding)
-
-        if findings:
-            return findings
+                return [finding]
 
         # No error-based hit anywhere — fall back to time-based blind probing,
         # returning as soon as any parameter confirms.

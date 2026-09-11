@@ -93,6 +93,42 @@ async def test_error_based_hit_skips_time_based_on_other_params(monkeypatch):
     time_based.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_error_based_short_circuits_after_first_param_confirms():
+    """Once error-based confirms on the first parameter, the agent must RETURN
+    immediately and NOT probe the remaining parameters. Probing a non-injectable
+    param exhausts its seeds and drives the (slow) LLM mutator, delaying the
+    agent's return past the coordinator's per-endpoint budget and forfeiting the
+    finding it already has. Regression for DVWA sqli timing out to "safe" despite
+    an instant error-based hit on the first param."""
+    target = _target(params=[
+        {"name": "id", "location": "query", "value": "1"},
+        {"name": "Submit", "location": "query", "value": "Submit"},
+    ])
+
+    async def fake_send(client, method, url, headers, body):
+        if "id=1'" in unquote(url) or "id='" in unquote(url):
+            return _resp(500, "You have an error in your SQL syntax near ''1'")
+        return _resp(200, '{"ok": true}')
+
+    agent = SqliAgent()
+    probed_params: list = []
+    real_probe = SqliAgent._probe_error_based
+
+    async def counting_error_probe(target, client, param, error_re, tech_context=None):
+        probed_params.append(param["name"])
+        return await real_probe(agent, target, client, param, error_re, tech_context)
+
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(agent, "_probe_error_based", side_effect=counting_error_probe):
+        findings = await agent.run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert findings[0].parameter == "id"
+    # Only the first parameter must have been probed — no grind on 'Submit'.
+    assert probed_params == ["id"]
+
+
 # ── negative: clean response ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

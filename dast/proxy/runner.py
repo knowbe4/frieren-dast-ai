@@ -1041,14 +1041,23 @@ class ProxyRunner:
         qs = self._scan_queue_state
 
         self._scan_sem = asyncio.Semaphore(self._workers)
-        # Align the global probe-concurrency semaphore with the configured value at
-        # startup (it otherwise keeps the module default until the user touches the
-        # UI). More workers with a tiny probe budget yields little real throughput,
-        # so scale the probe ceiling with worker count as a sensible floor.
-        probe_concurrency = int(self._engine_config.get("probe_concurrency", 3) or 3)
-        probe_concurrency = max(probe_concurrency, self._workers)
-        _ac._PROBE_SEM = asyncio.Semaphore(probe_concurrency)
-        logger.info("Scan worker started", workers=self._workers, probe_concurrency=probe_concurrency)
+        # `probe_concurrency` is the concurrent-probe budget PER endpoint scan, but
+        # the probe semaphore is GLOBAL across all endpoints scanning at once. Sizing
+        # it as a flat global cap (previously max(pc, workers)) collapses to roughly
+        # one probe slot per worker: a single slow probe — a 5s time-based SLEEP for
+        # blind SQLi or command injection — then monopolises a worker's only slot and
+        # starves every other probe on that endpoint. Under N concurrent workers the
+        # endpoint never finishes its time-based probes within the per-endpoint budget
+        # and an injectable endpoint is forfeited to timeout (the root cause of flaky
+        # blind-SQLi / cmdi detection). Scale the global pool by worker count so each
+        # concurrent scan gets its full probe budget instead of fighting for one slot.
+        per_scan_probe_concurrency = max(1, int(self._engine_config.get("probe_concurrency", 3) or 3))
+        global_probe_slots = per_scan_probe_concurrency * self._workers
+        _ac._PROBE_SEM = asyncio.Semaphore(global_probe_slots)
+        logger.info(
+            "Scan worker started", workers=self._workers,
+            probe_concurrency=per_scan_probe_concurrency, global_probe_slots=global_probe_slots,
+        )
         proxy_url = f"http://127.0.0.1:{self._proxy_port}"
         # Dedup: track (method, host, normalised-path, operation) tuples completed this session
         _scanned_keys: set = set()

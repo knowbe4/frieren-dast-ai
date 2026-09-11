@@ -436,6 +436,24 @@ _PROXY_UNREACHABLE_STATUSES = frozenset({502, 504})
 # Global semaphore — at most 3 concurrent outgoing probe requests across all agents
 _PROBE_SEM = asyncio.Semaphore(3)
 
+# Global lock serializing time-based blind probes (SLEEP/WAITFOR) across ALL
+# agents and endpoints. A single sleeping request holds an application worker for
+# the whole sleep duration, and most app servers (DVWA/PHP, gunicorn, php-fpm)
+# have a small worker pool — so concurrent sleep probes queue every OTHER request
+# (including the clean "control" a detector measures right before its probe)
+# behind them at the server, inflating the control to ~sleep-duration and
+# collapsing the control-vs-probe delta the detector depends on. Serializing sleep
+# probes keeps at most one sleep in flight, so the adjacent control sees a quiet
+# server and the differential isolates the injected sleep. Fast content-based
+# probes are unaffected — they never take this lock.
+_TIME_PROBE_LOCK = asyncio.Lock()
+
+
+def time_probe_lock() -> "asyncio.Lock":
+    """Global lock that time-based blind detectors hold around a control/probe
+    measurement so no other agent's SLEEP saturates the server mid-measurement."""
+    return _TIME_PROBE_LOCK
+
 
 async def _send(
     client: httpx.AsyncClient,

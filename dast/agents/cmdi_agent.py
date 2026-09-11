@@ -19,7 +19,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms
+from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms, time_probe_lock
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -302,8 +302,11 @@ class CmdiAgent(VulnAgent):
         for payload in payloads:
             payload = str(payload)
 
-            control_s, _ = await self._timed_send(target, client, param_name, "1")
-            probe_s, resp = await self._timed_send(target, client, param_name, payload)
+            # Hold the global time-probe lock across the measurement so no other
+            # agent's SLEEP saturates the server between control and probe.
+            async with time_probe_lock():
+                control_s, _ = await self._timed_send(target, client, param_name, "1")
+                probe_s, resp = await self._timed_send(target, client, param_name, payload)
             delta_s = probe_s - control_s
             candidate = (
                 resp is not None
@@ -318,8 +321,9 @@ class CmdiAgent(VulnAgent):
             if not candidate:
                 continue
 
-            control2_s, _ = await self._timed_send(target, client, param_name, "1")
-            probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
+            async with time_probe_lock():
+                control2_s, _ = await self._timed_send(target, client, param_name, "1")
+                probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
             delta2_s = probe2_s - control2_s
             confirmed = (
                 resp2 is not None

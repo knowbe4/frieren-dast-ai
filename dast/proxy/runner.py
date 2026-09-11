@@ -1056,7 +1056,7 @@ class ProxyRunner:
         # concurrent scan gets its full probe budget instead of fighting for one slot.
         per_scan_probe_concurrency = max(1, int(self._engine_config.get("probe_concurrency", 4) or 4))
         global_probe_slots = per_scan_probe_concurrency * self._workers
-        _ac._PROBE_SEM = asyncio.Semaphore(global_probe_slots)
+        _ac.set_probe_concurrency(global_probe_slots)
         logger.info(
             "Scan worker started", workers=self._workers,
             probe_concurrency=per_scan_probe_concurrency, global_probe_slots=global_probe_slots,

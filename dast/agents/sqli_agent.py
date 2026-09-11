@@ -16,7 +16,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, time_probe_lock
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, quiesce_for_time_probe
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -246,7 +246,7 @@ class SqliAgent(VulnAgent):
             # delta isolates the injected sleep regardless of absolute contention.
             # Hold the global time-probe lock across the whole measurement so no
             # other agent's SLEEP saturates the server between control and probe.
-            async with time_probe_lock():
+            async with quiesce_for_time_probe():
                 control_ms, _ = await self._timed_send(target, client, param, clean_value)
                 probe_ms, resp = await self._timed_send(target, client, param, payload)
 
@@ -275,7 +275,7 @@ class SqliAgent(VulnAgent):
                 # Re-confirm with a second control/probe pair: ambient load spikes
                 # are transient and rarely reproduce, but an injected SLEEP does
                 # every time. Only confirm when the delay holds on the re-test.
-                async with time_probe_lock():
+                async with quiesce_for_time_probe():
                     control2_ms, _ = await self._timed_send(target, client, param, clean_value)
                     probe2_ms, resp2 = await self._timed_send(target, client, param, payload)
                 delta2_ms = probe2_ms - control2_ms

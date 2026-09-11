@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -434,25 +435,56 @@ _PROXY_UNREACHABLE_STATUSES = frozenset({502, 504})
 
 
 # Global semaphore — at most 3 concurrent outgoing probe requests across all agents
+# (resized at scan start to probe_concurrency * workers by the runner). _PROBE_SEM_SIZE
+# mirrors its capacity so a time-based probe can drain all-but-one slot to quiesce the
+# target during a timing measurement.
 _PROBE_SEM = asyncio.Semaphore(3)
+_PROBE_SEM_SIZE = 3
 
-# Global lock serializing time-based blind probes (SLEEP/WAITFOR) across ALL
-# agents and endpoints. A single sleeping request holds an application worker for
-# the whole sleep duration, and most app servers (DVWA/PHP, gunicorn, php-fpm)
-# have a small worker pool — so concurrent sleep probes queue every OTHER request
-# (including the clean "control" a detector measures right before its probe)
-# behind them at the server, inflating the control to ~sleep-duration and
-# collapsing the control-vs-probe delta the detector depends on. Serializing sleep
-# probes keeps at most one sleep in flight, so the adjacent control sees a quiet
-# server and the differential isolates the injected sleep. Fast content-based
-# probes are unaffected — they never take this lock.
+
+def set_probe_concurrency(total_slots: int) -> None:
+    """Resize the global probe semaphore and record its capacity. Called by the
+    runner when a scan starts so quiesce_for_time_probe knows how many slots to
+    drain."""
+    global _PROBE_SEM, _PROBE_SEM_SIZE
+    _PROBE_SEM = asyncio.Semaphore(total_slots)
+    _PROBE_SEM_SIZE = total_slots
+
+# Global lock serializing time-based blind probes across ALL agents/endpoints.
 _TIME_PROBE_LOCK = asyncio.Lock()
 
 
-def time_probe_lock() -> "asyncio.Lock":
-    """Global lock that time-based blind detectors hold around a control/probe
-    measurement so no other agent's SLEEP saturates the server mid-measurement."""
-    return _TIME_PROBE_LOCK
+@asynccontextmanager
+async def quiesce_for_time_probe():
+    """Quiesce the whole scan's outbound probe traffic for a time-based blind
+    measurement, then restore it.
+
+    Differential timing (probe vs. adjacent control) only works if the control
+    measures the target's true idle latency. But the scan runs up to
+    probe_concurrency * workers concurrent probes (16 by default), and a target
+    with a small worker pool (DVWA/PHP, php-fpm, a single-worker dev server)
+    serializes them — so ANY concurrent probe traffic, not just other SLEEPs,
+    queues the control behind it and inflates it to seconds. Observed: an isolated
+    request through the proxy is ~0.2s, but mid-scan the clean control measured
+    5-11s, as slow as (or slower than) the SLEEP probe, collapsing the delta.
+
+    While held, this drains all-but-one probe-semaphore slot so no other outbound
+    probe runs during the measurement (the caller's own _send takes the last
+    slot), and serializes on _TIME_PROBE_LOCK so only one measurement quiesces at
+    a time. Fast content-based probes never enter here, so only the rare, last-
+    resort time-based phase pays this cost.
+    """
+    async with _TIME_PROBE_LOCK:
+        held = 0
+        slots_to_drain = max(0, _PROBE_SEM_SIZE - 1)
+        try:
+            for _ in range(slots_to_drain):
+                await _PROBE_SEM.acquire()
+                held += 1
+            yield
+        finally:
+            for _ in range(held):
+                _PROBE_SEM.release()
 
 
 async def _send(

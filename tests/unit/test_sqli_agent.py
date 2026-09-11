@@ -62,6 +62,37 @@ async def test_error_based_detection():
     assert "SQL error" in findings[0].evidence
 
 
+# ── an error-based hit skips slow time-based probing of other params ────────
+
+@pytest.mark.asyncio
+async def test_error_based_hit_skips_time_based_on_other_params(monkeypatch):
+    """Once error-based confirms injection on any parameter, the (slow) blind
+    time-based probes must not run — a single confirmed injection proves the
+    endpoint vulnerable, and leaving time-based sleeps running risks blowing the
+    per-endpoint budget and forfeiting the finding already in hand. Regression
+    for DVWA sqli timing out (kept_findings=0) despite an instant error-based
+    hit on 'id'."""
+    target = _target(params=[
+        {"name": "id", "location": "query", "value": "1"},
+        {"name": "Submit", "location": "query", "value": "Submit"},
+    ])
+
+    async def fake_send(client, method, url, headers, body):
+        # 'id' injection triggers a SQL error; everything else is clean.
+        if "id=1'" in unquote(url) or "id='" in unquote(url):
+            return _resp(500, "You have an error in your SQL syntax near ''1'")
+        return _resp(200, '{"ok": true}')
+
+    time_based = MagicMock()
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(SqliAgent, "_probe_time_based", new=time_based):
+        findings = await SqliAgent().run(target, MagicMock())
+
+    assert len(findings) >= 1
+    assert all(f.attack_type == "sqli" for f in findings)
+    time_based.assert_not_called()
+
+
 # ── negative: clean response ────────────────────────────────────────────────
 
 @pytest.mark.asyncio

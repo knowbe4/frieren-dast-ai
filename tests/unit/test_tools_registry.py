@@ -69,7 +69,17 @@ async def test_run_tool_never_raises_on_handler_error(monkeypatch):
 # ── send_request scope + safety ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_send_request_out_of_scope_blocked():
+async def test_send_request_out_of_scope_blocked(monkeypatch):
+    # A store-less (MCP) caller may ask the dashboard operator for an interactive
+    # approval on an out-of-scope target. Stub that out so this test stays
+    # hermetic and deterministic: with no operator approval, out-of-scope must be
+    # a hard block. (Without the stub the test would long-poll a real dashboard if
+    # one happened to be running on 127.0.0.1:8088, making the outcome depend on
+    # the developer's environment.)
+    async def _deny(ctx, url, method):
+        return False
+
+    monkeypatch.setattr("dast.tools.approval.request_approval", _deny)
     ctx = ToolContext(settings=_Scope(allow=False))
     result = await run_tool(ctx, "send_request",
                             {"url": "https://evil.example.com/x"})

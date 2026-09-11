@@ -145,6 +145,46 @@ async def test_run_preserves_findings_confirmed_before_timeout():
     assert result[0].title == "SQL Injection"
 
 
+@pytest.mark.asyncio
+async def test_run_streams_fast_agent_finding_while_slow_agent_blocks():
+    # Each agent's confirmed findings are published as soon as that agent
+    # finishes, so a slow agent (e.g. time-based SQLi) blocking past the budget
+    # must not discard a fast agent's already-confirmed finding. Under the old
+    # batch gather() this returned [] because nothing was published until every
+    # agent completed.
+    fast_finding = _finding(title="Reflected XSS", attack_type="_stream_fast_test")
+
+    class _FastHitAgent(VulnAgent):
+        name = "FastHit"
+        attack_type = "_stream_fast_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return [fast_finding]
+
+    class _SlowAgent(VulnAgent):
+        name = "SlowBlocker"
+        attack_type = "_stream_slow_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            await asyncio.sleep(10)
+            return []
+
+    _activity_log.clear()
+    validate_mock = AsyncMock(return_value=(True, 0.9, "confirmed by LLM"))
+    with _Registry():
+        Coordinator.register(_FastHitAgent)
+        Coordinator.register(_SlowAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(
+                return_value=(["_stream_fast_test", "_stream_slow_test"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.ai.red_team.validate", new=validate_mock):
+            client = MagicMock()
+            result = await Coordinator.run(_target(), client, budget_seconds=0.5)
+
+    assert len(result) == 1
+    assert result[0].title == "Reflected XSS"
+
+
 # ── early aborts ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

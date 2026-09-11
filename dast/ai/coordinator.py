@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
@@ -916,50 +916,65 @@ class Coordinator:
         if host_intel is not None:
             target.host_intel = host_intel
 
-        # Run all selected agents in parallel
-        tasks = [agent.run_safe(target, client, collaborator) for agent in agents]
-        results = await asyncio.gather(*tasks)
+        # Run all selected agents in parallel, but process each agent's results
+        # the moment it finishes rather than awaiting the whole batch. A slow
+        # agent (e.g. time-based SQLi) must not force the faster agents' already
+        # confirmed findings to be discarded when the scan budget expires
+        # mid-run: each agent's findings are validated and published to the
+        # shared collector as soon as that agent completes.
+        async def _run_and_tag(agent: VulnAgent) -> Tuple[VulnAgent, List[AgentFinding]]:
+            result = await agent.run_safe(target, client, collaborator)
+            return agent, (result if isinstance(result, list) else [])
 
         raw_findings: List[AgentFinding] = []
         agent_raw: Dict[str, List[AgentFinding]] = {}  # attack_type → findings
-        for agent, result in zip(agents, results):
-            findings = result if isinstance(result, list) else []
-            agent_raw[agent.attack_type] = findings
-            raw_findings.extend(findings)
-
-        # Validate findings
         confirmed: List[AgentFinding] = []
-        deterministic: List[AgentFinding] = []
-        non_deterministic: List[AgentFinding] = []
 
-        for finding in raw_findings:
-            if finding.bypass_validation:
-                deterministic.append(finding)
-            else:
-                non_deterministic.append(finding)
+        agent_tasks = [asyncio.ensure_future(_run_and_tag(agent)) for agent in agents]
+        try:
+            for completed in asyncio.as_completed(agent_tasks):
+                agent, findings = await completed
+                agent_raw[agent.attack_type] = findings
+                raw_findings.extend(findings)
 
-        # Validate all findings via Red Team.
-        # Deterministic findings (time-based SQLi, LFI match, secrets) bypass LLM validation.
-        # All others go through the 3-stage Red-Team Validator.
-        validate_tasks = [
-            cls._validate(f, target, model_id=model_id, confidence_threshold=confidence_threshold)
-            for f in non_deterministic
-        ]
-        validation_results = await asyncio.gather(*validate_tasks, return_exceptions=True)
-        for finding, result in zip(non_deterministic, validation_results):
-            if isinstance(result, BaseException):
-                logger.warning("Validation error — finding NOT confirmed",
-                               title=finding.title, error=str(result))
-                continue
-            if result:
-                confirmed.append(finding)
-        confirmed.extend(deterministic)
+                # Deterministic findings (time-based SQLi, LFI match, secrets)
+                # bypass LLM validation; all others go through the 3-stage
+                # Red-Team Validator.
+                deterministic = [f for f in findings if f.bypass_validation]
+                non_deterministic = [f for f in findings if not f.bypass_validation]
 
-        # Publish the confirmed set to the shared collector so a later timeout
-        # (during writeback / outcome logging below) still returns these.
-        if collected is not None:
-            collected.clear()
-            collected.extend(confirmed)
+                if non_deterministic:
+                    validation_results = await asyncio.gather(
+                        *(
+                            cls._validate(
+                                finding, target, model_id=model_id,
+                                confidence_threshold=confidence_threshold,
+                            )
+                            for finding in non_deterministic
+                        ),
+                        return_exceptions=True,
+                    )
+                    for finding, result in zip(non_deterministic, validation_results):
+                        if isinstance(result, BaseException):
+                            logger.warning("Validation error — finding NOT confirmed",
+                                           title=finding.title, error=str(result))
+                            continue
+                        if result:
+                            confirmed.append(finding)
+                confirmed.extend(deterministic)
+
+                # Publish the running confirmed set after every agent so a
+                # scan-budget timeout still returns everything confirmed so far.
+                if collected is not None:
+                    collected.clear()
+                    collected.extend(confirmed)
+        finally:
+            # If the scan budget expired (this coroutine was cancelled mid-run),
+            # cancel any agent still in flight so it does not run detached from
+            # the scan. asyncio.gather() used to do this for its children.
+            for task in agent_tasks:
+                if not task.done():
+                    task.cancel()
 
         # Write back scan results to session intelligence
         if host_intel is not None and session_intelligence is not None:

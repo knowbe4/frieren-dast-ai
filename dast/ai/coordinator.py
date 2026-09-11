@@ -564,14 +564,19 @@ class Coordinator:
 
         # Simple GET with few params and no prior intel → quicker pass, but still
         # enough for the selected agents plus LLM validation to actually finish.
-        # 45s was too tight: multi-agent runs (blind/time-based probes + red-team
-        # validation) routinely timed out mid-flight and, before the timeout path
-        # preserved partial results, discarded a genuinely-injectable endpoint as
-        # "safe". 75s lets the common case complete.
+        # This budget is a CEILING, not a floor: an endpoint with nothing to find
+        # returns as soon as its agents finish (a few seconds), so raising it does
+        # not slow clean scans — it only gives more time to endpoints that are slow
+        # to CONFIRM, which are precisely the injectable ones. 45s then 75s were
+        # both too tight: time-based blind SQLi / command injection needs several
+        # ~5s SLEEP probes that run after the deterministic checks and, under the
+        # contention of several endpoints scanning at once, could not complete
+        # before the budget expired — so a genuinely-injectable endpoint was
+        # forfeited to timeout and reported "safe" (observed on DVWA sqli_blind).
         if target.method == "GET" and num_params <= 3 and not effective:
-            return 75.0
+            return 150.0
 
-        return 90.0
+        return 150.0
 
     @classmethod
     async def run(

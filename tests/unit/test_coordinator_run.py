@@ -449,14 +449,16 @@ class TestAdaptiveBudget:
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(30)]
         assert Coordinator._adaptive_budget(_target(params=params), None) == 180.0
 
-    def test_simple_get_no_intel_gets_75s(self):
-        # A simple GET gets a quicker budget than a normal endpoint, but still
-        # enough for the selected agents plus LLM validation to finish (45s was
-        # too tight and timed out mid-scan, discarding real findings).
+    def test_simple_get_no_intel_gets_full_budget(self):
+        # The per-endpoint budget is a CEILING, not a floor: a clean endpoint
+        # returns as soon as its agents finish, so a generous ceiling only helps
+        # endpoints that are slow to CONFIRM (the injectable ones). 45s then 75s
+        # were both too tight for time-based blind probes under load, so a real
+        # injection could be forfeited to timeout.
         target = _target(method="GET", params=[{"name": "q", "location": "query", "value": "x"}])
-        assert Coordinator._adaptive_budget(target, None) == 75.0
+        assert Coordinator._adaptive_budget(target, None) == 150.0
 
-    def test_normal_endpoint_gets_90s(self):
+    def test_normal_endpoint_gets_full_budget(self):
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(5)]
         target = _target(method="POST", params=params)
-        assert Coordinator._adaptive_budget(target, None) == 90.0
+        assert Coordinator._adaptive_budget(target, None) == 150.0

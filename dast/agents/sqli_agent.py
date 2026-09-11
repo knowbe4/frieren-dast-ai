@@ -68,31 +68,32 @@ class SqliAgent(VulnAgent):
                         framework=ts.framework,
                     )
 
-        # Error-based first, across every parameter — this is the fastest and
-        # most reliable confirmation and completes in a few requests. A single
-        # confirmed injection already proves the endpoint is vulnerable, so we
-        # RETURN on the first error-based hit and do NOT keep probing the other
-        # parameters. This matters for the whole scan, not just tidiness: probing
-        # a non-injectable parameter exhausts its seed payloads and then drives
-        # the LLM mutator (a slow gateway round-trip per round), which can take
-        # tens of seconds. The coordinator publishes findings per agent as it
-        # RETURNS, under a shared per-endpoint budget; grinding a dead parameter
-        # after we already have a confirmed finding delays the return until the
-        # budget expires and forfeits the finding we already had. (Observed on
-        # DVWA sqli: id confirmed in <1s, but the mutator grind on the
-        # non-injectable Submit param blew the budget -> endpoint marked "safe".)
+        # Probe each parameter with error-based seeds FIRST (fast, a few requests,
+        # the most reliable confirmation) and, if that misses, time-based blind on
+        # the SAME parameter before moving on — then RETURN on the first hit anywhere.
+        #
+        # Interleaving per parameter (rather than sweeping error-based across ALL
+        # params before ANY time-based probe) is what makes blind SQLi detectable
+        # under load. On a blind endpoint error-based can never hit, so a full
+        # error-based sweep of every parameter burns the shared per-endpoint budget
+        # before time-based — the ONLY detector for blind injection — ever runs. The
+        # injectable parameter is usually first, so giving it its time-based probe
+        # after just its own error seeds (not the whole sweep) lets the SLEEP payload
+        # land within budget. (Observed on DVWA sqli_blind: the error-based seeds on
+        # 'id' then 'Submit' consumed the whole 75s budget and no SLEEP probe ever
+        # ran, so a genuinely-injectable endpoint was forfeited to timeout as "safe".)
+        #
+        # Returning on the first confirmation also avoids grinding a non-injectable
+        # parameter's LLM mutator after we already have a finding, which under the
+        # coordinator's per-agent-on-return publishing would otherwise delay the
+        # return past the budget and forfeit the finding in hand.
         for param in target.params:
             finding = await self._probe_error_based(target, client, param, error_re, tech_context)
             if finding:
                 return [finding]
-
-        # No error-based hit anywhere — fall back to time-based blind probing,
-        # returning as soon as any parameter confirms.
-        for param in target.params:
             finding = await self._probe_time_based(target, client, param, time_threshold, tech_context)
             if finding:
-                findings.append(finding)
-                break
+                return [finding]
 
         return findings
 
@@ -105,10 +106,19 @@ class SqliAgent(VulnAgent):
         tech_context: Optional[str] = None,
     ) -> Optional[AgentFinding]:
         seed = get_filtered_payloads("sqli", target) or (
-            get_payloads("sqli", "error_based") + get_payloads("sqli", "boolean_based")
+            get_payloads("sqli", "error_based")
         )
-        # Remove time-based from error probe — time-based has its own method
+        # Remove time-based from error probe — time-based has its own method.
         seed = [p for p in seed if "SLEEP" not in p and "WAITFOR" not in p and "pg_sleep" not in p]
+        # Remove boolean tautologies (' OR '1'='1, 1 AND 1=1, ...). They are VALID
+        # SQL that returns rows rather than raising an error, so they can never
+        # match an error signature — sending them through the error-signature probe
+        # is wasted budget that (under load) starves the time-based blind probe of
+        # the per-endpoint budget it needs to confirm blind injection. Boolean-based
+        # detection would need its own differential-response oracle, which this probe
+        # is not; until then these payloads add cost with zero error-based signal.
+        boolean_payloads = set(get_payloads("sqli", "boolean_based"))
+        seed = [p for p in seed if p not in boolean_payloads]
         payloads_to_try = prepend_import_payloads(list(seed), param["name"], "sqli", target)
         tried: set = set()
         mutation_iteration = 0

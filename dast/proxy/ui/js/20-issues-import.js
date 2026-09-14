@@ -434,32 +434,6 @@ function importFileSelected(input) {
   reader.readAsText(file);
 }
 
-async function testSuggestion(host, method, path, attackType, parameter) {
-  const btn = event.target;
-  btn.textContent = '...';
-  btn.disabled = true;
-  try {
-    const r = await fetch('/api/ai/suggestions/test', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({host, method, path, attack_type: attackType, parameter}),
-    });
-    const d = await r.json();
-    if (d.ok) {
-      btn.textContent = 'queued';
-      btn.style.background = 'var(--orange)';
-    } else {
-      btn.textContent = 'no entry';
-      btn.style.background = 'var(--txt3)';
-      btn.title = d.message || 'No matching proxy entry — browse to this endpoint first';
-      btn.disabled = false;
-    }
-  } catch(e) {
-    btn.textContent = 'error';
-    btn.disabled = false;
-  }
-}
-
 function importAddManualHost() {
   const input = document.getElementById('import-manual-host');
   const val = input.value.trim().replace(/\/$/, '');

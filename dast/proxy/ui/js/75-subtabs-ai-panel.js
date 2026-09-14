@@ -65,11 +65,8 @@ async function loadAiPanel() {
             ${hyps.length ? `
               <div style="font-weight:600;margin-bottom:4px;color:var(--txt2)">Vulnerability hypotheses (${hyps.length})</div>
               ${hyps.map(h => {
-                const epMatch = h.endpoint.match(/^(\w+)\s+(\/\S*)/);
-                const hMethod = epMatch ? epMatch[1] : 'GET';
-                const hPath   = epMatch ? epMatch[2] : h.endpoint;
-                const statusBadge = `<button onclick="testSuggestion(${JSON.stringify(host)},${JSON.stringify(hMethod)},${JSON.stringify(hPath)},${JSON.stringify(h.attack_type)},${JSON.stringify(h.parameter||'')})"
-                                style="font-size:9px;padding:1px 6px;background:var(--blue);color:#fff;border:none;border-radius:3px;cursor:pointer">Test Now</button>`;
+                const statusBadge = `<button onclick='exploreHypothesis(${JSON.stringify(host)},${JSON.stringify(h.attack_type)},${JSON.stringify(h.endpoint)},${JSON.stringify(h.parameter||'')},${JSON.stringify(h.rationale||'')})'
+                                style="font-size:9px;padding:1px 6px;background:var(--blue);color:#fff;border:none;border-radius:3px;cursor:pointer">Explore in Copilot</button>`;
                 return `
                 <div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-top:1px solid var(--bdr3,#252525)">
                   <span style="color:${_prioColor[h.priority]||'var(--txt2)'};font-size:10px;text-transform:uppercase;width:44px;flex-shrink:0">${esc(h.priority)}</span>

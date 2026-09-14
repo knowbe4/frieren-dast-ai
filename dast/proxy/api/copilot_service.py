@@ -51,6 +51,19 @@ _ESCALATION_TEMPLATE = (
     "human decision, say so explicitly."
 )
 
+# Seeded operator message for exploring an app-context vulnerability hypothesis.
+# Understand-before-acting (CLAUDE.md rule 7): the copilot reads the real
+# request/response first and only then decides whether the hypothesis holds.
+_HYPOTHESIS_TEMPLATE = (
+    "Investigate a vulnerability hypothesis raised by the app-context analysis. "
+    "Host: {host}. Suspected issue: '{attack_type}' on endpoint {endpoint}"
+    "{parameter_clause}. Rationale: {rationale}. Read the actual request and "
+    "response for this endpoint first, decide whether the hypothesis holds, and "
+    "if it does, attempt a safe, read-only proof. Report what you find with "
+    "evidence, or explain why the hypothesis does not hold. If you are blocked "
+    "or need a value only the operator has, say so explicitly."
+)
+
 
 class CopilotService:
     """Owns copilot session state, the turn runner, and block escalation."""
@@ -61,6 +74,9 @@ class CopilotService:
         # (host, attack_type) pairs already escalated this process lifetime — a
         # WAF-disabled type is handed to the copilot exactly once per host.
         self._escalated: Set[Tuple[str, str]] = set()
+        # Hypothesis key -> session id, so re-exploring the same hypothesis
+        # (e.g. a double-click) reuses the live session instead of duplicating it.
+        self._hypothesis_sessions: Dict[str, str] = {}
 
     # ── Session store ──────────────────────────────────────────────────────────
     def has(self, sid: str) -> bool:
@@ -89,6 +105,7 @@ class CopilotService:
             "last_reply": None,
             "origin": "operator",
             "escalation": None,
+            "hypothesis": None,
             "_pause_event": asyncio.Event(),
             "_pause_result": None,
             "approved_hosts": set(),
@@ -109,6 +126,7 @@ class CopilotService:
             "updated_at": session.get("updated_at", 0),
             "origin": session.get("origin", "operator"),
             "escalation": session.get("escalation"),
+            "hypothesis": session.get("hypothesis"),
             "messages": list(engine.messages),
             "trace": session.get("trace", []),
             "pause": session.get("pause"),
@@ -182,6 +200,51 @@ class CopilotService:
         self._escalated.add(key)
         logger.info("Copilot block escalation started",
                     session_id=sid, host=host, attack_type=attack_type)
+        return sid
+
+    def explore_hypothesis(self, host: str, attack_type: str, endpoint: str,
+                           parameter: str, rationale: str) -> Optional[str]:
+        """Open (or reuse) a copilot conversation to investigate an app-context
+        vulnerability hypothesis.
+
+        Idempotent per (host, endpoint, attack_type, parameter): a repeated
+        request returns the existing live session so a double-click does not spawn
+        duplicates. Returns the session id, or None if the turn could not be
+        scheduled.
+        """
+        key = "|".join((host, endpoint, attack_type, parameter))
+        existing = self._hypothesis_sessions.get(key)
+        if existing and existing in self._sessions:
+            return existing
+
+        parameter_clause = (
+            f", parameter '{parameter}'" if parameter and parameter != "*" else ""
+        )
+        message = _HYPOTHESIS_TEMPLATE.format(
+            host=host,
+            attack_type=attack_type,
+            endpoint=endpoint,
+            parameter_clause=parameter_clause,
+            rationale=rationale or "not provided",
+        )
+        sid = self.new_session()
+        session = self._sessions[sid]
+        session["origin"] = "hypothesis"
+        session["hypothesis"] = {
+            "host": host, "attack_type": attack_type, "endpoint": endpoint,
+            "parameter": parameter, "rationale": rationale,
+        }
+        try:
+            self.start_turn(sid, message)
+        except RuntimeError as exc:
+            logger.warning("copilot hypothesis exploration could not schedule turn",
+                           host=host, attack_type=attack_type, error=str(exc))
+            self._sessions.pop(sid, None)
+            return None
+        self._hypothesis_sessions[key] = sid
+        logger.info("Copilot hypothesis exploration started",
+                    session_id=sid, host=host, attack_type=attack_type,
+                    endpoint=endpoint)
         return sid
 
     # ── Turn runner ──────────────────────────────────────────────────────────────

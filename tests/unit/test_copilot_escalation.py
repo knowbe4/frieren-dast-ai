@@ -142,6 +142,55 @@ async def test_escalate_block_without_observations_still_escalates():
             task.cancel()
 
 
+# ── CopilotService.explore_hypothesis ────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_explore_hypothesis_seeds_session():
+    ctx = _FakeCtx()
+    service = CopilotService(ctx)
+    with patch("dast.ai.copilot.session.CopilotSession.send",
+               new=AsyncMock(return_value=None)):
+        sid = service.explore_hypothesis(
+            "api.example.com", "idor", "GET /api/orders/{id}", "id",
+            "sequential ids returned to any authenticated user")
+        assert sid is not None
+        session = service.get(sid)
+        assert session["origin"] == "hypothesis"
+        assert session["hypothesis"]["attack_type"] == "idor"
+        assert session["hypothesis"]["endpoint"] == "GET /api/orders/{id}"
+        task = session.get("_task")
+        if task:
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_explore_hypothesis_is_idempotent_per_key():
+    ctx = _FakeCtx()
+    service = CopilotService(ctx)
+    with patch("dast.ai.copilot.session.CopilotSession.send",
+               new=AsyncMock(return_value=None)):
+        first = service.explore_hypothesis("h", "xss", "GET /search", "q", "reflected")
+        # Same hypothesis -> same live session (no duplicate).
+        again = service.explore_hypothesis("h", "xss", "GET /search", "q", "reflected")
+        assert again == first
+        # A different parameter is a different hypothesis -> new session.
+        other = service.explore_hypothesis("h", "xss", "GET /search", "lang", "reflected")
+        assert other != first
+        for candidate in {first, other}:
+            task = service.get(candidate).get("_task")
+            if task:
+                task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_explore_hypothesis_scheduling_failure_returns_none():
+    ctx = _FakeCtx()
+    service = CopilotService(ctx)
+    with patch.object(CopilotService, "start_turn", side_effect=RuntimeError("no loop")):
+        assert service.explore_hypothesis("h", "sqli", "POST /login", "user", "r") is None
+    assert service.list_summaries() == []          # half-built session removed
+    assert service._hypothesis_sessions == {}      # not memoized on failure
+
+
 @pytest.mark.asyncio
 async def test_escalate_block_seeds_operator_message():
     ctx = _FakeCtx()

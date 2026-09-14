@@ -14,8 +14,60 @@ const _CP_INPROGRESS = ['running', 'paused_approve', 'paused_auth'];
 function cpOnOpen() {
   cpConnectWs();
   cpLoadSessions();
+  cpLoadHypotheses();
   if (_cpActive) cpRefresh(_cpActive);
   else cpRender(null);
+}
+
+// ── App-context hypotheses (fold-in) ─────────────────────────────────────────
+// The app-context analyser raises vulnerability hypotheses per host. Rather than
+// firing a blind scan, each one opens a conversation so the copilot understands
+// the endpoint first, then attempts a proof or reports why it does not hold.
+const _CP_PRIO_RANK = { high: 0, medium: 1, low: 2 };
+
+async function cpLoadHypotheses() {
+  const el = document.getElementById('cp-hypotheses');
+  if (!el) return;
+  try {
+    const ctx = await (await fetch('/api/ai/app-context')).json();
+    const rows = [];
+    for (const host of Object.keys(ctx || {})) {
+      for (const h of (ctx[host].vuln_hypotheses || [])) rows.push({ host, ...h });
+    }
+    rows.sort((a, b) => (_CP_PRIO_RANK[a.priority] ?? 3) - (_CP_PRIO_RANK[b.priority] ?? 3));
+    if (!rows.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    const prioColor = { high: 'var(--red)', medium: 'var(--orange)', low: 'var(--txt2)' };
+    el.style.display = '';
+    el.innerHTML =
+      `<div style="font-size:10px;font-weight:600;color:var(--txt2);text-transform:uppercase;letter-spacing:.3px;margin-bottom:6px">Hypotheses to explore (${rows.length})</div>` +
+      rows.slice(0, 12).map(h => `
+        <div style="display:flex;align-items:baseline;gap:8px;padding:3px 0;border-top:1px solid var(--bdr)">
+          <span style="color:${prioColor[h.priority] || 'var(--txt2)'};font-size:9px;text-transform:uppercase;width:40px;flex-shrink:0">${esc(h.priority || '')}</span>
+          <span style="color:var(--orange);font-family:monospace;font-size:10px;width:84px;flex-shrink:0">${esc(h.attack_type || '')}</span>
+          <span style="color:var(--txt);font-family:monospace;font-size:10px;white-space:nowrap">${esc(h.endpoint || '')}</span>
+          ${h.parameter && h.parameter !== '*' ? `<span style="color:var(--blue);font-size:10px">[${esc(h.parameter)}]</span>` : ''}
+          <span style="color:var(--txt2);font-size:10px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(h.rationale || '')}</span>
+          <button onclick='exploreHypothesis(${JSON.stringify(h.host)},${JSON.stringify(h.attack_type)},${JSON.stringify(h.endpoint)},${JSON.stringify(h.parameter || '')},${JSON.stringify(h.rationale || '')})'
+                  style="font-size:9px;padding:1px 7px;background:var(--blue);color:#fff;border:none;border-radius:3px;cursor:pointer;flex-shrink:0">Explore</button>
+        </div>`).join('');
+  } catch (e) { /* ignore — hypotheses are best-effort */ }
+}
+
+async function exploreHypothesis(host, attackType, endpoint, parameter, rationale) {
+  try {
+    const r = await fetch('/api/copilot/explore-hypothesis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        host, attack_type: attackType, endpoint,
+        parameter: parameter || '', rationale: rationale || '',
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) { showToast(d.error || 'Could not start exploration'); return; }
+    switchMain('copilot');
+    await cpSelectSession(d.session_id);
+  } catch (e) { showToast('Could not start exploration'); }
 }
 
 function cpNewChat() {

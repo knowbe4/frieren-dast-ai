@@ -13,6 +13,7 @@ the scanner can escalate a WAF-disabled attack type into a live conversation
 in-process. These routes are a thin HTTP adapter over that service.
 
   POST /api/copilot/message              — send an operator message; returns session_id
+  POST /api/copilot/explore-hypothesis   — open a conversation from an app-context hypothesis
   GET  /api/copilot/sessions             — list recent sessions
   GET  /api/copilot/session/{sid}        — full transcript + messages + pause + reply
   POST /api/copilot/resume/{sid}         — answer a pause (approve/auth)
@@ -64,6 +65,26 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "a turn is already in progress"}, status_code=409)
 
         service.start_turn(sid, text)
+        return {"session_id": sid, "status": "running"}
+
+    @router.post("/api/copilot/explore-hypothesis")
+    async def explore_hypothesis(body: dict):
+        """Open (or reuse) a conversation to investigate an app-context
+        vulnerability hypothesis. Body: {host, attack_type, endpoint,
+        parameter?, rationale?}."""
+        host = (body.get("host") or "").strip()
+        attack_type = (body.get("attack_type") or "").strip()
+        endpoint = (body.get("endpoint") or "").strip()
+        if not host or not attack_type or not endpoint:
+            return JSONResponse(
+                {"error": "host, attack_type and endpoint are required"},
+                status_code=400,
+            )
+        parameter = (body.get("parameter") or "").strip()
+        rationale = (body.get("rationale") or "").strip()[:2000]
+        sid = service.explore_hypothesis(host, attack_type, endpoint, parameter, rationale)
+        if sid is None:
+            return JSONResponse({"error": "could not start exploration"}, status_code=503)
         return {"session_id": sid, "status": "running"}
 
     @router.get("/api/copilot/sessions")

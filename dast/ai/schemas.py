@@ -244,6 +244,44 @@ TRIAGE_AGENT_STEP_SCHEMA: Dict[str, Any] = {
     "required": ["thought", "action"],
 }
 
+# Exploration Copilot — dast/ai/copilot/session.py CopilotSession.send().
+# One conversational turn's decision. Unlike the triage loop this never returns a
+# stored "verdict": a turn ends with action="reply" (a message back to the human),
+# which lets the operator answer, unblock, or steer. call_tool drives the same
+# shared tool layer the MCP server bridges.
+COPILOT_STEP_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "thought": {
+            "type": "string",
+            "description": "One or two sentences: what the last observation showed and what you will do next and why.",
+        },
+        "action": {
+            "type": "string",
+            "enum": ["call_tool", "reply"],
+            "description": "call_tool = run a Frieren tool and keep working this turn; reply = send a message to the operator and hand the turn back.",
+        },
+        "tool_name": {
+            "type": "string",
+            "description": "Required when action=call_tool: the exact registered tool name (e.g. send_request, get_history, run_recon).",
+        },
+        "tool_args": {
+            "type": "object",
+            "description": "Required when action=call_tool: the tool's arguments, matching that tool's input schema.",
+            "additionalProperties": True,
+        },
+        "message": {
+            "type": "string",
+            "description": "Required when action=reply: the message shown to the operator — a finding, a question, or a report that you are blocked and need their help.",
+        },
+        "blocked_reason": {
+            "type": "string",
+            "description": "Optional when action=reply: a short machine-readable reason you are handing back blocked, e.g. 'waf_block', 'auth_required', 'need_value', 'need_authorization', 'out_of_scope'. Empty when you are simply reporting progress.",
+        },
+    },
+    "required": ["thought", "action"],
+}
+
 # Probe-diff classifier — dast/ai/probe_classifier.py _SYSTEM / classify()
 PROBE_CLASSIFIER_SCHEMA: Dict[str, Any] = {
     "type": "object",

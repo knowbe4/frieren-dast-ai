@@ -228,6 +228,7 @@ def build_app(
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
     from dast.proxy.api.agent_triage_routes import make_router as agent_triage_router
+    from dast.proxy.api.copilot_routes import make_router as copilot_router
 
     ctx = DashboardContext(
         store=store,
@@ -291,5 +292,6 @@ def build_app(
     app.include_router(login_flow_router(ctx))
     app.include_router(mcp_approval_router(ctx))
     app.include_router(agent_triage_router(ctx))
+    app.include_router(copilot_router(ctx))
 
     return app

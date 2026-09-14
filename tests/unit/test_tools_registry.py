@@ -402,3 +402,27 @@ def test_tool_definitions_shape():
         assert d["inputSchema"]["type"] == "object"
     names = {d["name"] for d in defs}
     assert "send_request" in names
+
+
+# ── copilot_ask (message-passing primitive; exposed over MCP) ────────────────────
+
+def test_copilot_ask_registered_and_tagged():
+    tool = tools.get_tool("copilot_ask")
+    assert tool is not None
+    # Tagged "copilot" so the copilot engine excludes it from its own menu; the tag
+    # does NOT hide it from the registry or MCP.
+    assert "copilot" in (tool.tags or [])
+    assert "message" in tool.input_schema.get("required", [])
+
+
+def test_copilot_ask_exposed_over_mcp():
+    from dast.mcp import tool_definitions
+    names = {d["name"] for d in tool_definitions()}
+    assert "copilot_ask" in names  # external MCP clients can drive the copilot
+
+
+@pytest.mark.asyncio
+async def test_copilot_ask_requires_message():
+    result = await run_tool(ToolContext(settings=_Scope(True)), "copilot_ask", {})
+    assert result["ok"] is False
+    assert "message" in result["error"]

@@ -28,7 +28,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 
 # ── WAF fingerprints ──────────────────────────────────────────────────────
@@ -477,6 +477,12 @@ class SessionIntelligence:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._hosts: Dict[str, HostIntel] = {}
+        # Optional escalation callback, injected by the dashboard. When set, the
+        # coordinator hands a WAF-disabled attack type to it — signature
+        # (host, attack_type, host_intel) -> object — instead of silently
+        # dropping the type. Kept as a plain callable so this module never
+        # imports the dashboard/FastAPI layer (one-directional coupling).
+        self.escalation_sink: Optional[Callable[[str, str, object], object]] = None
 
     def get(self, host: str) -> HostIntel:
         with self._lock:

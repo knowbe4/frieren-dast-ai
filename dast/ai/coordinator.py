@@ -429,6 +429,33 @@ def _signal_PATTERNS_for(attack_type: str) -> Optional[_re.Pattern]:
     return _SIGNAL_PATTERNS.get(attack_type)
 
 
+# A WAF that blocks an attack type this many times on a host, with no confirmed
+# bypass or finding, gets that type disabled for the host. Instead of dropping it
+# silently, the coordinator escalates it to the Exploration Copilot (see
+# _waf_suppressed_attack_types + the escalation sink in _run_inner).
+_WAF_BLOCK_DISABLE_THRESHOLD = 5
+
+
+def _waf_suppressed_attack_types(host_intel: Optional[object]) -> List[str]:
+    """Attack types disabled on this host purely because a WAF blocked them
+    >= _WAF_BLOCK_DISABLE_THRESHOLD times with no confirmed bypass/finding.
+
+    These are the escalation candidates for the Exploration Copilot — the types
+    the scanner would otherwise silently stop attempting. Deterministic, no LLM.
+    """
+    if host_intel is None:
+        return []
+    effective = getattr(host_intel, "effective_attack_types", set()) or set()
+    waf_obs = getattr(host_intel, "waf_observations", []) or []
+    counts: Dict[str, int] = {}
+    for _, _, at in waf_obs:
+        counts[at] = counts.get(at, 0) + 1
+    return sorted(
+        at for at, count in counts.items()
+        if count >= _WAF_BLOCK_DISABLE_THRESHOLD and at not in effective
+    )
+
+
 def _select_attack_types_for_params(
     target: "CheckTarget",
     host_intel: Optional[object],
@@ -498,8 +525,8 @@ def _select_attack_types_for_params(
     for at in candidate_types:
         if at in ineffective and at not in effective:
             continue  # consistently failed, no new signal — skip
-        if waf_blocks.get(at, 0) >= 5 and at not in effective:
-            continue  # WAF blocks everything for this type
+        if waf_blocks.get(at, 0) >= _WAF_BLOCK_DISABLE_THRESHOLD and at not in effective:
+            continue  # WAF blocks everything for this type — escalated in _run_inner
         result.append(at)
 
     # Sort: deterministic types first (faster, no LLM needed), contextual last
@@ -735,6 +762,22 @@ class Coordinator:
 
         # Deterministic candidate selection — never calls LLM
         candidate_types = _select_attack_types_for_params(target, host_intel)
+
+        # Escalate WAF-disabled attack types to the Exploration Copilot instead of
+        # silently dropping them. If the dashboard has wired an escalation sink,
+        # hand each blocked type to the conversational agent (deduped per
+        # host+attack_type inside the sink) so it can attempt a bypass or flag
+        # that a human is needed. Best-effort — never fail the scan on this.
+        if session_intelligence is not None:
+            escalation_sink = getattr(session_intelligence, "escalation_sink", None)
+            if escalation_sink is not None:
+                for blocked_type in _waf_suppressed_attack_types(host_intel):
+                    try:
+                        escalation_sink(_host, blocked_type, host_intel)
+                    except Exception as exc:
+                        logger.warning("block escalation sink failed",
+                                       host=_host, attack_type=blocked_type,
+                                       error=str(exc))
 
         # Run canary probes in parallel for all (attack_type, param) combos
         # that have a canary payload defined.  Collect signal map.

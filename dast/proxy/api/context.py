@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from dast.proxy.scan_queue_state import ScanQueueState
     from dast.proxy.runner import ProxyRunner
     from dast.proxy.intercept_store import InterceptStore
+    from dast.proxy.api.copilot_service import CopilotService
 
 
 @dataclass
@@ -41,6 +42,10 @@ class DashboardContext:
     scan_queue_state: Optional["ScanQueueState"] = None
     runner: Optional["ProxyRunner"] = None
     intercept_store: Optional["InterceptStore"] = None
+    # Exploration Copilot service — owns conversational session state, the turn
+    # runner, and the in-process block-escalation entry point. Set in
+    # dashboard_server after ctx construction (needs ctx itself).
+    copilot: Optional["CopilotService"] = None
 
     # Mutable runtime state — shared across all routers
     ws_clients: Set[WebSocket] = field(default_factory=set)

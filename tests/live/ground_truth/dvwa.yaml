@@ -54,7 +54,11 @@ endpoints:
   - path: /vulnerabilities/exec/
     method: POST
     form: { ip: "127.0.0.1", Submit: "Submit" }
-    expect: [cmdi]
+    # cmdi: the ip field is passed to a shell ping command.
+    # csrf: the command form is cookie-session authenticated, carries no
+    # anti-CSRF token, and sets no SameSite on PHPSESSID, so a cross-site page
+    # can forge the state-changing request. Both are real, exploitable here.
+    expect: [cmdi, csrf]
 
   - path: /vulnerabilities/fi/
     method: GET

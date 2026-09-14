@@ -4,8 +4,11 @@ CSRF Agent — detects missing or bypassable CSRF protection on state-changing e
 Checks:
 1. Token removal — omit CSRF token param/header and see if request still succeeds
 2. Token swap — replace CSRF token with a random value and see if accepted
-3. Origin/Referer bypass — send cross-origin Origin header, check if accepted
-4. SameSite absence — detected via passive observation (no cookies to strip here)
+3. Token header removal — strip a CSRF token header and see if accepted
+4. Tokenless cookie-authenticated request — flag only when ALL affirmative CSRF
+   preconditions hold (ambient cookie auth + no token + no SameSite=Strict/Lax +
+   server ignores Origin/Referer). The cross-origin probe rules OUT Origin/Referer
+   defense; it is never treated as positive evidence on its own.
 
 Targets: POST/PUT/PATCH/DELETE requests with form bodies or JSON bodies.
 CSRF on JSON endpoints is real when the server accepts text/plain content-type
@@ -79,6 +82,41 @@ def _find_csrf_headers(target: "CheckTarget") -> List[str]:
         k for k in target.headers
         if _CSRF_HEADER_RE.search(k)
     ]
+
+
+def _request_carries_cookie_auth(target: "CheckTarget") -> bool:
+    """True when the request carries an ambient cookie credential. CSRF is only
+    exploitable against cookie-borne authority: a forged cross-site request cannot
+    read or attach a header/bearer token, so a tokenless header-authenticated API
+    is NOT CSRF-susceptible. Gating on this eliminates the false positive of
+    flagging every tokenless state-changing endpoint."""
+    for name, value in (target.headers or {}).items():
+        if name.lower() == "cookie" and str(value).strip():
+            return True
+    shared = getattr(target, "shared_cookies", None)
+    return bool(shared)
+
+
+def _samesite_protects(resp: "httpx.Response") -> bool:
+    """True when a Set-Cookie in this response marks a cookie SameSite=Strict or
+    Lax — the browser then withholds it on cross-site requests, mitigating CSRF.
+    Best-effort: the session cookie is usually not re-set on a state-changing
+    request, so an unknown SameSite is treated as unprotected (proceed)."""
+    try:
+        headers = resp.headers
+        get_list = getattr(headers, "get_list", None)
+        if callable(get_list):
+            set_cookies = get_list("set-cookie")
+        else:
+            raw = headers.get("set-cookie", "") if hasattr(headers, "get") else ""
+            set_cookies = [raw] if raw else []
+    except Exception as exc:
+        logger.debug("CSRF SameSite parse skipped", error=str(exc))
+        return False
+    for cookie in set_cookies:
+        if re.search(r"samesite\s*=\s*(strict|lax)", str(cookie), re.IGNORECASE):
+            return True
+    return False
 
 
 def _remove_param_from_body(body: str, param: str) -> str:
@@ -258,10 +296,25 @@ class CsrfAgent(VulnAgent):
                 ))
                 break
 
-        # ── Check 4: Cross-origin Origin header bypass ─────────────────────
-        # Only test when there is no CSRF token at all (token presence is stronger
-        # protection; this check targets endpoints that rely solely on Same-Origin)
-        if not csrf_params and not csrf_headers and not findings:
+        # ── Check 4: Tokenless cookie-authenticated state-changing request ──
+        # CSRF is exploitable only when a forged cross-site request rides an
+        # ambient cookie credential the browser attaches automatically. So this
+        # fires only when EVERY affirmative precondition holds — never on the mere
+        # fact that a forged Origin header returned 200 (servers do not defend CSRF
+        # by inspecting Origin, so that alone false-positives on protected apps):
+        #   - no anti-CSRF token in params or headers (checks 1-3 found none), AND
+        #   - the request is authenticated by an ambient cookie (no cookie -> a
+        #     forged request carries no authority -> not exploitable), AND
+        #   - the session cookie is not SameSite=Strict/Lax (else withheld
+        #     cross-site), AND
+        #   - the state-changing request is actually accepted (2xx), AND
+        #   - the server does not validate Origin/Referer. The cross-origin probe
+        #     is used here to RULE OUT Origin/Referer defense (a rejected forged
+        #     Origin proves protection), never as positive evidence.
+        if (not csrf_params and not csrf_headers and not findings
+                and _request_carries_cookie_auth(target)
+                and baseline_status in _SUCCESS_CODES
+                and not _samesite_protects(baseline_resp)):
             cross_origin_headers = {
                 **target.headers,
                 "Origin": "https://evil.example.com",
@@ -270,6 +323,8 @@ class CsrfAgent(VulnAgent):
             probe_resp = await _send(
                 client, target.method, target.url, cross_origin_headers, target.body
             )
+            # A forged Origin that is REJECTED (dissimilar/blocked) means the server
+            # enforces Origin/Referer checking -> CSRF-protected -> no finding.
             if probe_resp is not None and _responses_similar(
                 baseline_status, baseline_len,
                 probe_resp.status_code, len(probe_resp.content),
@@ -277,17 +332,20 @@ class CsrfAgent(VulnAgent):
                 baseline_req, baseline_resp_text = _fmt_http_pair(baseline_resp)
                 probe_req, probe_resp_text = _fmt_http_pair(probe_resp)
                 findings.append(AgentFinding(
-                    title="CSRF — No Token and Cross-Origin Request Accepted",
+                    title="CSRF — Cookie-Authenticated State Change Without Token or SameSite",
                     severity="medium",
                     cwe="CWE-352",
                     attack_type="csrf",
                     evidence=(
-                        f"State-changing {target.method} request with "
-                        f"Origin: evil.example.com returned {probe_resp.status_code}. "
-                        f"No CSRF token detected. Endpoint may be vulnerable to CSRF."
+                        f"State-changing {target.method} is authenticated by an ambient "
+                        f"cookie, carries no anti-CSRF token, its session cookie is not "
+                        f"SameSite=Strict/Lax, and the server does not validate "
+                        f"Origin/Referer (a forged cross-origin request still returned "
+                        f"{probe_resp.status_code}). A cross-site page can forge this "
+                        f"request with the victim's cookie."
                     ),
-                    payload="Origin: https://evil.example.com",
-                    parameter="Origin",
+                    payload="(no CSRF token; cross-site forgeable)",
+                    parameter="(request)",
                     url=target.url,
                     request_method=target.method,
                     bypass_validation=False,

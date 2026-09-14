@@ -52,7 +52,7 @@ def _no_mutation(monkeypatch):
 async def test_error_based_detection():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if "'" in unquote(url):
             return _resp(500, "You have an error in your SQL syntax near ''1'='1'")
         return _resp(200, '{"ok": true}')
@@ -82,7 +82,7 @@ async def test_error_based_hit_skips_time_based_on_other_params(monkeypatch):
         {"name": "Submit", "location": "query", "value": "Submit"},
     ])
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # 'id' injection triggers a SQL error; everything else is clean.
         if "id=1'" in unquote(url) or "id='" in unquote(url):
             return _resp(500, "You have an error in your SQL syntax near ''1'")
@@ -111,7 +111,7 @@ async def test_error_based_short_circuits_after_first_param_confirms():
         {"name": "Submit", "location": "query", "value": "Submit"},
     ])
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if "id=1'" in unquote(url) or "id='" in unquote(url):
             return _resp(500, "You have an error in your SQL syntax near ''1'")
         return _resp(200, '{"ok": true}')
@@ -146,7 +146,7 @@ async def test_error_based_does_not_mutate_without_block(monkeypatch):
     (a 404 differential is NOT a block) and the SLEEP probes never ran."""
     target = _target(params=[{"name": "id", "location": "query", "value": "1"}])
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # Injecting into 'id' returns a 404 (a differential, but NOT a WAF block);
         # baseline is a clean 200. No SQL error signature anywhere.
         if "id=1" not in unquote(url):
@@ -180,7 +180,7 @@ async def test_error_based_does_not_mutate_without_block(monkeypatch):
 async def test_clean_response_no_finding():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return _resp(200, '{"results": []}')
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
@@ -199,7 +199,7 @@ async def test_clean_response_no_finding():
 async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_threshold():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if "SLEEP" in unquote(url) or "WAITFOR" in unquote(url) or "pg_sleep" in unquote(url):
             return _resp(200, "ok", elapsed=5.0)   # SLEEP executed server-side
         return _resp(200, "ok", elapsed=0.05)      # clean adjacent control
@@ -218,7 +218,7 @@ async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_thresh
 async def test_time_based_blind_not_detected_within_baseline():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # Every request is uniformly slow (loaded endpoint), but the SLEEP adds
         # nothing over the control — the delta stays below threshold, no finding.
         return _resp(200, "ok", elapsed=3.0)
@@ -244,7 +244,7 @@ async def test_waf_block_then_bypass_records_waf_bypass(monkeypatch):
         _resp(500, "SQL syntax error near 'bypass'"),  # mutated payload succeeds
     ])
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return next(responses)
 
     call_state = {"n": 0}
@@ -282,7 +282,7 @@ async def test_body_location_injection_detects_error():
         params=[{"name": "accountId", "location": "body", "value": "1"}],
     )
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if body and "'" in body:
             return _resp(500, "SQL syntax error near 'accountId'")
         return _resp(200, '{"ok": true}')

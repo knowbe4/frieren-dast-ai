@@ -19,7 +19,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms, quiesce_for_time_probe
+from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -54,6 +54,10 @@ _SHELL_ERROR_RE = re.compile(
 # Time-based blind threshold — server must respond >3s slower than baseline
 _TIME_THRESHOLD_S = 3.0
 _SLEEP_DURATION = 4
+# Read timeout for time-based blind probes: the injected sleep stacks on ambient
+# latency under concurrent load, so the response must be allowed to return rather
+# than be discarded as a timeout (see sqli_agent._TIME_PROBE_TIMEOUT_S).
+_TIME_PROBE_TIMEOUT_S = 30.0
 
 
 class CmdiAgent(VulnAgent):
@@ -275,7 +279,10 @@ class CmdiAgent(VulnAgent):
         time waiting to acquire the shared probe semaphore under concurrent load
         does not pollute timing — see active_checks.response_elapsed_ms."""
         url = _inject_query(target.url, param_name, value)
-        resp = await _send(client, target.method, url, target.headers, target.body, payload=value)
+        resp = await _send(
+            client, target.method, url, target.headers, target.body,
+            payload=value, timeout=_TIME_PROBE_TIMEOUT_S,
+        )
         return response_elapsed_ms(resp) / 1000.0, resp
 
     async def _probe_time_based(
@@ -302,11 +309,11 @@ class CmdiAgent(VulnAgent):
         for payload in payloads:
             payload = str(payload)
 
-            # Hold the global time-probe lock across the measurement so no other
-            # agent's SLEEP saturates the server between control and probe.
-            async with quiesce_for_time_probe():
-                control_s, _ = await self._timed_send(target, client, param_name, "1")
-                probe_s, resp = await self._timed_send(target, client, param_name, payload)
+            # The adjacent control shares the probe's ambient load, so the delta
+            # isolates the injected sleep without any cross-agent lock (a global lock
+            # serialized every SLEEP across all endpoints and starved this probe).
+            control_s, _ = await self._timed_send(target, client, param_name, "1")
+            probe_s, resp = await self._timed_send(target, client, param_name, payload)
             delta_s = probe_s - control_s
             candidate = (
                 resp is not None
@@ -321,9 +328,8 @@ class CmdiAgent(VulnAgent):
             if not candidate:
                 continue
 
-            async with quiesce_for_time_probe():
-                control2_s, _ = await self._timed_send(target, client, param_name, "1")
-                probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
+            control2_s, _ = await self._timed_send(target, client, param_name, "1")
+            probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
             delta2_s = probe2_s - control2_s
             confirmed = (
                 resp2 is not None

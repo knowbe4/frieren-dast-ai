@@ -42,7 +42,7 @@ def _resp(status=200, text="", elapsed=0.0):
 async def test_output_reflected_detected():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if payload and payload.strip(";|&$()`") == "id":
             return _resp(200, "ping ok\nuid=0(root) gid=0(root) groups=0(root)")
         return _resp(200, "ping ok")
@@ -62,7 +62,7 @@ async def test_output_reflected_detected():
 async def test_shell_error_disclosure_detected():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if payload == ";id":
             return _resp(500, "sh: 1: id: command not found")
         return _resp(200, "ping ok")
@@ -80,7 +80,7 @@ async def test_shell_error_disclosure_detected():
 async def test_time_based_blind_detected():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # The `sleep` payload adds server-side delay over the adjacent control;
         # detection compares resp.elapsed (server round-trip), not wall-clock.
         if payload and "sleep" in payload:
@@ -102,7 +102,7 @@ async def test_time_based_blind_detected():
 async def test_waf_bypass_detected_when_direct_payloads_filtered():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # Simulate a WAF: direct output/blind payloads are filtered (clean
         # response), but an IFS/encoding bypass variant still executes `id`.
         if payload and ("${IFS}" in payload or "$IFS" in payload or "%0a" in payload or "%00" in payload):
@@ -124,7 +124,7 @@ async def test_waf_bypass_detected_when_direct_payloads_filtered():
 async def test_clean_response_no_finding():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return _resp(200, "ping ok, no output leaked")
 
     with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):

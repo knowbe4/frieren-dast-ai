@@ -16,7 +16,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, quiesce_for_time_probe
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -25,6 +25,13 @@ if TYPE_CHECKING:
     from dast.scanners.collaborator import CollaboratorService
 
 logger = get_logger(__name__)
+
+# Read timeout for time-based blind probes. A 5s SLEEP stacks on top of ambient
+# latency the target is under from concurrent probing (observed >8s on a loaded
+# DVWA); the response must be allowed to return so the delay is actually measured
+# rather than discarded as a timeout. Kept well above max_sleep (5s) + realistic
+# ambient, below the point where a truly hung endpoint would stall the scan.
+_TIME_PROBE_TIMEOUT_S = 30.0
 
 
 def _build_error_re() -> re.Pattern:
@@ -243,12 +250,13 @@ class SqliAgent(VulnAgent):
             # required delay ~10.2s, so a safety-capped 5s SLEEP (which DID execute)
             # never cleared the bar and a real blind injection was missed. An
             # adjacent control shares the same ambient load as its probe, so the
-            # delta isolates the injected sleep regardless of absolute contention.
-            # Hold the global time-probe lock across the whole measurement so no
-            # other agent's SLEEP saturates the server between control and probe.
-            async with quiesce_for_time_probe():
-                control_ms, _ = await self._timed_send(target, client, param, clean_value)
-                probe_ms, resp = await self._timed_send(target, client, param, payload)
+            # delta isolates the injected sleep regardless of absolute contention —
+            # no cross-agent lock needed. (A previous global time-probe lock made the
+            # measurement quiet but serialized every SLEEP on every endpoint through
+            # one gate, starving the concurrent CMDI time-based probe on a sibling
+            # endpoint until the coordinator budget expired.)
+            control_ms, _ = await self._timed_send(target, client, param, clean_value)
+            probe_ms, resp = await self._timed_send(target, client, param, payload)
 
             delta_ms = probe_ms - control_ms
             # A real SLEEP also has to show up in ABSOLUTE terms (the probe itself
@@ -275,9 +283,8 @@ class SqliAgent(VulnAgent):
                 # Re-confirm with a second control/probe pair: ambient load spikes
                 # are transient and rarely reproduce, but an injected SLEEP does
                 # every time. Only confirm when the delay holds on the re-test.
-                async with quiesce_for_time_probe():
-                    control2_ms, _ = await self._timed_send(target, client, param, clean_value)
-                    probe2_ms, resp2 = await self._timed_send(target, client, param, payload)
+                control2_ms, _ = await self._timed_send(target, client, param, clean_value)
+                probe2_ms, resp2 = await self._timed_send(target, client, param, payload)
                 delta2_ms = probe2_ms - control2_ms
                 confirmed = (
                     resp2 is not None
@@ -349,8 +356,17 @@ class SqliAgent(VulnAgent):
         """Send one probe and return (server_elapsed_ms, response). Uses httpx's
         `.elapsed` (server round-trip only) rather than wall-clock, so time spent
         waiting to acquire the shared probe semaphore under concurrent load does not
-        pollute the measurement — see active_checks.response_elapsed_ms."""
-        resp = await self._send_probe(target, client, param, payload)
+        pollute the measurement — see active_checks.response_elapsed_ms.
+
+        Time-based probes get a generous per-request read timeout: the injected
+        SLEEP delay stacks on top of whatever ambient latency the target is under
+        from concurrent probing, and if the response exceeds the default client
+        timeout it is discarded (resp=None) and the delay we were measuring is never
+        observed. The paired-adjacent-control delta cancels the ambient component,
+        but only when the probe actually returns."""
+        resp = await self._send_probe(
+            target, client, param, payload, timeout=_TIME_PROBE_TIMEOUT_S
+        )
         return response_elapsed_ms(resp), resp
 
     async def _send_probe(
@@ -359,20 +375,21 @@ class SqliAgent(VulnAgent):
         client: "httpx.AsyncClient",
         param: dict,
         payload: str,
+        timeout: "Optional[float]" = None,
     ):
         if param["location"] == "query":
             url = _inject_query(target.url, param["name"], payload)
-            return await _send(client, target.method, url, target.headers, target.body)
+            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
         elif param["location"] in ("body", "body_graphql"):
             body = _inject_body(
                 target.body or "", param["name"], payload,
                 target.headers.get("content-type", ""),
                 location=param["location"],
             )
-            return await _send(client, target.method, target.url, target.headers, body)
+            return await _send(client, target.method, target.url, target.headers, body, timeout=timeout)
         elif param["location"].startswith("multipart_"):
             raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-            return await _send(client, target.method, target.url, target.headers, raw)
+            return await _send(client, target.method, target.url, target.headers, raw, timeout=timeout)
         return None
 
 

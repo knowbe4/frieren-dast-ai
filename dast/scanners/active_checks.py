@@ -428,6 +428,7 @@ def reset_host_reachability() -> None:
     _HOST_DEAD.clear()
     _HOST_DEAD_AT.clear()
     _HOST_LIMITERS.clear()
+    _HOST_SCAN_GATE._in_flight.clear()
 
 
 # Statuses the MITM proxy returns when it cannot reach the upstream host —
@@ -485,6 +486,11 @@ class _HostConcurrencyLimiter:
         self.limit = float(self.max_limit)
         self.in_flight = 0
         self.min_rtt: "Optional[float]" = None  # uncontended baseline, seconds
+        # Sticky: set once this host has shown it cannot sustain concurrent load
+        # (a congestion signal or a latency-inflation backoff). The endpoint-scan
+        # gate reads it to clamp a host to serial scanning even if the operator
+        # raised host_scan_concurrency — a target that chokes stays protected.
+        self.saturated_seen = False
         self._cond = asyncio.Condition()
 
     async def acquire(self) -> None:
@@ -503,6 +509,7 @@ class _HostConcurrencyLimiter:
     def _update_limit(self, rtt_s: "Optional[float]", congested: bool) -> None:
         if congested:
             self.limit = max(1.0, self.limit * _CONCURRENCY_BACKOFF)
+            self.saturated_seen = True
             return
         if rtt_s is None or rtt_s <= 0:
             return
@@ -511,6 +518,7 @@ class _HostConcurrencyLimiter:
         ceiling = max((self.min_rtt or 0.0) * _LATENCY_INFLATION, _LATENCY_FLOOR_S)
         if rtt_s > ceiling:
             self.limit = max(1.0, self.limit * _CONCURRENCY_BACKOFF)
+            self.saturated_seen = True
         else:
             self.limit = min(float(self.max_limit), self.limit + _CONCURRENCY_RECOVER)
 
@@ -524,6 +532,75 @@ async def _get_host_limiter(hostname: str) -> "_HostConcurrencyLimiter":
             limiter = _HostConcurrencyLimiter(_PROBE_SLOTS_TOTAL)
             _HOST_LIMITERS[hostname] = limiter
         return limiter
+
+
+# ── per-host endpoint-scan gate (endpoint-level politeness) ──────────────────
+# The request limiter above throttles concurrent *probes*, but the runner still
+# starts several endpoint SCANS in parallel (runner._scan_sem, sized to `workers`).
+# Against a single-worker target that is self-defeating: N endpoint scans time-
+# slice the host's one worker, so a scan whose slower agents run late — time-based
+# blind (SLEEP/WAITFOR), or LFI walking a traversal list — can burn its whole
+# per-endpoint deadline before its working probe is even sent, and the endpoint is
+# scored a false "safe" (the observed run-to-run flaky LFI / blind detection).
+# Serializing endpoint scans per host gives each scan the host's full throughput so
+# it finishes within budget; it costs nothing on a single-worker target (its
+# requests were already serial under the limiter) and only trades cross-endpoint
+# parallelism on a genuinely scalable host, which the operator restores by raising
+# host_scan_concurrency. Different hosts still scan fully in parallel — the gate is
+# per host and the global _scan_sem remains the overall worker cap.
+_DEFAULT_HOST_SCAN_CONCURRENCY = 1
+
+
+class _HostScanGate:
+    """Adaptive per-host cap on concurrently-running endpoint scans. Single event
+    loop only. The allowance is `default_limit`, clamped to 1 for any host the
+    request limiter has already caught saturating under load (sticky), so raising
+    the knob for scalable targets never re-introduces starvation on a slow one."""
+
+    def __init__(self) -> None:
+        self.default_limit = _DEFAULT_HOST_SCAN_CONCURRENCY
+        self._in_flight: "Dict[str, int]" = {}
+        self._cond = asyncio.Condition()
+
+    def configure(self, default_limit: int) -> None:
+        self.default_limit = max(1, int(default_limit))
+
+    def _allowed(self, hostname: str) -> int:
+        limiter = _HOST_LIMITERS.get(hostname)
+        if limiter is not None and limiter.saturated_seen:
+            return 1
+        return max(1, self.default_limit)
+
+    async def acquire(self, hostname: str) -> None:
+        async with self._cond:
+            while self._in_flight.get(hostname, 0) >= self._allowed(hostname):
+                await self._cond.wait()
+            self._in_flight[hostname] = self._in_flight.get(hostname, 0) + 1
+
+    async def release(self, hostname: str) -> None:
+        async with self._cond:
+            self._in_flight[hostname] = max(0, self._in_flight.get(hostname, 0) - 1)
+            # Wake all waiters; each re-checks its own host's (possibly changed) allowance.
+            self._cond.notify_all()
+
+
+_HOST_SCAN_GATE = _HostScanGate()
+
+
+def configure_host_scan_concurrency(default_limit: int) -> None:
+    """Set how many endpoint scans may run concurrently against a single host.
+    Called by the runner at scan start (default 1 — serialize per host)."""
+    _HOST_SCAN_GATE.configure(default_limit)
+
+
+async def acquire_host_scan_slot(hostname: str) -> None:
+    """Block until this host may run another concurrent endpoint scan."""
+    await _HOST_SCAN_GATE.acquire(hostname)
+
+
+async def release_host_scan_slot(hostname: str) -> None:
+    """Release an endpoint-scan slot for this host."""
+    await _HOST_SCAN_GATE.release(hostname)
 
 
 # Global lock serializing time-based blind probes (SLEEP/WAITFOR) across ALL agents

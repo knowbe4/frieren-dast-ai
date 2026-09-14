@@ -96,6 +96,7 @@ class DashboardContext:
             self._scan_cfg = {
                 "workers": 2,
                 "probe_concurrency": 4,
+                "host_scan_concurrency": 1,
                 "passive_enabled": True,
                 "passive_ai": True,
                 "active_enabled": True,

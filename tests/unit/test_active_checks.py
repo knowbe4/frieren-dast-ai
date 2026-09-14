@@ -15,6 +15,7 @@ from dast.scanners.active_checks import (
     ActiveFinding,
     CheckTarget,
     _HostConcurrencyLimiter,
+    _HostScanGate,
     _inject_body,
     _inject_query,
     check_xss,
@@ -75,6 +76,99 @@ class TestHostConcurrencyLimiter:
         await limiter.acquire()
         await limiter.release(rtt_s=0.2)  # 20x baseline but < 1s floor -> healthy
         assert limiter.limit == 5.0
+
+    async def test_saturated_seen_is_sticky_on_congestion(self):
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        assert limiter.saturated_seen is False
+        await limiter.acquire()
+        await limiter.release(rtt_s=None, congested=True)
+        assert limiter.saturated_seen is True
+        # Recovery does NOT clear the sticky flag — a host that ever choked stays flagged.
+        limiter.min_rtt = 0.1
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.15)
+        assert limiter.saturated_seen is True
+
+    async def test_saturated_seen_set_on_latency_inflation(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.1)  # establish baseline, healthy
+        assert limiter.saturated_seen is False
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)  # baseline*>4 -> congestion
+        assert limiter.saturated_seen is True
+
+
+# ── per-host endpoint-scan gate ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestHostScanGate:
+    async def test_serializes_endpoint_scans_per_host_by_default(self):
+        import asyncio
+        gate = _HostScanGate()  # default_limit = 1
+        order: list[str] = []
+
+        async def scan(tag: str) -> None:
+            await gate.acquire("app.example.com")
+            order.append(f"start:{tag}")
+            await asyncio.sleep(0.01)
+            order.append(f"end:{tag}")
+            await gate.release("app.example.com")
+
+        await asyncio.gather(scan("a"), scan("b"))
+        # Serial: one scan fully finishes before the next starts (no interleaving).
+        assert order in (
+            ["start:a", "end:a", "start:b", "end:b"],
+            ["start:b", "end:b", "start:a", "end:a"],
+        )
+
+    async def test_different_hosts_run_in_parallel(self):
+        import asyncio
+        gate = _HostScanGate()
+        inflight = {"n": 0, "max": 0}
+
+        async def scan(host: str) -> None:
+            await gate.acquire(host)
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+            await asyncio.sleep(0.01)
+            inflight["n"] -= 1
+            await gate.release(host)
+
+        await asyncio.gather(scan("a.example.com"), scan("b.example.com"))
+        # Two different hosts overlap — the gate is per host, not global.
+        assert inflight["max"] == 2
+
+    async def test_configure_allows_concurrency_when_host_is_healthy(self):
+        import asyncio
+        gate = _HostScanGate()
+        gate.configure(3)
+        inflight = {"n": 0, "max": 0}
+
+        async def scan() -> None:
+            await gate.acquire("app.example.com")
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+            await asyncio.sleep(0.01)
+            inflight["n"] -= 1
+            await gate.release("app.example.com")
+
+        await asyncio.gather(*(scan() for _ in range(3)))
+        assert inflight["max"] == 3
+
+    async def test_saturated_host_clamped_to_serial_even_when_knob_raised(self):
+        import dast.scanners.active_checks as ac
+        gate = _HostScanGate()
+        gate.configure(4)
+        # A host the request limiter already caught saturating is pinned to serial.
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        limiter.saturated_seen = True
+        ac._HOST_LIMITERS["slow.example.com"] = limiter
+        try:
+            assert gate._allowed("slow.example.com") == 1
+            assert gate._allowed("fresh.example.com") == 4  # no limiter -> honor knob
+        finally:
+            ac._HOST_LIMITERS.pop("slow.example.com", None)
 
 
 # ── time-based differential control ─────────────────────────────────────────

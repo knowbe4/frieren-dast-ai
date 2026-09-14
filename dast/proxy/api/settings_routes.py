@@ -252,6 +252,13 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             n = max(1, min(20, int(body["probe_concurrency"])))
             _scan_config["probe_concurrency"] = n
             _resize_global_probe_sem()
+        if "host_scan_concurrency" in body:
+            # Concurrent endpoint scans allowed against a single host. Default 1
+            # serializes per host so a single-worker target's slower agents keep
+            # their per-endpoint budget (see active_checks._HostScanGate).
+            n = max(1, min(20, int(body["host_scan_concurrency"])))
+            _scan_config["host_scan_concurrency"] = n
+            _ac.configure_host_scan_concurrency(n)
         for flag in ("passive_enabled", "passive_ai", "active_enabled", "llm_planner",
                      "llm_validator", "discovery_llm_classify", "probe_diff"):
             if flag in body:

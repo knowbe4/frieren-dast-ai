@@ -19,7 +19,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send, response_elapsed_ms
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_query, _send, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -58,6 +58,13 @@ _SLEEP_DURATION = 4
 # latency under concurrent load, so the response must be allowed to return rather
 # than be discarded as a timeout (see sqli_agent._TIME_PROBE_TIMEOUT_S).
 _TIME_PROBE_TIMEOUT_S = 30.0
+# sqlmap-style delay-scaling confirmation: re-probe with a distinct shorter sleep
+# and require the measured delay to track the requested one. A real injection scales
+# linearly; ambient jitter does not. The shorter probe must clearly delay AND the
+# primary probe must add at least _SCALING_MARGIN_S more delay than it.
+_CONFIRM_SLEEP_DURATION = 2
+_CONFIRM_FLOOR_S = 1.2
+_SCALING_MARGIN_S = 1.0
 
 
 class CmdiAgent(VulnAgent):
@@ -111,31 +118,28 @@ class CmdiAgent(VulnAgent):
         # confirms output-reflected CMDi regardless of param ordering; time-based
         # blind is the last resort only when nothing reflected.
         for param in probe_params:
-            param_name = param.get("name", "")
-            if not param_name:
+            if not param.get("name"):
                 continue
             finding = await self._probe_output(
-                target, client, param_name, unix_basic[:8], baseline_body
+                target, client, param, unix_basic[:8], baseline_body
             )
             if finding:
                 return [finding]
 
         for param in probe_params:
-            param_name = param.get("name", "")
-            if not param_name:
+            if not param.get("name"):
                 continue
             finding = await self._probe_bypass_output(
-                target, client, param_name, bypass_payloads[:12], baseline_body
+                target, client, param, bypass_payloads[:12], baseline_body
             )
             if finding:
                 return [finding]
 
         for param in probe_params:
-            param_name = param.get("name", "")
-            if not param_name:
+            if not param.get("name"):
                 continue
             finding = await self._probe_time_based(
-                target, client, param_name, unix_blind[:4]
+                target, client, param, unix_blind[:4]
             )
             if finding:
                 return [finding]
@@ -146,16 +150,16 @@ class CmdiAgent(VulnAgent):
         self,
         target: "CheckTarget",
         client: "httpx.AsyncClient",
-        param_name: str,
+        param: dict,
         payloads: List[str],
         baseline_body: str,
     ) -> Optional[AgentFinding]:
         """Phase 1: inject `id`/`whoami` variants and look for command output or a
         shell-error disclosure directly in the response (no delay involved)."""
+        param_name = param["name"]
         for payload in payloads:
             payload = str(payload)
-            url = _inject_query(target.url, param_name, payload)
-            resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+            resp = await self._send_probe(target, client, param, payload)
             if not resp:
                 continue
             body = resp.text[:4000]
@@ -220,17 +224,17 @@ class CmdiAgent(VulnAgent):
         self,
         target: "CheckTarget",
         client: "httpx.AsyncClient",
-        param_name: str,
+        param: dict,
         payloads: List[str],
         baseline_body: str,
     ) -> Optional[AgentFinding]:
         """Phase 3: encoding / whitespace (IFS) / alternative-separator variants
         that still execute `id`, detected via the same output signature. Runs after
         the direct output probes so it only matters when a naive payload was filtered."""
+        param_name = param["name"]
         for payload in payloads:
             payload = str(payload)
-            url = _inject_query(target.url, param_name, payload)
-            resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+            resp = await self._send_probe(target, client, param, payload)
             if not resp:
                 continue
             body = resp.text[:4000]
@@ -270,26 +274,53 @@ class CmdiAgent(VulnAgent):
         self,
         target: "CheckTarget",
         client: "httpx.AsyncClient",
-        param_name: str,
+        param: dict,
         value: str,
     ) -> tuple[float, Optional["httpx.Response"]]:
-        """Inject `value` into `param_name` and return (server_elapsed_s, response).
+        """Inject `value` into `param` and return (server_elapsed_s, response).
 
         Uses httpx's `.elapsed` (server round-trip only) rather than wall-clock, so
         time waiting to acquire the shared probe semaphore under concurrent load
         does not pollute timing — see active_checks.response_elapsed_ms."""
-        url = _inject_query(target.url, param_name, value)
-        resp = await _send(
-            client, target.method, url, target.headers, target.body,
-            payload=value, timeout=_TIME_PROBE_TIMEOUT_S,
-        )
+        resp = await self._send_probe(target, client, param, value, timeout=_TIME_PROBE_TIMEOUT_S)
         return response_elapsed_ms(resp) / 1000.0, resp
+
+    async def _send_probe(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+        payload: str,
+        timeout: "Optional[float]" = None,
+    ) -> Optional["httpx.Response"]:
+        """Inject `payload` into `param` at its recorded location and send. Body
+        params (e.g. DVWA /exec/ `ip`, submitted as form fields) MUST be injected
+        into the body, not the query string — the server reads them from the body, so
+        query injection silently misses the vulnerable code path. Falls back to query
+        injection for locations without a dedicated injector (header/cookie), which
+        preserves prior behavior for those entrypoints."""
+        location = param.get("location", "query")
+        if location in ("body", "body_graphql"):
+            body = _inject_body(
+                target.body or "", param["name"], payload,
+                target.headers.get("content-type", ""),
+                location=location,
+            )
+            return await _send(
+                client, target.method, target.url, target.headers, body,
+                payload=payload, timeout=timeout,
+            )
+        url = _inject_query(target.url, param["name"], payload)
+        return await _send(
+            client, target.method, url, target.headers, target.body,
+            payload=payload, timeout=timeout,
+        )
 
     async def _probe_time_based(
         self,
         target: "CheckTarget",
         client: "httpx.AsyncClient",
-        param_name: str,
+        param: dict,
         payloads: List[str],
     ) -> Optional[AgentFinding]:
         """Phase 2: time-based blind — inject `sleep N` variants and confirm the
@@ -297,57 +328,96 @@ class CmdiAgent(VulnAgent):
         (each probe costs a full ~5s delay), so it runs last, only when nothing
         reflected.
 
-        Rather than comparing against the single baseline measured once at scan
-        start, each SLEEP probe is paired with a clean control request sent right
-        before it. Under concurrent multi-agent load on one endpoint, a plain
-        request can itself take several seconds and that ambient latency drifts
-        burst to burst; a stale start baseline then makes the required delay
-        unreachable by a safety-capped sleep, missing a real blind injection. The
-        adjacent control shares the probe's ambient load, so the delta isolates the
-        injected sleep. A second control/probe pair re-confirms: load spikes are
-        transient, an injected sleep reproduces every time."""
+        Each sleep probe is compared against a FALSE control sent immediately
+        before it: the same payload with the sleep duration zeroed (sqlmap's
+        true/false differential). Both take the identical injection path and share
+        the same ambient-load epoch, so the delta isolates the server-side sleep.
+        Both the candidate pair AND the confirmation are taken under a SINGLE hold of
+        the global time-probe lock so no other agent's SLEEP is in flight (a
+        concurrent sleep pins a target worker and inflated round-trips to >10s,
+        starving the budget) — and, critically, so the confirm cannot re-queue behind
+        other endpoints' time-probe loops on this contended lock and starve until the
+        per-endpoint deadline cancels the agent mid-confirm. The confirmation
+        re-probes with a distinct shorter sleep and requires the measured delay to
+        track the requested one (delay scaling, sqlmap's method): load spikes are
+        transient and uncorrelated with the requested sleep, an injected sleep scales
+        every time."""
+        param_name = param["name"]
         for payload in payloads:
             payload = str(payload)
+            control_value = zero_delay_variant(payload) or "1"
 
-            # The adjacent control shares the probe's ambient load, so the delta
-            # isolates the injected sleep without any cross-agent lock (a global lock
-            # serialized every SLEEP across all endpoints and starved this probe).
-            control_s, _ = await self._timed_send(target, client, param_name, "1")
-            probe_s, resp = await self._timed_send(target, client, param_name, payload)
-            delta_s = probe_s - control_s
-            candidate = (
-                resp is not None
-                and delta_s >= _TIME_THRESHOLD_S
-                and probe_s >= _TIME_THRESHOLD_S
-            )
-            logger.debug(
-                "cmdi time-based probe", param=param_name, payload=payload,
-                control_s=round(control_s, 2), probe_s=round(probe_s, 2),
-                delta_s=round(delta_s, 2), candidate=candidate,
-            )
-            if not candidate:
-                continue
+            confirmed = False
+            confirm_payload: Optional[str] = None
+            resp = resp2 = None
+            delta_s = confirm_delta_s = 0.0
+            evidence_tail = ""
+            async with serialize_time_probe():
+                control_s, _ = await self._timed_send(target, client, param, control_value)
+                probe_s, resp = await self._timed_send(target, client, param, payload)
+                delta_s = probe_s - control_s
+                candidate = (
+                    resp is not None
+                    and delta_s >= _TIME_THRESHOLD_S
+                    and probe_s >= _TIME_THRESHOLD_S
+                )
+                logger.debug(
+                    "cmdi time-based probe", param=param_name, payload=payload,
+                    control_value=control_value,
+                    control_s=round(control_s, 2), probe_s=round(probe_s, 2),
+                    delta_s=round(delta_s, 2), candidate=candidate,
+                )
 
-            control2_s, _ = await self._timed_send(target, client, param_name, "1")
-            probe2_s, resp2 = await self._timed_send(target, client, param_name, payload)
-            delta2_s = probe2_s - control2_s
-            confirmed = (
-                resp2 is not None
-                and delta2_s >= _TIME_THRESHOLD_S
-                and probe2_s >= _TIME_THRESHOLD_S
-            )
-            logger.debug(
-                "cmdi time-based re-confirm", param=param_name, payload=payload,
-                control_s=round(control2_s, 2), probe_s=round(probe2_s, 2),
-                delta_s=round(delta2_s, 2), confirmed=confirmed,
-            )
+                if candidate:
+                    # Confirm by delay scaling (sqlmap's method): re-probe with a
+                    # distinct shorter sleep and require the measured delay to track
+                    # the requested one. Falls back to reproducing the same delay when
+                    # the payload has no rewritable sleep construct. Still under the
+                    # lock held above.
+                    confirm_payload = scaled_delay_variant(payload, _CONFIRM_SLEEP_DURATION)
+                    if confirm_payload is None:
+                        control2_s, _ = await self._timed_send(target, client, param, control_value)
+                        confirm_s, resp2 = await self._timed_send(target, client, param, payload)
+                        confirm_delta_s = confirm_s - control2_s
+                        confirmed = (
+                            resp2 is not None
+                            and confirm_delta_s >= _TIME_THRESHOLD_S
+                            and confirm_s >= _TIME_THRESHOLD_S
+                        )
+                        evidence_tail = (
+                            f"delayed the response {delta_s:.1f}s then {confirm_delta_s:.1f}s "
+                            f"(reproduced) over a matched zero-delay control ('{control_value}')"
+                        )
+                    else:
+                        control2_s, _ = await self._timed_send(target, client, param, control_value)
+                        confirm_s, resp2 = await self._timed_send(target, client, param, confirm_payload)
+                        confirm_delta_s = confirm_s - control2_s
+                        confirmed = (
+                            resp2 is not None
+                            and confirm_delta_s >= _CONFIRM_FLOOR_S
+                            and confirm_s >= _CONFIRM_FLOOR_S
+                            and (delta_s - confirm_delta_s) >= _SCALING_MARGIN_S
+                        )
+                        evidence_tail = (
+                            f"delayed the response {delta_s:.1f}s for a {_SLEEP_DURATION}s sleep versus "
+                            f"{confirm_delta_s:.1f}s for a {_CONFIRM_SLEEP_DURATION}s sleep over a matched "
+                            f"zero-delay control ('{control_value}') — the delay scales with the requested "
+                            f"sleep, proving it is attacker-controlled"
+                        )
+                    logger.debug(
+                        "cmdi time-based re-confirm", param=param_name, payload=payload,
+                        confirm_payload=confirm_payload, control_s=round(control2_s, 2),
+                        confirm_s=round(confirm_s, 2), confirm_delta_s=round(confirm_delta_s, 2),
+                        delta_s=round(delta_s, 2), confirmed=confirmed,
+                    )
+
             if not confirmed:
                 continue
 
             confirm_resp = resp2 if resp2 is not None else resp
             raw_req, raw_resp = _fmt_http_pair(confirm_resp)
             log_event("agent", "finding",
-                      f"CMDi blind: {param_name} delayed {delta_s:.1f}s (x2) on {target.url}",
+                      f"CMDi blind: {param_name} delayed {delta_s:.1f}s on {target.url}",
                       url=target.url, finding="Blind CMDi", source="agent")
             return AgentFinding(
                 title="OS Command Injection — Time-Based Blind",
@@ -355,10 +425,7 @@ class CmdiAgent(VulnAgent):
                 cwe="CWE-78",
                 attack_type="cmdi",
                 evidence=(
-                    f"Parameter '{param_name}' with payload '{payload}' delayed the response "
-                    f"{delta_s:.1f}s then {delta2_s:.1f}s over an adjacent control "
-                    f"(control ~{control_s:.1f}/{control2_s:.1f}s). The {_SLEEP_DURATION}s sleep "
-                    f"reproduced server-side independent of ambient load.\n\n"
+                    f"Parameter '{param_name}' with payload '{payload}' {evidence_tail}.\n\n"
                     f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
                 ),
                 confirmed=True,

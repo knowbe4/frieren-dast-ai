@@ -16,7 +16,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -32,6 +32,26 @@ logger = get_logger(__name__)
 # rather than discarded as a timeout. Kept well above max_sleep (5s) + realistic
 # ambient, below the point where a truly hung endpoint would stall the scan.
 _TIME_PROBE_TIMEOUT_S = 30.0
+
+# Cap on how many standard time-based payloads (escape/dialect variants) are
+# measured per parameter before giving up when no block was seen. Each variant
+# costs a control + a full ~5s SLEEP probe (and a confirm pair on a hit), so under
+# the per-endpoint budget and the serialized time-probe lock, sampling the whole
+# seed list would time out before the injectable escape is reached. The seed list
+# is ordered so these first few cover the common escape contexts (quote / numeric /
+# bare); an un-blocked endpoint that did not delay for any of them is not
+# time-injectable. A WAF block still escalates to the mutator regardless.
+_MAX_TIME_PAYLOADS = 4
+
+# sqlmap-style delay-scaling confirmation. A candidate found with the primary ~5s
+# SLEEP is confirmed by re-probing with a distinct shorter sleep: a real injection's
+# measured delay tracks the requested one, ambient jitter does not. The shorter
+# probe must clearly delay (>= _CONFIRM_DELAY_S * _CONFIRM_FLOOR_RATIO) AND the
+# primary probe must add at least _SCALING_MARGIN_MS more delay than it — proving
+# the delay scales with the requested value rather than being a slow-response fluke.
+_CONFIRM_DELAY_S = 2
+_CONFIRM_FLOOR_RATIO = 600.0   # ms of measured delay required per requested second
+_SCALING_MARGIN_MS = 1500.0    # min extra delay the primary sleep adds over the confirm
 
 
 def _build_error_re() -> re.Pattern:
@@ -241,86 +261,63 @@ class SqliAgent(VulnAgent):
                 continue
             tried.add(payload)
 
-            # Time-based blind detection compares the SLEEP probe against a control
-            # request measured IMMEDIATELY BEFORE it — not against a single baseline
-            # sampled once at the start. Under the concurrent multi-agent load on a
-            # single endpoint (many agents probing through the same proxy), a plain
-            # localhost request can take several seconds, and that ambient latency
-            # drifts burst to burst. A stale start-baseline of ~5.7s made the
-            # required delay ~10.2s, so a safety-capped 5s SLEEP (which DID execute)
-            # never cleared the bar and a real blind injection was missed. An
-            # adjacent control shares the same ambient load as its probe, so the
-            # delta isolates the injected sleep regardless of absolute contention —
-            # no cross-agent lock needed. (A previous global time-probe lock made the
-            # measurement quiet but serialized every SLEEP on every endpoint through
-            # one gate, starving the concurrent CMDI time-based probe on a sibling
-            # endpoint until the coordinator budget expired.)
-            control_ms, _ = await self._timed_send(target, client, param, clean_value)
-            probe_ms, resp = await self._timed_send(target, client, param, payload)
+            # Stage 1 (candidate): compare the SLEEP probe against a FALSE control
+            # sent immediately before it — the same payload with the sleep zeroed
+            # (SLEEP(0), sqlmap's true/false differential). Identical query-parsing
+            # path and same ambient-load epoch, so the delta isolates the server-side
+            # sleep. The adaptive per-host limiter keeps a saturated single-worker
+            # target near-serial, so these requests stay fast and the delta clean (an
+            # un-throttled target inflates every round-trip to 10-20s and buries the
+            # signal). Falls back to the clean value when the payload has no
+            # recognizable sleep construct (e.g. the SQLite heavy-query form).
+            control_value = zero_delay_variant(payload) or clean_value
+            finding = None
+            # Hold the global time-probe lock across BOTH the candidate measurement
+            # AND the confirmation. Releasing between them lets the confirm re-queue
+            # behind other endpoints' time-probe loops on this globally-contended
+            # lock; under the per-endpoint deadline it then starves and the agent
+            # task is cancelled mid-confirm, silently dropping a strong candidate
+            # (observed: a clean 5157ms 'id' candidate lost because its confirm
+            # waited ~60s on the lock and never sent a request). The confirm adds
+            # only a control + one shorter SLEEP, and only when a candidate is
+            # found, so the extra hold is bounded and rare.
+            async with serialize_time_probe():
+                control_ms, _ = await self._timed_send(target, client, param, control_value)
+                probe_ms, resp = await self._timed_send(target, client, param, payload)
 
-            delta_ms = probe_ms - control_ms
-            # A real SLEEP also has to show up in ABSOLUTE terms (the probe itself
-            # must be at least ~sleep-duration long) so a control that happened to
-            # be anomalously fast cannot manufacture a large delta from noise.
-            candidate = (
-                resp is not None
-                and delta_ms >= threshold_ms
-                and probe_ms >= threshold_ms
-            )
-            logger.debug(
-                "SQLi time-based probe",
-                param=param["name"],
-                payload=payload,
-                control_ms=round(control_ms),
-                probe_ms=round(probe_ms),
-                delta_ms=round(delta_ms),
-                threshold_ms=threshold_ms,
-                resp=None if resp is None else resp.status_code,
-                candidate=candidate,
-            )
-
-            if candidate:
-                # Re-confirm with a second control/probe pair: ambient load spikes
-                # are transient and rarely reproduce, but an injected SLEEP does
-                # every time. Only confirm when the delay holds on the re-test.
-                control2_ms, _ = await self._timed_send(target, client, param, clean_value)
-                probe2_ms, resp2 = await self._timed_send(target, client, param, payload)
-                delta2_ms = probe2_ms - control2_ms
-                confirmed = (
-                    resp2 is not None
-                    and delta2_ms >= threshold_ms
-                    and probe2_ms >= threshold_ms
+                delta_ms = probe_ms - control_ms
+                # The delay must show up both as a delta over the control AND in
+                # absolute terms (the probe itself must be at least a sleep-duration
+                # long), so an anomalously slow control cannot hide a real sleep nor
+                # a fast one manufacture a delta from noise.
+                candidate = (
+                    resp is not None
+                    and delta_ms >= threshold_ms
+                    and probe_ms >= threshold_ms
                 )
                 logger.debug(
-                    "SQLi time-based re-confirm",
-                    param=param["name"], payload=payload,
-                    control_ms=round(control2_ms), probe_ms=round(probe2_ms),
-                    delta_ms=round(delta2_ms), confirmed=confirmed,
+                    "SQLi time-based probe",
+                    param=param["name"],
+                    payload=payload,
+                    control_value=control_value,
+                    control_ms=round(control_ms),
+                    probe_ms=round(probe_ms),
+                    delta_ms=round(delta_ms),
+                    threshold_ms=threshold_ms,
+                    resp=None if resp is None else resp.status_code,
+                    candidate=candidate,
                 )
-                if confirmed:
-                    confirm_resp = resp2 if resp2 is not None else resp
-                    probe_request, probe_response = _fmt_http_pair(confirm_resp)
-                    return AgentFinding(
-                        title="SQL Injection (Time-Based Blind)",
-                        severity="critical",
-                        cwe="CWE-89",
-                        attack_type="sqli",
-                        evidence=(
-                            f"Response to '{param['name']}' delayed {delta_ms:.0f}ms then "
-                            f"{delta2_ms:.0f}ms over an adjacent control with a 5s SLEEP payload "
-                            f"(control ~{control_ms:.0f}/{control2_ms:.0f}ms) — the delay reproduced, "
-                            f"confirming server-side execution independent of ambient load"
-                        ),
-                        payload=payload,
-                        parameter=param["name"],
-                        url=target.url,
-                        request_method=target.method,
-                        bypass_validation=True,
-                        probe_request=probe_request,
-                        probe_response=probe_response,
+
+                if candidate:
+                    finding = await self._confirm_time_scaling(
+                        target, client, param, payload, control_value,
+                        delta_ms, resp, threshold_ms,
                     )
 
-            if resp is not None and iteration >= len(seed) - 1:
+            if finding is not None:
+                return finding
+
+            if resp is not None and iteration >= min(len(seed), _MAX_TIME_PAYLOADS) - 1:
                 # Only drive the (very expensive: ~5s/probe) time-based mutator
                 # when a WAF actually blocked the standard SLEEP seeds. With no
                 # block, an obfuscated SLEEP is no more likely to land than the
@@ -345,6 +342,119 @@ class SqliAgent(VulnAgent):
                 payloads_to_try.append(mutation.payload)
 
         return None
+
+    async def _confirm_time_scaling(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+        payload: str,
+        control_value: str,
+        primary_delta_ms: float,
+        primary_resp: "Optional[httpx.Response]",
+        threshold_ms: float,
+    ) -> Optional[AgentFinding]:
+        """Confirm a time-based candidate by delay scaling (sqlmap's method): a real
+        injection's measured delay tracks the requested sleep. Re-probe with a
+        distinct, shorter sleep and require (a) the shorter sleep to clearly delay the
+        response and (b) the original (longer) sleep to add measurably MORE delay than
+        it. Ambient spikes are uncorrelated with the requested delay, so they cannot
+        satisfy the scaling relation — only an attacker-controlled sleep does.
+
+        When the payload has no rewritable sleep construct (e.g. the SQLite
+        heavy-query form), scaling is impossible, so fall back to reproducing the same
+        delay over the zero-delay control.
+
+        The caller invokes this while already holding the global time-probe lock
+        (serialize_time_probe), so the confirmation runs atomically after the
+        candidate measurement and cannot starve re-acquiring that contended lock
+        under the per-endpoint deadline. Do NOT take the lock again here."""
+        confirm_payload = scaled_delay_variant(payload, _CONFIRM_DELAY_S)
+
+        if confirm_payload is None:
+            control_ms, _ = await self._timed_send(target, client, param, control_value)
+            probe_ms, resp = await self._timed_send(target, client, param, payload)
+            reproduce_delta_ms = probe_ms - control_ms
+            confirmed = (
+                resp is not None
+                and reproduce_delta_ms >= threshold_ms
+                and probe_ms >= threshold_ms
+            )
+            logger.debug(
+                "SQLi time-based re-confirm (reproduce)",
+                param=param["name"], payload=payload,
+                control_ms=round(control_ms), probe_ms=round(probe_ms),
+                delta_ms=round(reproduce_delta_ms), confirmed=confirmed,
+            )
+            confirm_resp = resp if resp is not None else primary_resp
+            evidence_tail = (
+                f"the delay reproduced ({primary_delta_ms:.0f}ms then "
+                f"{reproduce_delta_ms:.0f}ms), confirming server-side execution "
+                f"independent of ambient load"
+            )
+            if not confirmed:
+                return None
+            return self._time_based_finding(
+                target, param, payload, control_value, evidence_tail, confirm_resp
+            )
+
+        # Delay-scaling confirmation (caller holds the time-probe lock).
+        control_ms, _ = await self._timed_send(target, client, param, control_value)
+        confirm_ms, resp = await self._timed_send(target, client, param, confirm_payload)
+        confirm_delta_ms = confirm_ms - control_ms
+        confirm_floor_ms = _CONFIRM_DELAY_S * _CONFIRM_FLOOR_RATIO
+        scaled = (
+            resp is not None
+            and confirm_delta_ms >= confirm_floor_ms          # shorter sleep clearly delayed
+            and confirm_ms >= confirm_floor_ms
+            and (primary_delta_ms - confirm_delta_ms) >= _SCALING_MARGIN_MS  # longer sleep added more
+        )
+        logger.debug(
+            "SQLi time-based re-confirm (scaling)",
+            param=param["name"], payload=payload, confirm_payload=confirm_payload,
+            confirm_delay_s=_CONFIRM_DELAY_S, control_ms=round(control_ms),
+            confirm_ms=round(confirm_ms), confirm_delta_ms=round(confirm_delta_ms),
+            primary_delta_ms=round(primary_delta_ms), confirmed=scaled,
+        )
+        if not scaled:
+            return None
+        evidence_tail = (
+            f"the delay scaled with the requested sleep — {primary_delta_ms:.0f}ms for a "
+            f"5s SLEEP versus {confirm_delta_ms:.0f}ms for a {_CONFIRM_DELAY_S}s SLEEP over a "
+            f"matched zero-delay control — proving the delay is attacker-controlled, not "
+            f"ambient load"
+        )
+        return self._time_based_finding(
+            target, param, payload, control_value, evidence_tail, resp
+        )
+
+    def _time_based_finding(
+        self,
+        target: "CheckTarget",
+        param: dict,
+        payload: str,
+        control_value: str,
+        evidence_tail: str,
+        confirm_resp: "Optional[httpx.Response]",
+    ) -> AgentFinding:
+        probe_request, probe_response = _fmt_http_pair(confirm_resp)
+        return AgentFinding(
+            title="SQL Injection (Time-Based Blind)",
+            severity="critical",
+            cwe="CWE-89",
+            attack_type="sqli",
+            evidence=(
+                f"Response to '{param['name']}' with a SLEEP payload delayed over a "
+                f"matched zero-delay control ('{control_value}'): {evidence_tail}."
+            ),
+            payload=payload,
+            parameter=param["name"],
+            url=target.url,
+            request_method=target.method,
+            bypass_validation=True,
+            probe_request=probe_request,
+            probe_response=probe_response,
+        )
 
     async def _timed_send(
         self,

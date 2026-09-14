@@ -6,6 +6,7 @@ dast.agents.cmdi_agent._send.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
@@ -81,17 +82,54 @@ async def test_time_based_blind_detected():
     target = _target()
 
     async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
-        # The `sleep` payload adds server-side delay over the adjacent control;
-        # detection compares resp.elapsed (server round-trip), not wall-clock.
-        if payload and "sleep" in payload:
-            return _resp(200, "ping ok", elapsed=4.5)
-        return _resp(200, "ping ok", elapsed=0.05)
+        # Injectable endpoint: the response time TRACKS the requested `sleep N`
+        # (delay scaling). `sleep 0` control is fast, `sleep 2` confirm ~2s, `sleep 4`
+        # probe ~4s — so both the candidate and the sqlmap-style scaling confirmation
+        # succeed. Detection compares resp.elapsed (server round-trip), not wall-clock.
+        requested_s = 0.0
+        if payload:
+            m = re.search(r"sleep\s+(\d+)", payload, re.IGNORECASE)
+            if m:
+                requested_s = float(m.group(1))
+        return _resp(200, "ping ok", elapsed=0.05 + requested_s)
 
     with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
         findings = await CmdiAgent().run(target, MagicMock())
 
     assert len(findings) == 1
     assert "Time-Based Blind" in findings[0].title
+
+
+# ── regression: body-location params are injected into the body, not the query ─
+# DVWA /exec/ reads `ip` from the POST body ($_POST['ip']); the agent used to
+# hardcode query-string injection (POST /exec/?ip=;id), which never reaches the
+# vulnerable code path, so command injection went undetected.
+
+@pytest.mark.asyncio
+async def test_body_location_param_injected_into_body():
+    target = CheckTarget(
+        method="POST",
+        url="https://example.com/exec/",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        body="ip=127.0.0.1&Submit=Submit",
+        params=[{"name": "ip", "location": "body", "value": "127.0.0.1"}],
+    )
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # `id` executes (uid output) ONLY when the payload landed in the body. If the
+        # agent (wrongly) injected into the query string, the body still carries the
+        # untouched value and no output leaks.
+        if payload and payload.strip(";|&$()`") == "id" and body and payload in body:
+            return _resp(200, "ping ok\nuid=33(www-data) gid=33(www-data)")
+        return _resp(200, "ping ok")
+
+    with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
+        findings = await CmdiAgent().run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert findings[0].attack_type == "cmdi"
+    assert findings[0].parameter == "ip"
+    assert "Output Reflected" in findings[0].title
 
 
 # ── regression: WAF-bypass payloads are exercised and detected ───────────────

@@ -8,6 +8,7 @@ and never touch the LLM gateway.
 
 from __future__ import annotations
 
+import re
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
@@ -200,9 +201,16 @@ async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_thresh
     target = _target()
 
     async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
-        if "SLEEP" in unquote(url) or "WAITFOR" in unquote(url) or "pg_sleep" in unquote(url):
-            return _resp(200, "ok", elapsed=5.0)   # SLEEP executed server-side
-        return _resp(200, "ok", elapsed=0.05)      # clean adjacent control
+        decoded = unquote(url)
+        # Injectable endpoint: the response time TRACKS the requested SLEEP duration
+        # (delay scaling). SLEEP(0) control is fast, SLEEP(2) confirm ~2s, SLEEP(5)
+        # probe ~5s — so both the candidate and the sqlmap-style scaling confirmation
+        # succeed. A tiny ambient baseline is added to every response.
+        m = re.search(r"SLEEP\((\d+)\)|pg_sleep\((\d+)\)|0:0:(\d+)", decoded, re.IGNORECASE)
+        requested_s = 0.0
+        if m:
+            requested_s = float(next(g for g in m.groups() if g is not None))
+        return _resp(200, "ok", elapsed=0.05 + requested_s)
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
         finding = await SqliAgent()._probe_time_based(

@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -426,6 +427,7 @@ def reset_host_reachability() -> None:
     _HOST_FAILURE_STATE.clear()
     _HOST_DEAD.clear()
     _HOST_DEAD_AT.clear()
+    _HOST_LIMITERS.clear()
 
 
 # Statuses the MITM proxy returns when it cannot reach the upstream host —
@@ -433,15 +435,152 @@ def reset_host_reachability() -> None:
 _PROXY_UNREACHABLE_STATUSES = frozenset({502, 504})
 
 
-# Global semaphore — at most 3 concurrent outgoing probe requests across all agents
-# (resized at scan start to probe_concurrency * workers by the runner).
+# Global semaphore — hard ceiling on concurrent outgoing probe requests across all
+# agents (resized at scan start to probe_concurrency * workers by the runner). This
+# is the absolute cap; the per-host adaptive limiter below drives the *effective*
+# concurrency down further whenever a target shows it cannot sustain the load.
 _PROBE_SEM = asyncio.Semaphore(3)
+_PROBE_SLOTS_TOTAL = 3  # mirror of the configured ceiling, used as the limiter's max
 
 
 def set_probe_concurrency(total_slots: int) -> None:
     """Resize the global probe semaphore. Called by the runner when a scan starts."""
-    global _PROBE_SEM
+    global _PROBE_SEM, _PROBE_SLOTS_TOTAL
     _PROBE_SEM = asyncio.Semaphore(total_slots)
+    _PROBE_SLOTS_TOTAL = max(1, total_slots)
+
+
+# ── per-host adaptive concurrency limiter (latency-gradient AIMD) ────────────
+# A single-worker target (a dev DVWA, a small app-server pool) cannot serve N
+# probes in parallel: concurrent requests queue behind each other, so every
+# request's latency grows roughly linearly with in-flight count while total
+# throughput stays flat. Observed on DVWA under 16-way probing: a ~0.1s localhost
+# round-trip inflated to 18-22s, past the client read timeout — time-based SLEEP
+# probes were discarded, and the per-endpoint budget bought only a handful of
+# requests, so blind-injection detection (which needs several clean probes) never
+# finished. More concurrency there is strictly worse.
+#
+# This limiter watches each host's server round-trip (resp.elapsed, not wall-clock,
+# so our own queue wait does not feed back) and applies AIMD, exactly like TCP
+# congestion control: when latency inflates far past the host's uncontended
+# baseline (or a probe times out) it multiplicatively halves the in-flight limit;
+# when latency is healthy it grows the limit by one. Against a single-worker target
+# it converges to near-serial (fast requests, clean timing, budget spent on many
+# probes); against a target that genuinely scales it climbs back to the ceiling.
+_LATENCY_INFLATION = 4.0      # rtt beyond baseline_min * this counts as congestion
+_LATENCY_FLOOR_S = 1.0        # never treat a sub-second rtt as congestion
+_CONCURRENCY_BACKOFF = 0.5    # multiplicative decrease on a congestion signal
+_CONCURRENCY_RECOVER = 1.0    # additive increase when latency is healthy
+
+_HOST_LIMITERS: "Dict[str, _HostConcurrencyLimiter]" = {}
+_HOST_LIMITERS_LOCK = asyncio.Lock()
+
+
+class _HostConcurrencyLimiter:
+    """Adaptive in-flight cap for one host. See the module comment above for the
+    congestion-control rationale. Not thread-safe; single event loop only."""
+
+    def __init__(self, max_limit: int) -> None:
+        self.max_limit = max(1, max_limit)
+        self.limit = float(self.max_limit)
+        self.in_flight = 0
+        self.min_rtt: "Optional[float]" = None  # uncontended baseline, seconds
+        self._cond = asyncio.Condition()
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            while self.in_flight >= max(1, int(self.limit)):
+                await self._cond.wait()
+            self.in_flight += 1
+
+    async def release(self, rtt_s: "Optional[float]", congested: bool = False) -> None:
+        async with self._cond:
+            self.in_flight = max(0, self.in_flight - 1)
+            self._update_limit(rtt_s, congested)
+            # Wake everyone; each waiter re-checks the (possibly changed) limit.
+            self._cond.notify_all()
+
+    def _update_limit(self, rtt_s: "Optional[float]", congested: bool) -> None:
+        if congested:
+            self.limit = max(1.0, self.limit * _CONCURRENCY_BACKOFF)
+            return
+        if rtt_s is None or rtt_s <= 0:
+            return
+        if self.min_rtt is None or rtt_s < self.min_rtt:
+            self.min_rtt = rtt_s
+        ceiling = max((self.min_rtt or 0.0) * _LATENCY_INFLATION, _LATENCY_FLOOR_S)
+        if rtt_s > ceiling:
+            self.limit = max(1.0, self.limit * _CONCURRENCY_BACKOFF)
+        else:
+            self.limit = min(float(self.max_limit), self.limit + _CONCURRENCY_RECOVER)
+
+
+async def _get_host_limiter(hostname: str) -> "_HostConcurrencyLimiter":
+    """Return (creating on first use) the adaptive limiter for a host, sized to the
+    current global ceiling."""
+    async with _HOST_LIMITERS_LOCK:
+        limiter = _HOST_LIMITERS.get(hostname)
+        if limiter is None or limiter.max_limit != _PROBE_SLOTS_TOTAL:
+            limiter = _HostConcurrencyLimiter(_PROBE_SLOTS_TOTAL)
+            _HOST_LIMITERS[hostname] = limiter
+        return limiter
+
+
+# Global lock serializing time-based blind probes (SLEEP/WAITFOR) across ALL agents
+# and endpoints. A single sleeping request pins one of the target's application
+# workers for the whole sleep duration; app servers (and especially a single-worker
+# dev target) have a small worker pool, so N concurrent SLEEP probes queue behind
+# each other and multiply the ambient latency every OTHER request measures against.
+# Under 16-way probe concurrency that inflated a 0.1s localhost round-trip to
+# 10-16s, which starved the per-endpoint budget so the injectable parameter's
+# time-based probe never finished. Serializing keeps at most one sleep in flight,
+# so the control/probe pair each stay fast and the differential is measured in a
+# few seconds. This deliberately does NOT drain the whole probe pool (an earlier
+# "quiesce everything" attempt did, starving concurrent non-time agents); fast
+# content probes never take this lock.
+_TIME_PROBE_LOCK = asyncio.Lock()
+
+
+@asynccontextmanager
+async def serialize_time_probe():
+    """Hold the global time-probe lock around one control/probe measurement so no
+    other agent's SLEEP is in flight at the same time (see _TIME_PROBE_LOCK)."""
+    async with _TIME_PROBE_LOCK:
+        yield
+
+
+# Regexes that rewrite the sleep duration inside a time-based payload to an
+# arbitrary value, preserving the exact query shape. Each template carries an `{n}`
+# placeholder between the captured prefix/suffix backreferences. Used to build both
+# the false control (sleep = 0) and the delay-scaling confirmation probe (sleep = a
+# distinct value), following sqlmap's approach: only the server-side sleep should
+# distinguish these otherwise-identical requests, and a real injection's measured
+# delay tracks the requested one while ambient jitter does not.
+_DELAY_SUBS: "List[tuple[re.Pattern, str]]" = [
+    (re.compile(r"(SLEEP\s*\(\s*)\d+(?:\.\d+)?(\s*\))", re.IGNORECASE), r"\g<1>{n}\g<2>"),
+    (re.compile(r"(pg_sleep\s*\(\s*)\d+(?:\.\d+)?(\s*\))", re.IGNORECASE), r"\g<1>{n}\g<2>"),
+    (re.compile(r"(WAITFOR\s+DELAY\s+'0:0:)\d+(')", re.IGNORECASE), r"\g<1>{n}\g<2>"),
+    (re.compile(r"(\bsleep\s+)\d+(?:\.\d+)?\b", re.IGNORECASE), r"\g<1>{n}"),
+]
+
+
+def scaled_delay_variant(payload: str, seconds: int) -> "Optional[str]":
+    """Return `payload` with its sleep duration rewritten to `seconds` (same query
+    shape), or None when no known sleep construct is present. `seconds=0` yields the
+    false control; a distinct value yields the delay-scaling confirmation probe."""
+    for pattern, template in _DELAY_SUBS:
+        replacement = template.replace("{n}", str(int(seconds)))
+        new_payload, count = pattern.subn(replacement, payload)
+        if count:
+            return new_payload
+    return None
+
+
+def zero_delay_variant(payload: str) -> "Optional[str]":
+    """Return `payload` with its sleep duration zeroed (the false control for a
+    true/false time differential), or None when no known sleep construct is present
+    — the caller then falls back to a plain clean-value control."""
+    return scaled_delay_variant(payload, 0)
 
 
 async def _send(
@@ -462,10 +601,14 @@ async def _send(
     if is_host_dead(hostname):
         return None
 
+    limiter = await _get_host_limiter(hostname)
     async with _PROBE_SEM:
-        delay = await _get_probe_delay(hostname)
-        await asyncio.sleep(delay)
+        await limiter.acquire()
+        rtt_s: "Optional[float]" = None
+        congested = False
         try:
+            delay = await _get_probe_delay(hostname)
+            await asyncio.sleep(delay)
             forward_headers = {
                 k: v for k, v in headers.items()
                 if k.lower() not in (
@@ -500,6 +643,11 @@ async def _send(
                 content=content,
                 timeout=request_timeout,
             )
+            # Feed the server round-trip to the adaptive limiter. A time-based
+            # SLEEP probe legitimately runs long, so it is not a congestion signal;
+            # exclude it (the caller passes an explicit timeout for those).
+            if timeout is None:
+                rtt_s = response_elapsed_ms(resp) / 1000.0
 
             # A 502/504 from the MITM proxy means it could not reach the upstream
             # host (DNS failure, connection refused) — treat it as a connection
@@ -542,7 +690,15 @@ async def _send(
             # probe's result.
             logger.debug("Active check request failed (host still reachable)", url=url, error=str(e))
             await _record_host_reachable(hostname)
+            # A default-timeout request that did not complete is the strongest
+            # congestion signal there is: the target could not answer in time under
+            # the current load. Time-based probes (explicit timeout) time out for
+            # benign reasons, so they do not count against concurrency.
+            if timeout is None:
+                congested = True
             return None
+        finally:
+            await limiter.release(rtt_s, congested)
 
 
 def response_elapsed_ms(resp: "Optional[httpx.Response]") -> float:

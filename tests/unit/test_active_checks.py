@@ -14,13 +14,89 @@ import respx
 from dast.scanners.active_checks import (
     ActiveFinding,
     CheckTarget,
+    _HostConcurrencyLimiter,
     _inject_body,
     _inject_query,
     check_xss,
     check_sqli,
     check_open_redirect,
+    zero_delay_variant,
 )
 from dast.proxy.runner import _entry_to_check_target
+
+
+# ── adaptive per-host concurrency limiter (AIMD) ─────────────────────────────
+
+@pytest.mark.asyncio
+class TestHostConcurrencyLimiter:
+    async def test_congestion_halves_the_limit(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        # A fast first request establishes the ~0.1s uncontended baseline.
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.1)
+        assert limiter.limit == 16.0  # healthy -> already at ceiling, stays capped
+        # A grossly inflated round-trip (baseline * >4) signals congestion.
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)
+        assert limiter.limit == 8.0
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)
+        assert limiter.limit == 4.0
+
+    async def test_explicit_congested_flag_backs_off(self):
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        await limiter.acquire()
+        # A timed-out default request reports congestion directly (no rtt).
+        await limiter.release(rtt_s=None, congested=True)
+        assert limiter.limit == 4.0
+
+    async def test_healthy_latency_recovers_additively(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        limiter.limit = 2.0
+        limiter.min_rtt = 0.1
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.15)  # within baseline*4 -> healthy
+        assert limiter.limit == 3.0
+
+    async def test_never_drops_below_one(self):
+        limiter = _HostConcurrencyLimiter(max_limit=4)
+        limiter.min_rtt = 0.1
+        for _ in range(10):
+            await limiter.acquire()
+            await limiter.release(rtt_s=30.0)
+        assert limiter.limit == 1.0
+
+    async def test_sub_second_latency_is_never_congestion(self):
+        # Absolute floor: a fast host must not be throttled even if a single
+        # request is several times its (tiny) baseline.
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        limiter.limit = 4.0
+        limiter.min_rtt = 0.01
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.2)  # 20x baseline but < 1s floor -> healthy
+        assert limiter.limit == 5.0
+
+
+# ── time-based differential control ─────────────────────────────────────────
+
+@pytest.mark.parametrize("payload,expected", [
+    ("1' AND SLEEP(5)-- -", "1' AND SLEEP(0)-- -"),
+    ("' OR SLEEP(5)-- -", "' OR SLEEP(0)-- -"),
+    ("1'; SELECT pg_sleep(5)-- -", "1'; SELECT pg_sleep(0)-- -"),
+    ("1; WAITFOR DELAY '0:0:5'-- -", "1; WAITFOR DELAY '0:0:0'-- -"),
+    (";sleep 4", ";sleep 0"),
+    ("$(sleep 4)", "$(sleep 0)"),
+])
+def test_zero_delay_variant_zeroes_the_sleep(payload, expected):
+    assert zero_delay_variant(payload) == expected
+
+
+def test_zero_delay_variant_returns_none_without_sleep():
+    # No recognizable sleep construct -> caller falls back to a clean value.
+    assert zero_delay_variant("' OR '1'='1") is None
+    assert zero_delay_variant(
+        "' AND (SELECT COUNT(*) FROM sqlite_master)>0 AND '1'='1"
+    ) is None
 
 
 # ── injection helpers ──────────────────────────────────────────────────────

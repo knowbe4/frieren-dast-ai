@@ -113,7 +113,6 @@ TOP_LEVEL_TABS = [
 ]
 PROXY_SUB_TABS = ["history", "intercept", "sitemap", "issues", "psettings"]
 BROWSE_SUB_TABS = ["manual", "crawl", "discovery"]
-AI_SUB_TABS = ["suggestions", "scan", "settings"]
 EXTRAS_SUB_TABS = ["h1", "code", "fedramp", "interactions", "decoder", "jwt"]
 GRAPHQL_SUB_TABS = ["explorer", "fuzzer"]
 
@@ -181,7 +180,7 @@ def test_browse_sub_tabs_have_no_console_errors(dashboard_url):
     assert errors == []
 
 
-def test_ai_sub_tabs_have_no_console_errors(dashboard_url):
+def test_ai_panel_has_no_console_errors(dashboard_url):
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
@@ -191,9 +190,7 @@ def test_ai_sub_tabs_have_no_console_errors(dashboard_url):
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
             page.evaluate("switchMain('ai')")
-            for sub in AI_SUB_TABS:
-                page.evaluate(f"switchAiSub('{sub}')")
-                page.wait_for_timeout(100)
+            page.wait_for_timeout(200)
         browser.close()
 
     assert errors == []

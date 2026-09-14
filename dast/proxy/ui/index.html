@@ -915,8 +915,8 @@
       <p style="color:var(--txt2);font-size:11px;margin-bottom:8px">
         Forced browsing: probes a curated list of common directories, files, and
         GraphQL endpoint paths against an in-scope host to surface endpoints nothing
-        links to. GET-only recon — hits appear in HTTP history (tagged "discovery")
-        and as review suggestions in the AI tab. The target must be in scope.
+        links to. GET-only recon — hits appear in HTTP history (tagged "discovery").
+        The target must be in scope.
       </p>
 
       <h3>Target URL</h3>
@@ -1046,42 +1046,9 @@
   <!-- ══ PLUGINS PANEL ══ -->
   <!-- ══ AI PANEL ══ -->
   <div class="tpanel" id="panel-ai" style="flex-direction:column">
-    <div class="subtab-bar">
-      <div class="stab on" id="st-ai-suggestions" onclick="switchAiSub('suggestions')">Suggestions</div>
-      <div class="stab"    id="st-ai-settings"    onclick="switchAiSub('settings')">Settings</div>
-    </div>
 
-    <!-- ── AI Suggestions sub-panel ── -->
-    <div id="ai-sub-suggestions" style="flex:1;overflow-y:auto;padding:18px 24px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
-        <h2 style="margin:0">AI Suggestions</h2>
-        <div style="display:flex;align-items:center;gap:10px">
-          <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--txt);cursor:pointer"
-                 title="Auto-scan new suggestions as they arrive (enabled automatically in AI mode)">
-            <input type="checkbox" id="ai-auto-scan" style="accent-color:var(--green)" onchange="toggleAutoScan(this)">
-            Auto-scan
-          </label>
-          <button class="tbtn pri" id="ai-scan-all-btn" onclick="scanAllSuggestions()">Scan All</button>
-          <button class="tbtn" onclick="loadAiSuggestions()">Refresh</button>
-        </div>
-      </div>
-
-      <!-- Session intelligence summary -->
-      <div id="ai-intel-summary" style="margin-bottom:16px"></div>
-
-      <!-- Suggestions table -->
-      <div id="ai-suggestions-wrap">
-        <div style="color:var(--txt2);font-size:11px;padding:12px 0">No suggestions yet — the AI will populate this as it analyses traffic through the proxy.</div>
-      </div>
-      <div id="sugg-pager" style="display:none;align-items:center;gap:6px;padding:8px 0;font-size:11px">
-        <button class="tbtn" onclick="suggPage(-1)">‹ Prev</button>
-        <span id="sugg-page-lbl" style="color:var(--txt2)"></span>
-        <button class="tbtn" onclick="suggPage(1)">Next ›</button>
-      </div>
-    </div><!-- end ai-sub-suggestions -->
-
-    <!-- ── AI Settings sub-panel ── -->
-    <div id="ai-sub-settings" style="flex:1;overflow-y:auto;display:none">
+    <!-- ── AI Settings ── -->
+    <div id="ai-sub-settings" style="flex:1;overflow-y:auto">
     <div class="settings-body" style="max-width:860px">
 
       <h2>AI Settings</h2>
@@ -1290,21 +1257,6 @@
       </div>
 
       <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
-
-      <!-- Activity log -->
-      <h3>Agent Activity Log</h3>
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
-        <button class="tbtn" onclick="loadAiLog()">Refresh</button>
-        <label style="font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:4px">
-          <input type="checkbox" id="ai-log-autoreload" onchange="toggleAiLogAuto(this)">
-          Auto-refresh every 5s
-        </label>
-      </div>
-      <div id="ai-activity-log" style="max-height:480px;overflow-y:auto;
-           border:1px solid var(--bdr);border-radius:4px;background:var(--bg2);
-           font-size:11px;margin-bottom:24px">
-        <div style="color:var(--txt2);padding:10px 14px">No agent scans yet.</div>
-      </div>
 
       <!-- Service graph -->
       <h3>Service Graph</h3>
@@ -1722,14 +1674,7 @@
         <div style="padding:12px 14px;border-bottom:1px solid var(--bdr);flex-shrink:0;overflow-y:auto">
           <div style="font-size:11px;font-weight:600;color:var(--acc2);margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px">Vuln Validator</div>
 
-          <!-- AI agentic validation is an opt-in; unchecked runs a single-shot validation. -->
-          <label id="vv-ai-toggle" style="display:flex;align-items:center;gap:8px;margin-bottom:8px;
-                 cursor:pointer;user-select:none;font-size:11px;color:var(--txt)">
-            <input type="checkbox" id="vv-use-ai" onchange="vvSetMode(this.checked ? 'ai' : 'manual')"
-                   style="cursor:pointer;margin:0">
-            <span>Use AI agentic reproduction</span>
-          </label>
-          <div id="vv-mode-hint" style="font-size:10px;color:var(--txt2);margin-bottom:10px;line-height:1.4">
+          <div style="font-size:10px;color:var(--txt2);margin-bottom:10px;line-height:1.4">
             Single-shot reproduction: parse the report and validate it once.
           </div>
 
@@ -1741,14 +1686,12 @@
                    line-height:1.5"></textarea>
 
           <div style="font-size:10px;color:var(--txt2);margin-top:8px;margin-bottom:4px">
-            Override URL <span style="color:var(--txt2)">(optional — if AI extraction is wrong)</span>
+            Override URL <span style="color:var(--txt2)">(optional — if extraction is wrong)</span>
           </div>
           <input id="h1-override-url" placeholder="https://..." type="url"
             style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
                    padding:4px 8px;border-radius:3px;font-size:11px;font-family:inherit;margin-bottom:8px">
 
-          <!-- Manual-only inputs (the AI path takes only the report text + optional URL) -->
-          <div id="vv-manual-only">
           <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">
             Override domain <span style="color:var(--txt2)">(for DNS takeover checks)</span>
           </div>
@@ -1767,10 +1710,9 @@
           </div>
           <input type="file" id="h1-img-input" accept="image/*" multiple style="display:none"
                  onchange="h1AddImages(this)">
-          </div>
 
           <div style="display:flex;gap:6px">
-            <button class="tbtn pri" onclick="vvValidate()" id="h1-submit-btn">Validate</button>
+            <button class="tbtn pri" onclick="h1Submit()" id="h1-submit-btn">Validate</button>
             <span id="h1-submit-msg" style="font-size:10px;color:var(--txt2);align-self:center"></span>
           </div>
         </div>
@@ -1780,27 +1722,17 @@
           <div style="padding:6px 14px;font-size:10px;color:var(--txt2);border-bottom:1px solid var(--bdr);
                       display:flex;align-items:center;gap:8px">
             <span style="flex:1">Recent validations</span>
-            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="vvLoadJobs()">Refresh</button>
+            <button class="tbtn" style="font-size:9px;padding:1px 7px" onclick="h1LoadJobs()">Refresh</button>
           </div>
           <div id="h1-job-list" style="font-size:11px"></div>
         </div>
       </div>
 
-      <!-- RIGHT: Result detail (manual single-shot) -->
+      <!-- RIGHT: Result detail (single-shot) -->
       <div id="vv-manual-result" style="flex:1;display:flex;flex-direction:column;overflow:hidden">
         <div id="h1-result-panel" style="flex:1;overflow-y:auto;padding:16px 20px">
           <div style="color:var(--txt2);font-size:12px;text-align:center;padding:60px 20px">
             Submit a report to validate it.
-          </div>
-        </div>
-      </div>
-
-      <!-- RIGHT: Live agent trace (AI mode) -->
-      <div id="vv-ai-result" style="flex:1;display:none;flex-direction:column;overflow:hidden">
-        <div id="vv-trace-panel" style="flex:1;overflow-y:auto;padding:16px 20px">
-          <div style="color:var(--txt2);font-size:12px;text-align:center;padding:60px 20px">
-            Paste a report and click Validate — the agent will try to reproduce it,
-            streaming each step here and pausing for you when it hits a wall.
           </div>
         </div>
       </div>
@@ -2157,7 +2089,6 @@
 <script src="/ui/js/80-setup-status-sessions.js"></script>
 <script src="/ui/js/85-overview-scanconfig-provider.js"></script>
 <script src="/ui/js/90-h1-interactions.js"></script>
-<script src="/ui/js/91-vuln-validator.js"></script>
 <script src="/ui/js/92-copilot.js"></script>
 <script src="/ui/js/95-code-analysis.js"></script>
 <script src="/ui/js/96-mode-intercept-mr.js"></script>

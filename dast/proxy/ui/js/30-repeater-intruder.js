@@ -16,20 +16,15 @@ function switchMain(tab) {
   if (tab === 'logs')     loadLogs();
   if (tab === 'plugins')  loadPlugins();
   if (tab === 'scan')     loadScanQueue();
-  if (tab === 'ai') {
-    // Re-fire the currently active AI sub-tab's load call.
-    const activeSub = ['suggestions', 'settings'].find(
-      s => document.getElementById('st-ai-' + s).classList.contains('on')
-    );
-    if (activeSub) switchAiSub(activeSub);
-  }
+  if (tab === 'ai')       { loadAiPanel(); loadScanConfig(); }
   if (tab === 'copilot')  cpOnOpen();
   if (tab === 'overview') loadOverview();
   if (tab === 'browse') {
-    // Re-fire the currently active Browse sub-tab's load call (mirrors the old
-    // per-top-level-tab dispatch for the folded-in Crawl tab).
-    const isManualActive = document.getElementById('st-browse-manual').classList.contains('on');
-    switchBrowseSub(isManualActive ? 'manual' : 'crawl');
+    // Re-fire the currently active Browse sub-tab's load call.
+    const activeSub = ['manual', 'crawl', 'discovery', 'logins'].find(
+      s => document.getElementById('st-browse-' + s).classList.contains('on')
+    );
+    switchBrowseSub(activeSub || 'manual');
   }
   if (tab === 'proxy') {
     // Re-fire the currently active Proxy sub-tab's load call (mirrors the old

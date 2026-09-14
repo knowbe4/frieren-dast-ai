@@ -1,6 +1,20 @@
 // ── Mode switcher ──────────────────────────────────────────────────────────
 let _aiMode = false;
-let _autoScanBeforeAiMode = false; // remember checkbox state before AI mode
+let _autoScanEnabled = false;      // current server-side auto-scan state
+let _autoScanBeforeAiMode = false; // remember state before AI mode
+
+// Enable/disable auto-scanning of in-scope traffic. AI mode turns this on for
+// the duration and restores the prior state on exit.
+async function setAutoScan(enabled) {
+  _autoScanEnabled = enabled;
+  try {
+    await fetch('/api/ai/auto-scan', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+  } catch (_) {}
+}
 
 async function setMode(mode) {
   _aiMode = mode === 'ai';
@@ -12,26 +26,19 @@ async function setMode(mode) {
 
   const manual = document.getElementById('pill-manual');
   const ai     = document.getElementById('pill-ai');
-  const autoScanCb = document.getElementById('ai-auto-scan');
 
   if (_aiMode) {
     manual.classList.remove('on'); ai.classList.add('on');
     ai.style.background = 'var(--green)';
-    // Save current auto-scan state and enable it in AI mode
-    if (autoScanCb) {
-      _autoScanBeforeAiMode = autoScanCb.checked;
-      autoScanCb.checked = true;
-      toggleAutoScan(autoScanCb);
-    }
+    // Save current auto-scan state and enable it in AI mode.
+    _autoScanBeforeAiMode = _autoScanEnabled;
+    await setAutoScan(true);
     showToast('AI mode — auto-scanning all in-scope traffic');
   } else {
     ai.classList.remove('on'); ai.style.background = '';
     manual.classList.add('on');
-    // Restore auto-scan to what it was before AI mode
-    if (autoScanCb) {
-      autoScanCb.checked = _autoScanBeforeAiMode;
-      toggleAutoScan(autoScanCb);
-    }
+    // Restore auto-scan to what it was before AI mode.
+    await setAutoScan(_autoScanBeforeAiMode);
     showToast('Manual mode');
   }
 }

@@ -101,6 +101,48 @@ async def test_escalate_block_seeds_session_and_dedupes():
 
 
 @pytest.mark.asyncio
+async def test_escalate_block_scheduling_failure_is_retryable():
+    """A transient scheduling failure must not permanently suppress the pair:
+    the dedup mark is only set after the turn is scheduled, and the half-built
+    session is dropped."""
+    ctx = _FakeCtx()
+    service = CopilotService(ctx)
+    intel = _host_with_blocks("h", {"sqli": _WAF_BLOCK_DISABLE_THRESHOLD})
+
+    with patch.object(CopilotService, "start_turn", side_effect=RuntimeError("no loop")):
+        assert service.escalate_block("h", "sqli", intel) is None
+    assert service._escalated == set()          # pair not marked
+    assert service.list_summaries() == []       # half-built session removed
+
+    # With scheduling working again, the same pair still escalates.
+    with patch("dast.ai.copilot.session.CopilotSession.send",
+               new=AsyncMock(return_value=None)):
+        sid = service.escalate_block("h", "sqli", intel)
+        assert sid is not None
+        task = service.get(sid).get("_task")
+        if task:
+            task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_escalate_block_without_observations_still_escalates():
+    """A host_intel with no matching WAF observation escalates with an empty
+    signal (the seeded message falls back to a placeholder), never crashing."""
+    ctx = _FakeCtx()
+    service = CopilotService(ctx)
+    intel = SessionIntelligence().get("h")  # no waf_observations at all
+
+    with patch("dast.ai.copilot.session.CopilotSession.send",
+               new=AsyncMock(return_value=None)):
+        sid = service.escalate_block("h", "sqli", intel)
+        assert sid is not None
+        assert service.get(sid)["escalation"]["signal"] == ""
+        task = service.get(sid).get("_task")
+        if task:
+            task.cancel()
+
+
+@pytest.mark.asyncio
 async def test_escalate_block_seeds_operator_message():
     ctx = _FakeCtx()
     service = CopilotService(ctx)

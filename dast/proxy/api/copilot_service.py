@@ -146,7 +146,6 @@ class CopilotService:
         key = (host, attack_type)
         if key in self._escalated:
             return None
-        self._escalated.add(key)
 
         signal = ""
         try:
@@ -172,9 +171,15 @@ class CopilotService:
         except RuntimeError as exc:
             # No running event loop — should not happen (the coordinator runs in
             # the dashboard loop), but never crash the scan over an escalation.
+            # Leave the pair un-marked and drop the half-built session so a later
+            # call (with a running loop) can retry the escalation.
             logger.warning("copilot escalation could not schedule turn",
                            host=host, attack_type=attack_type, error=str(exc))
+            self._sessions.pop(sid, None)
             return None
+        # Mark escalated only after the turn is scheduled, so a transient
+        # scheduling failure does not permanently suppress this pair.
+        self._escalated.add(key)
         logger.info("Copilot block escalation started",
                     session_id=sid, host=host, attack_type=attack_type)
         return sid

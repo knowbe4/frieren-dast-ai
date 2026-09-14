@@ -771,13 +771,12 @@ class Coordinator:
         if session_intelligence is not None:
             escalation_sink = getattr(session_intelligence, "escalation_sink", None)
             if escalation_sink is not None:
-                for blocked_type in _waf_suppressed_attack_types(host_intel):
-                    try:
+                try:
+                    for blocked_type in _waf_suppressed_attack_types(host_intel):
                         escalation_sink(_host, blocked_type, host_intel)
-                    except Exception as exc:
-                        logger.warning("block escalation sink failed",
-                                       host=_host, attack_type=blocked_type,
-                                       error=str(exc))
+                except Exception as exc:
+                    logger.warning("block escalation failed",
+                                   host=_host, error=str(exc))
 
         # Run canary probes in parallel for all (attack_type, param) combos
         # that have a canary payload defined.  Collect signal map.

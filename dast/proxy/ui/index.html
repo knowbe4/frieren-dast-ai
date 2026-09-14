@@ -62,6 +62,7 @@
   <div class="mtab"    id="mt-intruder"      onclick="switchMain('intruder')">Intruder</div>
   <div class="mtab"    id="mt-logs"     onclick="switchMain('logs')">Logs</div>
   <div class="mtab"    id="mt-extras"   onclick="switchMain('extras')">Extras</div>
+  <div class="mtab"    id="mt-copilot"  onclick="switchMain('copilot')">Copilot</div>
 </div>
 
 <!-- hidden file inputs for OS file picker -->
@@ -2092,6 +2093,53 @@
     </div>
   </div><!-- /panel-extras -->
 
+  <!-- ══ COPILOT PANEL ══ -->
+  <!-- Conversational exploration agent: chat with the AI, which drives the shared
+       tool layer, reports findings, and says when it is blocked and needs a human. -->
+  <div class="tpanel" id="panel-copilot" style="flex-direction:row;overflow:hidden">
+
+    <!-- Left: session list -->
+    <div style="width:230px;min-width:230px;border-right:1px solid var(--bdr);display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:10px 12px;border-bottom:1px solid var(--bdr);display:flex;gap:8px;align-items:center">
+        <span style="font-weight:600;font-size:12px;flex:1">Conversations</span>
+        <button class="tbtn pri" onclick="cpNewChat()" title="Start a new conversation">New</button>
+      </div>
+      <div id="cp-session-list" style="flex:1;overflow-y:auto"></div>
+    </div>
+
+    <!-- Right: conversation -->
+    <div style="flex:1;display:flex;flex-direction:column;overflow:hidden">
+      <div style="padding:9px 14px;border-bottom:1px solid var(--bdr);display:flex;align-items:center;gap:10px">
+        <span style="font-weight:600;font-size:13px">Exploration Copilot</span>
+        <span id="cp-status" style="font-size:10px;color:var(--txt2)"></span>
+        <button class="tbtn del" id="cp-cancel-btn" onclick="cpCancel()"
+                style="margin-left:auto;display:none;font-size:9px;padding:1px 7px">Cancel turn</button>
+      </div>
+
+      <div id="cp-messages" style="flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px">
+        <div class="empty" style="margin:auto;text-align:center;color:var(--txt2);max-width:440px;line-height:1.6">
+          Ask the copilot to explore or exploit something in scope.<br>
+          It drives the same tools the scanner uses, reports findings with evidence,
+          and tells you when it is blocked (a WAF, a login wall, or a value only you have)
+          so you can unblock it and it continues.
+        </div>
+      </div>
+
+      <!-- Pause / blocked action area (approve / auth) -->
+      <div id="cp-pause" style="padding:0 18px"></div>
+
+      <!-- Composer -->
+      <div style="border-top:1px solid var(--bdr);padding:10px 14px;display:flex;gap:8px;align-items:flex-end">
+        <textarea id="cp-input" rows="2" placeholder="Message the copilot (e.g. 'try to reproduce the SQLi on the login form')..."
+          onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();cpSend();}"
+          style="flex:1;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);
+                 padding:8px 10px;border-radius:4px;font-size:12px;font-family:inherit;resize:vertical;max-height:160px"></textarea>
+        <button class="tbtn pri" id="cp-send-btn" onclick="cpSend()" style="padding:8px 16px">Send</button>
+      </div>
+      <div id="cp-send-msg" style="font-size:10px;color:var(--txt2);padding:0 14px 8px"></div>
+    </div>
+  </div><!-- /panel-copilot -->
+
 </div><!-- workspace -->
 
 <script src="/ui/js/10-state-core.js"></script>
@@ -2110,6 +2158,7 @@
 <script src="/ui/js/85-overview-scanconfig-provider.js"></script>
 <script src="/ui/js/90-h1-interactions.js"></script>
 <script src="/ui/js/91-vuln-validator.js"></script>
+<script src="/ui/js/92-copilot.js"></script>
 <script src="/ui/js/95-code-analysis.js"></script>
 <script src="/ui/js/96-mode-intercept-mr.js"></script>
 <script src="/ui/js/99-bootstrap-ctxmenu.js"></script>

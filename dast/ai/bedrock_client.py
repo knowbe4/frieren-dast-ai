@@ -204,6 +204,16 @@ def get_active_model() -> str:
     return _active_model_id or settings.ai_model_id
 
 
+def _is_bedrock_arn(model_id: str) -> bool:
+    """True if ``model_id`` is an AWS Bedrock model / inference-profile ARN.
+
+    A Bedrock ARN is only meaningful to the ``bedrock`` provider; every other
+    provider (gateway/anthropic/openai and any future local backend such as
+    Ollama) expects a plain model *name*.
+    """
+    return bool(model_id) and model_id.startswith("arn:aws:")
+
+
 def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     """Return ``tier_model_id`` only if it is valid for the active provider.
 
@@ -221,13 +231,44 @@ def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     if not tier_model_id:
         return ""
     provider = get_active_provider()
-    if provider != "bedrock" and tier_model_id.startswith("arn:aws:"):
+    if provider != "bedrock" and _is_bedrock_arn(tier_model_id):
         logger.warning(
             "Ignoring Bedrock ARN configured for tier under non-Bedrock provider",
             tier=tier_name, provider=provider,
         )
         return ""
     return tier_model_id
+
+
+def _resolve_model(model_id: Optional[str]) -> str:
+    """Resolve the model id to send to the active provider, guarding a mismatch.
+
+    The AI connection (bedrock/anthropic/openai/gateway, and future local
+    backends like Ollama) is a pluggable layer, not part of the scanner core: a
+    model id is only valid for the provider it was configured for. The default
+    ``settings.ai_model_id`` is a Bedrock ARN, so a non-Bedrock provider can end
+    up handed an ARN through either the tier fallback or an explicit ``model_id``
+    (the coordinator planner passes one directly). The gateway rejects that with
+    ``HTTP 400: ... not in your role's availableModels allowlist``, which would
+    otherwise silently degrade every LLM call and produce flaky detection.
+
+    Rather than ship a wrong model and let detection quietly fail, fail loud: when
+    the active provider is non-Bedrock and no provider-appropriate model resolves
+    (empty, or a Bedrock ARN), pause AI and raise an actionable error so the
+    operator sets a model *name* (e.g. ``claude-haiku-4-5``) in the dashboard AI
+    settings / ``/api/scan-config``.
+    """
+    provider = get_active_provider()
+    model = model_id or get_active_model()
+    if provider != "bedrock" and (not model or _is_bedrock_arn(model)):
+        mark_ai_unavailable()
+        raise AiUnavailableError(
+            f"No model configured for AI provider '{provider}'. A Bedrock ARN "
+            f"cannot be used with '{provider}' — set a provider-appropriate model "
+            f"name (for example claude-haiku-4-5) in the dashboard AI settings, "
+            f"then click Resume."
+        )
+    return model
 
 
 def get_fast_model() -> str:
@@ -410,7 +451,7 @@ def _invoke_raw(
     """
     from botocore.exceptions import ClientError
 
-    model = model_id or get_active_model()
+    model = _resolve_model(model_id)
     body = _build_body(system, user, max_tokens, temperature, cache_system, schema)
 
     provider = get_active_provider()

@@ -428,6 +428,74 @@ async def test_run_validation_exception_does_not_confirm_finding():
     assert result == []
 
 
+# ── deterministic CSRF selection on state-changing endpoints ───────────────
+
+@pytest.mark.asyncio
+async def test_run_forces_csrf_agent_when_planner_drops_it_on_post():
+    # The fast planner model sometimes omits csrf from a state-changing endpoint
+    # (the DVWA /exec/ false negative). CSRF is a deterministic protocol property
+    # and the CsrfAgent self-gates hard, so the coordinator must run it anyway on
+    # any POST/PUT/PATCH/DELETE candidate — never leaving it to the planner.
+    ran: dict = {"csrf": False}
+
+    class _CsrfAgent(VulnAgent):
+        name = "CSRF"
+        attack_type = "csrf"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            ran["csrf"] = True
+            return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_CsrfAgent)
+        # Planner drops everything (returns no selected types).
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=([], "planner dropped all", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=AsyncMock(return_value=_resp())):
+            client = MagicMock()
+            target = _target(method="POST", body="{\"cmd\": \"x\"}",
+                             params=[{"name": "cmd", "location": "body", "value": "x"}])
+            await Coordinator.run(target, client, budget_seconds=5.0)
+
+    assert ran["csrf"] is True
+    assert len(_activity_log) == 1
+    assert "csrf" in _activity_log[0]["agents_selected"]
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_force_csrf_on_get_endpoint():
+    # csrf is only a candidate for state-changing methods; a GET must not run it.
+    ran: dict = {"csrf": False}
+
+    class _CsrfAgent(VulnAgent):
+        name = "CSRF"
+        attack_type = "csrf"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            ran["csrf"] = True
+            return []
+
+    class _XssAgent(VulnAgent):
+        name = "XSS"
+        attack_type = "xss"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_CsrfAgent)
+        Coordinator.register(_XssAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=(["xss"], "reflected", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=AsyncMock(return_value=_resp())):
+            client = MagicMock()
+            await Coordinator.run(_target(method="GET"), client, budget_seconds=5.0)
+
+    assert ran["csrf"] is False
+
+
 # ── adaptive budget ────────────────────────────────────────────────────────
 
 class TestAdaptiveBudget:

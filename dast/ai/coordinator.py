@@ -916,6 +916,18 @@ class Coordinator:
             selected_types = list({*signal_map.keys(), *no_canary_types})
             plan_reason = "No-LLM mode: canary signals + non-injectable types"
 
+        # CSRF is a deterministic protocol property (anti-CSRF token presence,
+        # SameSite, Origin/Referer enforcement), not a response-semantics judgment
+        # the planner should gate — and the CsrfAgent self-gates hard (it only
+        # confirms when every CSRF precondition holds), so it is inherently
+        # low-false-positive. Guarantee it runs on any state-changing endpoint
+        # rather than trusting the fast planner model to remember to select it:
+        # otherwise a real tokenless state-changing request (e.g. DVWA /exec/) is
+        # silently skipped. business_logic stays planner-gated — it genuinely
+        # needs the LLM to judge whether the response computes extra state.
+        if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
+            selected_types = [*selected_types, "csrf"]
+
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented
         # parameters, mine them now. Discovered names become recon suggestions

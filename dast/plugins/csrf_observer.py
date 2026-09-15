@@ -25,6 +25,17 @@ if TYPE_CHECKING:
 
 _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
+# Sources whose requests are synthesized by the scanner itself (active agent
+# probes, param-discovery, probe-diff baselines) rather than produced by the
+# application or a real user. A tokenless state-changing request is only a real
+# CSRF signal when it came from genuine traffic — flagging our own agent's
+# POST probes is a self-inflicted false positive (the CLAUDE.md bar) AND, because
+# this observer re-enqueues each flagged entry for active scanning, it turns the
+# scanner's own probe traffic into a self-amplifying scan-queue feedback loop
+# that starves real endpoints. The corresponding real request (source
+# "proxy"/"browse"/"crawler"/…) is still analysed, so nothing real is missed.
+_SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
+
 _CSRF_HEADER_RE = re.compile(
     r'x-csrf-token|x-xsrf-token|x-requested-with|x-request-token',
     re.IGNORECASE,
@@ -94,6 +105,9 @@ class CsrfObserverPlugin(ProxyPlugin):
     enabled     = True
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
+        # Never flag or re-enqueue the scanner's own injected requests (see _SYNTHETIC_SOURCES).
+        if getattr(entry, "source", "proxy") in _SYNTHETIC_SOURCES:
+            return
         if entry.method not in _STATE_METHODS:
             return
         if not entry.response_status:

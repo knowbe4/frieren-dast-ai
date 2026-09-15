@@ -45,7 +45,7 @@ def _no_mutation(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_browser(monkeypatch):
-    async def _fake_browser_confirm(url, proxy_port):
+    async def _fake_browser_confirm(url, proxy_port, cookie_header=""):
         return False, "csp_or_sink"
     monkeypatch.setattr("dast.agents.xss_agent._browser_confirm", _fake_browser_confirm)
 
@@ -132,7 +132,7 @@ async def test_clean_response_no_finding():
 @pytest.mark.asyncio
 async def test_browser_confirmed_flag_set_when_js_executes(monkeypatch):
     from dast.agents.xss_agent import _tagged_payload
-    async def _confirmed(url, proxy_port):
+    async def _confirmed(url, proxy_port, cookie_header=""):
         return True, "confirmed"
     monkeypatch.setattr("dast.agents.xss_agent._browser_confirm", _confirmed)
     tagged = _tagged_payload("<img src=x onerror=alert(1)>", "q")
@@ -216,3 +216,51 @@ async def test_body_location_injection_detects_reflection():
 
     assert len(findings) == 1
     assert findings[0].parameter == "comment"
+
+
+# ── browser confirmation carries the authenticated session ──────────────────
+
+def test_cookies_from_header_parses_and_scopes_to_url():
+    from dast.agents.xss_agent import _cookies_from_header
+    cookies = _cookies_from_header("PHPSESSID=abc123; security=low", "http://127.0.0.1:8081/x")
+    assert cookies == [
+        {"name": "PHPSESSID", "value": "abc123", "url": "http://127.0.0.1:8081/x"},
+        {"name": "security", "value": "low", "url": "http://127.0.0.1:8081/x"},
+    ]
+
+
+def test_cookies_from_header_ignores_malformed_pairs():
+    from dast.agents.xss_agent import _cookies_from_header
+    # Empty header, stray semicolons, and valueless tokens produce no cookies.
+    assert _cookies_from_header("", "http://h/") == []
+    assert _cookies_from_header(" ; ; flag ; ", "http://h/") == []
+
+
+@pytest.mark.asyncio
+async def test_browser_confirm_receives_session_cookie(monkeypatch):
+    """The reflected-XSS path must hand the agent's Cookie header to the browser,
+    otherwise an authenticated target bounces it to login and a real XSS is
+    misreported as 'did not execute' (the DVWA false negative this fixes)."""
+    from dast.agents.xss_agent import _tagged_payload
+    monkeypatch.setattr("dast.agents.xss_agent.get_filtered_payloads",
+                        lambda *a, **k: ["<img src=x onerror=alert(1)>"])
+    tagged = _tagged_payload("<img src=x onerror=alert(1)>", "q")
+
+    seen: dict = {}
+
+    async def _capture(url, proxy_port, cookie_header=""):
+        seen["cookie_header"] = cookie_header
+        return False, "csp_or_sink"
+    monkeypatch.setattr("dast.agents.xss_agent._browser_confirm", _capture)
+
+    target = _target(headers={"content-type": "text/html", "Cookie": "PHPSESSID=abc123; security=low"})
+
+    async def fake_send(client, method, url, headers, body):
+        if "onerror" in unquote(url):
+            return _resp(200, f"<html><body>{tagged}</body></html>")
+        return _resp(200, "<html><body>hello</body></html>")
+
+    with patch("dast.agents.xss_agent._send", side_effect=fake_send):
+        await XssAgent().run(target, MagicMock())
+
+    assert seen.get("cookie_header") == "PHPSESSID=abc123; security=low"

@@ -31,6 +31,14 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 
+# Minimum number of DISTINCT paths on which an attack type must produce no signal
+# before it is treated as *consistently* ineffective host-wide (used to skip it as
+# a candidate on later endpoints). A single failure — e.g. a speculative sqli probe
+# on a search field — must never blacklist the type, or a later endpoint where it
+# IS the real vulnerability gets silently skipped.
+_CONSISTENT_INEFFECTIVE_MIN_PATHS = 2
+
+
 # ── WAF fingerprints ──────────────────────────────────────────────────────
 # Matched against response body (lowercase) to identify WAF vendor from a 403.
 _WAF_SIGNATURES: List[Tuple[str, str]] = [
@@ -133,8 +141,18 @@ class HostIntel:
     # Attack types that produced at least one confirmed finding on this host
     effective_attack_types: Set[str] = field(default_factory=set)
 
-    # Attack types that consistently produced no signal
+    # Attack types that produced no signal on at least one endpoint. Kept for the
+    # scan-timeout estimator (a fully-ineffective host warrants a shorter budget).
+    # Candidate SUPPRESSION uses consistently_ineffective_types() instead, which
+    # requires failures on multiple distinct paths — see ineffective_paths.
     ineffective_attack_types: Set[str] = field(default_factory=set)
+
+    # Distinct paths on which each attack type produced no signal. Drives
+    # consistently_ineffective_types(): one non-injectable param on a single
+    # endpoint must not veto the type on the endpoint where it is the real vuln.
+    ineffective_paths: Dict[str, Set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
 
     # Structural errors per (path, operation) — coordinator skips known-broken paths
     structural_errors: Dict[Tuple[str, str], List[str]] = field(
@@ -270,6 +288,7 @@ class HostIntel:
             self.confirmed_vulns[key].append(attack_type)
         self.effective_attack_types.add(attack_type)
         self.ineffective_attack_types.discard(attack_type)
+        self.ineffective_paths.pop(attack_type, None)
         self.ts = time.time()
 
     def record_scan_result(
@@ -290,7 +309,25 @@ class HostIntel:
                 self.waf_observations = self.waf_observations[-100:]
         if not found and attack_type not in self.effective_attack_types:
             self.ineffective_attack_types.add(attack_type)
+            if path:
+                self.ineffective_paths[attack_type].add(path)
         self.ts = time.time()
+
+    def consistently_ineffective_types(self) -> Set[str]:
+        """
+        Attack types that failed on enough DISTINCT paths to be treated as
+        host-wide ineffective for candidate selection. A single failure (e.g. a
+        speculative sqli probe on a search field that isn't SQL-backed) is
+        deliberately not enough — it must not suppress the type on a later
+        endpoint where it is the real vulnerability. Types with a confirmed
+        finding are never ineffective.
+        """
+        return {
+            attack_type
+            for attack_type, paths in self.ineffective_paths.items()
+            if attack_type not in self.effective_attack_types
+            and len(paths) >= _CONSISTENT_INEFFECTIVE_MIN_PATHS
+        }
 
     def record_bypass(self, attack_type: str, payload: str) -> None:
         """

@@ -478,7 +478,14 @@ def _select_attack_types_for_params(
     5. For state-changing methods (POST/PUT/PATCH/DELETE): add csrf + business_logic
     """
     effective = getattr(host_intel, "effective_attack_types", set()) if host_intel else set()
-    ineffective = getattr(host_intel, "ineffective_attack_types", set()) if host_intel else set()
+    # Suppress only types proven ineffective across MULTIPLE endpoints. A single
+    # failed speculative probe (e.g. sqli on a search field) must not blacklist the
+    # type on a later endpoint where it is the real vuln (that was a whole class of
+    # false negatives — error-based sqli on /sqli/, csrf on /exec/ — masked before).
+    if host_intel is not None and hasattr(host_intel, "consistently_ineffective_types"):
+        ineffective = host_intel.consistently_ineffective_types()
+    else:
+        ineffective = getattr(host_intel, "ineffective_attack_types", set()) if host_intel else set()
     waf_obs = getattr(host_intel, "waf_observations", []) if host_intel else []
 
     waf_blocks: Dict[str, int] = {}

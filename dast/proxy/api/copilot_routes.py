@@ -151,9 +151,9 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         target_url = (pause.get("payload") or {}).get("url", "")
         if not ctx.browse_queue:
             return JSONResponse({"error": "browse not available"}, status_code=503)
-        from dast.hackerone.validator import _is_safe_url
-        if not _is_safe_url(target_url):
-            return JSONResponse({"error": "No valid public URL to open"}, status_code=400)
+        from dast.proxy.api.browse_targets import is_openable_target_url
+        if not is_openable_target_url(target_url):
+            return JSONResponse({"error": "No valid http(s) URL to open"}, status_code=400)
 
         result: dict = {}
         done = asyncio.Event()

@@ -1,0 +1,38 @@
+# Ground-truth benchmark spec for VAmPI (Vulnerable API).
+#
+# VAmPI is a JSON REST API whose identifiers live in the URL PATH, not the query
+# string — /users/v1/{username} is SQL-injectable. It is the counterpart to DVWA
+# (query/body params) and exists to validate that the scanner fuzzes REST path
+# parameters. See dast/proxy/check_target_adapter.py path-segment enumeration.
+#
+# Bring the target up in "vulnerable" mode and seed its sample users first:
+#   docker run --rm -d --name vampi -p 5001:5000 erev0s/vampi:latest
+#   curl http://127.0.0.1:5001/createdb
+#
+# Data-only; orchestration lives in tests/live/vuln_bench.py.
+
+target:
+  name: vampi
+  base_url: http://127.0.0.1:5001
+  # The SQLi endpoint is unauthenticated, so no login flow is needed to reach it.
+  auth:
+    type: none
+
+scope:
+  host: 127.0.0.1
+  port: "5001"
+
+# VAmPI's Flask debug page and generic API responses carry informational
+# passive signals that are not the subject of this active-detection benchmark.
+ignore_attack_types:
+  - passive
+
+endpoints:
+  # GET /users/v1/{username}: the username is interpolated straight into
+  #   SELECT * FROM users WHERE username = '<seg>'
+  # so a single quote in the path segment raises a SQL error (error-based SQLi).
+  # `name1` is a value-like path segment (alphanumeric + digit) the adapter
+  # enumerates as an injectable "path" parameter.
+  - path: /users/v1/name1
+    method: GET
+    expect: [sqli]

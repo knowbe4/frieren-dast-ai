@@ -389,7 +389,7 @@ async def _run_canary_probe(
     Returns True if the response contains a signal indicating potential vulnerability.
     Time-based types (sqli blind) return False here — the full agent handles timing.
     """
-    from dast.scanners.active_checks import _inject_body, _inject_query, _send
+    from dast.scanners.active_checks import _inject_body, _inject_path, _inject_query, _send
     payload = _CANARY_PAYLOADS.get(attack_type)
     if not payload:
         return False
@@ -406,6 +406,12 @@ async def _run_canary_probe(
                 location=loc,
             )
             resp = await _send(client, target.method, target.url, target.headers, body)
+        elif loc == "path":
+            # REST path parameters (/users/v1/{id}) are injectable too — probe them
+            # so injection signals in the path reach the planner (else the agent is
+            # never selected). See check_target_adapter path-segment enumeration.
+            url = _inject_path(target.url, param.get("path_index", 0), payload)
+            resp = await _send(client, target.method, url, target.headers, target.body)
         else:
             return False
 

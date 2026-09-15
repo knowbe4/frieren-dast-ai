@@ -79,6 +79,17 @@ error_signatures:
   - "Syntax error.*SQL"
   - "SQLiteException"
   - "SQLITE_ERROR"
+  # SQLite / SQLAlchemy (Python, Flask, embedded, mobile) — the sqlite3 driver
+  # and SQLAlchemy surface these when an injected quote breaks the query. Common
+  # and previously unmatched (e.g. VAmPI's /users/v1/{username}).
+  - "sqlite3.OperationalError"
+  - "sqlite3.IntegrityError"
+  - "sqlite3.ProgrammingError"
+  - "sqlite3.DatabaseError"
+  - "unrecognized token"
+  - "SQL logic error"
+  - "sqlalchemy.exc.OperationalError"
+  - "sqlalchemy.exc.ProgrammingError"
   - "sql syntax.*near"
   - "near.*syntax error"
   - "warning.*mysql"

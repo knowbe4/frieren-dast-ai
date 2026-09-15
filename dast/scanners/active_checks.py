@@ -887,6 +887,11 @@ _SQLI_ERROR_RE = re.compile(
     r"quoted string not properly terminated|pg_query\(\)|"
     r"ORA-\d{5}|Microsoft OLE DB Provider for SQL|"
     r"Syntax error.*SQL|SQLiteException|SQLITE_ERROR|"
+    # SQLite / SQLAlchemy (Python/Flask/embedded) — surfaced when an injected
+    # quote breaks the query; common and previously unmatched.
+    r"sqlite3\.(?:Operational|Integrity|Programming|Database)Error|"
+    r"unrecognized token|SQL logic error|"
+    r"sqlalchemy\.exc\.(?:Operational|Programming)Error|"
     r"sql syntax.*near|near.*syntax error|warning.*mysql",
     re.IGNORECASE,
 )

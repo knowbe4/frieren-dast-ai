@@ -39,6 +39,36 @@ _DANGEROUS_SEGMENTS = frozenset({
 })
 
 
+# Route tokens that are structural, never values — skip so we do not fuzz them.
+_STATIC_PATH_SEGMENTS = frozenset({"api", "rest", "graphql", "www", "v"})
+_PATH_VERSION_RE = re.compile(r"^v\d+$", re.IGNORECASE)          # v1, v2, ... route version
+_PATH_NUMERIC_RE = re.compile(r"^\d+$")                          # numeric id: /orders/42
+_PATH_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
+_PATH_HEX_RE = re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE)      # hex id / hash
+# Alphanumeric identifier carrying at least one digit (e.g. name1, user42). A
+# digit is the low-false-positive signal that a token is a value, not a static
+# route word; pure-alpha ids (/users/john) are a known, accepted miss.
+_PATH_ALNUM_WITH_DIGIT_RE = re.compile(r"^(?=[^\s]*\d)[A-Za-z0-9._~-]+$")
+
+
+def _is_value_like_path_segment(segment: str) -> bool:
+    """Whether a URL path segment looks like an injectable value, not a route token.
+
+    Conservative on purpose (the CLAUDE.md low-false-positive bar): only numeric
+    IDs, UUID/hex identifiers, and alphanumeric tokens carrying a digit qualify.
+    File-like segments (a dot, e.g. include.php) and known static route tokens are
+    excluded so we never fuzz structural path components."""
+    if not segment or "." in segment:
+        return False
+    if segment.lower() in _STATIC_PATH_SEGMENTS or _PATH_VERSION_RE.match(segment):
+        return False
+    if _PATH_NUMERIC_RE.match(segment) or _PATH_UUID_RE.match(segment) or _PATH_HEX_RE.match(segment):
+        return True
+    return bool(_PATH_ALNUM_WITH_DIGIT_RE.match(segment))
+
+
 def _entry_to_check_target(entry: "ProxyEntry", store=None):
     """Convert a ProxyEntry into a CheckTarget for the active scanner."""
     from urllib.parse import parse_qs, urlparse
@@ -60,6 +90,19 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
 
     for name, values in parse_qs(parsed.query).items():
         params.append({"name": name, "location": "query", "value": values[0] if values else ""})
+
+    # Path-segment parameters. Modern REST APIs carry identifiers in the path
+    # (/users/v1/{id}, /orders/{ref}), and the injection agents can only fuzz
+    # what lands in `params` — so a value-like path segment is a real injectable
+    # surface (VAmPI's flagship SQLi is a path parameter). Only value-shaped
+    # segments (numeric IDs, UUID/hex, or alphanumeric identifiers carrying a
+    # digit) are emitted; static route tokens (users, v1, api) and file-like
+    # segments are skipped so the probe surface and false-positive risk stay low.
+    for index, segment in enumerate(seg for seg in parsed.path.split("/") if seg):
+        if _is_value_like_path_segment(segment):
+            params.append(
+                {"name": segment, "location": "path", "value": segment, "path_index": index}
+            )
 
     content_type = entry.request_headers.get("content-type", "").lower()
 

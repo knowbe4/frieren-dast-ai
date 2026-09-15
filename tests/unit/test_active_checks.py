@@ -17,6 +17,7 @@ from dast.scanners.active_checks import (
     _HostConcurrencyLimiter,
     _HostScanGate,
     _inject_body,
+    _inject_path,
     _inject_query,
     check_xss,
     check_sqli,
@@ -269,6 +270,61 @@ def _fake_entry(method="POST", url="https://example.com/graphql",
     if body is not None:
         e.request_body = body if isinstance(body, bytes) else body.encode()
     return e
+
+
+class TestInjectPath:
+    def test_replaces_targeted_segment_encoded(self):
+        # path_index 2 = the third non-empty segment ("name1").
+        url = _inject_path("https://api.example.com/users/v1/name1", 2, "name1'")
+        assert url == "https://api.example.com/users/v1/name1%27"
+
+    def test_preserves_other_segments_and_query(self):
+        url = _inject_path("https://x.com/a/42/b?q=1", 1, "99")
+        assert url == "https://x.com/a/99/b?q=1"
+
+    def test_preserves_trailing_slash(self):
+        url = _inject_path("https://x.com/orders/7/", 1, "8")
+        assert url == "https://x.com/orders/8/"
+
+    def test_out_of_range_index_is_noop(self):
+        original = "https://x.com/users/1"
+        assert _inject_path(original, 9, "PAYLOAD") == original
+
+
+class TestPathParamEnumeration:
+    """The adapter must expose value-like REST path segments as injectable
+    params (VAmPI's SQLi is a path parameter) without fuzzing static route
+    tokens — and must not regress DVWA, whose paths hold no value-like segment."""
+
+    def test_numeric_and_valuelike_segments_become_path_params(self):
+        entry = _fake_entry(method="GET", url="https://api.example.com/users/v1/name1")
+        target = _entry_to_check_target(entry)
+        assert target is not None
+        path_params = [p for p in target.params if p["location"] == "path"]
+        assert [p["name"] for p in path_params] == ["name1"]
+        assert path_params[0]["path_index"] == 2  # users(0) v1(1) name1(2)
+
+    def test_numeric_id_segment(self):
+        entry = _fake_entry(method="GET", url="https://api.example.com/orders/42")
+        target = _entry_to_check_target(entry)
+        assert target is not None
+        assert {p["name"] for p in target.params if p["location"] == "path"} == {"42"}
+
+    def test_static_route_tokens_are_not_fuzzed(self):
+        # No value-like segment anywhere -> no path params, and (no query/body) None.
+        entry = _fake_entry(method="GET", url="https://api.example.com/api/users/profile")
+        entry.path = "/api/users/profile"
+        target = _entry_to_check_target(entry)
+        assert target is None
+
+    def test_dvwa_paths_yield_no_path_params(self):
+        # Regression guard: the validated DVWA baseline must stay unchanged.
+        for path in ("/vulnerabilities/xss_r/", "/vulnerabilities/sqli/",
+                     "/vulnerabilities/exec/", "/vulnerabilities/fi/", "/login.php"):
+            entry = _fake_entry(method="GET", url=f"http://127.0.0.1:8081{path}?x=1")
+            target = _entry_to_check_target(entry)
+            assert target is not None
+            assert [p for p in target.params if p["location"] == "path"] == [], path
 
 
 class TestEntryToCheckTarget:

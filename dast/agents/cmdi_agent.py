@@ -19,7 +19,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_query, _send, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_path, _inject_query, _send, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -308,6 +308,12 @@ class CmdiAgent(VulnAgent):
             )
             return await _send(
                 client, target.method, target.url, target.headers, body,
+                payload=payload, timeout=timeout,
+            )
+        if location == "path":
+            url = _inject_path(target.url, param.get("path_index", 0), payload)
+            return await _send(
+                client, target.method, url, target.headers, target.body,
                 payload=payload, timeout=timeout,
             )
         url = _inject_query(target.url, param["name"], payload)

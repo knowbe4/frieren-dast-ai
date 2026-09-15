@@ -27,7 +27,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -130,6 +130,26 @@ def _inject_query(url: str, param: str, value: str) -> str:
     qs[param] = [value]
     new_query = urlencode(qs, doseq=True)
     return urlunparse(parsed._replace(query=new_query))
+
+
+def _inject_path(url: str, path_index: int, value: str) -> str:
+    """Replace the path segment at ``path_index`` with ``value`` (percent-encoded).
+
+    REST APIs carry identifiers in the path (``/users/v1/{username}``); the
+    injection agents can only fuzz what lands in ``target.params``, so a path
+    segment is exposed as an injectable surface with ``location == "path"`` and a
+    ``path_index``. ``path_index`` is 0-based over the NON-EMPTY path components
+    (the same enumeration the CheckTarget adapter uses), so leading/trailing
+    slashes are preserved. The payload is percent-encoded so quotes/spaces/slashes
+    travel intact in the path and are decoded server-side before reaching the
+    vulnerable sink. Out-of-range indices leave the URL unchanged."""
+    parsed = urlparse(url)
+    raw_segments = parsed.path.split("/")
+    non_empty_positions = [i for i, seg in enumerate(raw_segments) if seg]
+    if path_index < 0 or path_index >= len(non_empty_positions):
+        return url
+    raw_segments[non_empty_positions[path_index]] = quote(value, safe="")
+    return urlunparse(parsed._replace(path="/".join(raw_segments)))
 
 
 def _inject_multipart(raw_body: bytes, param: str, value: str) -> bytes:

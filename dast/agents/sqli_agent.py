@@ -16,7 +16,7 @@ from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
+from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_path, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -500,6 +500,9 @@ class SqliAgent(VulnAgent):
         elif param["location"].startswith("multipart_"):
             raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
             return await _send(client, target.method, target.url, target.headers, raw, timeout=timeout)
+        elif param["location"] == "path":
+            url = _inject_path(target.url, param.get("path_index", 0), payload)
+            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
         return None
 
 

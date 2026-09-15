@@ -351,6 +351,66 @@ def test_graphql_sub_tabs_have_no_console_errors(dashboard_url):
     assert errors == []
 
 
+def test_needs_human_inbox_aggregates_and_renders_cards(dashboard_url):
+    """The Copilot needs-human inbox renders a card for every human-in-loop
+    source/kind, badges the aggregate count on the Copilot tab, and clears down
+    cleanly. Drives the inbox's public setters (the same entry points its WS
+    handlers call) so the render/aggregate/clear logic is exercised without a
+    live LLM pause, MCP client, or captcha-walled login replay.
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        with _console_error_guard(page) as errors:
+            page.goto(dashboard_url, wait_until="domcontentloaded")
+            page.wait_for_timeout(500)
+
+            # Nothing pending: no badge, inbox hidden.
+            assert page.evaluate("document.getElementById('cp-inbox-badge')") is None
+            assert page.eval_on_selector("#cp-hil-inbox", "el => el.style.display") == "none"
+
+            # One pending pause per source/kind, exactly as each WS handler would set them.
+            page.evaluate("_hilSet('triage','job-1','question',{question:'What is the admin path?'})")
+            page.evaluate("_hilSet('triage','job-2','approve',{method:'POST',tool:'http_request',url:'https://evil.example/x'})")
+            page.evaluate("_hilSet('triage','job-3','auth',{host:'app.example.com',status:401})")
+            page.evaluate("_hilSet('mcp','current','approve',{method:'GET',url:'https://out.example/y',host:'out.example'})")
+            page.evaluate("_hilSet('login','profile-a','captcha',{slug:'profile-a',reason:'captcha wall'})")
+            page.wait_for_timeout(100)
+
+            # Badge carries the aggregate count across all sources.
+            assert page.eval_on_selector("#cp-inbox-badge", "el => el.textContent") == "5"
+
+            inbox = page.eval_on_selector("#cp-hil-inbox", "el => el.textContent")
+            assert "Needs human (5)" in inbox
+            assert "What is the admin path?" in inbox   # triage question card
+            assert "http_request" in inbox              # triage approve via-tool clause
+            assert "app.example.com" in inbox           # triage auth card
+            assert "MCP client" in inbox                # mcp source label
+            assert "profile-a" in inbox                 # login captcha card
+            assert page.eval_on_selector("#cp-hil-inbox", "el => el.style.display") != "none"
+
+            # Resolving one pause (as the 'resumed' WS event does) clears just it.
+            page.evaluate("_hilDel('triage','job-1')")
+            page.wait_for_timeout(50)
+            assert page.eval_on_selector("#cp-inbox-badge", "el => el.textContent") == "4"
+            assert "What is the admin path?" not in page.eval_on_selector(
+                "#cp-hil-inbox", "el => el.textContent")
+
+            # Clearing the rest removes the badge and hides the inbox.
+            for source, ident in [("triage", "job-2"), ("triage", "job-3"),
+                                  ("mcp", "current"), ("login", "profile-a")]:
+                page.evaluate(f"_hilDel('{source}','{ident}')")
+            page.wait_for_timeout(50)
+            assert page.evaluate("document.getElementById('cp-inbox-badge')") is None
+            assert page.eval_on_selector("#cp-hil-inbox", "el => el.style.display") == "none"
+
+        browser.close()
+
+    assert errors == []
+
+
 def test_crawl_host_shortcut_lands_on_browse_crawl_subtab(dashboard_url):
     from playwright.sync_api import sync_playwright
 

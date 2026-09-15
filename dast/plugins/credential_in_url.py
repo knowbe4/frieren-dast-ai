@@ -25,6 +25,15 @@ _SENSITIVE_PARAM_RE = re.compile(
 # Minimum value length to avoid false positives on empty/placeholder values
 _MIN_VALUE_LEN = 6
 
+# Sources whose query strings are synthesized by the scanner itself (param
+# discovery probes, agent attack payloads, probe-diff baselines) rather than
+# produced by the application or a real user. A "credential in the URL" is only a
+# real misconfiguration when the request came from genuine traffic — flagging our
+# own injected `token=`/`password=` discovery probes is a self-inflicted false
+# positive. The corresponding real request (source "proxy"/"browse"/"crawler"/…)
+# is still analysed, so nothing real is missed.
+_SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
+
 
 class CredentialInUrlPlugin(ProxyPlugin):
     name        = "credential-in-url"
@@ -34,6 +43,10 @@ class CredentialInUrlPlugin(ProxyPlugin):
     enabled     = True
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
+        # Never flag the scanner's own injected query strings (see _SYNTHETIC_SOURCES).
+        if getattr(entry, "source", "proxy") in _SYNTHETIC_SOURCES:
+            return
+
         parsed = urlparse(entry.url)
         if not parsed.query:
             return

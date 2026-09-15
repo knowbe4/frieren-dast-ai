@@ -1,53 +1,118 @@
 // ── Human-in-the-loop inbox (needs-human aggregator) ─────────────────────────
 // The Copilot panel is the single place where automated exploration meets human
-// help. This inbox folds in the OTHER mechanisms that pause for a human but have
-// no surface of their own. Step 1: the Vuln Validator (agentic triage), whose
-// approve / auth / question pauses were previously reachable only over the
-// HTTP/MCP API with no UI at all — a headless capability nobody could unblock.
+// help. This inbox folds in every mechanism that pauses for a human, so a
+// pending prompt is reachable from any tab (via the count badge on the Copilot
+// tab) even when its own contextual surface is off-screen. Each source keeps its
+// own resume contract; all events share the same pause/resolve vocabulary here.
 //
-// Each pending pause renders as an answerable card and resolves through the
-// mechanism's own existing resume endpoint (no backend change). The copilot's
-// own in-turn pause keeps rendering inline in #cp-pause — this does not touch it.
-// A badge on the Copilot tab surfaces pending prompts from any tab.
+// Sources:
+//   * triage — the headless Vuln Validator (approve / auth / question). Its ONLY
+//     surface: it had no UI at all before this inbox.
+//   * mcp    — MCP request approval (out-of-scope call). Also shown as a global
+//     blocking modal (67-mcp-approval.js); this card is the cross-tab mirror.
+//   * login  — login-flow replay paused on a captcha/MFA wall. Also banners in
+//     the Login Profiles panel (66-login-profiles.js).
+//
+// All three resolve through their own existing endpoints — no backend change.
+// The copilot's own in-turn pause keeps rendering inline in #cp-pause, untouched.
 
-let _hilWs = null;
 const _hilItems = {};   // "source:id" -> { source, id, kind, payload }
 
-// Resume wiring per source. A table, not branching logic, so step 2 (MCP
-// approval, login captcha) only adds rows here.
+// Per-source wiring: how to build the resume request (and, where supported, the
+// open-browser request) for a card. A table, not branching logic, so a new
+// human-in-loop mechanism is one row.
 const _HIL_SOURCES = {
   triage: {
     label: 'Vuln Validator',
-    resume:      (id) => `/api/vuln-validator/resume/${encodeURIComponent(id)}`,
-    openBrowser: (id) => `/api/vuln-validator/open-browser/${encodeURIComponent(id)}`,
+    resumeReq: (item, kind, value) => ({
+      url: `/api/vuln-validator/resume/${encodeURIComponent(item.id)}`,
+      body: { kind, value },
+    }),
+    openBrowserReq: (item) => ({
+      url: `/api/vuln-validator/open-browser/${encodeURIComponent(item.id)}`,
+    }),
+  },
+  mcp: {
+    label: 'MCP client',
+    // Singleton pause (no id); decision maps straight onto the approval endpoint.
+    resumeReq: (_item, _kind, value) => ({
+      url: '/api/mcp/approval-resume',
+      body: { decision: (value && value.decision) || 'deny' },
+    }),
+  },
+  login: {
+    label: 'Login replay',
+    // Shared resume gate — no id, no body; the human solved it in the open browser.
+    resumeReq: () => ({ url: '/api/login-flow/resume', body: {} }),
   },
 };
 
 function _hilKey(source, id) { return source + ':' + id; }
 function _hilCount() { return Object.keys(_hilItems).length; }
 
-// The triage stream speaks the same pause/resumed vocabulary as the copilot,
-// keyed by job_id. On (re)connect the server re-pushes in-flight pauses, so a
-// late-loading UI still sees an outstanding prompt.
-function hilConnectWs() {
+function _hilSet(source, id, kind, payload) {
+  _hilItems[_hilKey(source, id)] = { source, id: String(id), kind, payload: payload || {} };
+  hilRender();
+}
+
+function _hilDel(source, id) {
+  delete _hilItems[_hilKey(source, id)];
+  hilRender();
+}
+
+// Generic auto-reconnecting subscription. On (re)connect a server may re-push
+// in-flight pauses, so a late-loading UI still sees an outstanding prompt.
+function _hilWsConnect(path, onMsg) {
   try {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    _hilWs = new WebSocket(`${proto}://${location.host}/ws/agent-triage`);
-    _hilWs.onmessage = (ev) => {
+    const ws = new WebSocket(`${proto}://${location.host}${path}`);
+    ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-      if (m.type === 'pause' && m.job_id) {
-        _hilItems[_hilKey('triage', m.job_id)] = {
-          source: 'triage', id: m.job_id, kind: m.kind, payload: m.payload || {},
-        };
-        hilRender();
-      } else if (m.type === 'resumed' && m.job_id) {
-        delete _hilItems[_hilKey('triage', m.job_id)];
-        hilRender();
-      }
+      onMsg(m);
     };
-    _hilWs.onclose = () => { _hilWs = null; setTimeout(hilConnectWs, 3000); };
-    _hilWs.onerror = () => { /* onclose reconnects */ };
-  } catch (e) { _hilWs = null; }
+    ws.onclose = () => setTimeout(() => _hilWsConnect(path, onMsg), 3000);
+    ws.onerror = () => { /* onclose reconnects */ };
+  } catch (e) { setTimeout(() => _hilWsConnect(path, onMsg), 3000); }
+}
+
+function hilConnectTriage() {
+  _hilWsConnect('/ws/agent-triage', (m) => {
+    if (m.type === 'pause' && m.job_id) {
+      _hilSet('triage', m.job_id, m.kind, m.payload || {});
+    } else if (m.type === 'resumed' && m.job_id) {
+      _hilDel('triage', m.job_id);
+    }
+  });
+}
+
+function hilConnectMcp() {
+  _hilWsConnect('/ws/mcp-approval', (m) => {
+    if (m.type === 'approval_needed') {
+      _hilSet('mcp', 'current', 'approve', {
+        url: m.url || '', host: m.host || '', method: m.method || 'GET', port: m.port,
+      });
+    } else if (m.type === 'approval_resolved') {
+      _hilDel('mcp', 'current');
+    }
+  });
+}
+
+function hilConnectLogin() {
+  _hilWsConnect('/ws/login', (m) => {
+    if (m.type === 'needs_human') {
+      _hilSet('login', m.slug || 'current', 'captcha', { slug: m.slug || '', reason: m.reason || '' });
+    } else if (m.type === 'replay_done') {
+      _hilDel('login', m.slug || 'current');
+    } else if (m.type === 'resumed') {
+      // The login resume gate is shared and this event carries no slug — clear
+      // every pending login captcha.
+      let changed = false;
+      for (const key of Object.keys(_hilItems)) {
+        if (key.indexOf('login:') === 0) { delete _hilItems[key]; changed = true; }
+      }
+      if (changed) hilRender();
+    }
+  });
 }
 
 function hilRender() {
@@ -63,7 +128,7 @@ function hilRender() {
 }
 
 // A small count badge on the Copilot tab so a pending prompt is visible from any
-// tab (the triage agent has no other surface).
+// tab (some sources have no other cross-tab surface).
 function hilUpdateBadge() {
   const tab = document.getElementById('mt-copilot');
   if (!tab) return;
@@ -86,15 +151,18 @@ function hilCard(item) {
   const id = esc(item.id);
   const source = esc(item.source);
   const header =
-    `<div style="font-size:10px;color:var(--txt2);margin-bottom:6px">${esc(src.label)} · job ${id} · ` +
-    `<span style="color:var(--yellow);text-transform:uppercase">${esc(item.kind)}</span></div>`;
+    `<div style="font-size:10px;color:var(--txt2);margin-bottom:6px">${esc(src.label)}` +
+    (item.source === 'triage' ? ` · job ${id}` : '') +
+    ` · <span style="color:var(--yellow);text-transform:uppercase">${esc(item.kind)}</span></div>`;
 
   let body;
   if (item.kind === 'approve') {
+    const viaClause = payload.tool
+      ? ` via <code style="color:var(--orange)">${esc(payload.tool)}</code>` : '';
     body =
       `<div style="font-size:10px;color:var(--txt2);margin-bottom:4px">
-         Wants to send a <code style="color:var(--orange)">${esc(payload.method || 'GET')}</code>
-         via <code style="color:var(--orange)">${esc(payload.tool || 'tool')}</code> to an out-of-scope host:
+         Wants to send a <code style="color:var(--orange)">${esc(payload.method || 'GET')}</code>${viaClause}
+         to an out-of-scope target:
        </div>
        <code style="display:block;font-size:10px;background:var(--bg2);padding:6px 8px;border-radius:3px;
              word-break:break-all;margin-bottom:10px">${esc(payload.url || payload.host || '')}</code>
@@ -125,6 +193,16 @@ function hilCard(item) {
        <div style="display:flex;gap:8px">
          <button class="tbtn pri" onclick="hilQuestionSubmit('${source}','${id}')">Submit answer</button>
        </div>`;
+  } else if (item.kind === 'captcha') {
+    body =
+      `<div style="font-size:10px;color:var(--txt2);margin-bottom:10px">
+         Login replay for profile <code style="color:var(--orange)">${esc(payload.slug || '')}</code>
+         paused: ${esc(payload.reason || 'a human action is needed')}. Solve it in the open
+         browser window, then click Continue.
+       </div>
+       <div style="display:flex;gap:8px">
+         <button class="tbtn pri" onclick="hilResume('${source}','${id}','captcha',{})">Continue — I solved it</button>
+       </div>`;
   } else {
     body = `<div style="font-size:10px;color:var(--txt2)">Unsupported pause kind: ${esc(item.kind)}</div>`;
   }
@@ -137,16 +215,18 @@ function hilCard(item) {
 async function hilResume(source, id, kind, value) {
   const src = _HIL_SOURCES[source];
   if (!src) return;
+  const item = _hilItems[_hilKey(source, id)] || { id };
+  const req = src.resumeReq(item, kind, value);
   try {
-    const r = await fetch(src.resume(id), {
+    const r = await fetch(req.url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind, value }),
+      body: JSON.stringify(req.body || {}),
     });
-    const d = await r.json();
+    const d = await r.json().catch(() => ({}));
     if (d && d.error) { showToast(d.error, true); return; }
-    // The 'resumed' WS event clears the card; drop it optimistically too so the
-    // UI feels immediate even if the socket lags.
+    // The resolve WS event clears the card; drop it optimistically too so the UI
+    // feels immediate even if the socket lags.
     delete _hilItems[_hilKey(source, id)];
     hilRender();
   } catch (e) { showToast('Resume failed', true); }
@@ -156,10 +236,11 @@ async function hilOpenBrowser(source, id) {
   const src = _HIL_SOURCES[source];
   const msgEl = document.getElementById(`hil-auth-msg-${id}`);
   const doneBtn = document.getElementById(`hil-login-done-${id}`);
-  if (!src || !src.openBrowser) return;
+  if (!src || !src.openBrowserReq) return;
+  const item = _hilItems[_hilKey(source, id)] || { id };
   if (msgEl) msgEl.textContent = 'Opening browser...';
   try {
-    const r = await fetch(src.openBrowser(id), { method: 'POST' });
+    const r = await fetch(src.openBrowserReq(item).url, { method: 'POST' });
     const d = await r.json();
     if (d.ok) {
       if (msgEl) msgEl.textContent = `Browser open at ${d.target_url || ''}. Log in, then click "Login done".`;
@@ -216,5 +297,7 @@ async function hilQuestionSubmit(source, id) {
   await hilResume(source, id, 'question', { text });
 }
 
-hilConnectWs();
+hilConnectTriage();
+hilConnectMcp();
+hilConnectLogin();
 hilRender();

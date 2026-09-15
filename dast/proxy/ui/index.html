@@ -2048,6 +2048,10 @@
                 style="margin-left:auto;display:none;font-size:9px;padding:1px 7px">Cancel turn</button>
       </div>
 
+      <!-- Needs-human inbox: pauses from other headless mechanisms (Vuln Validator
+           triage today; MCP approval + login captcha next) surface here as cards. -->
+      <div id="cp-hil-inbox" style="display:none;padding:10px 18px;border-bottom:1px solid var(--bdr);max-height:280px;overflow-y:auto"></div>
+
       <!-- App-context hypotheses: click Explore to open a conversation on one -->
       <div id="cp-hypotheses" style="display:none;padding:10px 18px;border-bottom:1px solid var(--bdr);max-height:150px;overflow-y:auto"></div>
 
@@ -2093,6 +2097,7 @@
 <script src="/ui/js/85-overview-scanconfig-provider.js"></script>
 <script src="/ui/js/90-h1-interactions.js"></script>
 <script src="/ui/js/92-copilot.js"></script>
+<script src="/ui/js/93-hil-inbox.js"></script>
 <script src="/ui/js/95-code-analysis.js"></script>
 <script src="/ui/js/96-mode-intercept-mr.js"></script>
 <script src="/ui/js/99-bootstrap-ctxmenu.js"></script>

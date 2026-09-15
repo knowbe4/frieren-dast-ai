@@ -92,11 +92,11 @@ class CopilotService:
             for k in oldest[:len(self._sessions) - _MAX_SESSIONS]:
                 self._sessions.pop(k, None)
 
-    def new_session(self) -> str:
+    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
         from dast.ai.copilot import CopilotSession
         sid = str(uuid.uuid4())[:12]
         self._sessions[sid] = {
-            "engine": CopilotSession(sid),
+            "engine": CopilotSession(sid, focus_hosts=focus_hosts),
             "status": "idle",
             "created_at": time.time(),
             "updated_at": time.time(),
@@ -175,7 +175,7 @@ class CopilotService:
             logger.warning("copilot escalation signal extraction failed",
                            host=host, attack_type=attack_type, error=str(exc))
 
-        sid = self.new_session()
+        sid = self.new_session(focus_hosts=[host])
         session = self._sessions[sid]
         session["origin"] = "block_escalation"
         session["escalation"] = {"host": host, "attack_type": attack_type, "signal": signal}
@@ -227,7 +227,7 @@ class CopilotService:
             parameter_clause=parameter_clause,
             rationale=rationale or "not provided",
         )
-        sid = self.new_session()
+        sid = self.new_session(focus_hosts=[host])
         session = self._sessions[sid]
         session["origin"] = "hypothesis"
         session["hypothesis"] = {

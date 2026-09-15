@@ -490,6 +490,13 @@ class SessionIntelligence:
                 self._hosts[host] = HostIntel(host=host)
             return self._hosts[host]
 
+    def peek(self, host: str) -> Optional[HostIntel]:
+        """Return the intel for a host, or None — without creating an empty
+        entry. For read-only consumers (e.g. the copilot context brief) that must
+        not pollute the store with hosts they merely inspected."""
+        with self._lock:
+            return self._hosts.get(host)
+
     # ── Passive ingestion (called from session_store._bg_analyse) ─────────
 
     def observe_entry(

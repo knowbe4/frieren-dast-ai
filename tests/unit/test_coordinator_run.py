@@ -114,6 +114,77 @@ async def test_run_completes_within_explicit_budget():
     assert len(_activity_log) == 1
 
 
+@pytest.mark.asyncio
+async def test_run_preserves_findings_confirmed_before_timeout():
+    # Findings validated before the deadline must survive a timeout instead of
+    # being discarded (which had marked genuinely-vulnerable endpoints "safe").
+    kept = _finding(title="SQL Injection", attack_type="_preserve_test")
+
+    class _NoopAgent(VulnAgent):
+        name = "Noop"
+        attack_type = "_preserve_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    async def _fake_inner(target, client, collaborator, use_llm_planner,
+                          model_id, confidence_threshold, session_intelligence,
+                          probe_diff, collected):
+        # Simulate: validation finalised one confirmed finding into the shared
+        # collector, then the run stalls (e.g. slow write-back) and times out.
+        collected.append(kept)
+        await asyncio.sleep(10)
+        return collected
+
+    with _Registry():
+        Coordinator.register(_NoopAgent)
+        with patch.object(Coordinator, "_run_inner", new=_fake_inner):
+            result = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.05)
+
+    assert len(result) == 1
+    assert result[0].title == "SQL Injection"
+
+
+@pytest.mark.asyncio
+async def test_run_streams_fast_agent_finding_while_slow_agent_blocks():
+    # Each agent's confirmed findings are published as soon as that agent
+    # finishes, so a slow agent (e.g. time-based SQLi) blocking past the budget
+    # must not discard a fast agent's already-confirmed finding. Under the old
+    # batch gather() this returned [] because nothing was published until every
+    # agent completed.
+    fast_finding = _finding(title="Reflected XSS", attack_type="_stream_fast_test")
+
+    class _FastHitAgent(VulnAgent):
+        name = "FastHit"
+        attack_type = "_stream_fast_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return [fast_finding]
+
+    class _SlowAgent(VulnAgent):
+        name = "SlowBlocker"
+        attack_type = "_stream_slow_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            await asyncio.sleep(10)
+            return []
+
+    _activity_log.clear()
+    validate_mock = AsyncMock(return_value=(True, 0.9, "confirmed by LLM"))
+    with _Registry():
+        Coordinator.register(_FastHitAgent)
+        Coordinator.register(_SlowAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(
+                return_value=(["_stream_fast_test", "_stream_slow_test"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.ai.red_team.validate", new=validate_mock):
+            client = MagicMock()
+            result = await Coordinator.run(_target(), client, budget_seconds=0.5)
+
+    assert len(result) == 1
+    assert result[0].title == "Reflected XSS"
+
+
 # ── early aborts ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -357,6 +428,74 @@ async def test_run_validation_exception_does_not_confirm_finding():
     assert result == []
 
 
+# ── deterministic CSRF selection on state-changing endpoints ───────────────
+
+@pytest.mark.asyncio
+async def test_run_forces_csrf_agent_when_planner_drops_it_on_post():
+    # The fast planner model sometimes omits csrf from a state-changing endpoint
+    # (the DVWA /exec/ false negative). CSRF is a deterministic protocol property
+    # and the CsrfAgent self-gates hard, so the coordinator must run it anyway on
+    # any POST/PUT/PATCH/DELETE candidate — never leaving it to the planner.
+    ran: dict = {"csrf": False}
+
+    class _CsrfAgent(VulnAgent):
+        name = "CSRF"
+        attack_type = "csrf"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            ran["csrf"] = True
+            return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_CsrfAgent)
+        # Planner drops everything (returns no selected types).
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=([], "planner dropped all", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=AsyncMock(return_value=_resp())):
+            client = MagicMock()
+            target = _target(method="POST", body="{\"cmd\": \"x\"}",
+                             params=[{"name": "cmd", "location": "body", "value": "x"}])
+            await Coordinator.run(target, client, budget_seconds=5.0)
+
+    assert ran["csrf"] is True
+    assert len(_activity_log) == 1
+    assert "csrf" in _activity_log[0]["agents_selected"]
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_force_csrf_on_get_endpoint():
+    # csrf is only a candidate for state-changing methods; a GET must not run it.
+    ran: dict = {"csrf": False}
+
+    class _CsrfAgent(VulnAgent):
+        name = "CSRF"
+        attack_type = "csrf"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            ran["csrf"] = True
+            return []
+
+    class _XssAgent(VulnAgent):
+        name = "XSS"
+        attack_type = "xss"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_CsrfAgent)
+        Coordinator.register(_XssAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=(["xss"], "reflected", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=AsyncMock(return_value=_resp())):
+            client = MagicMock()
+            await Coordinator.run(_target(method="GET"), client, budget_seconds=5.0)
+
+    assert ran["csrf"] is False
+
+
 # ── adaptive budget ────────────────────────────────────────────────────────
 
 class TestAdaptiveBudget:
@@ -367,22 +506,31 @@ class TestAdaptiveBudget:
         host_intel.confirmed_vulns = {}
         assert Coordinator._adaptive_budget(_target(), host_intel) == 180.0
 
-    def test_all_types_ineffective_gets_45s(self):
+    def test_all_types_ineffective_deprioritized_but_not_starved(self):
+        # Host-level "ineffective" is a mild deprioritization (below the 150s
+        # normal ceiling), NOT a starve: the one endpoint actually vulnerable to a
+        # blind/time-based type inherits the host penalty, so 45s used to time out
+        # a real command injection before its SLEEP probes could confirm.
         host_intel = MagicMock()
         host_intel.effective_attack_types = set()
         host_intel.ineffective_attack_types = {"sqli"}
         host_intel.confirmed_vulns = {}
-        assert Coordinator._adaptive_budget(_target(), host_intel) == 45.0
+        assert Coordinator._adaptive_budget(_target(), host_intel) == 120.0
 
     def test_many_params_scales_and_caps_at_180s(self):
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(30)]
         assert Coordinator._adaptive_budget(_target(params=params), None) == 180.0
 
-    def test_simple_get_no_intel_gets_45s(self):
+    def test_simple_get_no_intel_gets_full_budget(self):
+        # The per-endpoint budget is a CEILING, not a floor: a clean endpoint
+        # returns as soon as its agents finish, so a generous ceiling only helps
+        # endpoints that are slow to CONFIRM (the injectable ones). 45s then 75s
+        # were both too tight for time-based blind probes under load, so a real
+        # injection could be forfeited to timeout.
         target = _target(method="GET", params=[{"name": "q", "location": "query", "value": "x"}])
-        assert Coordinator._adaptive_budget(target, None) == 45.0
+        assert Coordinator._adaptive_budget(target, None) == 150.0
 
-    def test_normal_endpoint_gets_90s(self):
+    def test_normal_endpoint_gets_full_budget(self):
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(5)]
         target = _target(method="POST", params=params)
-        assert Coordinator._adaptive_budget(target, None) == 90.0
+        assert Coordinator._adaptive_budget(target, None) == 150.0

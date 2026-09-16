@@ -10,13 +10,70 @@ This is the repeater primitive exposed to agents and MCP clients.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import html
+from typing import Any, Dict, List
+from urllib.parse import parse_qsl, urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Reflection detection: an injected value shorter than this is too noisy to be a
+# reliable reflection signal (e.g. "1", "ok"), so it is skipped.
+_MIN_REFLECTION_VALUE_LEN = 4
+# Caps so the reflection summary stays a compact signal, never a second body dump.
+_MAX_REFLECTIONS = 6
+_REFLECTION_CONTEXT_CHARS = 80
+
+
+def _reflection_context(text: str, needle: str) -> str:
+    """A short snippet of ``text`` around the first occurrence of ``needle``."""
+    idx = text.find(needle)
+    if idx < 0:
+        return ""
+    start = max(0, idx - _REFLECTION_CONTEXT_CHARS)
+    end = min(len(text), idx + len(needle) + _REFLECTION_CONTEXT_CHARS)
+    return text[start:end]
+
+
+def _detect_reflections(url: str, body: str, response_text: str) -> List[Dict[str, Any]]:
+    """Report which request-supplied values echo back in the response body.
+
+    The observation fed to an agent is truncated well below the full body, so a
+    reflection deep in a large page is invisible to the caller. This surfaces a
+    decisive, compact signal instead: for each injected value that echoes back,
+    whether it reflected RAW (unencoded — the XSS-relevant case) and whether an
+    HTML-escaped copy is also present, with a short context snippet.
+    """
+    candidates: List[tuple[str, str, str]] = []  # (location, name, value)
+    for name, value in parse_qsl(urlparse(url).query, keep_blank_values=False):
+        candidates.append(("query", name, value))
+    for name, value in parse_qsl(body or "", keep_blank_values=False):
+        candidates.append(("body", name, value))
+
+    reflections: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for location, name, value in candidates:
+        if len(value) < _MIN_REFLECTION_VALUE_LEN or value in seen:
+            continue
+        seen.add(value)
+        raw_reflected = value in response_text
+        escaped = html.escape(value, quote=True)
+        escaped_reflected = escaped != value and escaped in response_text
+        if not raw_reflected and not escaped_reflected:
+            continue
+        reflections.append({
+            "parameter": name,
+            "location": location,
+            "reflected_raw": raw_reflected,
+            "html_escaped_also_present": escaped_reflected,
+            "context": _reflection_context(response_text, value if raw_reflected else escaped),
+        })
+        if len(reflections) >= _MAX_REFLECTIONS:
+            break
+    return reflections
 
 _SEND_REQUEST_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -95,14 +152,21 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                 method, url, headers=headers or None,
                 content=request_body.encode("utf-8") if request_body else None,
             )
-        return {
+        full_text = resp.text
+        result: Dict[str, Any] = {
             "ok": True,
             "status": resp.status_code,
             "headers": dict(resp.headers),
-            "body": resp.text[:8000],
-            "length": len(resp.text),
+            "body": full_text[:8000],
+            "length": len(full_text),
             "final_url": str(resp.url),
         }
+        # Reflection signal computed on the FULL body (before truncation) so a
+        # reflected value deep in a large page is still reported to the caller.
+        reflections = _detect_reflections(url, request_body, full_text)
+        if reflections:
+            result["reflections"] = reflections
+        return result
     except Exception as exc:
         return {"ok": False, "error": f"request failed: {str(exc)[:200]}"}
 

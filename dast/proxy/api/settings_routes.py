@@ -228,18 +228,37 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     @router.post("/api/scan-config")
     async def set_scan_config(body: dict):
         import dast.scanners.active_checks as _ac
+        import asyncio as _asyncio
+
+        def _resize_global_probe_sem() -> int:
+            # probe_concurrency is per endpoint scan; the semaphore is global across
+            # all concurrently-scanning endpoints. Scale by worker count so each
+            # concurrent scan keeps its full probe budget instead of starving on a
+            # shared handful of slots (see runner._scan_worker for the rationale).
+            workers = max(1, int(_scan_config.get("workers", 4) or 4))
+            per_scan = max(1, int(_scan_config.get("probe_concurrency", 3) or 3))
+            slots = per_scan * workers
+            _ac._PROBE_SEM = _asyncio.Semaphore(slots)
+            return slots
+
         if "workers" in body:
             n = max(1, min(20, int(body["workers"])))
             _scan_config["workers"] = n
             if ctx.runner is not None:
                 ctx.runner._workers = n
-                import asyncio as _asyncio
                 ctx.runner._scan_sem = _asyncio.Semaphore(n)
+            _resize_global_probe_sem()
         if "probe_concurrency" in body:
             n = max(1, min(20, int(body["probe_concurrency"])))
             _scan_config["probe_concurrency"] = n
-            import asyncio as _asyncio
-            _ac._PROBE_SEM = _asyncio.Semaphore(n)
+            _resize_global_probe_sem()
+        if "host_scan_concurrency" in body:
+            # Concurrent endpoint scans allowed against a single host. Default 1
+            # serializes per host so a single-worker target's slower agents keep
+            # their per-endpoint budget (see active_checks._HostScanGate).
+            n = max(1, min(20, int(body["host_scan_concurrency"])))
+            _scan_config["host_scan_concurrency"] = n
+            _ac.configure_host_scan_concurrency(n)
         for flag in ("passive_enabled", "passive_ai", "active_enabled", "llm_planner",
                      "llm_validator", "discovery_llm_classify", "probe_diff"):
             if flag in body:

@@ -228,6 +228,8 @@ def build_app(
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
     from dast.proxy.api.agent_triage_routes import make_router as agent_triage_router
+    from dast.proxy.api.copilot_routes import make_router as copilot_router
+    from dast.proxy.api.copilot_service import CopilotService
 
     ctx = DashboardContext(
         store=store,
@@ -246,6 +248,14 @@ def build_app(
         runner=runner,
         intercept_store=intercept_store,
     )
+
+    # Copilot service owns conversational session state + the turn runner, and
+    # exposes escalate_block as the coordinator's in-process escalation sink.
+    # Wired onto session_intelligence so dast.ai reaches it via a plain callable,
+    # never importing the dashboard layer.
+    ctx.copilot = CopilotService(ctx)
+    if store is not None and getattr(store, "session_intelligence", None) is not None:
+        store.session_intelligence.escalation_sink = ctx.copilot.escalate_block
 
     app = FastAPI(title="Frieren DAST-AI Proxy Dashboard")
 
@@ -291,5 +301,6 @@ def build_app(
     app.include_router(login_flow_router(ctx))
     app.include_router(mcp_approval_router(ctx))
     app.include_router(agent_triage_router(ctx))
+    app.include_router(copilot_router(ctx))
 
     return app

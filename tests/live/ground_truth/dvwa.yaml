@@ -1,0 +1,66 @@
+# Ground-truth benchmark spec for DVWA (Damn Vulnerable Web Application).
+#
+# Each endpoint under `endpoints` is driven through the Frieren proxy so it
+# lands in the intercepted-history store; the bench then scans it and matches
+# the confirmed active findings against `expect`.
+#
+# `expect` is the set of attack_type slugs a correct scanner MUST confirm on
+# that endpoint (true positives). Any confirmed active finding whose
+# attack_type is NOT in the union of all `expect` sets — and is not in
+# `ignore_attack_types` — is counted as a false positive.
+#
+# Run DVWA at the configured base_url with security level "low" before scanning:
+#   docker run --rm -it -p 8081:80 vulnerables/web-dvwa
+#
+# This file is data-only; the orchestration lives in tests/live/vuln_bench.py.
+
+target:
+  name: dvwa
+  base_url: http://127.0.0.1:8081
+  # Named auth flow implemented in vuln_bench.py (_authenticate_dvwa):
+  # GET login.php -> extract user_token -> POST credentials -> set security cookie.
+  auth:
+    type: dvwa
+    username: admin
+    password: password
+    security: low
+
+scope:
+  host: 127.0.0.1
+  port: "8081"
+
+# Passive/informational classes that appear on every DVWA page and are not the
+# subject of this active-detection benchmark. Confirmed findings of these types
+# are neither true nor false positives — they are excluded from scoring.
+ignore_attack_types:
+  - passive
+
+endpoints:
+  - path: /vulnerabilities/xss_r/
+    method: GET
+    query: { name: "hello" }
+    expect: [xss]
+
+  - path: /vulnerabilities/sqli/
+    method: GET
+    query: { id: "1", Submit: "Submit" }
+    expect: [sqli]
+
+  - path: /vulnerabilities/sqli_blind/
+    method: GET
+    query: { id: "1", Submit: "Submit" }
+    expect: [sqli]
+
+  - path: /vulnerabilities/exec/
+    method: POST
+    form: { ip: "127.0.0.1", Submit: "Submit" }
+    # cmdi: the ip field is passed to a shell ping command.
+    # csrf: the command form is cookie-session authenticated, carries no
+    # anti-CSRF token, and sets no SameSite on PHPSESSID, so a cross-site page
+    # can forge the state-changing request. Both are real, exploitable here.
+    expect: [cmdi, csrf]
+
+  - path: /vulnerabilities/fi/
+    method: GET
+    query: { page: "include.php" }
+    expect: [lfi]

@@ -39,3 +39,6 @@ dast/scope_presets/*.json
 sessions/
 # OS / editor junk
 .DS_Store
+
+# Local presentation artifacts (screenshots may show target data)
+presentation/

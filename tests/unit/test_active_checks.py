@@ -14,13 +14,184 @@ import respx
 from dast.scanners.active_checks import (
     ActiveFinding,
     CheckTarget,
+    _HostConcurrencyLimiter,
+    _HostScanGate,
     _inject_body,
+    _inject_path,
     _inject_query,
     check_xss,
     check_sqli,
     check_open_redirect,
+    zero_delay_variant,
 )
 from dast.proxy.runner import _entry_to_check_target
+
+
+# ── adaptive per-host concurrency limiter (AIMD) ─────────────────────────────
+
+@pytest.mark.asyncio
+class TestHostConcurrencyLimiter:
+    async def test_congestion_halves_the_limit(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        # A fast first request establishes the ~0.1s uncontended baseline.
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.1)
+        assert limiter.limit == 16.0  # healthy -> already at ceiling, stays capped
+        # A grossly inflated round-trip (baseline * >4) signals congestion.
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)
+        assert limiter.limit == 8.0
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)
+        assert limiter.limit == 4.0
+
+    async def test_explicit_congested_flag_backs_off(self):
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        await limiter.acquire()
+        # A timed-out default request reports congestion directly (no rtt).
+        await limiter.release(rtt_s=None, congested=True)
+        assert limiter.limit == 4.0
+
+    async def test_healthy_latency_recovers_additively(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        limiter.limit = 2.0
+        limiter.min_rtt = 0.1
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.15)  # within baseline*4 -> healthy
+        assert limiter.limit == 3.0
+
+    async def test_never_drops_below_one(self):
+        limiter = _HostConcurrencyLimiter(max_limit=4)
+        limiter.min_rtt = 0.1
+        for _ in range(10):
+            await limiter.acquire()
+            await limiter.release(rtt_s=30.0)
+        assert limiter.limit == 1.0
+
+    async def test_sub_second_latency_is_never_congestion(self):
+        # Absolute floor: a fast host must not be throttled even if a single
+        # request is several times its (tiny) baseline.
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        limiter.limit = 4.0
+        limiter.min_rtt = 0.01
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.2)  # 20x baseline but < 1s floor -> healthy
+        assert limiter.limit == 5.0
+
+    async def test_saturated_seen_is_sticky_on_congestion(self):
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        assert limiter.saturated_seen is False
+        await limiter.acquire()
+        await limiter.release(rtt_s=None, congested=True)
+        assert limiter.saturated_seen is True
+        # Recovery does NOT clear the sticky flag — a host that ever choked stays flagged.
+        limiter.min_rtt = 0.1
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.15)
+        assert limiter.saturated_seen is True
+
+    async def test_saturated_seen_set_on_latency_inflation(self):
+        limiter = _HostConcurrencyLimiter(max_limit=16)
+        await limiter.acquire()
+        await limiter.release(rtt_s=0.1)  # establish baseline, healthy
+        assert limiter.saturated_seen is False
+        await limiter.acquire()
+        await limiter.release(rtt_s=15.0)  # baseline*>4 -> congestion
+        assert limiter.saturated_seen is True
+
+
+# ── per-host endpoint-scan gate ──────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestHostScanGate:
+    async def test_serializes_endpoint_scans_per_host_by_default(self):
+        import asyncio
+        gate = _HostScanGate()  # default_limit = 1
+        order: list[str] = []
+
+        async def scan(tag: str) -> None:
+            await gate.acquire("app.example.com")
+            order.append(f"start:{tag}")
+            await asyncio.sleep(0.01)
+            order.append(f"end:{tag}")
+            await gate.release("app.example.com")
+
+        await asyncio.gather(scan("a"), scan("b"))
+        # Serial: one scan fully finishes before the next starts (no interleaving).
+        assert order in (
+            ["start:a", "end:a", "start:b", "end:b"],
+            ["start:b", "end:b", "start:a", "end:a"],
+        )
+
+    async def test_different_hosts_run_in_parallel(self):
+        import asyncio
+        gate = _HostScanGate()
+        inflight = {"n": 0, "max": 0}
+
+        async def scan(host: str) -> None:
+            await gate.acquire(host)
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+            await asyncio.sleep(0.01)
+            inflight["n"] -= 1
+            await gate.release(host)
+
+        await asyncio.gather(scan("a.example.com"), scan("b.example.com"))
+        # Two different hosts overlap — the gate is per host, not global.
+        assert inflight["max"] == 2
+
+    async def test_configure_allows_concurrency_when_host_is_healthy(self):
+        import asyncio
+        gate = _HostScanGate()
+        gate.configure(3)
+        inflight = {"n": 0, "max": 0}
+
+        async def scan() -> None:
+            await gate.acquire("app.example.com")
+            inflight["n"] += 1
+            inflight["max"] = max(inflight["max"], inflight["n"])
+            await asyncio.sleep(0.01)
+            inflight["n"] -= 1
+            await gate.release("app.example.com")
+
+        await asyncio.gather(*(scan() for _ in range(3)))
+        assert inflight["max"] == 3
+
+    async def test_saturated_host_clamped_to_serial_even_when_knob_raised(self):
+        import dast.scanners.active_checks as ac
+        gate = _HostScanGate()
+        gate.configure(4)
+        # A host the request limiter already caught saturating is pinned to serial.
+        limiter = _HostConcurrencyLimiter(max_limit=8)
+        limiter.saturated_seen = True
+        ac._HOST_LIMITERS["slow.example.com"] = limiter
+        try:
+            assert gate._allowed("slow.example.com") == 1
+            assert gate._allowed("fresh.example.com") == 4  # no limiter -> honor knob
+        finally:
+            ac._HOST_LIMITERS.pop("slow.example.com", None)
+
+
+# ── time-based differential control ─────────────────────────────────────────
+
+@pytest.mark.parametrize("payload,expected", [
+    ("1' AND SLEEP(5)-- -", "1' AND SLEEP(0)-- -"),
+    ("' OR SLEEP(5)-- -", "' OR SLEEP(0)-- -"),
+    ("1'; SELECT pg_sleep(5)-- -", "1'; SELECT pg_sleep(0)-- -"),
+    ("1; WAITFOR DELAY '0:0:5'-- -", "1; WAITFOR DELAY '0:0:0'-- -"),
+    (";sleep 4", ";sleep 0"),
+    ("$(sleep 4)", "$(sleep 0)"),
+])
+def test_zero_delay_variant_zeroes_the_sleep(payload, expected):
+    assert zero_delay_variant(payload) == expected
+
+
+def test_zero_delay_variant_returns_none_without_sleep():
+    # No recognizable sleep construct -> caller falls back to a clean value.
+    assert zero_delay_variant("' OR '1'='1") is None
+    assert zero_delay_variant(
+        "' AND (SELECT COUNT(*) FROM sqlite_master)>0 AND '1'='1"
+    ) is None
 
 
 # ── injection helpers ──────────────────────────────────────────────────────
@@ -99,6 +270,61 @@ def _fake_entry(method="POST", url="https://example.com/graphql",
     if body is not None:
         e.request_body = body if isinstance(body, bytes) else body.encode()
     return e
+
+
+class TestInjectPath:
+    def test_replaces_targeted_segment_encoded(self):
+        # path_index 2 = the third non-empty segment ("name1").
+        url = _inject_path("https://api.example.com/users/v1/name1", 2, "name1'")
+        assert url == "https://api.example.com/users/v1/name1%27"
+
+    def test_preserves_other_segments_and_query(self):
+        url = _inject_path("https://x.com/a/42/b?q=1", 1, "99")
+        assert url == "https://x.com/a/99/b?q=1"
+
+    def test_preserves_trailing_slash(self):
+        url = _inject_path("https://x.com/orders/7/", 1, "8")
+        assert url == "https://x.com/orders/8/"
+
+    def test_out_of_range_index_is_noop(self):
+        original = "https://x.com/users/1"
+        assert _inject_path(original, 9, "PAYLOAD") == original
+
+
+class TestPathParamEnumeration:
+    """The adapter must expose value-like REST path segments as injectable
+    params (VAmPI's SQLi is a path parameter) without fuzzing static route
+    tokens — and must not regress DVWA, whose paths hold no value-like segment."""
+
+    def test_numeric_and_valuelike_segments_become_path_params(self):
+        entry = _fake_entry(method="GET", url="https://api.example.com/users/v1/name1")
+        target = _entry_to_check_target(entry)
+        assert target is not None
+        path_params = [p for p in target.params if p["location"] == "path"]
+        assert [p["name"] for p in path_params] == ["name1"]
+        assert path_params[0]["path_index"] == 2  # users(0) v1(1) name1(2)
+
+    def test_numeric_id_segment(self):
+        entry = _fake_entry(method="GET", url="https://api.example.com/orders/42")
+        target = _entry_to_check_target(entry)
+        assert target is not None
+        assert {p["name"] for p in target.params if p["location"] == "path"} == {"42"}
+
+    def test_static_route_tokens_are_not_fuzzed(self):
+        # No value-like segment anywhere -> no path params, and (no query/body) None.
+        entry = _fake_entry(method="GET", url="https://api.example.com/api/users/profile")
+        entry.path = "/api/users/profile"
+        target = _entry_to_check_target(entry)
+        assert target is None
+
+    def test_dvwa_paths_yield_no_path_params(self):
+        # Regression guard: the validated DVWA baseline must stay unchanged.
+        for path in ("/vulnerabilities/xss_r/", "/vulnerabilities/sqli/",
+                     "/vulnerabilities/exec/", "/vulnerabilities/fi/", "/login.php"):
+            entry = _fake_entry(method="GET", url=f"http://127.0.0.1:8081{path}?x=1")
+            target = _entry_to_check_target(entry)
+            assert target is not None
+            assert [p for p in target.params if p["location"] == "path"] == [], path
 
 
 class TestEntryToCheckTarget:

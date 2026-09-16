@@ -6,7 +6,8 @@ dast.agents.cmdi_agent._send.
 
 from __future__ import annotations
 
-import asyncio
+import re
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,10 +26,14 @@ def _target(url="https://example.com/ping?host=example.com", method="GET", param
     )
 
 
-def _resp(status=200, text=""):
+def _resp(status=200, text="", elapsed=0.0):
     m = MagicMock()
     m.status_code = status
     m.text = text
+    # Time-based detection reads server round-trip via resp.elapsed.total_seconds()
+    # (active_checks.response_elapsed_ms), not wall-clock. Model it as a real
+    # timedelta so a slow SLEEP response is simulated deterministically.
+    m.elapsed = timedelta(seconds=elapsed)
     return m
 
 
@@ -38,7 +43,7 @@ def _resp(status=200, text=""):
 async def test_output_reflected_detected():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if payload and payload.strip(";|&$()`") == "id":
             return _resp(200, "ping ok\nuid=0(root) gid=0(root) groups=0(root)")
         return _resp(200, "ping ok")
@@ -58,7 +63,7 @@ async def test_output_reflected_detected():
 async def test_shell_error_disclosure_detected():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if payload == ";id":
             return _resp(500, "sh: 1: id: command not found")
         return _resp(200, "ping ok")
@@ -73,22 +78,58 @@ async def test_shell_error_disclosure_detected():
 # ── positive: time-based blind ──────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_time_based_blind_detected(monkeypatch):
+async def test_time_based_blind_detected():
     target = _target()
-    # Force a small threshold and sleep duration so the test runs fast while
-    # still exercising the "slower than baseline" comparison.
-    monkeypatch.setattr("dast.agents.cmdi_agent._TIME_THRESHOLD_S", 0.05)
 
-    async def fake_send(client, method, url, headers, body, payload=None):
-        if payload and "sleep" in payload:
-            await asyncio.sleep(0.08)
-        return _resp(200, "ping ok")
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # Injectable endpoint: the response time TRACKS the requested `sleep N`
+        # (delay scaling). `sleep 0` control is fast, `sleep 2` confirm ~2s, `sleep 4`
+        # probe ~4s — so both the candidate and the sqlmap-style scaling confirmation
+        # succeed. Detection compares resp.elapsed (server round-trip), not wall-clock.
+        requested_s = 0.0
+        if payload:
+            m = re.search(r"sleep\s+(\d+)", payload, re.IGNORECASE)
+            if m:
+                requested_s = float(m.group(1))
+        return _resp(200, "ping ok", elapsed=0.05 + requested_s)
 
     with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
         findings = await CmdiAgent().run(target, MagicMock())
 
     assert len(findings) == 1
     assert "Time-Based Blind" in findings[0].title
+
+
+# ── regression: body-location params are injected into the body, not the query ─
+# DVWA /exec/ reads `ip` from the POST body ($_POST['ip']); the agent used to
+# hardcode query-string injection (POST /exec/?ip=;id), which never reaches the
+# vulnerable code path, so command injection went undetected.
+
+@pytest.mark.asyncio
+async def test_body_location_param_injected_into_body():
+    target = CheckTarget(
+        method="POST",
+        url="https://example.com/exec/",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        body="ip=127.0.0.1&Submit=Submit",
+        params=[{"name": "ip", "location": "body", "value": "127.0.0.1"}],
+    )
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # `id` executes (uid output) ONLY when the payload landed in the body. If the
+        # agent (wrongly) injected into the query string, the body still carries the
+        # untouched value and no output leaks.
+        if payload and payload.strip(";|&$()`") == "id" and body and payload in body:
+            return _resp(200, "ping ok\nuid=33(www-data) gid=33(www-data)")
+        return _resp(200, "ping ok")
+
+    with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):
+        findings = await CmdiAgent().run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert findings[0].attack_type == "cmdi"
+    assert findings[0].parameter == "ip"
+    assert "Output Reflected" in findings[0].title
 
 
 # ── regression: WAF-bypass payloads are exercised and detected ───────────────
@@ -99,7 +140,7 @@ async def test_time_based_blind_detected(monkeypatch):
 async def test_waf_bypass_detected_when_direct_payloads_filtered():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         # Simulate a WAF: direct output/blind payloads are filtered (clean
         # response), but an IFS/encoding bypass variant still executes `id`.
         if payload and ("${IFS}" in payload or "$IFS" in payload or "%0a" in payload or "%00" in payload):
@@ -121,7 +162,7 @@ async def test_waf_bypass_detected_when_direct_payloads_filtered():
 async def test_clean_response_no_finding():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body, payload=None):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return _resp(200, "ping ok, no output leaked")
 
     with patch("dast.agents.cmdi_agent._send", side_effect=fake_send):

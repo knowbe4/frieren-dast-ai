@@ -67,3 +67,90 @@ class TestListModels:
         result = bedrock_client.list_models()  # must not raise
         assert result["source"] == "preset"
         assert "network down" in result["error"]
+
+
+_BEDROCK_ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
+
+
+class TestTierModelProviderGuard:
+    """A Bedrock ARN configured for a tier must never be sent to a non-Bedrock
+    provider — the gateway rejects ARNs with HTTP 400, silently degrading every
+    tier-helper AI call (flaky detection). It must fall back to the active model."""
+
+    def teardown_method(self):
+        bedrock_client.set_tiered_models("", "")
+        bedrock_client.set_active_model("")
+
+    def test_bedrock_keeps_arn_tiers(self):
+        bedrock_client.set_provider("bedrock")
+        bedrock_client.set_tiered_models(fast=_BEDROCK_ARN, validation=_BEDROCK_ARN)
+        assert bedrock_client.get_fast_model() == _BEDROCK_ARN
+        assert bedrock_client.get_validation_model() == _BEDROCK_ARN
+
+    def test_gateway_drops_arn_tier_falls_back_to_active_model(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        bedrock_client.set_tiered_models(fast=_BEDROCK_ARN, validation=_BEDROCK_ARN)
+        # Both tier helpers must resolve to the gateway model name, not the ARN.
+        assert bedrock_client.get_fast_model() == "claude-sonnet-5"
+        assert bedrock_client.get_validation_model() == "claude-sonnet-5"
+
+    def test_gateway_keeps_provider_appropriate_tier_name(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        bedrock_client.set_tiered_models(fast="claude-haiku-4-5", validation="claude-opus-5")
+        # A real model NAME for the provider is honoured, not overridden.
+        assert bedrock_client.get_fast_model() == "claude-haiku-4-5"
+        assert bedrock_client.get_validation_model() == "claude-opus-5"
+
+
+class TestResolveModelProviderGuard:
+    """The invoke boundary (_resolve_model) is the single choke point every LLM
+    call funnels through. It must never hand a Bedrock ARN to a non-Bedrock
+    provider — regardless of whether the ARN arrived via the tier/active fallback
+    or an explicit model_id (the coordinator planner passes one directly). When no
+    provider-appropriate model resolves, it fails loud (pauses AI) instead of
+    silently degrading detection."""
+
+    def teardown_method(self):
+        bedrock_client.set_provider("bedrock")
+        bedrock_client.set_tiered_models("", "")
+        bedrock_client.set_active_model("")
+        bedrock_client.mark_ai_available()
+
+    def test_bedrock_arn_passes_through_under_bedrock(self):
+        bedrock_client.set_provider("bedrock")
+        bedrock_client.set_active_model(_BEDROCK_ARN)
+        assert bedrock_client._resolve_model(None) == _BEDROCK_ARN
+        assert bedrock_client._resolve_model(_BEDROCK_ARN) == _BEDROCK_ARN
+        assert bedrock_client.is_ai_available()
+
+    def test_gateway_explicit_arn_model_id_fails_loud(self):
+        # The coordinator planner path: an ARN passed as an explicit model_id.
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        with pytest.raises(bedrock_client.AiUnavailableError) as exc:
+            bedrock_client._resolve_model(_BEDROCK_ARN)
+        assert "gateway" in str(exc.value)
+        assert not bedrock_client.is_ai_available()  # AI paused, not degraded
+
+    def test_gateway_arn_active_model_fallback_fails_loud(self):
+        # The fallback path: no explicit model, and the active model is an ARN.
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model(_BEDROCK_ARN)
+        with pytest.raises(bedrock_client.AiUnavailableError):
+            bedrock_client._resolve_model(None)
+        assert not bedrock_client.is_ai_available()
+
+    def test_gateway_no_model_configured_fails_loud(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("")
+        with pytest.raises(bedrock_client.AiUnavailableError):
+            bedrock_client._resolve_model(None)
+
+    def test_gateway_provider_name_resolves(self):
+        bedrock_client.set_provider("gateway")
+        bedrock_client.set_active_model("claude-sonnet-5")
+        assert bedrock_client._resolve_model(None) == "claude-sonnet-5"
+        assert bedrock_client._resolve_model("claude-haiku-4-5") == "claude-haiku-4-5"
+        assert bedrock_client.is_ai_available()

@@ -58,10 +58,33 @@ def _tagged_payload(payload: str, param_name: str) -> str:
     return f"{payload}<!--{marker}-->"
 
 
-async def _browser_confirm(url: str, proxy_port: int) -> tuple[bool, str]:
+def _cookies_from_header(cookie_header: str, url: str) -> list[dict]:
+    """Parse a request ``Cookie:`` header into Playwright cookie dicts scoped to
+    ``url``. Scoping by URL (not domain) lets Playwright infer domain/path/secure
+    correctly, which matters for hosts like ``127.0.0.1`` where a bare domain
+    cookie is rejected."""
+    cookies: list[dict] = []
+    for pair in cookie_header.split(";"):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, value = pair.split("=", 1)
+        name = name.strip()
+        if name:
+            cookies.append({"name": name, "value": value.strip(), "url": url})
+    return cookies
+
+
+async def _browser_confirm(url: str, proxy_port: int, cookie_header: str = "") -> tuple[bool, str]:
     """
     Open URL in a headless browser via proxy and check if DAST_XSS_CONFIRM
     was called. Returns (confirmed, reason).
+
+    ``cookie_header`` is the request ``Cookie:`` header the agent authenticated
+    with — injected into the browser context so the headless page loads the same
+    authenticated session. Without it, an authenticated target bounces the
+    browser to its login page, the payload never reflects, and a genuine XSS is
+    misreported as "did not execute" (a false negative).
 
     reason values:
       "confirmed"       — JS executed (alert fired or marker in DOM)
@@ -78,6 +101,13 @@ async def _browser_confirm(url: str, proxy_port: int) -> tuple[bool, str]:
                 proxy={"server": f"http://127.0.0.1:{proxy_port}"},
             )
             ctx = await browser.new_context(ignore_https_errors=True)
+            cookies = _cookies_from_header(cookie_header, url)
+            if cookies:
+                try:
+                    await ctx.add_cookies(cookies)
+                except Exception as exc:
+                    logger.warning("XSS browser confirm: cookie injection failed",
+                                   error=str(exc))
             page = await ctx.new_page()
 
             confirmed = False
@@ -198,16 +228,29 @@ class XssAgent(VulnAgent):
                     self.observe("waf_bypass", payload=payload, signal="payload reflected unencoded after prior block")
                 confirm_payload = f'<img src=x onerror=alert("{_CONFIRM_MARKER}")>'
                 confirm_resp, confirm_url = await self._send_probe(target, client, param, confirm_payload)
+                # Carry the session the agent authenticated with into the browser
+                # so it loads the reflected page, not the login redirect.
+                cookie_header = target.headers.get("cookie", "") or target.headers.get("Cookie", "")
                 browser_confirmed, browser_reason = await _browser_confirm(
-                    confirm_url or target.url, self._proxy_port
+                    confirm_url or target.url, self._proxy_port, cookie_header
                 )
 
-                # Extract response snippet around the reflection point
-                match = _REFLECTED_RE.search(body_text)
-                snippet = ""
-                if match:
-                    start = max(0, match.start() - 80)
-                    snippet = body_text[start:match.end() + 80].strip()
+                # Extract the response snippet around the ACTUAL reflection
+                # point. Anchor on where the tagged payload landed — a generic
+                # _REFLECTED_RE match can sit in unrelated page chrome
+                # (header/nav), producing a snippet with no trace of the
+                # payload. This snippet is the validator's only
+                # target-controlled evidence, so it must contain the reflection.
+                reflect_index = body_text.find(tagged)
+                if reflect_index == -1:
+                    # Payload partially transformed — fall back to the marker.
+                    reflect_index = body_text.find(_param_marker(param["name"]))
+                if reflect_index == -1:
+                    match = _REFLECTED_RE.search(body_text)
+                    reflect_index = match.start() if match else 0
+                snippet_start = max(0, reflect_index - 80)
+                snippet_end = min(len(body_text), reflect_index + len(tagged) + 80)
+                snippet = body_text[snippet_start:snippet_end].strip()
 
                 # The probe with payload is the exploit proof.
                 probe_request, probe_response = _fmt_http_pair(resp)
@@ -218,16 +261,21 @@ class XssAgent(VulnAgent):
                     "timeout":    "browser timed out loading the page",
                 }.get(browser_reason, browser_reason)
 
+                # A compact view of the reflected region, so the evidence
+                # string itself carries proof the payload rendered unencoded.
+                reflected_context = " ".join(snippet.split())[:200]
                 if browser_confirmed:
                     evidence = (
                         f"Payload reflected unencoded and JS executed in browser "
-                        f"(status {resp.status_code}) — parameter '{param['name']}'"
+                        f"(status {resp.status_code}) — parameter '{param['name']}'. "
+                        f"Reflected context: {reflected_context}"
                     )
                 else:
                     evidence = (
                         f"Payload reflected unencoded (status {resp.status_code}) — "
                         f"{_reason_label}. "
-                        f"Parameter '{param['name']}' — manual review recommended."
+                        f"Parameter '{param['name']}' — manual review recommended. "
+                        f"Reflected context: {reflected_context}"
                     )
 
                 return AgentFinding(

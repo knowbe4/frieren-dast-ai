@@ -13,8 +13,11 @@ import httpx
 import pytest
 import respx
 
+import time
+
 from dast.scanners import active_checks as ac
 from dast.scanners.active_checks import (
+    _HOST_DEAD_COOLDOWN_SECONDS,
     _HOST_DEAD_THRESHOLD,
     _send,
     is_host_dead,
@@ -73,6 +76,59 @@ class TestBreakerTrips:
 
         assert result is None
         assert route.call_count == calls_when_dead
+
+
+class TestReadTimeoutsAreReachable:
+    @respx.mock
+    async def test_read_timeouts_do_not_trip_breaker(self):
+        # A read timeout means the host accepted the connection but was slow —
+        # exactly what a time-based blind SQLi probe (SLEEP payload) produces.
+        # It must NEVER be counted as "host unreachable", or the very probe that
+        # detects blind injection would trip the breaker and suppress the finding.
+        respx.get("https://slow.example.com/t").mock(
+            side_effect=httpx.ReadTimeout("timed out waiting for response")
+        )
+        async with _client() as client:
+            for _ in range(_HOST_DEAD_THRESHOLD + 3):
+                await _send(client, "GET", "https://slow.example.com/t", {}, None)
+
+        assert not is_host_dead("slow.example.com")
+
+    @respx.mock
+    async def test_pool_timeout_does_not_trip_breaker(self):
+        respx.get("https://busy.example.com/p").mock(
+            side_effect=httpx.PoolTimeout("no free connection")
+        )
+        async with _client() as client:
+            for _ in range(_HOST_DEAD_THRESHOLD + 3):
+                await _send(client, "GET", "https://busy.example.com/p", {}, None)
+
+        assert not is_host_dead("busy.example.com")
+
+
+class TestBreakerSelfHeals:
+    @respx.mock
+    async def test_breaker_reopens_after_cooldown(self):
+        # Trip the breaker with genuine connection errors.
+        respx.get("https://blip.example.com/c").mock(side_effect=httpx.ConnectError("refused"))
+        async with _client() as client:
+            for _ in range(_HOST_DEAD_THRESHOLD):
+                await _send(client, "GET", "https://blip.example.com/c", {}, None)
+        assert is_host_dead("blip.example.com")
+
+        # Simulate the cooldown having elapsed by back-dating the trip time.
+        ac._HOST_DEAD_AT["blip.example.com"] = time.monotonic() - (_HOST_DEAD_COOLDOWN_SECONDS + 1)
+
+        # The breaker self-heals: probing resumes and stale state is cleared, so a
+        # host that has recovered is scanned again instead of staying dead forever.
+        assert not is_host_dead("blip.example.com")
+        assert "blip.example.com" not in ac._HOST_DEAD
+        assert "blip.example.com" not in ac._HOST_FAILURE_STATE
+
+    def test_breaker_stays_open_within_cooldown(self):
+        ac._HOST_DEAD.add("fresh.example.com")
+        ac._HOST_DEAD_AT["fresh.example.com"] = time.monotonic()
+        assert is_host_dead("fresh.example.com")
 
 
 class TestBreakerResets:

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from dast.proxy.scan_queue_state import ScanQueueState
     from dast.proxy.runner import ProxyRunner
     from dast.proxy.intercept_store import InterceptStore
+    from dast.proxy.api.copilot_service import CopilotService
 
 
 @dataclass
@@ -41,6 +42,10 @@ class DashboardContext:
     scan_queue_state: Optional["ScanQueueState"] = None
     runner: Optional["ProxyRunner"] = None
     intercept_store: Optional["InterceptStore"] = None
+    # Exploration Copilot service — owns conversational session state, the turn
+    # runner, and the in-process block-escalation entry point. Set in
+    # dashboard_server after ctx construction (needs ctx itself).
+    copilot: Optional["CopilotService"] = None
 
     # Mutable runtime state — shared across all routers
     ws_clients: Set[WebSocket] = field(default_factory=set)
@@ -68,6 +73,11 @@ class DashboardContext:
     # /ws/agent-triage; per-job pause events + approved hosts live in the routes
     # layer's job dicts (not process-wide, unlike mcp_approved_hosts above).
     agent_triage_ws_clients: Set[WebSocket] = field(default_factory=set)
+    # Exploration Copilot (dast/ai/copilot/) conversational trace + pause channel.
+    # Mirrors the agent-triage channel: per-turn step/observation/reply events and
+    # approve/auth pauses stream to /ws/copilot; per-session pause events live in
+    # the routes layer's session dicts.
+    copilot_ws_clients: Set[WebSocket] = field(default_factory=set)
     status_cache: dict = field(default_factory=dict)
     status_cache_ts: list = field(default_factory=lambda: [0.0])
     # Wall-clock (time.time()) of the last MCP-server heartbeat; 0.0 = never seen.
@@ -95,7 +105,8 @@ class DashboardContext:
         else:
             self._scan_cfg = {
                 "workers": 2,
-                "probe_concurrency": 3,
+                "probe_concurrency": 4,
+                "host_scan_concurrency": 1,
                 "passive_enabled": True,
                 "passive_ai": True,
                 "active_enabled": True,
@@ -171,3 +182,15 @@ class DashboardContext:
             except Exception:
                 dead.add(ws)
         self.agent_triage_ws_clients.difference_update(dead)
+
+    async def broadcast_copilot(self, payload: dict) -> None:
+        """Fan out an Exploration Copilot trace/pause/reply event to /ws/copilot."""
+        import json
+        dead = set()
+        msg = json.dumps(payload, default=str)
+        for ws in list(self.copilot_ws_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.add(ws)
+        self.copilot_ws_clients.difference_update(dead)

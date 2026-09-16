@@ -8,6 +8,8 @@ and never touch the LLM gateway.
 
 from __future__ import annotations
 
+import re
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 from urllib.parse import unquote
 
@@ -31,6 +33,10 @@ def _resp(status=200, text="", elapsed=None):
     m = MagicMock()
     m.status_code = status
     m.text = text
+    # Time-based detection reads server round-trip via resp.elapsed.total_seconds()
+    # (see active_checks.response_elapsed_ms), not wall-clock. Model it as a real
+    # timedelta so a slow SLEEP response can be simulated deterministically.
+    m.elapsed = timedelta(seconds=elapsed if elapsed is not None else 0.0)
     return m
 
 
@@ -47,7 +53,7 @@ def _no_mutation(monkeypatch):
 async def test_error_based_detection():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if "'" in unquote(url):
             return _resp(500, "You have an error in your SQL syntax near ''1'='1'")
         return _resp(200, '{"ok": true}')
@@ -62,13 +68,120 @@ async def test_error_based_detection():
     assert "SQL error" in findings[0].evidence
 
 
+# ── an error-based hit skips slow time-based probing of other params ────────
+
+@pytest.mark.asyncio
+async def test_error_based_hit_skips_time_based_on_other_params(monkeypatch):
+    """Once error-based confirms injection on any parameter, the (slow) blind
+    time-based probes must not run — a single confirmed injection proves the
+    endpoint vulnerable, and leaving time-based sleeps running risks blowing the
+    per-endpoint budget and forfeiting the finding already in hand. Regression
+    for DVWA sqli timing out (kept_findings=0) despite an instant error-based
+    hit on 'id'."""
+    target = _target(params=[
+        {"name": "id", "location": "query", "value": "1"},
+        {"name": "Submit", "location": "query", "value": "Submit"},
+    ])
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # 'id' injection triggers a SQL error; everything else is clean.
+        if "id=1'" in unquote(url) or "id='" in unquote(url):
+            return _resp(500, "You have an error in your SQL syntax near ''1'")
+        return _resp(200, '{"ok": true}')
+
+    time_based = MagicMock()
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(SqliAgent, "_probe_time_based", new=time_based):
+        findings = await SqliAgent().run(target, MagicMock())
+
+    assert len(findings) >= 1
+    assert all(f.attack_type == "sqli" for f in findings)
+    time_based.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_error_based_short_circuits_after_first_param_confirms():
+    """Once error-based confirms on the first parameter, the agent must RETURN
+    immediately and NOT probe the remaining parameters. Probing a non-injectable
+    param exhausts its seeds and drives the (slow) LLM mutator, delaying the
+    agent's return past the coordinator's per-endpoint budget and forfeiting the
+    finding it already has. Regression for DVWA sqli timing out to "safe" despite
+    an instant error-based hit on the first param."""
+    target = _target(params=[
+        {"name": "id", "location": "query", "value": "1"},
+        {"name": "Submit", "location": "query", "value": "Submit"},
+    ])
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        if "id=1'" in unquote(url) or "id='" in unquote(url):
+            return _resp(500, "You have an error in your SQL syntax near ''1'")
+        return _resp(200, '{"ok": true}')
+
+    agent = SqliAgent()
+    probed_params: list = []
+    real_probe = SqliAgent._probe_error_based
+
+    async def counting_error_probe(target, client, param, error_re, tech_context=None):
+        probed_params.append(param["name"])
+        return await real_probe(agent, target, client, param, error_re, tech_context)
+
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(agent, "_probe_error_based", side_effect=counting_error_probe):
+        findings = await agent.run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert findings[0].parameter == "id"
+    # Only the first parameter must have been probed — no grind on 'Submit'.
+    assert probed_params == ["id"]
+
+
+# ── error-based mutator must NOT grind without a WAF block ──────────────────
+
+@pytest.mark.asyncio
+async def test_error_based_does_not_mutate_without_block(monkeypatch):
+    """On an endpoint with no WAF block, the error-based phase must exhaust its
+    seed payloads and STOP without ever calling the LLM mutator. The mutator is a
+    WAF-bypass tool; invoking it when nothing was blocked burns the per-endpoint
+    budget and starves the time-based blind probe that follows. Regression for
+    DVWA sqli_blind timing out to "safe": the error-based mutator ground on 'id'
+    (a 404 differential is NOT a block) and the SLEEP probes never ran."""
+    target = _target(params=[{"name": "id", "location": "query", "value": "1"}])
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # Injecting into 'id' returns a 404 (a differential, but NOT a WAF block);
+        # baseline is a clean 200. No SQL error signature anywhere.
+        if "id=1" not in unquote(url):
+            return _resp(404, "Not Found")
+        return _resp(200, '{"ok": true}')
+
+    mutator_calls = {"n": 0}
+    async def counting_next_payload(*a, **k):
+        mutator_calls["n"] += 1
+        return None
+    monkeypatch.setattr("dast.agents.sqli_agent.next_payload", counting_next_payload)
+
+    agent = SqliAgent()
+    # Time-based must still get to run (it is the only detector for blind SQLi).
+    async def fake_time_based(*a, **k):
+        return None
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send), \
+         patch.object(agent, "_probe_time_based", side_effect=fake_time_based) as tb:
+        findings = await agent.run(target, MagicMock())
+
+    assert findings == []
+    # The mutator must never have been called — no block was observed.
+    assert mutator_calls["n"] == 0
+    # And control must have reached the time-based blind fallback.
+    assert tb.called
+
+
 # ── negative: clean response ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_clean_response_no_finding():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return _resp(200, '{"results": []}')
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
@@ -78,25 +191,30 @@ async def test_clean_response_no_finding():
 
 
 # ── time-based blind ────────────────────────────────────────────────────────
-# Real (small) delays are used instead of mocking time.monotonic, since the
-# exact call count to monotonic() is an implementation detail we shouldn't
-# have to track — a fast baseline vs. an artificially slow probe response is
-# enough to exercise the "must be slower than baseline, not just over an
-# absolute threshold" logic with a tiny, fast-running threshold.
+# Detection compares each SLEEP probe against an adjacent CLEAN control using the
+# server round-trip (resp.elapsed), not wall-clock — so contention while waiting
+# for the probe semaphore cannot mask the signal. Simulate by giving SLEEP
+# responses a large .elapsed and control responses a small one.
 
 @pytest.mark.asyncio
 async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_threshold():
-    import asyncio
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
-        if "SLEEP" in unquote(url) or "WAITFOR" in unquote(url) or "pg_sleep" in unquote(url):
-            await asyncio.sleep(0.08)
-        return _resp(200, "ok")
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        decoded = unquote(url)
+        # Injectable endpoint: the response time TRACKS the requested SLEEP duration
+        # (delay scaling). SLEEP(0) control is fast, SLEEP(2) confirm ~2s, SLEEP(5)
+        # probe ~5s — so both the candidate and the sqlmap-style scaling confirmation
+        # succeed. A tiny ambient baseline is added to every response.
+        m = re.search(r"SLEEP\((\d+)\)|pg_sleep\((\d+)\)|0:0:(\d+)", decoded, re.IGNORECASE)
+        requested_s = 0.0
+        if m:
+            requested_s = float(next(g for g in m.groups() if g is not None))
+        return _resp(200, "ok", elapsed=0.05 + requested_s)
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
         finding = await SqliAgent()._probe_time_based(
-            target, MagicMock(), target.params[0], threshold_ms=50,
+            target, MagicMock(), target.params[0], threshold_ms=4500,
         )
 
     assert finding is not None
@@ -108,8 +226,10 @@ async def test_time_based_blind_detected_when_delay_exceeds_baseline_plus_thresh
 async def test_time_based_blind_not_detected_within_baseline():
     target = _target()
 
-    async def fake_send(client, method, url, headers, body):
-        return _resp(200, "ok")
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        # Every request is uniformly slow (loaded endpoint), but the SLEEP adds
+        # nothing over the control — the delta stays below threshold, no finding.
+        return _resp(200, "ok", elapsed=3.0)
 
     with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
         finding = await SqliAgent()._probe_time_based(
@@ -132,7 +252,7 @@ async def test_waf_block_then_bypass_records_waf_bypass(monkeypatch):
         _resp(500, "SQL syntax error near 'bypass'"),  # mutated payload succeeds
     ])
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         return next(responses)
 
     call_state = {"n": 0}
@@ -170,7 +290,7 @@ async def test_body_location_injection_detects_error():
         params=[{"name": "accountId", "location": "body", "value": "1"}],
     )
 
-    async def fake_send(client, method, url, headers, body):
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
         if body and "'" in body:
             return _resp(500, "SQL syntax error near 'accountId'")
         return _resp(200, '{"ok": true}')

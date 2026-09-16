@@ -69,7 +69,17 @@ async def test_run_tool_never_raises_on_handler_error(monkeypatch):
 # ── send_request scope + safety ────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_send_request_out_of_scope_blocked():
+async def test_send_request_out_of_scope_blocked(monkeypatch):
+    # A store-less (MCP) caller may ask the dashboard operator for an interactive
+    # approval on an out-of-scope target. Stub that out so this test stays
+    # hermetic and deterministic: with no operator approval, out-of-scope must be
+    # a hard block. (Without the stub the test would long-poll a real dashboard if
+    # one happened to be running on 127.0.0.1:8088, making the outcome depend on
+    # the developer's environment.)
+    async def _deny(ctx, url, method):
+        return False
+
+    monkeypatch.setattr("dast.tools.approval.request_approval", _deny)
     ctx = ToolContext(settings=_Scope(allow=False))
     result = await run_tool(ctx, "send_request",
                             {"url": "https://evil.example.com/x"})
@@ -112,6 +122,96 @@ async def test_send_request_success(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == 200
     assert result["body"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_send_request_reports_raw_reflection_past_truncation(monkeypatch):
+    # An injected value that reflects UNENCODED deep in a large body is invisible
+    # in the truncated `body`, so send_request must surface it as a reflection
+    # signal — the decisive evidence for reflected XSS.
+    marker = "<script>alert('FrierenXSS123')</script>"
+    big_body = ("x" * 9000) + f"Hello {marker}, welcome" + ("y" * 500)
+
+    class _Resp:
+        status_code = 200
+        text = big_body
+        url = "https://api.acme-corp.com/xss?name=" + marker
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/xss?name=" + marker})
+
+    assert result["ok"] is True
+    assert marker not in result["body"]  # reflection lives past the 8000-char slice
+    reflections = result["reflections"]
+    assert len(reflections) == 1
+    hit = reflections[0]
+    assert hit["parameter"] == "name"
+    assert hit["location"] == "query"
+    assert hit["reflected_raw"] is True
+    assert hit["html_escaped_also_present"] is False
+    assert marker in hit["context"]
+
+
+@pytest.mark.asyncio
+async def test_send_request_reports_html_escaped_reflection(monkeypatch):
+    # A value that comes back HTML-escaped is a reflection but NOT raw — the caller
+    # needs both booleans to tell an XSS sink from a safely-encoded echo.
+    injected = "<b>probe</b>"
+
+    class _Resp:
+        status_code = 200
+        text = "search results for &lt;b&gt;probe&lt;/b&gt; here"
+        url = "https://api.acme-corp.com/s?q=" + injected
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/s?q=" + injected})
+
+    hit = result["reflections"][0]
+    assert hit["reflected_raw"] is False
+    assert hit["html_escaped_also_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_request_no_reflection_field_when_absent(monkeypatch):
+    class _Resp:
+        status_code = 200
+        text = "nothing echoed back"
+        url = "https://api.acme-corp.com/x?token=abcdef12345"
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/x?token=abcdef12345"})
+    assert result["ok"] is True
+    assert "reflections" not in result
 
 
 # ── get_history in-process store path ──────────────────────────────────────────
@@ -392,3 +492,27 @@ def test_tool_definitions_shape():
         assert d["inputSchema"]["type"] == "object"
     names = {d["name"] for d in defs}
     assert "send_request" in names
+
+
+# ── copilot_ask (message-passing primitive; exposed over MCP) ────────────────────
+
+def test_copilot_ask_registered_and_tagged():
+    tool = tools.get_tool("copilot_ask")
+    assert tool is not None
+    # Tagged "copilot" so the copilot engine excludes it from its own menu; the tag
+    # does NOT hide it from the registry or MCP.
+    assert "copilot" in (tool.tags or [])
+    assert "message" in tool.input_schema.get("required", [])
+
+
+def test_copilot_ask_exposed_over_mcp():
+    from dast.mcp import tool_definitions
+    names = {d["name"] for d in tool_definitions()}
+    assert "copilot_ask" in names  # external MCP clients can drive the copilot
+
+
+@pytest.mark.asyncio
+async def test_copilot_ask_requires_message():
+    result = await run_tool(ToolContext(settings=_Scope(True)), "copilot_ask", {})
+    assert result["ok"] is False
+    assert "message" in result["error"]

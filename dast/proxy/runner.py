@@ -155,7 +155,16 @@ class ProxyRunner:
         # Shared mutable config — dashboard reads/writes this same dict at runtime
         self._engine_config: dict = {
             "workers": workers,
-            "probe_concurrency": 3,
+            # Concurrent probes PER endpoint scan (the global pool is this x workers,
+            # see _scan_worker). 4 gives time-based blind probes enough throughput to
+            # confirm within budget even when several endpoints scan at once.
+            "probe_concurrency": 4,
+            # How many endpoint scans may run concurrently against ONE host. Default
+            # 1 (serialize per host) so a single-worker target's slower agents are not
+            # starved of their per-endpoint budget by sibling scans time-slicing the
+            # same backend (see active_checks._HostScanGate). Different hosts still
+            # scan in parallel up to `workers`. Raise for genuinely scalable targets.
+            "host_scan_concurrency": 1,
             "passive_enabled": True,
             "passive_ai": True,
             "active_enabled": True,
@@ -1041,32 +1050,65 @@ class ProxyRunner:
         qs = self._scan_queue_state
 
         self._scan_sem = asyncio.Semaphore(self._workers)
-        # Align the global probe-concurrency semaphore with the configured value at
-        # startup (it otherwise keeps the module default until the user touches the
-        # UI). More workers with a tiny probe budget yields little real throughput,
-        # so scale the probe ceiling with worker count as a sensible floor.
-        probe_concurrency = int(self._engine_config.get("probe_concurrency", 3) or 3)
-        probe_concurrency = max(probe_concurrency, self._workers)
-        _ac._PROBE_SEM = asyncio.Semaphore(probe_concurrency)
-        logger.info("Scan worker started", workers=self._workers, probe_concurrency=probe_concurrency)
+        # `probe_concurrency` is the concurrent-probe budget PER endpoint scan, but
+        # the probe semaphore is GLOBAL across all endpoints scanning at once. Sizing
+        # it as a flat global cap (previously max(pc, workers)) collapses to roughly
+        # one probe slot per worker: a single slow probe — a 5s time-based SLEEP for
+        # blind SQLi or command injection — then monopolises a worker's only slot and
+        # starves every other probe on that endpoint. Under N concurrent workers the
+        # endpoint never finishes its time-based probes within the per-endpoint budget
+        # and an injectable endpoint is forfeited to timeout (the root cause of flaky
+        # blind-SQLi / cmdi detection). Scale the global pool by worker count so each
+        # concurrent scan gets its full probe budget instead of fighting for one slot.
+        per_scan_probe_concurrency = max(1, int(self._engine_config.get("probe_concurrency", 4) or 4))
+        global_probe_slots = per_scan_probe_concurrency * self._workers
+        _ac.set_probe_concurrency(global_probe_slots)
+        # Endpoint scans against ONE host are serialized by default so a single-worker
+        # target's slower agents keep their per-endpoint budget (see _admit below and
+        # active_checks._HostScanGate). Cross-host parallelism is unaffected.
+        host_scan_concurrency = max(1, int(self._engine_config.get("host_scan_concurrency", 1) or 1))
+        _ac.configure_host_scan_concurrency(host_scan_concurrency)
+        logger.info(
+            "Scan worker started", workers=self._workers,
+            probe_concurrency=per_scan_probe_concurrency, global_probe_slots=global_probe_slots,
+            host_scan_concurrency=host_scan_concurrency,
+        )
         proxy_url = f"http://127.0.0.1:{self._proxy_port}"
         # Dedup: track (method, host, normalised-path, operation) tuples completed this session
         _scanned_keys: set = set()
 
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _admit(entry_id: str):
+            # Admission control for one endpoint scan. Acquire the per-host endpoint
+            # gate FIRST, then the global scan semaphore — so a host waiting its turn
+            # never pins a global worker slot that a different host could use. The
+            # semaphore is read at acquire time so runtime worker-count changes take
+            # effect even for tasks already waiting in the queue.
+            peek = self._store.get_entry(entry_id)
+            host = peek.host if peek else None
+            if host:
+                await _ac.acquire_host_scan_slot(host)
+            try:
+                async with self._scan_sem:  # type: ignore[attr-defined]
+                    yield
+            finally:
+                if host:
+                    await _ac.release_host_scan_slot(host)
+
         async def _attack_one(entry_id: str) -> None:
             from dast.proxy.plugin_manager import log_event
 
-            # Wait here if paused — release sem only once we're ready to run
+            # Wait here if paused — enter admission only once we're ready to run
             await qs.wait_if_paused()
 
-            # Check cancellation before acquiring the semaphore
+            # Check cancellation before acquiring any slot
             if qs.is_cancelled(entry_id):
                 qs.finish(entry_id, 0, "cancelled")
                 return
 
-            # Always read self._scan_sem at acquire time so runtime changes take effect
-            # even for tasks that were already waiting in the queue.
-            async with self._scan_sem:  # type: ignore[attr-defined]
+            async with _admit(entry_id):
                 # Re-check after acquiring (may have been cancelled while waiting)
                 if qs.is_cancelled(entry_id):
                     qs.finish(entry_id, 0, "cancelled")

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
 
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
@@ -389,7 +389,7 @@ async def _run_canary_probe(
     Returns True if the response contains a signal indicating potential vulnerability.
     Time-based types (sqli blind) return False here — the full agent handles timing.
     """
-    from dast.scanners.active_checks import _inject_body, _inject_query, _send
+    from dast.scanners.active_checks import _inject_body, _inject_path, _inject_query, _send
     payload = _CANARY_PAYLOADS.get(attack_type)
     if not payload:
         return False
@@ -406,6 +406,12 @@ async def _run_canary_probe(
                 location=loc,
             )
             resp = await _send(client, target.method, target.url, target.headers, body)
+        elif loc == "path":
+            # REST path parameters (/users/v1/{id}) are injectable too — probe them
+            # so injection signals in the path reach the planner (else the agent is
+            # never selected). See check_target_adapter path-segment enumeration.
+            url = _inject_path(target.url, param.get("path_index", 0), payload)
+            resp = await _send(client, target.method, url, target.headers, target.body)
         else:
             return False
 
@@ -429,6 +435,33 @@ def _signal_PATTERNS_for(attack_type: str) -> Optional[_re.Pattern]:
     return _SIGNAL_PATTERNS.get(attack_type)
 
 
+# A WAF that blocks an attack type this many times on a host, with no confirmed
+# bypass or finding, gets that type disabled for the host. Instead of dropping it
+# silently, the coordinator escalates it to the Exploration Copilot (see
+# _waf_suppressed_attack_types + the escalation sink in _run_inner).
+_WAF_BLOCK_DISABLE_THRESHOLD = 5
+
+
+def _waf_suppressed_attack_types(host_intel: Optional[object]) -> List[str]:
+    """Attack types disabled on this host purely because a WAF blocked them
+    >= _WAF_BLOCK_DISABLE_THRESHOLD times with no confirmed bypass/finding.
+
+    These are the escalation candidates for the Exploration Copilot — the types
+    the scanner would otherwise silently stop attempting. Deterministic, no LLM.
+    """
+    if host_intel is None:
+        return []
+    effective = getattr(host_intel, "effective_attack_types", set()) or set()
+    waf_obs = getattr(host_intel, "waf_observations", []) or []
+    counts: Dict[str, int] = {}
+    for _, _, at in waf_obs:
+        counts[at] = counts.get(at, 0) + 1
+    return sorted(
+        at for at, count in counts.items()
+        if count >= _WAF_BLOCK_DISABLE_THRESHOLD and at not in effective
+    )
+
+
 def _select_attack_types_for_params(
     target: "CheckTarget",
     host_intel: Optional[object],
@@ -445,7 +478,14 @@ def _select_attack_types_for_params(
     5. For state-changing methods (POST/PUT/PATCH/DELETE): add csrf + business_logic
     """
     effective = getattr(host_intel, "effective_attack_types", set()) if host_intel else set()
-    ineffective = getattr(host_intel, "ineffective_attack_types", set()) if host_intel else set()
+    # Suppress only types proven ineffective across MULTIPLE endpoints. A single
+    # failed speculative probe (e.g. sqli on a search field) must not blacklist the
+    # type on a later endpoint where it is the real vuln (that was a whole class of
+    # false negatives — error-based sqli on /sqli/, csrf on /exec/ — masked before).
+    if host_intel is not None and hasattr(host_intel, "consistently_ineffective_types"):
+        ineffective = host_intel.consistently_ineffective_types()
+    else:
+        ineffective = getattr(host_intel, "ineffective_attack_types", set()) if host_intel else set()
     waf_obs = getattr(host_intel, "waf_observations", []) if host_intel else []
 
     waf_blocks: Dict[str, int] = {}
@@ -498,8 +538,8 @@ def _select_attack_types_for_params(
     for at in candidate_types:
         if at in ineffective and at not in effective:
             continue  # consistently failed, no new signal — skip
-        if waf_blocks.get(at, 0) >= 5 and at not in effective:
-            continue  # WAF blocks everything for this type
+        if waf_blocks.get(at, 0) >= _WAF_BLOCK_DISABLE_THRESHOLD and at not in effective:
+            continue  # WAF blocks everything for this type — escalated in _run_inner
         result.append(at)
 
     # Sort: deterministic types first (faster, no LLM needed), contextual last
@@ -553,20 +593,42 @@ class Coordinator:
         if confirmed_vulns:
             return 180.0
 
-        # All known attack types are ineffective — don't spend much time
+        # Host-level learning says the attack types tried so far were ineffective
+        # ON OTHER ENDPOINTS of this host. Deprioritize, but do NOT starve: a type
+        # is marked ineffective for the whole host as soon as it finds nothing on
+        # any one endpoint, yet the ONE endpoint that IS vulnerable to that type
+        # then inherits the penalty. This bites blind/time-based classes hardest —
+        # they emit no signal anywhere except their own vulnerable endpoint, so
+        # they are always "ineffective" host-wide, and the old 45s starved the
+        # exact scan that needed the most time (several ~5s SLEEP probes, run late
+        # after planning, under concurrent-scan contention). Observed on DVWA
+        # /exec/: cmdi marked ineffective from earlier endpoints, /exec/ capped at
+        # 45s, the agent started ~30s in and timed out before confirming a real
+        # command injection. Keep it below the normal 150s ceiling as a mild
+        # deprioritization, but high enough for a contended time-based sweep.
         all_types_ineffective = ineffective and not effective
         if all_types_ineffective:
-            return 45.0
+            return 120.0
 
         # Scale with param count, capped
         if num_params > 10:
             return min(60.0 * ((num_params // 5) + 1), 180.0)
 
-        # Simple GET with few params and no prior intel → quick pass
+        # Simple GET with few params and no prior intel → quicker pass, but still
+        # enough for the selected agents plus LLM validation to actually finish.
+        # This budget is a CEILING, not a floor: an endpoint with nothing to find
+        # returns as soon as its agents finish (a few seconds), so raising it does
+        # not slow clean scans — it only gives more time to endpoints that are slow
+        # to CONFIRM, which are precisely the injectable ones. 45s then 75s were
+        # both too tight: time-based blind SQLi / command injection needs several
+        # ~5s SLEEP probes that run after the deterministic checks and, under the
+        # contention of several endpoints scanning at once, could not complete
+        # before the budget expired — so a genuinely-injectable endpoint was
+        # forfeited to timeout and reported "safe" (observed on DVWA sqli_blind).
         if target.method == "GET" and num_params <= 3 and not effective:
-            return 45.0
+            return 150.0
 
-        return 90.0
+        return 150.0
 
     @classmethod
     async def run(
@@ -601,24 +663,33 @@ class Coordinator:
         else:
             effective_budget = budget_seconds
 
+        # Shared collector so findings already CONFIRMED before the deadline
+        # survive a timeout instead of being thrown away. _run_inner extends this
+        # the moment validation finalises the confirmed set; on timeout we return
+        # whatever was confirmed rather than an empty list (which had marked a
+        # genuinely-vulnerable endpoint "safe").
+        collected: List[AgentFinding] = []
         try:
             return await asyncio.wait_for(
                 cls._run_inner(
                     target, client, collaborator, use_llm_planner,
                     model_id, confidence_threshold, session_intelligence,
-                    probe_diff,
+                    probe_diff, collected,
                 ),
                 timeout=effective_budget,
             )
         except asyncio.TimeoutError:
             from dast.proxy.plugin_manager import log_event as _le
+            kept = len(collected)
             _le(
                 "coordinator", "warn",
-                f"Scan budget exceeded ({effective_budget:.0f}s) — partial results discarded",
+                f"Scan budget exceeded ({effective_budget:.0f}s) — "
+                f"kept {kept} confirmed finding(s) validated before the deadline",
                 url=target.url, source="agent",
             )
-            logger.warning("Coordinator scan timed out", url=target.url, budget_s=effective_budget)
-            return []
+            logger.warning("Coordinator scan timed out", url=target.url,
+                           budget_s=effective_budget, kept_findings=kept)
+            return list(collected)
 
     @classmethod
     async def _run_inner(
@@ -631,6 +702,7 @@ class Coordinator:
         confidence_threshold: float = 0.5,
         session_intelligence: Optional[object] = None,
         probe_diff: bool = False,
+        collected: Optional[List[AgentFinding]] = None,
     ) -> List[AgentFinding]:
         from urllib.parse import urlparse as _urlparse
         _parsed_url = _urlparse(target.url)
@@ -703,6 +775,21 @@ class Coordinator:
 
         # Deterministic candidate selection — never calls LLM
         candidate_types = _select_attack_types_for_params(target, host_intel)
+
+        # Escalate WAF-disabled attack types to the Exploration Copilot instead of
+        # silently dropping them. If the dashboard has wired an escalation sink,
+        # hand each blocked type to the conversational agent (deduped per
+        # host+attack_type inside the sink) so it can attempt a bypass or flag
+        # that a human is needed. Best-effort — never fail the scan on this.
+        if session_intelligence is not None:
+            escalation_sink = getattr(session_intelligence, "escalation_sink", None)
+            if escalation_sink is not None:
+                try:
+                    for blocked_type in _waf_suppressed_attack_types(host_intel):
+                        escalation_sink(_host, blocked_type, host_intel)
+                except Exception as exc:
+                    logger.warning("block escalation failed",
+                                   host=_host, error=str(exc))
 
         # Run canary probes in parallel for all (attack_type, param) combos
         # that have a canary payload defined.  Collect signal map.
@@ -842,6 +929,18 @@ class Coordinator:
             selected_types = list({*signal_map.keys(), *no_canary_types})
             plan_reason = "No-LLM mode: canary signals + non-injectable types"
 
+        # CSRF is a deterministic protocol property (anti-CSRF token presence,
+        # SameSite, Origin/Referer enforcement), not a response-semantics judgment
+        # the planner should gate — and the CsrfAgent self-gates hard (it only
+        # confirms when every CSRF precondition holds), so it is inherently
+        # low-false-positive. Guarantee it runs on any state-changing endpoint
+        # rather than trusting the fast planner model to remember to select it:
+        # otherwise a real tokenless state-changing request (e.g. DVWA /exec/) is
+        # silently skipped. business_logic stays planner-gated — it genuinely
+        # needs the LLM to judge whether the response computes extra state.
+        if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
+            selected_types = [*selected_types, "csrf"]
+
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented
         # parameters, mine them now. Discovered names become recon suggestions
@@ -901,44 +1000,65 @@ class Coordinator:
         if host_intel is not None:
             target.host_intel = host_intel
 
-        # Run all selected agents in parallel
-        tasks = [agent.run_safe(target, client, collaborator) for agent in agents]
-        results = await asyncio.gather(*tasks)
+        # Run all selected agents in parallel, but process each agent's results
+        # the moment it finishes rather than awaiting the whole batch. A slow
+        # agent (e.g. time-based SQLi) must not force the faster agents' already
+        # confirmed findings to be discarded when the scan budget expires
+        # mid-run: each agent's findings are validated and published to the
+        # shared collector as soon as that agent completes.
+        async def _run_and_tag(agent: VulnAgent) -> Tuple[VulnAgent, List[AgentFinding]]:
+            result = await agent.run_safe(target, client, collaborator)
+            return agent, (result if isinstance(result, list) else [])
 
         raw_findings: List[AgentFinding] = []
         agent_raw: Dict[str, List[AgentFinding]] = {}  # attack_type → findings
-        for agent, result in zip(agents, results):
-            findings = result if isinstance(result, list) else []
-            agent_raw[agent.attack_type] = findings
-            raw_findings.extend(findings)
-
-        # Validate findings
         confirmed: List[AgentFinding] = []
-        deterministic: List[AgentFinding] = []
-        non_deterministic: List[AgentFinding] = []
 
-        for finding in raw_findings:
-            if finding.bypass_validation:
-                deterministic.append(finding)
-            else:
-                non_deterministic.append(finding)
+        agent_tasks = [asyncio.ensure_future(_run_and_tag(agent)) for agent in agents]
+        try:
+            for completed in asyncio.as_completed(agent_tasks):
+                agent, findings = await completed
+                agent_raw[agent.attack_type] = findings
+                raw_findings.extend(findings)
 
-        # Validate all findings via Red Team.
-        # Deterministic findings (time-based SQLi, LFI match, secrets) bypass LLM validation.
-        # All others go through the 3-stage Red-Team Validator.
-        validate_tasks = [
-            cls._validate(f, target, model_id=model_id, confidence_threshold=confidence_threshold)
-            for f in non_deterministic
-        ]
-        validation_results = await asyncio.gather(*validate_tasks, return_exceptions=True)
-        for finding, result in zip(non_deterministic, validation_results):
-            if isinstance(result, BaseException):
-                logger.warning("Validation error — finding NOT confirmed",
-                               title=finding.title, error=str(result))
-                continue
-            if result:
-                confirmed.append(finding)
-        confirmed.extend(deterministic)
+                # Deterministic findings (time-based SQLi, LFI match, secrets)
+                # bypass LLM validation; all others go through the 3-stage
+                # Red-Team Validator.
+                deterministic = [f for f in findings if f.bypass_validation]
+                non_deterministic = [f for f in findings if not f.bypass_validation]
+
+                if non_deterministic:
+                    validation_results = await asyncio.gather(
+                        *(
+                            cls._validate(
+                                finding, target, model_id=model_id,
+                                confidence_threshold=confidence_threshold,
+                            )
+                            for finding in non_deterministic
+                        ),
+                        return_exceptions=True,
+                    )
+                    for finding, result in zip(non_deterministic, validation_results):
+                        if isinstance(result, BaseException):
+                            logger.warning("Validation error — finding NOT confirmed",
+                                           title=finding.title, error=str(result))
+                            continue
+                        if result:
+                            confirmed.append(finding)
+                confirmed.extend(deterministic)
+
+                # Publish the running confirmed set after every agent so a
+                # scan-budget timeout still returns everything confirmed so far.
+                if collected is not None:
+                    collected.clear()
+                    collected.extend(confirmed)
+        finally:
+            # If the scan budget expired (this coroutine was cancelled mid-run),
+            # cancel any agent still in flight so it does not run detached from
+            # the scan. asyncio.gather() used to do this for its children.
+            for task in agent_tasks:
+                if not task.done():
+                    task.cancel()
 
         # Write back scan results to session intelligence
         if host_intel is not None and session_intelligence is not None:
@@ -1491,11 +1611,22 @@ class Coordinator:
         confidence_threshold: float = 0.5,
     ) -> bool:
         from dast.ai import red_team
-        confirmed, _confidence, _reasoning = await red_team.validate(
+        confirmed, confidence, reasoning = await red_team.validate(
             finding,
             target,
             model_id=model_id,
             confidence_threshold=confidence_threshold,
             app_profile_hint=getattr(target, "app_profile_hint", "") or "",
         )
+        # Log the verdict — especially rejections. Without this, a real finding
+        # the agent raised but the validator dropped ("raw=N confirmed=0") is a
+        # black box, and there is no way to tell a correct FP-rejection from a
+        # false negative. warning on reject (actionable), debug on confirm.
+        if confirmed:
+            logger.debug("Finding confirmed by validator", title=finding.title,
+                         attack_type=finding.attack_type, confidence=confidence)
+        else:
+            logger.warning("Finding rejected by validator", title=finding.title,
+                           attack_type=finding.attack_type, confidence=confidence,
+                           reason=(reasoning or "")[:300])
         return confirmed

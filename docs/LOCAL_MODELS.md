@@ -11,9 +11,9 @@ model your server can serve.
 
 ---
 
-## Before you start — three hard requirements
+## Before you start — two hard requirements
 
-Frieren is not a chatbot; it drives an agentic scanner. Two of these are the difference between
+Frieren is not a chatbot; it drives an agentic scanner. These are the difference between
 "it works" and "every scan silently degrades", so read them first.
 
 1. **The model must support tool calling with forced `tool_choice`.**
@@ -24,12 +24,7 @@ Frieren is not a chatbot; it drives an agentic scanner. Two of these are the dif
    native tool support (Qwen2.5-Instruct qualifies) and a server configured to force tool calls
    (see the vLLM notes below — it is the most reliable for this).
 
-2. **`OPENAI_API_KEY` must be non-empty — even though local servers ignore it.**
-   `invoke_openai` and the dashboard's AI-reachability check both treat an empty key as "provider
-   not configured" (`bedrock_client.provider_api_key_present`). Local servers don't validate the
-   key, so set any placeholder (e.g. `local`, `ollama`). Leaving it blank shows AI as disabled.
-
-3. **Model capability drives the false-positive rate.**
+2. **Model capability drives the false-positive rate.**
    The Red-Team Validator is Frieren's main false-positive guard, and it is only as good as the
    model behind it. A small model produces weak plans and unreliable verdicts — more noise, the
    opposite of the project's goal. Prefer **≥ 14B instruct** (32B is noticeably better); treat 7B
@@ -42,12 +37,16 @@ Frieren is not a chatbot; it drives an agentic scanner. Two of these are the dif
 ```bash
 AI_PROVIDER=openai
 OPENAI_BASE_URL=http://localhost:11434/v1   # your server's OpenAI base (see per-server values)
-OPENAI_API_KEY=local                        # any non-empty value; local servers ignore it
+OPENAI_API_KEY=                             # optional for a local base_url; required only for api.openai.com
 AI_MODEL_ID=qwen2.5:14b                      # the model NAME your server exposes (never an ARN)
 ```
 
 - `OPENAI_BASE_URL` is the base to which Frieren appends `/chat/completions` and `/models`, so it
   must end at the `/v1`-style root, **not** include `/chat/completions`.
+- `OPENAI_API_KEY` can be left blank when `OPENAI_BASE_URL` is not the public OpenAI API: Frieren
+  detects the non-`api.openai.com` host and sends a placeholder bearer token, which local servers
+  ignore. A real key is required only when targeting `api.openai.com`. (If your local server *does*
+  enforce a token, set it here and it is used verbatim.)
 - `AI_MODEL_ID` is a plain model name for the `openai` provider. It must **not** be a Bedrock ARN —
   if it is (or is left unset, which defaults to the Bedrock Sonnet placeholder), Frieren fails loud
   with `No model configured for AI provider 'openai'` rather than silently misbehaving.
@@ -167,7 +166,7 @@ that the local model is driving the pipeline correctly.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Dashboard shows AI disabled; logs mention no API key | `OPENAI_API_KEY` is empty | Set any non-empty placeholder (`local`, `ollama`) |
+| Dashboard shows AI disabled; logs mention no API key | `OPENAI_API_KEY` is empty **and** `OPENAI_BASE_URL` still points at `api.openai.com` | Point `OPENAI_BASE_URL` at your local server (any non-`api.openai.com` host makes the key optional), or set a real key for the public API |
 | `No model configured for AI provider 'openai' ... Bedrock ARN cannot be used` | `AI_MODEL_ID` unset or an ARN | Set `AI_MODEL_ID` to the local model name |
 | `OpenAI API 400 ... tool_choice` / model "does not support tools" | Server/model can't force a tool call | Use a tool-capable instruct model (Qwen2.5-Instruct) and enable tool calling (vLLM: `--enable-auto-tool-choice --tool-call-parser hermes`; update Ollama) |
 | Structured decisions come back empty or malformed | Model too small/weak for forced JSON | Use ≥ 14B instruct; prefer vLLM's forced `tool_choice` |

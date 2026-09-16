@@ -143,7 +143,13 @@ def provider_api_key_present() -> bool:
     if provider == "anthropic":
         return bool(_anthropic_api_key or settings.anthropic_api_key)
     if provider == "openai":
-        return bool(_openai_api_key or settings.openai_api_key)
+        if _openai_api_key or settings.openai_api_key:
+            return True
+        # Local / self-hosted OpenAI-compatible servers ignore the key, so a
+        # non-public base_url is reachable without one (see providers.py).
+        from dast.ai import providers
+        base_url = _openai_base_url or settings.openai_base_url
+        return not providers.is_public_openai(base_url)
     if provider == "gateway":
         # The gateway has no API key — reachability means a usable CLI OAuth
         # session (Keychain) or an explicit GATEWAY_JWT is available.

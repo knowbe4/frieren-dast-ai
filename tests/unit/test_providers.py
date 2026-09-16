@@ -129,6 +129,35 @@ def test_openai_text_response_becomes_anthropic_envelope(patch_http):
     assert sent["model"] == "gpt-4o"
 
 
+def test_openai_local_base_url_allows_empty_key(patch_http):
+    """A non-public base_url accepts an empty key and sends a placeholder bearer."""
+    oai_payload = {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+    fake = patch_http(_FakeResponse(200, oai_payload))
+
+    body = {"max_tokens": 50, "messages": [{"role": "user", "content": "go"}]}
+    result = providers.invoke_openai(body, model_id="qwen2.5:14b",
+                                     api_key="", base_url="http://localhost:11434/v1")
+
+    assert result["content"] == [{"type": "text", "text": "hi"}]
+    call = fake.calls[0]
+    assert call["url"] == "http://localhost:11434/v1/chat/completions"
+    assert call["headers"]["Authorization"] == "Bearer local"
+
+
+def test_openai_public_base_url_still_requires_key(patch_http):
+    """The public OpenAI API must reject an empty key rather than send a placeholder."""
+    with pytest.raises(providers.ProviderError):
+        providers.invoke_openai({"messages": []}, model_id="gpt-4o",
+                                api_key="", base_url="https://api.openai.com/v1")
+
+
+def test_is_public_openai_detects_host():
+    assert providers.is_public_openai("https://api.openai.com/v1") is True
+    assert providers.is_public_openai("https://eu.api.openai.com/v1") is True
+    assert providers.is_public_openai("http://localhost:11434/v1") is False
+    assert providers.is_public_openai("http://192.168.1.5:8000/v1") is False
+
+
 def test_openai_tool_call_becomes_tool_use_block(patch_http):
     oai_payload = {
         "choices": [{
@@ -209,6 +238,30 @@ def test_gateway_routes_invoke_json_to_openai(monkeypatch):
 def test_get_active_provider_defaults_to_bedrock(monkeypatch):
     monkeypatch.setattr(bedrock_client, "_active_provider", "")
     assert bedrock_client.get_active_provider() == "bedrock"
+
+
+def test_provider_key_present_true_for_local_openai_without_key(monkeypatch):
+    """A local OpenAI base_url reports ready even with no API key set."""
+    from dast.config import settings
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    try:
+        bedrock_client.set_provider(provider="openai", openai_api_key="",
+                                    openai_base_url="http://localhost:11434/v1")
+        assert bedrock_client.provider_api_key_present() is True
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+
+def test_provider_key_present_false_for_public_openai_without_key(monkeypatch):
+    """The public OpenAI API without a key is reported as not configured."""
+    from dast.config import settings
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    try:
+        bedrock_client.set_provider(provider="openai", openai_api_key="",
+                                    openai_base_url="https://api.openai.com/v1")
+        assert bedrock_client.provider_api_key_present() is False
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
 
 
 # ── gateway provider ──────────────────────────────────────────────────────────

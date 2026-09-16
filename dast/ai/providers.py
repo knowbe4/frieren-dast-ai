@@ -26,6 +26,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import httpx
 
@@ -39,9 +40,40 @@ _STRUCTURED_TOOL_NAME = "emit_result"
 
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0)
 
+# Local / self-hosted OpenAI-compatible servers (Ollama, vLLM, LM Studio,
+# llama.cpp) do not validate the bearer token but some reject a missing
+# Authorization header, so we send this harmless placeholder when no key is set.
+_LOCAL_OPENAI_PLACEHOLDER_KEY = "local"
+
 
 class ProviderError(RuntimeError):
     """Raised when an external provider returns a non-success HTTP response."""
+
+
+def is_public_openai(base_url: str) -> bool:
+    """
+    Whether ``base_url`` targets OpenAI's public API (``api.openai.com``).
+
+    The public API mandates a real API key; any other host is treated as a
+    self-hosted / local OpenAI-compatible server where the key is optional.
+    """
+    host = (urlparse(base_url or "").hostname or "").lower()
+    return host == "api.openai.com" or host.endswith(".openai.com")
+
+
+def _resolve_openai_key(api_key: str, base_url: str) -> str:
+    """
+    Return the bearer token to use for an OpenAI-compatible request.
+
+    A real key is required only for the public OpenAI API. Local / self-hosted
+    servers ignore the key, so an empty one is accepted and a harmless
+    placeholder is substituted for the Authorization header.
+    """
+    if api_key:
+        return api_key
+    if is_public_openai(base_url):
+        raise ProviderError("OpenAI provider selected but no API key is configured")
+    return _LOCAL_OPENAI_PLACEHOLDER_KEY
 
 
 def _system_to_text(system: Any) -> str:
@@ -123,10 +155,9 @@ def list_anthropic_models(api_key: str, base_url: str) -> List[Dict[str, str]]:
 
 def list_openai_models(api_key: str, base_url: str) -> List[Dict[str, str]]:
     """List models from the OpenAI (or OpenAI-compatible) API (GET /models)."""
-    if not api_key:
-        raise ProviderError("OpenAI provider selected but no API key is configured")
+    key = _resolve_openai_key(api_key, base_url)
     url = base_url.rstrip("/") + "/models"
-    headers = {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {key}"}
     with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
         response = client.get(url, headers=headers)
     if response.status_code >= 400:
@@ -312,13 +343,12 @@ def invoke_openai(
     Send an Anthropic-style body to an OpenAI-compatible chat-completions
     endpoint and return an Anthropic-style response envelope.
     """
-    if not api_key:
-        raise ProviderError("OpenAI provider selected but no API key is configured")
+    key = _resolve_openai_key(api_key, base_url)
 
     request = _to_openai_request(body, model_id)
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {key}",
         "content-type": "application/json",
     }
     with httpx.Client(timeout=_HTTP_TIMEOUT) as client:

@@ -8,10 +8,12 @@
 let _cpActive = null;      // active session_id
 let _cpPollTimer = null;
 let _cpWs = null;
+let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (see cpRender)
 
 const _CP_INPROGRESS = ['running', 'paused_approve', 'paused_auth'];
 
 function cpOnOpen() {
+  _cpPauseSig = null;  // force a pause re-render — the tab DOM may be fresh
   cpConnectWs();
   cpLoadSessions();
   cpLoadHypotheses();
@@ -241,7 +243,20 @@ function cpRender(session) {
   cpEnsurePulse();
   el.scrollTop = el.scrollHeight;
 
-  if (pauseEl) pauseEl.innerHTML = session.pause ? cpRenderPause(session) : '';
+  // Only rewrite the pause panel when the pause identity actually changes. The
+  // poll loop and WS nudges re-render on every tick during a paused_* status; if
+  // we rebuilt the panel each time we'd clobber live DOM state the operator set
+  // mid-pause (e.g. the "Login done" button enabled by Open Browser, and the
+  // auth status message) — which is exactly what left the button greyed out.
+  if (pauseEl) {
+    const sig = session.pause
+      ? `${session.session_id}:${session.pause.kind}:${JSON.stringify(session.pause.payload || {})}`
+      : null;
+    if (sig !== _cpPauseSig) {
+      pauseEl.innerHTML = session.pause ? cpRenderPause(session) : '';
+      _cpPauseSig = sig;
+    }
+  }
 }
 
 function cpBubble(m) {
@@ -385,44 +400,16 @@ async function cpOpenBrowser(sid) {
   }
 }
 
-// Collect Set-Cookie values captured by the proxy for the auth-wall domain and
-// hand them to the copilot as the session. Mirrors the vuln-validator handoff.
+// Hand the browser session to the copilot. The Set-Cookie responses from the
+// login you did in the opened browser were ingested into the proxy's cookie jar
+// (not into the header-less UI entry list), so the SERVER collects them for the
+// paused host — we just ask it to. Mirrors the vuln-validator handoff.
 async function cpLoginDone(sid) {
   const msgEl = document.getElementById('cp-auth-msg');
   const doneBtn = document.getElementById('cp-login-done-btn');
   if (doneBtn) doneBtn.disabled = true;
-  if (msgEl) msgEl.textContent = 'Collecting session cookies...';
-
-  let targetDomain = '';
-  try {
-    const session = await (await fetch(`/api/copilot/session/${sid}`)).json();
-    const url = (session.pause && session.pause.payload && session.pause.payload.url) || '';
-    if (url) targetDomain = new URL(url).hostname;
-  } catch (e) { /* fall through with empty domain */ }
-
-  const cookies = {};
-  if (targetDomain && typeof order !== 'undefined' && typeof entries !== 'undefined') {
-    for (const eid of order) {
-      const entry = entries[eid];
-      if (!entry || !entry.host) continue;
-      if (!entry.host.includes(targetDomain) && !targetDomain.includes(entry.host)) continue;
-      const setCookie = entry.response_headers?.['set-cookie'] || '';
-      if (!setCookie) continue;
-      for (const part of setCookie.split(';')) {
-        const eq = part.trim().indexOf('=');
-        if (eq > 0) {
-          const name = part.trim().slice(0, eq).trim();
-          const val = part.trim().slice(eq + 1).trim();
-          if (name && val && !['path', 'domain', 'expires', 'samesite', 'secure', 'httponly'].includes(name.toLowerCase())) {
-            cookies[name] = val;
-          }
-        }
-      }
-    }
-  }
-
-  if (msgEl) msgEl.textContent = `Sending ${Object.keys(cookies).length} cookies to the copilot...`;
-  await cpResume(sid, 'auth', { cookies });
+  if (msgEl) msgEl.textContent = 'Handing session to the copilot...';
+  await cpResume(sid, 'auth', { from_jar: true, cookies: {} });
 }
 
 async function cpCancel() {

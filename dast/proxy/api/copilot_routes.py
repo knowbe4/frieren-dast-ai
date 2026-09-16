@@ -38,6 +38,36 @@ logger = get_logger(__name__)
 _MAX_MESSAGE_CHARS = 20_000
 
 
+def _collect_jar_cookies(ctx: DashboardContext, pause: dict) -> dict:
+    """Collect the proxy jar's session cookies for a paused auth wall's host.
+
+    The operator logs in through the browser opened for the pause; every
+    Set-Cookie on that traffic is ingested into the shared proxy jar. Return
+    them as a ``{name: value}`` map for the handoff (sanitised by the caller)."""
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return {}
+    payload = pause.get("payload") or {}
+    host = str(payload.get("host") or "").strip().lower()
+    if not host:
+        from urllib.parse import urlparse
+        host = (urlparse(str(payload.get("url") or "")).hostname or "").lower()
+    if not host:
+        return {}
+    try:
+        cookies = store.get_cookies_for_host(host)
+    except Exception as exc:
+        logger.warning("could not read proxy jar cookies", host=host, error=str(exc))
+        return {}
+    result: dict = {}
+    for cookie in cookies or []:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name and value is not None:
+            result[name] = value
+    return result
+
+
 def make_router(ctx: DashboardContext) -> APIRouter:
     router = APIRouter()
     service = ctx.copilot
@@ -129,6 +159,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             raw = value.get("cookies") or {}
             if not isinstance(raw, dict):
                 return JSONResponse({"error": "cookies must be an object"}, status_code=400)
+            # "Login done" handoff: the browser's Set-Cookie responses were ingested
+            # into the shared proxy jar, not into the header-less UI entry list, so
+            # the client cannot read them. When it asks us to source from the jar,
+            # collect the session cookies server-side for the paused host.
+            if value.get("from_jar") and not raw:
+                raw = _collect_jar_cookies(ctx, pause)
+                logger.info(
+                    "Copilot auth resume collected cookies from proxy jar",
+                    session_id=sid, cookie_count=len(raw),
+                )
             session["_pause_result"] = {"cookies": _sanitise_cookies(raw)}
         else:
             return JSONResponse({"error": "kind must be approve|auth"}, status_code=400)

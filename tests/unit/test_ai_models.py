@@ -104,13 +104,29 @@ class TestTierModelProviderGuard:
         assert bedrock_client.get_validation_model() == "claude-opus-5"
 
 
+_GATEWAY_CATALOGUE = {
+    "provider": "gateway",
+    "models": [
+        {"id": "claude-haiku-4-5", "label": "Haiku 4.5"},
+        {"id": "claude-sonnet-5", "label": "Sonnet 5"},
+        {"id": "claude-sonnet-5[1m]", "label": "Sonnet 5 (1M)"},
+        {"id": "claude-opus-4-8", "label": "Opus 4.8"},
+    ],
+    "source": "live",
+    "error": "",
+}
+
+_EMPTY_CATALOGUE = {"provider": "gateway", "models": [], "source": "preset", "error": "offline"}
+
+
 class TestResolveModelProviderGuard:
     """The invoke boundary (_resolve_model) is the single choke point every LLM
     call funnels through. It must never hand a Bedrock ARN to a non-Bedrock
     provider — regardless of whether the ARN arrived via the tier/active fallback
-    or an explicit model_id (the coordinator planner passes one directly). When no
-    provider-appropriate model resolves, it fails loud (pauses AI) instead of
-    silently degrading detection."""
+    or an explicit model_id (the coordinator planner passes one directly). When the
+    configured model is unusable it auto-heals to a provider-appropriate default
+    (preferring Sonnet) resolved from the provider's live catalogue, and only fails
+    loud (pauses AI) when the catalogue yields no usable model name."""
 
     def teardown_method(self):
         bedrock_client.set_provider("bedrock")
@@ -125,30 +141,42 @@ class TestResolveModelProviderGuard:
         assert bedrock_client._resolve_model(_BEDROCK_ARN) == _BEDROCK_ARN
         assert bedrock_client.is_ai_available()
 
-    def test_gateway_explicit_arn_model_id_fails_loud(self):
-        # The coordinator planner path: an ARN passed as an explicit model_id.
+    def test_gateway_explicit_arn_model_id_heals(self, monkeypatch):
+        # The coordinator planner path: an ARN passed as an explicit model_id is
+        # substituted by the provider's default (Sonnet) rather than failing.
+        monkeypatch.setattr(bedrock_client, "list_models", lambda: _GATEWAY_CATALOGUE)
         bedrock_client.set_provider("gateway")
         bedrock_client.set_active_model("claude-sonnet-5")
+        assert bedrock_client._resolve_model(_BEDROCK_ARN) == "claude-sonnet-5"
+        assert bedrock_client.is_ai_available()
+
+    def test_gateway_arn_active_model_heals(self, monkeypatch):
+        # The fallback path: no explicit model, and the active model is an ARN.
+        monkeypatch.setattr(bedrock_client, "list_models", lambda: _GATEWAY_CATALOGUE)
+        bedrock_client.set_active_model(_BEDROCK_ARN)
+        bedrock_client.set_provider("gateway")  # eager heal on switch
+        assert bedrock_client._resolve_model(None) == "claude-sonnet-5"
+        assert bedrock_client.is_ai_available()
+
+    def test_gateway_no_model_configured_heals(self, monkeypatch):
+        monkeypatch.setattr(bedrock_client, "list_models", lambda: _GATEWAY_CATALOGUE)
+        bedrock_client.set_active_model("")
+        bedrock_client.set_provider("gateway")
+        assert bedrock_client._resolve_model(None) == "claude-sonnet-5"
+        assert bedrock_client.is_ai_available()
+
+    def test_gateway_fails_loud_when_catalogue_empty(self, monkeypatch):
+        # Offline / empty catalogue: nothing to heal to → fail loud, pause AI.
+        monkeypatch.setattr(bedrock_client, "list_models", lambda: _EMPTY_CATALOGUE)
+        bedrock_client.set_active_model(_BEDROCK_ARN)
+        bedrock_client.set_provider("gateway")
         with pytest.raises(bedrock_client.AiUnavailableError) as exc:
             bedrock_client._resolve_model(_BEDROCK_ARN)
         assert "gateway" in str(exc.value)
-        assert not bedrock_client.is_ai_available()  # AI paused, not degraded
-
-    def test_gateway_arn_active_model_fallback_fails_loud(self):
-        # The fallback path: no explicit model, and the active model is an ARN.
-        bedrock_client.set_provider("gateway")
-        bedrock_client.set_active_model(_BEDROCK_ARN)
-        with pytest.raises(bedrock_client.AiUnavailableError):
-            bedrock_client._resolve_model(None)
         assert not bedrock_client.is_ai_available()
 
-    def test_gateway_no_model_configured_fails_loud(self):
-        bedrock_client.set_provider("gateway")
-        bedrock_client.set_active_model("")
-        with pytest.raises(bedrock_client.AiUnavailableError):
-            bedrock_client._resolve_model(None)
-
-    def test_gateway_provider_name_resolves(self):
+    def test_gateway_provider_name_resolves(self, monkeypatch):
+        monkeypatch.setattr(bedrock_client, "list_models", lambda: _GATEWAY_CATALOGUE)
         bedrock_client.set_provider("gateway")
         bedrock_client.set_active_model("claude-sonnet-5")
         assert bedrock_client._resolve_model(None) == "claude-sonnet-5"

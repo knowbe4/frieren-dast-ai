@@ -78,6 +78,45 @@ async def test_reply_ends_turn_and_records_history():
 
 
 @pytest.mark.asyncio
+async def test_reply_with_empty_message_falls_back_to_thought():
+    # The step schema only requires thought+action, so the model can commit to a
+    # reply with all its substance in `thought` and `message` left blank. The turn
+    # must surface that reasoning to the operator, not a useless placeholder.
+    session = CopilotSession("s-empty")
+    events, on_event = _collector()
+
+    analysis = ("Both ldapToken and adiToken returned non-null values (redacted). "
+                "Field-level access control appears missing for this session.")
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=AsyncMock()), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=[{"action": "reply", "thought": analysis,
+                                           "message": ""}])):
+        reply = await session.send("test", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.message == analysis
+    assert "empty reply" not in reply.message
+    assert session.messages[-1] == {"role": "copilot", "content": analysis}
+
+
+@pytest.mark.asyncio
+async def test_reply_with_no_message_and_no_thought_uses_placeholder():
+    session = CopilotSession("s-blank")
+    _, on_event = _collector()
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=AsyncMock()), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=[{"action": "reply", "thought": "",
+                                           "message": ""}])):
+        reply = await session.send("test", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.message == "(the copilot produced an empty reply)"
+
+
+@pytest.mark.asyncio
 async def test_call_tool_then_reply_runs_tool_and_observes():
     session = CopilotSession("s2")
     events, on_event = _collector()

@@ -189,10 +189,13 @@ async function loadProviderModels() {
     const data = await r.json();
     if (Array.isArray(data.models) && data.models.length) {
       populateModelPresets(data.models);
-      // Re-apply saved tiered selections now that provider-specific options exist.
+      // Re-apply saved primary + tiered selections now that provider-specific
+      // options exist (repopulating the <select> can otherwise drop them).
       const cfg = await fetch('/api/scan-config').then(x => x.json()).catch(() => ({}));
+      const primary = document.getElementById('sc-model-id');
       const fast = document.getElementById('sc-fast-model-id');
       const val  = document.getElementById('sc-validation-model-id');
+      if (primary && cfg.model_id && [...primary.options].some(o => o.value === cfg.model_id)) primary.value = cfg.model_id;
       if (fast && cfg.fast_model_id && [...fast.options].some(o => o.value === cfg.fast_model_id)) fast.value = cfg.fast_model_id;
       if (val && cfg.validation_model_id && [...val.options].some(o => o.value === cfg.validation_model_id)) val.value = cfg.validation_model_id;
     }
@@ -246,7 +249,10 @@ async function saveScanConfig() {
   const g = id => document.getElementById(id);
   const v = (id, fallback) => { const el = g(id); return el ? el.value : fallback; };
   const chk = (id, fallback) => { const el = g(id); return el ? el.checked : fallback; };
-  const modelId = currentModelId();
+  // NOTE: the primary model is intentionally NOT sent here. It has its own
+  // dedicated "Apply" button (saveAiModel); folding it into the Scan Engine save
+  // meant applying engine/tier settings silently overwrote the primary model up
+  // top with a possibly-stale value. Keep the two concerns decoupled.
   const body = {
     workers:              parseInt(v('sc-workers', 2))           || 2,
     probe_concurrency:    parseInt(v('sc-probe-concurrency', 4)) || 4,
@@ -262,7 +268,6 @@ async function saveScanConfig() {
     fast_model_id:         v('sc-fast-model-id', ''),
     validation_model_id:   v('sc-validation-model-id', ''),
     scan_budget_seconds:   parseInt(v('sc-budget', 300)) || 300,
-    ...(modelId ? { model_id: modelId } : {}),
   };
   try {
     const r = await fetch('/api/scan-config', {
@@ -284,12 +289,21 @@ async function saveScanConfig() {
   }
 }
 
-// The active model id comes from the ARN preset dropdown for Bedrock, or the
+// Providers with a fixed, reliable live catalogue use the model dropdown (a
+// name picked from the list). Bedrock lists its ARN presets; the internal
+// gateway lists its live model NAMES. Anthropic/OpenAI target arbitrary
+// (possibly self-hosted) endpoints, so they keep a free-text field for a model
+// name the catalogue may not know.
+function providerUsesModelDropdown(provider) {
+  return provider === 'bedrock' || provider === 'gateway';
+}
+
+// The active model id comes from the dropdown for Bedrock/gateway, or the
 // free-form model-name field for Anthropic/OpenAI.
 function currentModelId() {
   const g = id => document.getElementById(id);
   const provider = g('sc-ai-provider') ? g('sc-ai-provider').value : 'bedrock';
-  if (provider === 'bedrock') return g('sc-model-id') ? g('sc-model-id').value : '';
+  if (providerUsesModelDropdown(provider)) return g('sc-model-id') ? g('sc-model-id').value : '';
   return g('sc-model-freeform') ? g('sc-model-freeform').value.trim() : '';
 }
 
@@ -325,9 +339,9 @@ function onProviderChange() {
   if (g('provider-anthropic')) g('provider-anthropic').style.display = provider === 'anthropic' ? 'block' : 'none';
   if (g('provider-openai'))    g('provider-openai').style.display    = provider === 'openai'    ? 'block' : 'none';
   if (g('provider-gateway'))   g('provider-gateway').style.display   = provider === 'gateway'   ? 'block' : 'none';
-  const isBedrock = provider === 'bedrock';
-  if (g('sc-model-id'))       g('sc-model-id').style.display       = isBedrock ? '' : 'none';
-  if (g('sc-model-freeform')) g('sc-model-freeform').style.display = isBedrock ? 'none' : '';
+  const usesDropdown = providerUsesModelDropdown(provider);
+  if (g('sc-model-id'))       g('sc-model-id').style.display       = usesDropdown ? '' : 'none';
+  if (g('sc-model-freeform')) g('sc-model-freeform').style.display = usesDropdown ? 'none' : '';
   // NOTE: do NOT refresh the model catalogue here — on a mere dropdown change the
   // backend is still on the OLD provider (and may lack the new key), so listing
   // would show stale models. The catalogue refreshes after "Apply Provider".

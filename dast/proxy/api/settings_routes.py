@@ -302,6 +302,13 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 openai_base_url=_scan_config.get("openai_base_url", ""),
                 gateway_base_url=_scan_config.get("gateway_base_url", ""),
             )
+            # set_provider auto-heals the active model when the previous one was a
+            # Bedrock ARN under a non-Bedrock provider. Persist the healed NAME into
+            # scan config so GET /api/scan-config and the model badge reflect the
+            # model that will actually be used, instead of the stale ARN.
+            effective_model = _bc3.get_active_model()
+            if effective_model and effective_model != _scan_config.get("model_id"):
+                _scan_config["model_id"] = effective_model
             # Invalidate the AI-status cache (5-min TTL) so the connection badge
             # re-probes the just-selected provider on the next poll instead of
             # showing the previous provider's stale "connected/not connected".

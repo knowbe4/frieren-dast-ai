@@ -360,7 +360,19 @@ class CopilotSession:
                 if action == "reply":
                     message = str(decision.get("message", "")).strip()
                     if not message:
-                        message = "(the copilot produced an empty reply)"
+                        # The schema only requires thought+action, so a reply can
+                        # arrive with all the substance in `thought` and message
+                        # left blank (a common failure with schema-forced steps).
+                        # Surface the thought rather than a useless placeholder so
+                        # the operator still gets the copilot's actual conclusion.
+                        if thought:
+                            message = thought
+                            logger.info(
+                                "Copilot: reply had empty message; used thought as fallback",
+                                session_id=self.session_id, step=step,
+                            )
+                        else:
+                            message = "(the copilot produced an empty reply)"
                     blocked_reason = str(decision.get("blocked_reason", "") or "").strip()
                     reply = _finalize(message, blocked_reason)
                     await on_event({"type": "reply", "message": reply.message,

@@ -60,6 +60,13 @@ _gateway_base_url: str = ""
 # Causes the scan queue to pause until credentials are refreshed.
 _ai_unavailable: bool = False
 
+# Per-provider auto-resolved default model NAME, used when a non-Bedrock provider
+# is active but no provider-appropriate model is configured (the model is empty or
+# a Bedrock ARN carried over from the Bedrock defaults). Resolved once from the
+# provider's live catalogue (preferring a Sonnet tier) and cached here; cleared on
+# any provider switch or explicit model change so it re-resolves. Keyed by provider.
+_default_model_cache: Dict[str, str] = {}
+
 
 class AiUnavailableError(RuntimeError):
     """Raised when AWS credentials are expired and cannot be refreshed."""
@@ -79,9 +86,54 @@ def mark_ai_unavailable() -> None:
     _ai_unavailable = True
 
 
+def _preferred_default_model(models: list) -> str:
+    """Pick a provider-appropriate default model NAME from a catalogue, preferring
+    a Sonnet tier (the balanced default) over Haiku/Opus. Bedrock ARNs are skipped
+    — they are only valid for the Bedrock provider. Among Sonnet options a plain
+    variant is preferred over context-window variants (e.g. ``claude-sonnet-5``
+    over ``claude-sonnet-5[1m]``). Returns "" when the catalogue has no usable name.
+    """
+    ids = [
+        str(m.get("id"))
+        for m in models
+        if m.get("id") and not _is_bedrock_arn(str(m.get("id")))
+    ]
+    if not ids:
+        return ""
+    plain_sonnet = [i for i in ids if "sonnet" in i.lower() and "[" not in i]
+    if plain_sonnet:
+        return plain_sonnet[0]
+    any_sonnet = [i for i in ids if "sonnet" in i.lower()]
+    if any_sonnet:
+        return any_sonnet[0]
+    return ids[0]
+
+
+def _resolve_default_model(provider: str) -> str:
+    """Resolve (and cache) the default model NAME for a non-Bedrock provider from
+    its live catalogue, preferring Sonnet. Cached per provider so the catalogue is
+    fetched at most once per provider between switches. Never raises — a catalogue
+    failure caches "" so callers can fall back to their own error handling."""
+    if provider == "bedrock":
+        return ""
+    if provider in _default_model_cache:
+        return _default_model_cache[provider]
+    chosen = ""
+    try:
+        catalogue = list_models()
+        chosen = _preferred_default_model(catalogue.get("models", []))
+    except Exception as exc:  # never let model listing crash an LLM call
+        logger.warning("Default-model resolution failed", provider=provider, error=str(exc))
+    if chosen:
+        logger.info("Auto-selected default model for provider", provider=provider, model=chosen)
+    _default_model_cache[provider] = chosen
+    return chosen
+
+
 def set_active_model(model_id: str) -> None:
     global _active_model_id
     _active_model_id = model_id or ""
+    _default_model_cache.clear()
 
 
 def set_tiered_models(fast: str = "", validation: str = "") -> None:
@@ -112,7 +164,7 @@ def set_provider(
     marked unavailable on expired AWS creds).
     """
     global _active_provider, _anthropic_api_key, _anthropic_base_url
-    global _openai_api_key, _openai_base_url, _gateway_base_url
+    global _openai_api_key, _openai_base_url, _gateway_base_url, _active_model_id
     _active_provider = (provider or "").strip().lower()
     _anthropic_api_key = anthropic_api_key or ""
     _anthropic_base_url = anthropic_base_url or ""
@@ -120,8 +172,27 @@ def set_provider(
     _openai_base_url = openai_base_url or ""
     _gateway_base_url = gateway_base_url or ""
     _reset_client()
+    _default_model_cache.clear()
     mark_ai_available()
-    logger.info("AI provider configured", provider=get_active_provider())
+    active_provider = get_active_provider()
+    logger.info("AI provider configured", provider=active_provider)
+
+    # Auto-heal the active model on switch: a Bedrock ARN (the Bedrock default,
+    # often carried over) is meaningless to a non-Bedrock provider and would make
+    # every LLM call fail. Eagerly resolve a provider-appropriate default NAME
+    # (preferring Sonnet) from the provider's live catalogue so the model badge,
+    # scans, and copilot all work without the operator re-picking a model.
+    if active_provider != "bedrock":
+        from dast.config import settings
+        current = _active_model_id or settings.ai_model_id
+        if not current or _is_bedrock_arn(current):
+            healed = _resolve_default_model(active_provider)
+            if healed:
+                _active_model_id = healed
+                logger.info(
+                    "Reset active model to provider default (was empty or a Bedrock ARN)",
+                    provider=active_provider, model=healed,
+                )
 
 
 def get_active_provider() -> str:
@@ -207,7 +278,15 @@ def list_models() -> Dict[str, Any]:
 
 def get_active_model() -> str:
     from dast.config import settings
-    return _active_model_id or settings.ai_model_id
+    model = _active_model_id or settings.ai_model_id
+    # A Bedrock ARN (or empty) under a non-Bedrock provider is not usable — this
+    # happens when AI_PROVIDER is set to gateway/anthropic/openai via env at boot
+    # (no provider switch runs). Lazily resolve a provider-appropriate default
+    # NAME so the badge and every LLM call reflect a model the provider accepts.
+    provider = get_active_provider()
+    if provider != "bedrock" and (not model or _is_bedrock_arn(model)):
+        return _resolve_default_model(provider) or model
+    return model
 
 
 def _is_bedrock_arn(model_id: str) -> bool:
@@ -267,6 +346,16 @@ def _resolve_model(model_id: Optional[str]) -> str:
     provider = get_active_provider()
     model = model_id or get_active_model()
     if provider != "bedrock" and (not model or _is_bedrock_arn(model)):
+        # An explicit Bedrock ARN (e.g. the coordinator planner passing model_id
+        # directly) still reaches here even though get_active_model() self-heals.
+        # Prefer a provider-appropriate default over failing the call outright.
+        healed = _resolve_default_model(provider)
+        if healed and not _is_bedrock_arn(healed):
+            logger.warning(
+                "Substituting provider default for a Bedrock ARN under non-Bedrock provider",
+                provider=provider, model=healed,
+            )
+            return healed
         mark_ai_unavailable()
         raise AiUnavailableError(
             f"No model configured for AI provider '{provider}'. A Bedrock ARN "

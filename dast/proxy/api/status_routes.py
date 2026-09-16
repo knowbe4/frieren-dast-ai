@@ -48,7 +48,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             from dast.proxy.dashboard_server import _detect_aws_sso_profile
 
             ai_ok = False
-            ai_model = cfg.ai_model_id
+            # The EFFECTIVE model, not the raw setting: under a non-Bedrock provider
+            # a Bedrock ARN in settings is auto-healed to a catalogue model NAME, and
+            # the badge must show what will actually be used (the ARN "labelled sonnet"
+            # is exactly what hid the provider/model mismatch that broke the copilot).
+            ai_model = bedrock_client.get_active_model()
             ai_error = None
             aws_identity = None
 
@@ -280,7 +284,8 @@ async def prefetch_ai_status(ctx: DashboardContext) -> None:
         from dast.ai import bedrock_client
         from dast.proxy.dashboard_server import _detect_aws_sso_profile
 
-        ai_model = cfg.ai_model_id
+        # Effective model (auto-healed for non-Bedrock providers), not the raw setting.
+        ai_model = bedrock_client.get_active_model()
         aws_identity = None
         provider = bedrock_client.get_active_provider()
 

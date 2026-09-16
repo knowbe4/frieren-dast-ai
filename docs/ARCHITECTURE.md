@@ -813,7 +813,9 @@ dast/
   `anthropic_api_key`, `openai_api_key`, `*_base_url`, `gateway_base_url`). Defaults via `.env`
   (see Environment Variables in CLAUDE.md). For non-Bedrock providers `model_id` is a plain
   model name (e.g. `claude-opus-4-8`, `gpt-4o`), not an ARN. API keys are never echoed back by
-  `GET /api/scan-config` (only `*_set` booleans).
+  `GET /api/scan-config` (only `*_set` booleans). Local models (Qwen via Ollama/vLLM, LM Studio,
+  `llama.cpp`) run through this same `openai` path — point `openai_base_url` at the local server;
+  see [LOCAL_MODELS.md](LOCAL_MODELS.md) for the walkthrough and the forced-tool-call requirement.
 - Gateway provider (`dast/ai/gateway_auth.py`): the internal Claude apps gateway speaks the
   Anthropic Messages API over an OAuth JWT reused from the Claude Code CLI session (macOS
   Keychain, service `Claude Code-credentials`; or an explicit `GATEWAY_JWT` on Linux/CI). It

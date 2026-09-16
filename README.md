@@ -273,6 +273,11 @@ OPENAI_BASE_URL=https://api.openai.com/v1   # point at any OpenAI-compatible end
 AI_MODEL_ID=gpt-4o
 ```
 
+Running a **local model** (Qwen via Ollama/vLLM, LM Studio, `llama.cpp`) uses this same `openai`
+provider — point `OPENAI_BASE_URL` at the local server. See
+[docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) for the full walkthrough and gotchas (forced tool
+calling, the dummy API key, model-size guidance).
+
 All three can also be switched at runtime from the AI tab in the dashboard (`POST /api/scan-config`).
 
 ### Troubleshooting

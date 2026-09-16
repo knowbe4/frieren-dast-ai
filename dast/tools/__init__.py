@@ -24,6 +24,7 @@ from dast.tools import http_tools as _http_tools  # noqa: F401
 from dast.tools import oob_tools as _oob_tools  # noqa: F401
 from dast.tools import profile_tools as _profile_tools  # noqa: F401
 from dast.tools import recon_tools as _recon_tools  # noqa: F401
+from dast.tools import record_finding_tools as _record_finding_tools  # noqa: F401
 from dast.tools import triage_tools as _triage_tools  # noqa: F401
 
 __all__ = [

@@ -34,7 +34,7 @@ def test_registry_lists_builtin_tools():
     names = {t.name for t in tools.all_tools()}
     assert {"send_request", "get_history", "content_discovery",
             "param_mining", "triage_report", "validate_chain", "list_login_profiles",
-            "get_findings", "oob_generate", "oob_poll",
+            "get_findings", "record_finding", "oob_generate", "oob_poll",
             "url_encode", "url_decode", "base64_encode", "base64_decode",
             "html_encode", "html_decode"} <= names
 
@@ -357,6 +357,95 @@ async def test_get_findings_http_fallback(monkeypatch):
     assert result["ok"] is True
     assert result["count"] == 1
     assert result["findings"][0]["title"] == "XSS"
+
+
+# ── record_finding (write, both paths) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_record_finding_writes_store():
+    class _Store:
+        def __init__(self):
+            self.calls = []
+        def record_manual_finding(self, finding, url, method="GET"):
+            self.calls.append((finding, url, method))
+            return "e-42"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Missing access control on ldapToken",
+        "severity": "high", "url": "https://acme-corp.com/graphql",
+        "method": "POST", "evidence": "Both fields PRESENT with HTTP 200.",
+        "attack_type": "broken-access-control", "cwe": "CWE-284",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "e-42"
+    finding, url, method = store.calls[0]
+    assert url == "https://acme-corp.com/graphql" and method == "POST"
+    assert finding["title"] == "Missing access control on ldapToken"
+    assert finding["severity"] == "high"
+    assert finding["confirmed"] is True
+    assert finding["validated_by"] == ["copilot"]
+
+
+@pytest.mark.asyncio
+async def test_record_finding_requires_core_fields():
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    # Missing url
+    r1 = await run_tool(ctx, "record_finding",
+                        {"title": "x", "severity": "high", "evidence": "e"})
+    assert r1["ok"] is False and "url" in r1["error"]
+    # Missing evidence
+    r2 = await run_tool(ctx, "record_finding",
+                        {"title": "x", "severity": "high", "url": "https://acme-corp.com/"})
+    assert r2["ok"] is False and "evidence" in r2["error"]
+
+
+@pytest.mark.asyncio
+async def test_record_finding_invalid_severity_defaults_medium():
+    class _Store:
+        def __init__(self): self.finding = None
+        def record_manual_finding(self, finding, url, method="GET"):
+            self.finding = finding
+            return "e1"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "t", "severity": "spicy", "url": "https://acme-corp.com/x",
+        "evidence": "observed",
+    })
+    assert result["ok"] is True
+    assert store.finding["severity"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_record_finding_http_fallback(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"ok": True, "entry_id": "srv-1"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None):
+            posted["url"] = url
+            posted["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store -> HTTP path
+    result = await run_tool(ctx, "record_finding", {
+        "title": "t", "severity": "critical", "url": "https://acme-corp.com/x",
+        "evidence": "observed",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "srv-1"
+    assert posted["url"].endswith("/api/findings/manual")
+    assert posted["json"]["finding"]["title"] == "t"
 
 
 # ── encoders (pure) ─────────────────────────────────────────────────────────────

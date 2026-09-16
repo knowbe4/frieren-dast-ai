@@ -9,6 +9,7 @@ import asyncio
 import concurrent.futures
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 from typing import Callable, Dict, List, Optional
@@ -929,6 +930,46 @@ class SessionStore:
                 e.scan_result = scan_result
         if e:
             self._notify(e)
+
+    def record_manual_finding(
+        self, finding: dict, url: str, method: str = "GET"
+    ) -> Optional[str]:
+        """Attach a finding produced outside the scan pipeline (Exploration Copilot
+        or an MCP client) to the proxy history so it shows in the Findings tab.
+
+        Links the finding to the most recent in-store entry for the same url+method
+        so it carries the real request/response it was confirmed on. When no such
+        entry exists (the caller never proxied that url through Frieren) a
+        lightweight synthetic entry is created so the finding still lands with its
+        request context. Returns the entry id it was attached to, or None if url is
+        missing.
+        """
+        url = (url or "").strip()
+        if not url:
+            return None
+        method = (method or "GET").strip().upper() or "GET"
+        parsed = urlparse(url)
+        host = parsed.netloc
+        path = parsed.path or "/"
+        entry_id: Optional[str] = None
+        with self._lock:
+            # Newest matching entry first (the request the caller just probed).
+            for eid in reversed(self._order):
+                e = self._entries.get(eid)
+                if e and e.url == url and e.method == method:
+                    entry_id = eid
+                    break
+            if entry_id is None:
+                entry_id = f"copilot-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+                self._entries[entry_id] = ProxyEntry(
+                    id=entry_id, method=method, url=url, host=host, path=path,
+                    request_headers={}, request_body=None, source="copilot",
+                )
+                self._order.append(entry_id)
+        # add_finding re-acquires the lock and notifies listeners — call it outside
+        # the lock block above (the lock is not reentrant).
+        self.add_finding(entry_id, finding, "vulnerable")
+        return entry_id
 
     def remove_finding(self, entry_id: str, finding_index: int) -> bool:
         """Remove a single finding by index. Returns True if removed."""

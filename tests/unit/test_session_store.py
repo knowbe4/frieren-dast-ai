@@ -122,6 +122,40 @@ class TestAddFinding:
         assert len(store.get_entry(eid).findings) == 2
 
 
+# ── record_manual_finding (copilot / MCP path) ─────────────────────────────
+
+class TestRecordManualFinding:
+    def test_links_to_existing_entry_for_url(self):
+        store = _make_store()
+        eid = store.new_entry("POST", "https://example.com/graphql", {}, None)
+        returned = store.record_manual_finding(
+            {"title": "BAC", "attack_type": "broken-access-control", "confirmed": True},
+            "https://example.com/graphql", "POST",
+        )
+        # Attached to the request already in history, not a new synthetic entry.
+        assert returned == eid
+        entry = store.get_entry(eid)
+        assert entry.scan_result == "vulnerable"
+        assert entry.findings[0]["title"] == "BAC"
+
+    def test_creates_synthetic_entry_when_no_match(self):
+        store = _make_store()
+        returned = store.record_manual_finding(
+            {"title": "SSRF", "attack_type": "ssrf"},
+            "https://never-proxied.example.com/api", "GET",
+        )
+        assert returned is not None
+        entry = store.get_entry(returned)
+        assert entry is not None
+        assert entry.source == "copilot"
+        assert entry.url == "https://never-proxied.example.com/api"
+        assert entry.findings[0]["title"] == "SSRF"
+
+    def test_missing_url_returns_none(self):
+        store = _make_store()
+        assert store.record_manual_finding({"title": "x"}, "", "GET") is None
+
+
 # ── cookie jar ────────────────────────────────────────────────────────────
 
 class TestCookieJar:

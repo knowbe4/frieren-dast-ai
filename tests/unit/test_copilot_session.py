@@ -188,6 +188,129 @@ async def test_copilot_tagged_tool_is_hidden_from_menu():
 
 
 @pytest.mark.asyncio
+async def test_blank_action_with_tool_name_is_recovered():
+    # The decision model sometimes omits/blanks `action` while still naming a tool.
+    # That step carries clear intent and must run the tool, not be discarded.
+    session = CopilotSession("s8")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200})
+
+    steps = [
+        {"action": "", "thought": "plan", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x"}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    run_tool.assert_awaited_once()
+    assert reply.message == "ok"
+
+
+@pytest.mark.asyncio
+async def test_blank_action_with_message_is_recovered_as_reply():
+    session = CopilotSession("s9")
+    _, on_event = _collector()
+
+    steps = [{"action": "", "thought": "", "message": "I'm done here."}]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=AsyncMock()), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.message == "I'm done here."
+
+
+@pytest.mark.asyncio
+async def test_planning_only_steps_are_bounded_and_end_turn():
+    # A step that commits to neither a tool call nor a reply must not loop forever:
+    # consecutive planning-only steps hit the failure ceiling and hand back.
+    session = CopilotSession("s10")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True})
+
+    def planning_only(*_a, **_k):
+        return {"action": "", "thought": "still thinking, no action yet"}
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=planning_only)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    run_tool.assert_not_awaited()
+    assert reply.blocked_reason == "need_direction"
+
+
+@pytest.mark.asyncio
+async def test_planning_steps_do_not_consume_tool_budget():
+    # A planning-only step interleaved with real tool calls resets the failure
+    # counter, so the copilot still gets its full per-turn tool-call budget rather
+    # than losing half of it to empty steps (the pre-fix bug).
+    from dast.ai.copilot.session import _MAX_TOOL_CALLS_PER_TURN
+
+    session = CopilotSession("s11")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200})
+
+    def alternate(*_a, **_k):
+        alternate.n += 1
+        if alternate.n % 2 == 1:
+            return {"action": "", "thought": "plan next probe"}  # no tool, no reply
+        return {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+                "tool_args": {"url": f"https://in.scope/{alternate.n}"}}
+    alternate.n = 0
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=alternate)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "need_direction"
+    assert run_tool.await_count == _MAX_TOOL_CALLS_PER_TURN
+
+
+def test_summarize_result_keeps_reflections_ahead_of_body():
+    # send_request returns a large body plus a compact `reflections` signal. The
+    # summary must lead with reflections so a 2000-char truncation keeps it.
+    from dast.ai.copilot.session import (
+        _OBSERVATION_MAX_CHARS,
+        _summarize_result,
+    )
+
+    result = {
+        "ok": True,
+        "status": 200,
+        "length": 9500,
+        "final_url": "https://in.scope/xss",
+        "body": "A" * 9000,  # dominates the raw dump, would bury the signal
+        "reflections": [{"parameter": "name", "location": "query",
+                         "reflected_raw": True, "html_escaped_also_present": False,
+                         "context": "Hello <script>alert('x')</script> world"}],
+    }
+    summary = _summarize_result(result)
+    truncated = summary[:_OBSERVATION_MAX_CHARS]
+    # The reflection signal survives the truncation the transcript will apply.
+    assert "reflections" in truncated
+    assert "reflected_raw" in truncated
+    assert "<script>alert('x')</script>" in truncated
+    # The bulky body is trimmed, not dumped whole.
+    assert result["body"] not in summary
+
+
+def test_summarize_result_passes_through_non_body_results():
+    from dast.ai.copilot.session import _summarize_result
+
+    assert _summarize_result({"ok": True, "count": 3}) == '{"ok": true, "count": 3}'
+
+
+@pytest.mark.asyncio
 async def test_turn_ceiling_forces_reply():
     session = CopilotSession("s7")
     _, on_event = _collector()

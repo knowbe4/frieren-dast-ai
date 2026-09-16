@@ -124,6 +124,96 @@ async def test_send_request_success(monkeypatch):
     assert result["body"] == "hello"
 
 
+@pytest.mark.asyncio
+async def test_send_request_reports_raw_reflection_past_truncation(monkeypatch):
+    # An injected value that reflects UNENCODED deep in a large body is invisible
+    # in the truncated `body`, so send_request must surface it as a reflection
+    # signal — the decisive evidence for reflected XSS.
+    marker = "<script>alert('FrierenXSS123')</script>"
+    big_body = ("x" * 9000) + f"Hello {marker}, welcome" + ("y" * 500)
+
+    class _Resp:
+        status_code = 200
+        text = big_body
+        url = "https://api.acme-corp.com/xss?name=" + marker
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/xss?name=" + marker})
+
+    assert result["ok"] is True
+    assert marker not in result["body"]  # reflection lives past the 8000-char slice
+    reflections = result["reflections"]
+    assert len(reflections) == 1
+    hit = reflections[0]
+    assert hit["parameter"] == "name"
+    assert hit["location"] == "query"
+    assert hit["reflected_raw"] is True
+    assert hit["html_escaped_also_present"] is False
+    assert marker in hit["context"]
+
+
+@pytest.mark.asyncio
+async def test_send_request_reports_html_escaped_reflection(monkeypatch):
+    # A value that comes back HTML-escaped is a reflection but NOT raw — the caller
+    # needs both booleans to tell an XSS sink from a safely-encoded echo.
+    injected = "<b>probe</b>"
+
+    class _Resp:
+        status_code = 200
+        text = "search results for &lt;b&gt;probe&lt;/b&gt; here"
+        url = "https://api.acme-corp.com/s?q=" + injected
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/s?q=" + injected})
+
+    hit = result["reflections"][0]
+    assert hit["reflected_raw"] is False
+    assert hit["html_escaped_also_present"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_request_no_reflection_field_when_absent(monkeypatch):
+    class _Resp:
+        status_code = 200
+        text = "nothing echoed back"
+        url = "https://api.acme-corp.com/x?token=abcdef12345"
+        headers = {"Content-Type": "text/html"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/x?token=abcdef12345"})
+    assert result["ok"] is True
+    assert "reflections" not in result
+
+
 # ── get_history in-process store path ──────────────────────────────────────────
 
 @pytest.mark.asyncio

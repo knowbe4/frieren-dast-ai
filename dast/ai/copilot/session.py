@@ -33,12 +33,49 @@ logger = get_logger(__name__)
 # replies (a bug, not normal dialogue).
 _MAX_TOOL_CALLS_PER_TURN = 12
 
-# Consecutive LLM step failures before the turn gives up and replies with an error.
+# Consecutive non-productive steps (an LLM call failure, or a step that commits to
+# neither a tool call nor a reply) before the turn gives up and hands back.
 _MAX_CONSECUTIVE_LLM_FAILURES = 3
 
 # Tool observations fed back into the turn transcript are truncated to this many
 # chars so a large response body cannot blow the context.
 _OBSERVATION_MAX_CHARS = 2000
+
+# Within a single observation, the response body is trimmed to this much so the
+# decisive compact signals (status, length, reflections) that follow it always
+# survive the _OBSERVATION_MAX_CHARS cut instead of being pushed out by the body.
+_OBSERVATION_BODY_CHARS = 900
+
+# Order in which a tool result's fields are serialized into an observation: the
+# small, decisive signals lead so truncation only ever eats the trailing body.
+_OBSERVATION_PRIORITY_FIELDS = (
+    "ok", "status", "length", "final_url", "reflections",
+    "error", "safe_variant", "hint",
+)
+
+
+def _summarize_result(result: Any) -> str:
+    """Serialize a tool result for the transcript, keeping the decisive signal
+    fields ahead of the bulky response body.
+
+    ``send_request`` returns an 8000-char ``body`` plus compact signals such as
+    ``reflections``. Dumped verbatim, the body dominates and truncation at
+    ``_OBSERVATION_MAX_CHARS`` drops the very signal the model needs. Reordering
+    the keys (and trimming the body) guarantees those signals reach the model.
+    """
+    if not isinstance(result, dict) or "body" not in result:
+        return json.dumps(result, default=str)
+    ordered: Dict[str, Any] = {}
+    for key in _OBSERVATION_PRIORITY_FIELDS:
+        if key in result:
+            ordered[key] = result[key]
+    for key, value in result.items():
+        if key not in ordered and key not in ("body", "headers"):
+            ordered[key] = value
+    body = result.get("body")
+    if isinstance(body, str):
+        ordered["body"] = body[:_OBSERVATION_BODY_CHARS]
+    return json.dumps(ordered, default=str)
 
 # The conversation history sent to the model is capped to the most recent N
 # messages so a long thread stays within the context budget.
@@ -283,7 +320,10 @@ class CopilotSession:
             )
 
         try:
-            for step in range(1, _MAX_TOOL_CALLS_PER_TURN + 1):
+            step = 0
+            tool_calls_used = 0
+            while tool_calls_used < _MAX_TOOL_CALLS_PER_TURN:
+                step += 1
                 user = _build_user_prompt(
                     self.messages, tool_menu, turn_transcript, context_brief
                 )
@@ -302,10 +342,17 @@ class CopilotSession:
                                         "blocked_reason": reply.blocked_reason})
                         return reply
                     continue
-                consecutive_failures = 0
 
                 action = str(decision.get("action", "")).strip()
                 thought = str(decision.get("thought", "")).strip()
+                # A blank/unknown action still carries intent: recover it from the
+                # payload the model provided so a planning step that named a tool or
+                # wrote a message is honored instead of discarded as malformed.
+                if action not in ("call_tool", "reply"):
+                    if str(decision.get("tool_name", "")).strip():
+                        action = "call_tool"
+                    elif str(decision.get("message", "")).strip():
+                        action = "reply"
                 await on_event({"type": "step", "step": step, "thought": thought,
                                 "action": action})
 
@@ -322,6 +369,8 @@ class CopilotSession:
 
                 # ── call_tool ───────────────────────────────────────────────────
                 if action == "call_tool":
+                    consecutive_failures = 0
+                    tool_calls_used += 1
                     tool_name = str(decision.get("tool_name", "")).strip()
                     tool_args = decision.get("tool_args") or {}
                     if not isinstance(tool_args, dict):
@@ -374,13 +423,28 @@ class CopilotSession:
                     ):
                         continue  # session applied — retry allowed
 
-                    await _observe(entry, json.dumps(result, default=str))
+                    await _observe(entry, _summarize_result(result))
                     continue
 
-                # ── malformed action ──────────────────────────────────────────────
+                # ── no committed action: a planning-only step ─────────────────────
+                # Don't spend the tool-call budget on it; nudge the model and bound
+                # the retries with the consecutive-failure ceiling so a stuck model
+                # still ends the turn instead of looping.
+                consecutive_failures += 1
                 entry = {"step": step, "thought": thought, "action": action}
                 turn_transcript.append(entry)
-                await _observe(entry, f"Unknown action '{action}'. Use call_tool or reply.")
+                await _observe(entry, "No tool call or reply was provided. Respond with "
+                               "action=call_tool (and set tool_name) or action=reply "
+                               "(and set message).")
+                if consecutive_failures >= _MAX_CONSECUTIVE_LLM_FAILURES:
+                    reply = _finalize(
+                        "I couldn't settle on a next step this turn. Tell me how "
+                        "you'd like me to proceed.",
+                        blocked_reason="need_direction",
+                    )
+                    await on_event({"type": "reply", "message": reply.message,
+                                    "blocked_reason": reply.blocked_reason})
+                    return reply
 
             # Ceiling reached without the LLM replying.
             logger.warning("Copilot: tool-call ceiling reached this turn",
@@ -472,5 +536,5 @@ class CopilotSession:
             await observe(entry, f"Auth wall (HTTP {status_code}); operator provided "
                           f"{len(cookies)} session cookies. Retry with the session applied.")
             return True
-        await observe(entry, json.dumps(result, default=str))
+        await observe(entry, _summarize_result(result))
         return False

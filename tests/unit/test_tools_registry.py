@@ -36,7 +36,7 @@ def test_registry_lists_builtin_tools():
             "param_mining", "triage_report", "validate_chain", "list_login_profiles",
             "get_findings", "record_finding", "oob_generate", "oob_poll",
             "url_encode", "url_decode", "base64_encode", "base64_decode",
-            "html_encode", "html_decode"} <= names
+            "html_encode", "html_decode", "graphql_introspect"} <= names
 
 
 def test_every_tool_has_object_schema_and_handler():
@@ -568,6 +568,94 @@ async def test_validate_chain_out_of_scope_blocked():
     result = await run_tool(ctx, "validate_chain", {"chain": spec})
     assert result["ok"] is False
     assert "out of scope" in result["error"]
+
+
+# ── graphql_introspect (dedicated introspection path, both callers) ─────────────
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_out_of_scope_blocked():
+    # store set (in-process) so no interactive approval is attempted.
+    ctx = ToolContext(store=object(), settings=_Scope(False))
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://evil.example.com/graphql"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_reads_store(monkeypatch):
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {}
+
+    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection"):
+        store.graphql_schemas[endpoint] = {
+            "introspected": True,
+            "queries": {"me": {}, "user": {}},
+            "mutations": {"login": {}},
+        }
+        return None  # success
+
+    monkeypatch.setattr(
+        "dast.plugins.graphql_introspection._introspect", fake_introspect
+    )
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is True
+    assert result["query_count"] == 2
+    assert result["mutation_count"] == 1
+    assert result["queries"] == ["me", "user"]
+    assert result["mutations"] == ["login"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_disabled_surfaces_error(monkeypatch):
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {}
+
+    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection"):
+        return "Introspection disabled on this endpoint"
+
+    monkeypatch.setattr(
+        "dast.plugins.graphql_introspection._introspect", fake_introspect
+    )
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is False
+    assert "disabled" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_http_fallback(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"ok": True, "schema": {"introspected": True,
+                    "queries": {"me": {}}, "mutations": {}}}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None):
+            posted["url"] = url
+            posted["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store -> HTTP path
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is True
+    assert result["queries"] == ["me"]
+    assert posted["url"].endswith("/api/graphql/introspect")
+    assert posted["json"]["endpoint"] == "https://api.acme-corp.com/graphql"
 
 
 # ── MCP conversion (pure, no mcp import) ────────────────────────────────────────

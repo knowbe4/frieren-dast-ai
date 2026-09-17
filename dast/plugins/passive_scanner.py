@@ -222,17 +222,23 @@ def _eval_header_value_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optio
             header_names = list(hdrs.keys())
 
     for hdr in header_names:
-        val = hdrs.get(hdr, "")
-        if not val or not pattern.search(val):
+        raw_val = hdrs.get(hdr, "")
+        # A header may be stored as a list when it repeats (e.g. multiple
+        # Set-Cookie). Search each occurrence and report the one that matched.
+        candidates = raw_val if isinstance(raw_val, list) else [raw_val]
+        matched_val = next((c for c in candidates if c and pattern.search(c)), None)
+        if matched_val is None:
             continue
         if also_name and also_val:
-            actual_also = hdrs.get(also_name, "").lower()
-            if also_val.lower() not in actual_also:
+            actual_also = hdrs.get(also_name, "")
+            if isinstance(actual_also, list):
+                actual_also = " ".join(actual_also)
+            if also_val.lower() not in actual_also.lower():
                 continue
         evidence = _format_evidence(
             rule.get("evidence_template", f"Header '{hdr}' value matches pattern"),
             header=hdr,
-            value=val,
+            value=matched_val,
             path=entry.path,
         )
         return (rule["title"], rule["severity"], rule["cwe"], evidence, None, None, rule.get("needs_ai_validation", False), None, rule.get("confirmed", True))

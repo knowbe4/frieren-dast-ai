@@ -194,6 +194,103 @@ class TestCookies:
         assert medium, "Session cookie without HttpOnly should be medium severity"
 
 
+# ── CDN signed cookies ───────────────────────────────────────────────────────
+
+# Multiple Set-Cookie headers are stored as a LIST on the entry (the proxy
+# builds them via resp.headers.multi_items()); a single one stays a string.
+_CLOUDFRONT_SET_COOKIE = [
+    "CloudFront-Policy=eyJTdGF0ZW1lbnQi; Path=/; Secure; HttpOnly",
+    "CloudFront-Signature=abc123~def456; Path=/; Secure; HttpOnly",
+    "CloudFront-Key-Pair-Id=K2EXAMPLEKEYID; Path=/; Secure; HttpOnly",
+]
+
+
+class TestCdnSignedCookies:
+    def test_fires_on_list_of_set_cookie(self):
+        e = _entry(
+            url="https://training.example.com/spa/session",
+            path="/spa/session",
+            response_headers={"set-cookie": list(_CLOUDFRONT_SET_COOKIE)},
+        )
+        findings = _run_rule_by_id(e, "cloudfront-signed-cookie-issued")
+        assert findings, "CloudFront signed cookies in a list should fire the rule"
+
+    def test_fires_on_single_string_set_cookie(self):
+        e = _entry(
+            url="https://training.example.com/spa/session",
+            path="/spa/session",
+            response_headers={
+                "set-cookie": "CloudFront-Signature=abc123~def456; Path=/; Secure",
+            },
+        )
+        assert _run_rule_by_id(e, "cloudfront-signed-cookie-issued")
+
+    def test_does_not_fire_without_cloudfront_cookies(self):
+        e = _entry(
+            url="https://training.example.com/spa/session",
+            path="/spa/session",
+            response_headers={
+                "set-cookie": ["session=abc; Secure; HttpOnly", "csrf=xyz; Secure"],
+            },
+        )
+        assert _run_rule_by_id(e, "cloudfront-signed-cookie-issued") == []
+
+    def test_routes_to_ai_validation_and_unconfirmed(self):
+        e = _entry(
+            url="https://training.example.com/spa/session",
+            path="/spa/session",
+            response_headers={"set-cookie": list(_CLOUDFRONT_SET_COOKIE)},
+        )
+        findings = _run_rule_by_id(e, "cloudfront-signed-cookie-issued")
+        assert findings
+        title, severity, cwe, evidence, _, _, needs_ai, _, confirmed = findings[0]
+        assert needs_ai is True, "Signed-cookie lead must route through the LLM"
+        assert confirmed is False, "Detection is a lead, not a confirmed finding"
+        assert severity == "medium"
+        assert cwe == "CWE-639"
+        # The signature value must never be echoed into stored evidence.
+        assert "abc123" not in evidence and "~def456" not in evidence
+
+    def test_evidence_omits_secret_values(self):
+        e = _entry(
+            url="https://training.example.com/spa/session",
+            path="/spa/session",
+            response_headers={"set-cookie": list(_CLOUDFRONT_SET_COOKIE)},
+        )
+        evidence = _run_rule_by_id(e, "cloudfront-signed-cookie-issued")[0][3]
+        for secret in ("eyJTdGF0ZW1lbnQi", "K2EXAMPLEKEYID"):
+            assert secret not in evidence
+
+
+class TestHeaderValueRegexListHandling:
+    """Regression: header_value_regex must search each occurrence of a repeated
+    header (Set-Cookie stored as a list), not treat the list as a string."""
+
+    def test_samesite_none_fires_on_matching_entry_in_list(self):
+        e = _entry(
+            url="https://example.com/",
+            response_headers={
+                "set-cookie": [
+                    "a=1; Secure; SameSite=Strict",
+                    "tracker=2; SameSite=None",  # None without Secure -> should fire
+                ],
+            },
+        )
+        assert _run_rule_by_id(e, "cookie-samesite-none-without-secure")
+
+    def test_samesite_none_no_fire_when_no_occurrence_matches(self):
+        e = _entry(
+            url="https://example.com/",
+            response_headers={
+                "set-cookie": [
+                    "a=1; Secure; SameSite=None",
+                    "b=2; Secure; SameSite=Strict",
+                ],
+            },
+        )
+        assert _run_rule_by_id(e, "cookie-samesite-none-without-secure") == []
+
+
 # ── CORS ───────────────────────────────────────────────────────────────────
 
 class TestCors:

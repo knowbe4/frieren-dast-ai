@@ -1,0 +1,43 @@
+# CDN signed-cookie authorization checks — flags CloudFront (and similar CDN)
+# signed cookies that grant direct CDN-layer access to content, so their scope
+# can be reviewed against the application's own entitlement checks.
+#
+# A broad Resource scope (e.g. a wildcard) issued to an unauthenticated / guest
+# session decouples CDN-layer access from application-layer authorization: any
+# visitor who receives the cookie gains file-level access to content the app's
+# own API restricts by subscription / entitlement. This is an authorization
+# bypass at the CDN edge (OWASP A01 Broken Access Control / CWE-639 / CWE-284).
+#
+# Detection is a LEAD, not a proof: the rule flags that signed cookies were
+# issued and routes to AI validation to decode the base64 CloudFront-Policy,
+# judge whether the Resource scope is over-broad, and check whether it is bound
+# to the authenticated user. The active proof (request gated content with vs.
+# without the cookies) is the scanner/copilot's follow-up.
+
+rules:
+  - id: cloudfront-signed-cookie-issued
+    title: CloudFront Signed Cookies Issued (verify scope vs. entitlement)
+    severity: medium
+    cwe: CWE-639
+    description: >
+      The response issues CloudFront signed cookies (CloudFront-Policy /
+      CloudFront-Signature / CloudFront-Key-Pair-Id), which grant direct
+      CDN-layer access to content under the signed Resource scope. If the
+      policy's Resource is broad (a wildcard such as */path/*) and the cookie is
+      handed to an unauthenticated or guest session, any visitor gains file-level
+      access to content the application's own API restricts by entitlement — a
+      CDN-layer authorization bypass decoupled from app-layer checks. Decode the
+      base64 CloudFront-Policy, confirm the Resource scope, and verify any binding
+      to the user/session before reporting.
+    match:
+      header_value_regex: 'CloudFront-(Policy|Signature|Key-Pair-Id)='
+      header_name: set-cookie
+    conditions:
+      content_type: any
+      one_per_host: true
+    evidence_template: >-
+      Response sets CloudFront signed cookies granting CDN-layer content access;
+      decode the CloudFront-Policy Resource scope and verify it is bound to the
+      authenticated user and is not over-broad
+    needs_ai_validation: true
+    confirmed: false

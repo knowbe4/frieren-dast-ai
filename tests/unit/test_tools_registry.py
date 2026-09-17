@@ -125,6 +125,75 @@ async def test_send_request_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_surfaces_all_set_cookies(monkeypatch):
+    # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced
+    # as a list, not collapsed by dict(resp.headers). A cookie set on a redirect hop
+    # must also be included, since follow_redirects hides it from the final response.
+    hop = httpx.Response(
+        302,
+        headers=[("set-cookie", "CloudFront-Policy=abc"),
+                 ("set-cookie", "CloudFront-Signature=def"),
+                 ("location", "https://api.acme-corp.com/final")],
+        request=httpx.Request("GET", "https://api.acme-corp.com/spa/session"),
+    )
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+        url = "https://api.acme-corp.com/final"
+        headers = httpx.Headers([("set-cookie", "CloudFront-Key-Pair-Id=ghi"),
+                                 ("content-type", "text/plain")])
+        history = [hop]
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/spa/session"})
+
+    assert result["ok"] is True
+    cookies = result["set_cookies"]
+    # All three CloudFront cookies present, across the redirect hop and the final hop.
+    joined = "; ".join(cookies)
+    assert "CloudFront-Policy=abc" in joined
+    assert "CloudFront-Signature=def" in joined
+    assert "CloudFront-Key-Pair-Id=ghi" in joined
+    assert result["redirects"] == [
+        {"status": 302, "url": "https://api.acme-corp.com/spa/session"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_request_omits_set_cookies_when_none(monkeypatch):
+    class _Resp:
+        status_code = 200
+        text = "ok"
+        url = "https://api.acme-corp.com/x"
+        headers = httpx.Headers([("content-type", "text/plain")])
+        history: list = []
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is True
+    assert "set_cookies" not in result
+    assert "redirects" not in result
+
+
+@pytest.mark.asyncio
 async def test_send_request_reports_raw_reflection_past_truncation(monkeypatch):
     # An injected value that reflects UNENCODED deep in a large body is invisible
     # in the truncated `body`, so send_request must surface it as a reflection

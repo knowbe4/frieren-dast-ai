@@ -2048,6 +2048,38 @@
                 style="margin-left:auto;display:none;font-size:9px;padding:1px 7px">Cancel turn</button>
       </div>
 
+      <!-- Autonomous orchestrator run: objective + budget, then the copilot drives
+           the arsenal (crawl -> scan -> validate -> record) on its own, escalating
+           only when it truly needs a human. -->
+      <details id="cp-auto-panel" style="border-bottom:1px solid var(--bdr)">
+        <summary style="cursor:pointer;padding:8px 18px;font-size:11px;font-weight:600;color:var(--acc2)">Autonomous run</summary>
+        <div style="padding:4px 18px 12px;display:flex;flex-direction:column;gap:8px">
+          <textarea id="cp-auto-objective" rows="2"
+            placeholder="Objective (e.g. 'find broken access control on the GraphQL API')"
+            style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:7px 9px;border-radius:4px;font-size:12px;font-family:inherit;resize:vertical"></textarea>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-size:10px;color:var(--txt2)">
+            <label>Hosts <input id="cp-auto-hosts" placeholder="host1, host2"
+              style="width:170px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 6px;border-radius:3px;font-size:11px"></label>
+            <label>Login <select id="cp-auto-profile"
+              style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 6px;border-radius:3px;font-size:11px"><option value="">none</option></select></label>
+          </div>
+          <details style="font-size:10px;color:var(--txt2)">
+            <summary style="cursor:pointer">Budget &amp; limits</summary>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;align-items:center">
+              <label>Tool calls <input id="cp-auto-tools" type="number" min="1" value="150" style="width:64px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label>Minutes <input id="cp-auto-mins" type="number" min="1" value="30" style="width:56px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label>Stuck turns <input id="cp-auto-stuck" type="number" min="1" value="3" style="width:48px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label><input id="cp-auto-escalate" type="checkbox"> Ask before out-of-scope</label>
+            </div>
+          </details>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="tbtn pri" id="cp-auto-start" onclick="cpStartAutonomous()">Start autonomous run</button>
+            <span id="cp-auto-msg" style="font-size:10px;color:var(--txt2)"></span>
+          </div>
+          <div id="cp-auto-status"></div>
+        </div>
+      </details>
+
       <!-- Needs-human inbox: pauses from other headless mechanisms (Vuln Validator
            triage today; MCP approval + login captcha next) surface here as cards. -->
       <div id="cp-hil-inbox" style="display:none;padding:10px 18px;border-bottom:1px solid var(--bdr);max-height:280px;overflow-y:auto"></div>

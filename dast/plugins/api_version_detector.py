@@ -28,6 +28,12 @@ _VERSION_RE = re.compile(
 # host → { base_path → set of versions }
 _seen: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
+# (host, base, oldest, newest) version pairs already reported. Without this the
+# finding would re-emit on every subsequent request to a versioned path (the
+# per-entry dedup in ``add_finding`` does not span entries), flooding the
+# dashboard with identical medium findings.
+_flagged: set[tuple[str, str, str, str]] = set()
+
 
 def _parse_version(path: str):
     m = _VERSION_RE.match(path)
@@ -63,7 +69,13 @@ class ApiVersionDetectorPlugin(ProxyPlugin):
         oldest = sorted_versions[0]
         newest = sorted_versions[-1]
 
-        # Only flag once per host+base combination
+        # Flag once per (host, base, version-pair). Re-emit only when a newer
+        # version surfaces (the pair changes), never on every request.
+        dedup_key = (entry.host, base, oldest, newest)
+        if dedup_key in _flagged:
+            return
+        _flagged.add(dedup_key)
+
         store.add_finding(
             entry.id,
             {

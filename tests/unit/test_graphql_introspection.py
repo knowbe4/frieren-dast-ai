@@ -12,13 +12,17 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import json
+
 from dast.plugins.graphql_introspection import (
     GraphQLIntrospectionPlugin,
     _compact_schema,
     _is_graphql_endpoint,
+    _request_is_introspection,
     _unwrap_type,
     _wrapper_kind,
     catalogue_endpoint,
+    store_captured_introspection,
 )
 
 
@@ -287,3 +291,178 @@ class TestOnEntryNeverAutoIntrospects:
         plugin = GraphQLIntrospectionPlugin()
         await plugin.on_entry(self._FakeEntry(path="/api/users"), store)
         assert store.graphql_schemas == {}
+
+
+_INTROSPECTION_REQUEST_BODY = b'{"query": "query IntrospectionQuery { __schema { queryType { name } } }"}'
+
+
+def _introspection_response_body() -> bytes:
+    """A minimal but valid introspection response with one query and one mutation."""
+    raw = {
+        "data": {
+            "__schema": {
+                "mutationType": {"name": "Mutation"},
+                "queryType": {"name": "Query"},
+                "types": [
+                    {
+                        "name": "Query", "kind": "OBJECT",
+                        "fields": [{
+                            "name": "me",
+                            "type": {"name": "User", "kind": "OBJECT"},
+                            "args": [],
+                        }],
+                    },
+                    {
+                        "name": "Mutation", "kind": "OBJECT",
+                        "fields": [{
+                            "name": "login",
+                            "type": {"name": "String", "kind": "SCALAR"},
+                            "args": [{"name": "password", "type": _non_null(_scalar("String"))}],
+                        }],
+                    },
+                ],
+            }
+        }
+    }
+    return json.dumps(raw).encode("utf-8")
+
+
+class _CaptureEntry:
+    def __init__(
+        self,
+        request_body: bytes | None = _INTROSPECTION_REQUEST_BODY,
+        response_status: int | None = 200,
+        response_body: bytes | None = None,
+        source: str = "browse",
+        method: str = "POST",
+        path: str = "/graphql",
+        url: str = "https://example.com/graphql",
+    ):
+        self.request_body = request_body
+        self.response_status = response_status
+        self.response_body = _introspection_response_body() if response_body is None else response_body
+        self.source = source
+        self.method = method
+        self.path = path
+        self.url = url
+        self.request_headers = {}
+
+
+class TestRequestIsIntrospection:
+    def test_detects_schema_query(self):
+        assert _request_is_introspection(_CaptureEntry()) is True
+
+    def test_plain_query_is_not_introspection(self):
+        assert _request_is_introspection(_CaptureEntry(request_body=b'{"query": "{ me }"}')) is False
+
+    def test_empty_body_is_not_introspection(self):
+        assert _request_is_introspection(_CaptureEntry(request_body=None)) is False
+
+
+class TestStoreCapturedIntrospection:
+    def _store(self):
+        from dast.proxy.session_store import SessionStore
+        return SessionStore()
+
+    def test_captured_introspection_is_stored_with_schema(self):
+        store = self._store()
+        stored = store_captured_introspection(
+            _CaptureEntry(), "https://example.com/graphql", store
+        )
+        assert stored is True
+        schema = store.graphql_schemas["https://example.com/graphql"]
+        assert schema["introspected"] is True
+        assert "me" in schema["queries"]
+        assert "login" in schema["mutations"]
+
+    def test_overwrites_uninstrospected_sentinel(self):
+        store = self._store()
+        store.graphql_schemas["https://example.com/graphql"] = {"introspected": False}
+        stored = store_captured_introspection(
+            _CaptureEntry(), "https://example.com/graphql", store
+        )
+        assert stored is True
+        assert store.graphql_schemas["https://example.com/graphql"]["introspected"] is True
+
+    def test_does_not_clobber_existing_introspected_schema(self):
+        store = self._store()
+        store.graphql_schemas["https://example.com/graphql"] = {
+            "introspected": True, "queries": {"manual": {}}
+        }
+        stored = store_captured_introspection(
+            _CaptureEntry(), "https://example.com/graphql", store
+        )
+        assert stored is False
+        assert store.graphql_schemas["https://example.com/graphql"]["queries"] == {"manual": {}}
+
+    def test_non_200_response_is_not_stored(self):
+        store = self._store()
+        stored = store_captured_introspection(
+            _CaptureEntry(response_status=403), "https://example.com/graphql", store
+        )
+        assert stored is False
+        assert store.graphql_schemas == {}
+
+    def test_non_introspection_request_is_not_stored(self):
+        store = self._store()
+        stored = store_captured_introspection(
+            _CaptureEntry(request_body=b'{"query": "{ me }"}'),
+            "https://example.com/graphql", store,
+        )
+        assert stored is False
+        assert store.graphql_schemas == {}
+
+    def test_response_without_schema_data_is_not_stored(self):
+        store = self._store()
+        stored = store_captured_introspection(
+            _CaptureEntry(response_body=b'{"data": {"me": {"id": 1}}}'),
+            "https://example.com/graphql", store,
+        )
+        assert stored is False
+        assert store.graphql_schemas == {}
+
+    def test_non_json_response_is_not_stored(self):
+        store = self._store()
+        stored = store_captured_introspection(
+            _CaptureEntry(response_body=b"<html>not json</html>"),
+            "https://example.com/graphql", store,
+        )
+        assert stored is False
+        assert store.graphql_schemas == {}
+
+
+class TestOnEntryHarvestsCapturedIntrospection:
+    def _store(self):
+        from dast.proxy.session_store import SessionStore
+        return SessionStore()
+
+    @pytest.mark.asyncio
+    async def test_on_entry_harvests_schema_from_captured_response(self):
+        store = self._store()
+        plugin = GraphQLIntrospectionPlugin()
+        # Never sends an outbound request — the schema comes from the captured response.
+        with patch("dast.plugins.graphql_introspection._introspect", AsyncMock()) as mock_introspect:
+            await plugin.on_entry(_CaptureEntry(), store)
+        mock_introspect.assert_not_called()
+        schema = store.graphql_schemas["https://example.com/graphql"]
+        assert schema["introspected"] is True
+        assert "me" in schema["queries"]
+        assert "login" in schema["mutations"]
+
+    @pytest.mark.asyncio
+    async def test_on_entry_ignores_agent_captured_introspection(self):
+        store = self._store()
+        plugin = GraphQLIntrospectionPlugin()
+        await plugin.on_entry(_CaptureEntry(source="agent"), store)
+        assert store.graphql_schemas == {}
+
+    @pytest.mark.asyncio
+    async def test_on_entry_plain_query_only_catalogues(self):
+        # A normal (non-introspection) GraphQL request just catalogues the endpoint.
+        store = self._store()
+        plugin = GraphQLIntrospectionPlugin()
+        await plugin.on_entry(
+            _CaptureEntry(request_body=b'{"query": "{ me }"}', response_body=b'{"data": {"me": null}}'),
+            store,
+        )
+        assert store.graphql_schemas["https://example.com/graphql"] == {"introspected": False}

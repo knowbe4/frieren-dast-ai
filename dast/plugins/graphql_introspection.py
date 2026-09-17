@@ -4,11 +4,16 @@ GraphQL Introspection plugin.
 On every proxied request, detects new GraphQL endpoints (POST requests whose
 path ends with /graphql or whose body contains a GraphQL query/mutation) and
 catalogues them in SessionStore.graphql_schemas keyed by endpoint URL — no
-outbound request is made automatically. Introspection (which sends a real
-request to the target, and needs the right auth headers for the endpoint's
-owning session) is always a manual, user-triggered action from the GraphQL
-tab's Schema Explorer (POST /api/graphql/introspect) or from rescanning
-already-captured history (POST /api/graphql/rescan-history).
+outbound request is made automatically. When a captured exchange IS itself a
+successful introspection (the browser or the copilot ran the introspection
+query directly), the plugin harvests the schema straight from the response so
+it populates the Schema Explorer — still without sending anything of its own.
+
+Actively *sending* an introspection request to the target (which needs the
+right auth headers for the endpoint's owning session) remains a manual,
+user-triggered action from the GraphQL tab's Schema Explorer
+(POST /api/graphql/introspect) or from rescanning already-captured history
+(POST /api/graphql/rescan-history).
 
 The findings importer reads introspected schemas when constructing query/mutation
 bodies for imported reports, so the generated bodies match the actual API schema.
@@ -320,6 +325,51 @@ def catalogue_endpoint(endpoint: str, store: "SessionStore") -> bool:
     return True
 
 
+def _request_is_introspection(entry: "ProxyEntry") -> bool:
+    """True if the request body is (or contains) a GraphQL introspection query."""
+    if not entry.request_body:
+        return False
+    try:
+        body = entry.request_body[:8000].decode("utf-8", errors="replace")
+    except Exception:
+        return False
+    return "__schema" in body
+
+
+def store_captured_introspection(
+    entry: "ProxyEntry", endpoint: str, store: "SessionStore"
+) -> bool:
+    """
+    If this captured exchange IS a successful introspection — the request asks for
+    ``__schema`` and the 200 response carries ``data.__schema`` — compact the schema
+    straight from the response and store it, so it populates the Schema Explorer
+    without a redundant re-send. This is what makes an introspection performed by the
+    browser or by the copilot's send_request show up in the GraphQL tab instead of
+    leaving an un-introspected endpoint the operator must re-query by hand.
+
+    Never clobbers an already-introspected schema (a manual run may have used better
+    auth). ``response_body`` is stored already-decompressed by the proxy, so it parses
+    as plain JSON. Returns True iff a schema was stored.
+    """
+    response_status = getattr(entry, "response_status", None)
+    response_body = getattr(entry, "response_body", None)
+    if response_status != 200 or not response_body:
+        return False
+    if not _request_is_introspection(entry):
+        return False
+    existing = store.graphql_schemas.get(endpoint)
+    if existing and existing.get("introspected"):
+        return False
+    try:
+        data = json.loads(response_body.decode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or not (data.get("data") or {}).get("__schema"):
+        return False
+    store.graphql_schemas[endpoint] = _compact_schema(data)
+    return True
+
+
 class GraphQLIntrospectionPlugin(ProxyPlugin):
     name = "GraphQL Introspection"
     description = (
@@ -344,5 +394,17 @@ class GraphQLIntrospectionPlugin(ProxyPlugin):
             log_event(
                 self.name, "info",
                 "New GraphQL endpoint discovered — run introspection from the GraphQL tab to load its schema",
+                url=endpoint,
+            )
+
+        # If this exchange itself carried a full introspection response (the browser
+        # or the copilot ran the introspection query directly), harvest the schema
+        # from the captured response so it populates the Schema Explorer without a
+        # redundant re-send.
+        if store_captured_introspection(entry, endpoint, store):
+            logger.info("GraphQL schema harvested from captured introspection", endpoint=endpoint)
+            log_event(
+                self.name, "info",
+                "GraphQL schema loaded from captured introspection traffic",
                 url=endpoint,
             )

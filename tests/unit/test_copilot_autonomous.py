@@ -143,7 +143,7 @@ async def test_driver_self_continues_then_completes():
     # Turn 1 is the autonomous preamble; later turns are continuation prompts.
     prompts = [c.args[0] for c in session["engine"].send.await_args_list]
     assert "AUTONOMOUS PENTEST" in prompts[0]
-    assert "Continue with your plan" in prompts[1]
+    assert "Continue autonomously" in prompts[1]
 
 
 @pytest.mark.asyncio
@@ -370,3 +370,99 @@ async def test_policy_escalates_scope_when_enabled():
     session["_pause_event"].set()
     result = await task
     assert result == {"decision": "allow_once"}
+
+
+# ── Tool-first + pentester prompts, and app-context leads feed ──────────────────
+class _FakeProfile:
+    """Stand-in for AppProfile — only to_coordinator_hint() is read by _leads_label."""
+
+    def __init__(self, hint: str) -> None:
+        self._hint = hint
+
+    def to_coordinator_hint(self) -> str:
+        return self._hint
+
+
+class _FakeDiscoveryEngine:
+    def __init__(self, profiles: Optional[dict] = None, raises: bool = False) -> None:
+        self._profiles = profiles or {}
+        self._raises = raises
+
+    def all_app_profiles(self) -> dict:
+        if self._raises:
+            raise RuntimeError("discovery engine unavailable")
+        return self._profiles
+
+
+class _StoreWithProfiles(_FakeStore):
+    def __init__(self, profiles: Optional[dict] = None, raises: bool = False,
+                 **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.discovery_engine = _FakeDiscoveryEngine(profiles, raises=raises)
+
+
+def _service_with_profiles(profiles: Optional[dict] = None,
+                           raises: bool = False) -> CopilotService:
+    return CopilotService(_FakeCtx(_StoreWithProfiles(profiles=profiles, raises=raises)))
+
+
+@pytest.mark.asyncio
+async def test_start_prompt_mandates_internal_tools_and_active_testing():
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    start = session["engine"].send.await_args_list[0].args[0]
+    # Tool-first mandate — drive Frieren's own instruments, not raw HTTP.
+    assert "USE THE INTERNAL TOOLS" in start
+    assert "graphql_introspect" in start
+    assert "run_scan" in start
+    # Pentester-not-reader mandate — form hypotheses and actively TEST them.
+    assert "BE A PENTESTER" in start
+    assert "IDOR" in start
+
+
+def test_leads_label_nudge_when_no_profiles():
+    label = _service_with_profiles({})._leads_label(["h"])
+    assert "none from app-context analysis yet" in label
+
+
+def test_leads_label_survives_discovery_error():
+    # A broken discovery engine must never crash the run — degrade to the nudge.
+    label = _service_with_profiles(raises=True)._leads_label(["h"])
+    assert "none from app-context analysis yet" in label
+
+
+def test_leads_label_returns_hint_for_focus_host():
+    service = _service_with_profiles(
+        {"api.example.com": _FakeProfile("HIGH: IDOR on /lx/profile — swap user id")})
+    label = service._leads_label(["api.example.com"])
+    assert "chase and TEST" in label
+    assert "HIGH: IDOR on /lx/profile — swap user id" in label
+    assert "[api.example.com]" in label
+
+
+def test_leads_label_filters_out_non_focus_hosts():
+    service = _service_with_profiles({
+        "api.example.com": _FakeProfile("in-focus lead"),
+        "other.example.com": _FakeProfile("off-focus lead"),
+    })
+    label = service._leads_label(["api.example.com"])
+    assert "in-focus lead" in label
+    assert "off-focus lead" not in label
+
+
+@pytest.mark.asyncio
+async def test_app_context_leads_are_injected_into_start_and_continue_prompts():
+    store = _StoreWithProfiles({"h": _FakeProfile("HIGH: BOLA on /users/{id}")})
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("obj", focus_hosts=["h"],
+                                 budget={"max_stuck_turns": 10})
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[
+        _Reply("progress"), _Reply("done", "complete")])
+    await session["_task"]
+    prompts = [c.args[0] for c in session["engine"].send.await_args_list]
+    assert "HIGH: BOLA on /users/{id}" in prompts[0]      # start prompt carries leads
+    assert "HIGH: BOLA on /users/{id}" in prompts[1]      # continuation carries them too

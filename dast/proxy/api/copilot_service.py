@@ -87,23 +87,44 @@ _ESCALATE_REASONS = frozenset({
 })
 
 _AUTONOMOUS_START = (
-    "[AUTONOMOUS PENTEST] You are running fully autonomously against {hosts}. "
-    "Objective: {objective}\n\n"
-    "Work the objective end to end across many turns without waiting for me. Map the "
-    "surface first (crawl, graphql_introspect, get_history), then actively test "
-    "in-scope endpoints: use run_scan to unleash the full arsenal on an endpoint, and "
-    "send_request / validate_chain for targeted checks. Record confirmed issues with "
-    "record_finding. After each result, keep going to the next endpoint or technique.\n"
-    "Signal control ONLY through blocked_reason on a reply: set it to 'complete' when "
-    "the objective is fully covered, or 'need_human' with a specific question when you "
-    "genuinely cannot proceed without me (a value only I have, or a decision). "
-    "Otherwise just report progress in the message and continue working."
+    "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
+    "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
+    "every action is registered inside the tool (schemas, history, findings) for the human to "
+    "review later. Objective: {objective}\n\n"
+    "Work the objective end to end across many turns without waiting for me.\n"
+    "USE THE INTERNAL TOOLS — never hand-roll with send_request what a dedicated tool does:\n"
+    "- graphql_introspect on any GraphQL endpoint (this registers the schema in Frieren); do "
+    "NOT introspect by hand with send_request.\n"
+    "- run_scan on every interesting in-scope endpoint to unleash the full arsenal "
+    "(planner + parallel VulnAgents + Red-Team Validator) — this is how confirmed findings get "
+    "registered; a raw request that you eyeball registers nothing.\n"
+    "- crawl / content_discovery / param_mining to expand the surface; get_history to reuse what "
+    "you already captured; record_finding for anything you confirm yourself.\n"
+    "- send_request / validate_chain ONLY for a targeted check no dedicated tool covers.\n"
+    "BE A PENTESTER, NOT A READER. When you observe auth material (decode JWTs and reason about "
+    "claims/roles/expiry), permission or ACL maps (e.g. /spa/session), or user-scoped endpoints "
+    "(e.g. /lx/profile), form a concrete hypothesis and TEST it: IDOR/BOLA by swapping ids or "
+    "account context, privilege escalation, mass assignment, reflected/stored XSS, parameter "
+    "tampering. Non-destructive, detection-only, any time delay <= 5s. Reading an endpoint and "
+    "moving on WITHOUT testing it is a failure.\n\n"
+    "{leads}\n\n"
+    "Signal control ONLY through blocked_reason on a reply: set it to 'complete' when the "
+    "objective is fully covered AND you have actively TESTED the high-value leads (not merely "
+    "mapped them); or 'need_human' with a specific question when you genuinely cannot proceed "
+    "without me (a value only I have, or a decision) — and then also say what a vulnerable "
+    "response would look like vs. a normal one, so I can help. Otherwise just report progress "
+    "in the message and keep working."
 )
 
 _AUTONOMOUS_CONTINUE = (
-    "Continue with your plan autonomously. Progress so far: {progress}. "
-    "Budget remaining: {budget}. Set blocked_reason='complete' once the objective is "
-    "fully covered, or 'need_human' if you are truly blocked."
+    "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
+    "run_scan, crawl, param_mining, record_finding), and actively TEST leads "
+    "(IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
+    "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
+    "{leads}\n\n"
+    "Set blocked_reason='complete' ONLY once the objective is covered and the high-value leads "
+    "have been actively tested; or 'need_human' if you are truly blocked (say what a vulnerable "
+    "vs. normal response would look like)."
 )
 
 _AUTONOMOUS_GUIDANCE = (
@@ -734,6 +755,33 @@ class CopilotService:
         )
         return result if isinstance(result, dict) else {"action": "abort", "answer": ""}
 
+    def _leads_label(self, hosts: List[str]) -> str:
+        """Compact, prioritised app-context leads for the focus hosts, injected into the
+        autonomous turn prompt so the copilot chases concrete hypotheses ITSELF instead of
+        escalating to a human. Reuses AppProfile.to_coordinator_hint() (already
+        prompt-injection sanitised). Empty-safe: returns a nudge when nothing is profiled yet."""
+        nudge = ("Leads: none from app-context analysis yet — map the surface "
+                 "(crawl, graphql_introspect, get_history) to surface concrete hypotheses.")
+        store = self._ctx.store
+        if store is None:
+            return nudge
+        try:
+            profiles = store.discovery_engine.all_app_profiles()
+        except Exception as exc:  # noqa: BLE001 — leads are best-effort, never crash the run
+            logger.debug("autonomous leads unavailable", error=str(exc))
+            return nudge
+        focus_names = {h.split(":")[0] for h in (hosts or [])}
+        blocks: List[str] = []
+        for host, profile in profiles.items():
+            if focus_names and host.split(":")[0] not in focus_names:
+                continue
+            hint = profile.to_coordinator_hint()
+            if hint:
+                blocks.append(f"[{host}]\n{hint}")
+        if not blocks:
+            return nudge
+        return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
+
     async def _drive_autonomous(self, sid: str) -> None:
         """The cross-turn autonomy loop: self-continue turns commanding the arsenal
         until a stop condition trips. A plain reply is a checkpoint, not a stop."""
@@ -748,7 +796,10 @@ class CopilotService:
         wait_for_human = self._make_autonomous_wait(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
-        prompt = _AUTONOMOUS_START.format(objective=auto["objective"], hosts=hosts_label)
+        prompt = _AUTONOMOUS_START.format(
+            objective=auto["objective"], hosts=hosts_label,
+            leads=self._leads_label(auto["hosts"]),
+        )
 
         last_progress = self._progress_snapshot()
         stuck_turns = 0
@@ -818,6 +869,7 @@ class CopilotService:
                     prompt = _AUTONOMOUS_CONTINUE.format(
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
+                        leads=self._leads_label(auto["hosts"]),
                     )
                     continue
 
@@ -863,6 +915,7 @@ class CopilotService:
                 prompt = _AUTONOMOUS_CONTINUE.format(
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
+                    leads=self._leads_label(auto["hosts"]),
                 )
         except asyncio.CancelledError:
             self._finish_autonomous(session, "stopped", "cancelled")

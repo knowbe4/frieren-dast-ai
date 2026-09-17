@@ -570,6 +570,25 @@ async def test_validate_chain_out_of_scope_blocked():
     assert "out of scope" in result["error"]
 
 
+def test_validate_chain_schema_specifies_steps_and_requires_one_of():
+    # The schema must describe chain.steps concretely (so an LLM builds a valid
+    # spec instead of an empty {}), and forbid empty args via anyOf so a caller
+    # cannot satisfy it with neither report_text nor chain.
+    from dast.tools.chain_tools import _VALIDATE_CHAIN_SCHEMA
+
+    props = _VALIDATE_CHAIN_SCHEMA["properties"]
+    assert "report_text" in props and "chain" in props
+    steps = props["chain"]["properties"]["steps"]
+    assert steps["type"] == "array"
+    step_item = steps["items"]
+    assert step_item["required"] == ["name", "url"]
+    assert "extract" in step_item["properties"]
+    assert "assertions" in step_item["properties"]
+    branches = _VALIDATE_CHAIN_SCHEMA["anyOf"]
+    assert {"required": ["report_text"]} in branches
+    assert {"required": ["chain"]} in branches
+
+
 # ── graphql_introspect (dedicated introspection path, both callers) ─────────────
 
 @pytest.mark.asyncio

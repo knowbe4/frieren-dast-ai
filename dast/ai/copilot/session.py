@@ -37,6 +37,12 @@ _MAX_TOOL_CALLS_PER_TURN = 12
 # neither a tool call nor a reply) before the turn gives up and hands back.
 _MAX_CONSECUTIVE_LLM_FAILURES = 3
 
+# Consecutive tool calls that fail, repeat, or name an unknown tool before the turn
+# gives up. Distinct from the LLM-failure counter: a model that keeps firing broken
+# calls (e.g. validate_chain with empty args) resets the LLM counter every step, so
+# without this guard only the 12-call budget stops it — a long, useless loop.
+_MAX_CONSECUTIVE_TOOL_FAILURES = 4
+
 # Tool observations fed back into the turn transcript are truncated to this many
 # chars so a large response body cannot blow the context.
 _OBSERVATION_MAX_CHARS = 2000
@@ -158,12 +164,40 @@ def _candidate_urls(args: Dict[str, Any]) -> List[str]:
     return urls
 
 
+def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
+    """Compact one-line argument hint from a tool's JSON Schema: ``name:type`` per
+    property, required ones marked ``*``. Without this the copilot menu shows a
+    tool's name and description but NOT its arguments, so the model guesses the
+    shape (and fires empty/malformed calls like validate_chain({}))."""
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return ""
+    required = set(schema.get("required") or [])
+    # anyOf/oneOf branches carry their own required lists (e.g. validate_chain
+    # requires report_text OR chain); mark those args required too so the model
+    # knows at least one is mandatory.
+    for branch in schema.get("anyOf", []) + schema.get("oneOf", []):
+        if isinstance(branch, dict):
+            required.update(branch.get("required") or [])
+    parts: List[str] = []
+    for name, spec in properties.items():
+        type_name = str(spec.get("type", "")) if isinstance(spec, dict) else ""
+        marker = "*" if name in required else ""
+        parts.append(f"{name}{marker}:{type_name}" if type_name else f"{name}{marker}")
+    return ", ".join(parts)
+
+
 def _render_tool_menu(tool_defs: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for definition in tool_defs:
         desc = (definition.get("description") or "").strip().splitlines()
         first = desc[0] if desc else ""
         lines.append(f"- {definition['name']}: {first}")
+        signature = _render_arg_signature(definition.get("input_schema"))
+        if signature:
+            lines.append(f"    args ('*' = required): {signature}")
     return "\n".join(lines)
 
 
@@ -290,7 +324,7 @@ class CopilotSession:
         # Exclude copilot-tagged tools (e.g. copilot_ask) so the copilot can never
         # call itself — those exist only to let OTHER agents/MCP clients drive it.
         tool_defs = [
-            {"name": t.name, "description": t.description}
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
             for t in all_tools()
             if "copilot" not in (t.tags or [])
         ]
@@ -308,6 +342,7 @@ class CopilotSession:
 
         turn_transcript: List[Dict[str, Any]] = []
         consecutive_failures = 0
+        consecutive_tool_failures = 0
 
         async def _observe(entry: Dict[str, Any], observation: str) -> None:
             entry["observation"] = observation
@@ -322,6 +357,31 @@ class CopilotSession:
             return CopilotReply(
                 message=message, blocked_reason=blocked_reason, transcript=turn_transcript
             )
+
+        async def _record_tool_failure(
+            entry: Dict[str, Any], observation: str
+        ) -> Optional[CopilotReply]:
+            """Record a failed/repeated/unknown tool call and bail out of the turn
+            once too many pile up in a row. Returns a reply to return, or None to
+            keep going."""
+            nonlocal consecutive_tool_failures
+            consecutive_tool_failures += 1
+            await _observe(entry, observation)
+            if consecutive_tool_failures >= _MAX_CONSECUTIVE_TOOL_FAILURES:
+                logger.warning("Copilot: too many failed tool calls this turn",
+                               session_id=self.session_id,
+                               failures=consecutive_tool_failures)
+                reply = _finalize(
+                    "Several of my tool calls in a row failed or repeated without "
+                    "making progress, so I'm stopping to avoid spinning. Here's where "
+                    "I am — tell me how you'd like me to proceed, or give me a value "
+                    "I'm missing (an ID, a second account, or explicit scope).",
+                    blocked_reason="need_direction",
+                )
+                await on_event({"type": "reply", "message": reply.message,
+                                "blocked_reason": reply.blocked_reason})
+                return reply
+            return None
 
         try:
             step = 0
@@ -405,25 +465,28 @@ class CopilotSession:
                             self._context_hosts.add(touched)
 
                     if tool_name not in tool_names:
-                        await _observe(entry, f"Unknown tool '{tool_name}'. Choose one "
-                                       f"of: {', '.join(sorted(tool_names))}.")
+                        reply = await _record_tool_failure(
+                            entry, f"Unknown tool '{tool_name}'. Choose one of: "
+                            f"{', '.join(sorted(tool_names))}.")
+                        if reply is not None:
+                            return reply
                         continue
 
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
-                        await _observe(entry, "Repeat of an earlier identical call — "
-                                       "suppressed. Try a different request or reply.")
+                        reply = await _record_tool_failure(
+                            entry, "Repeat of an earlier identical call — suppressed. "
+                            "Try a different request or reply.")
+                        if reply is not None:
+                            return reply
                         continue
                     self._seen_calls.add(call_key)
 
-                    # Apply any collected session cookies to a request-shaped call.
-                    if self._session_cookies and "url" in tool_args:
-                        headers = dict(tool_args.get("headers") or {})
-                        if not any(k.lower() == "cookie" for k in headers):
-                            headers["Cookie"] = "; ".join(
-                                f"{k}={v}" for k, v in self._session_cookies.items()
-                            )
-                            tool_args["headers"] = headers
+                    # Reuse the operator's already-captured session (proxy cookie jar
+                    # + borrowed auth headers) on a request-shaped call. Runs after
+                    # the anti-repeat key is computed so the injected session never
+                    # changes the dedup identity of the model's intended call.
+                    self._apply_session_auth(tool_ctx, tool_args)
 
                     if await self._scope_gate(
                         tool_name, tool_args, tool_ctx, approved_hosts,
@@ -437,8 +500,16 @@ class CopilotSession:
                         result, tool_args, entry, wait_for_human, _observe,
                         _looks_like_auth_wall, _sanitise_cookies, call_key,
                     ):
+                        consecutive_tool_failures = 0  # session applied — progress made
                         continue  # session applied — retry allowed
 
+                    if not result.get("ok"):
+                        reply = await _record_tool_failure(entry, _summarize_result(result))
+                        if reply is not None:
+                            return reply
+                        continue
+
+                    consecutive_tool_failures = 0
                     await _observe(entry, _summarize_result(result))
                     continue
 
@@ -479,6 +550,74 @@ class CopilotSession:
         except Exception as exc:
             logger.error("Copilot turn error", session_id=self.session_id, error=str(exc))
             return _finalize(f"Internal error: {str(exc)[:300]}", blocked_reason="error")
+
+    def _apply_session_auth(self, tool_ctx: Any, tool_args: Dict[str, Any]) -> None:
+        """Reuse the operator's already-captured session on a request-shaped call.
+
+        Frieren has usually already seen the operator log in through the proxy, so
+        the session it needs is sitting in the store: the cookie jar for the target
+        host, plus the auth headers (Authorization / X-Auth-Token / X-Api-Key) of
+        the most recent real request to that host. This sources both and injects
+        whatever the model did not set itself — so the copilot picks up the logged-in
+        session from history instead of bouncing off a login wall on every request.
+
+        Precedence: browser-handoff cookies (collected on an auth-wall pause) beat
+        the passive jar; anything the model set explicitly beats both (never
+        overwritten). Cookies are host-scoped via the jar; borrowed non-cookie auth
+        headers come from the freshest matching request to the same host.
+        """
+        urls = _candidate_urls(tool_args)
+        if not urls:
+            return
+        host = (urlparse(urls[0]).hostname or "").lower()
+        if not host:
+            return
+
+        store = getattr(tool_ctx, "store", None)
+
+        # Cookies: passive proxy jar for the host, overlaid with fresh handoff cookies.
+        cookies: Dict[str, str] = {}
+        if store is not None:
+            try:
+                for cookie in store.get_cookies_for_host(host):
+                    name = cookie.get("name")
+                    if name:
+                        cookies[name] = cookie.get("value", "")
+            except Exception as exc:
+                logger.warning("Copilot: cookie-jar lookup failed",
+                               host=host, error=str(exc))
+        cookies.update(self._session_cookies)  # handoff cookies win
+
+        # Auth headers: the freshest real request to this host.
+        borrowed_headers: Dict[str, str] = {}
+        if store is not None:
+            try:
+                from dast.proxy.auth_headers import extract_auth_headers
+                recent_first = list(reversed(store.all_entries()))
+                borrowed_headers = extract_auth_headers(
+                    recent_first, host=host, limit=200
+                )
+            except Exception as exc:
+                logger.warning("Copilot: auth-header lookup failed",
+                               host=host, error=str(exc))
+
+        if not cookies and not borrowed_headers:
+            return
+
+        headers = dict(tool_args.get("headers") or {})
+        present = {key.lower() for key in headers}
+
+        if cookies and "cookie" not in present:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+        for name, value in borrowed_headers.items():
+            if name.lower() == "cookie":
+                continue  # cookies come from the host-scoped jar above
+            if name.lower() not in present:
+                headers[name] = value
+
+        if headers:
+            tool_args["headers"] = headers
 
     async def _scope_gate(
         self,

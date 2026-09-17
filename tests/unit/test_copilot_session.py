@@ -24,12 +24,39 @@ class _FakeTool:
     name: str
     description: str = "does a thing"
     tags: List[str] = field(default_factory=list)
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _FakeEntry:
+    """Minimal ProxyEntry stand-in for auth-header sniffing."""
+
+    host: str
+    request_headers: Dict[str, str] = field(default_factory=dict)
+    source: str = "proxy"
+
+
+class _FakeStore:
+    """Minimal SessionStore stand-in exposing the cookie/entry accessors that
+    CopilotSession._apply_session_auth reads."""
+
+    def __init__(self, cookies: List[Dict[str, str]] | None = None,
+                 entries: List[_FakeEntry] | None = None) -> None:
+        self._cookies = cookies or []
+        self._entries = entries or []
+
+    def get_cookies_for_host(self, host: str) -> List[Dict[str, str]]:
+        return list(self._cookies)
+
+    def all_entries(self) -> List[_FakeEntry]:
+        return list(self._entries)
 
 
 class _FakeCtx:
     def __init__(self, in_scope: bool = True) -> None:
         self._in_scope = in_scope
         self.approved_hosts: set = set()
+        self.store: Any = None
 
     def is_in_scope(self, url: str) -> bool:
         return self._in_scope
@@ -370,3 +397,174 @@ async def test_turn_ceiling_forces_reply():
                                    wait_for_human=_deny_human())
 
     assert reply.blocked_reason == "need_direction"
+
+
+@pytest.mark.asyncio
+async def test_repeated_failing_tool_calls_end_turn_early():
+    # A model that keeps firing failing calls (e.g. validate_chain with bad args)
+    # must not run to the 12-call ceiling: the tool-failure guard hands back after
+    # _MAX_CONSECUTIVE_TOOL_FAILURES. Distinct URLs each step evade anti-repeat, so
+    # the failure counter (not the dedup) is what stops the loop.
+    from dast.ai.copilot.session import _MAX_CONSECUTIVE_TOOL_FAILURES
+
+    session = CopilotSession("s-fail")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": False, "error": "bad args"})
+
+    def failing(*_a, **_k):
+        failing.n += 1
+        return {"action": "call_tool", "thought": "retry", "tool_name": "send_request",
+                "tool_args": {"url": f"https://in.scope/{failing.n}"}}
+    failing.n = 0
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=failing)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "need_direction"
+    assert run_tool.await_count == _MAX_CONSECUTIVE_TOOL_FAILURES  # not the 12 ceiling
+
+
+@pytest.mark.asyncio
+async def test_successful_calls_reset_the_failure_guard():
+    # An occasional failure interleaved with successes must not accumulate toward
+    # the failure ceiling — only a *consecutive* run of failures ends the turn.
+    session = CopilotSession("s-mix")
+    _, on_event = _collector()
+
+    def outcome(ctx, name, args):
+        # Odd calls fail, even calls succeed -> failures never reach the ceiling.
+        outcome.n += 1
+        return {"ok": outcome.n % 2 == 0, "status": 200}
+    outcome.n = 0
+    run_tool = AsyncMock(side_effect=outcome)
+
+    def alternate(*_a, **_k):
+        alternate.n += 1
+        if alternate.n > 8:
+            return {"action": "reply", "thought": "done", "message": "ok"}
+        return {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+                "tool_args": {"url": f"https://in.scope/{alternate.n}"}}
+    alternate.n = 0
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=alternate)):
+        reply = await session.send("go", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.message == "ok"  # reached the reply, not the failure guard
+
+
+@pytest.mark.asyncio
+async def test_session_auth_injects_jar_cookies_and_borrowed_headers():
+    # The copilot must reuse the operator's already-captured session: the proxy
+    # cookie jar for the target host plus auth headers borrowed from the freshest
+    # request to that host, applied when the model did not set them itself.
+    session = CopilotSession("s-auth")
+    _, on_event = _collector()
+
+    store = _FakeStore(
+        cookies=[{"name": "session", "value": "abc"}],
+        entries=[_FakeEntry(host="in.scope",
+                            request_headers={"Authorization": "Bearer XYZ",
+                                             "Cookie": "old=1"})],
+    )
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_tool(_ctx, _name, args):
+        captured["args"] = args
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x"}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    headers = captured["args"]["headers"]
+    assert headers["Cookie"] == "session=abc"  # from the host-scoped jar
+    assert headers["Authorization"] == "Bearer XYZ"  # borrowed from history
+
+
+@pytest.mark.asyncio
+async def test_session_auth_never_overwrites_model_set_headers():
+    session = CopilotSession("s-auth2")
+    _, on_event = _collector()
+
+    store = _FakeStore(
+        cookies=[{"name": "session", "value": "abc"}],
+        entries=[_FakeEntry(host="in.scope",
+                            request_headers={"Authorization": "Bearer STALE"})],
+    )
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_tool(_ctx, _name, args):
+        captured["args"] = args
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x",
+                       "headers": {"Authorization": "Bearer MINE"}}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    headers = captured["args"]["headers"]
+    assert headers["Authorization"] == "Bearer MINE"  # model's header preserved
+    assert headers["Cookie"] == "session=abc"  # jar cookie still added
+
+
+def test_render_arg_signature_marks_required_and_anyof():
+    from dast.ai.copilot.session import _render_arg_signature
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+            "method": {"type": "string"},
+            "report_text": {"type": "string"},
+            "chain": {"type": "object"},
+        },
+        "required": ["url"],
+        "anyOf": [{"required": ["report_text"]}, {"required": ["chain"]}],
+    }
+    signature = _render_arg_signature(schema)
+    assert "url*:string" in signature
+    assert "method:string" in signature
+    assert "report_text*:string" in signature  # required via anyOf
+    assert "chain*:object" in signature
+    assert _render_arg_signature({}) == ""
+    assert _render_arg_signature(None) == ""
+
+
+def test_tool_menu_includes_arg_signatures():
+    from dast.ai.copilot.session import _render_tool_menu
+
+    tool_defs = [{
+        "name": "send_request",
+        "description": "Send one HTTP request.\nMore detail here.",
+        "input_schema": {"type": "object",
+                         "properties": {"url": {"type": "string"}},
+                         "required": ["url"]},
+    }]
+    menu = _render_tool_menu(tool_defs)
+    assert "- send_request: Send one HTTP request." in menu
+    assert "url*:string" in menu
+    assert "More detail here." not in menu  # only the first description line

@@ -17,6 +17,7 @@ rules:
       header_name: cache-control
     conditions:
       content_type: any
+      one_per_host: true
     evidence_template: >-
       Authenticated request but Cache-Control is '{value}' — response may be cached
     needs_ai_validation: false

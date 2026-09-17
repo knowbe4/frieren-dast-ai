@@ -34,6 +34,12 @@ _seen: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 # dashboard with identical medium findings.
 _flagged: set[tuple[str, str, str, str]] = set()
 
+# Only genuine app/user traffic proves a version is really active. Scanner-
+# synthesized entries (content-discovery fuzzing /v1|/v2 prefixes, agent probes)
+# must not count, or every wordlist hit looks like a live multi-version API — a
+# false positive that wastes a developer's time (the CLAUDE.md bar).
+_GENUINE_SOURCES = frozenset({"proxy", "crawler", "browse"})
+
 
 def _parse_version(path: str):
     m = _VERSION_RE.match(path)
@@ -54,6 +60,13 @@ class ApiVersionDetectorPlugin(ProxyPlugin):
     enabled     = True
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
+        # Ignore scanner-synthesized traffic and non-existent paths — either would
+        # turn content-discovery probes into phantom "multiple versions" findings.
+        if getattr(entry, "source", "proxy") not in _GENUINE_SOURCES:
+            return
+        if getattr(entry, "response_status", None) == 404:
+            return
+
         version, base = _parse_version(entry.path)
         if not version or not base:
             return

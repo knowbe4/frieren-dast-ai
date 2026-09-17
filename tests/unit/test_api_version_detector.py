@@ -30,8 +30,20 @@ class _Store:
         self.findings.append((entry_id, finding, status))
 
 
-def _entry(path: str, host: str = "api.example.com", entry_id: str = "e1") -> SimpleNamespace:
-    return SimpleNamespace(id=entry_id, host=host, path=path)
+def _entry(
+    path: str,
+    host: str = "api.example.com",
+    entry_id: str = "e1",
+    source: str = "proxy",
+    response_status: int = 200,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=entry_id,
+        host=host,
+        path=path,
+        source=source,
+        response_status=response_status,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -102,3 +114,34 @@ def test_distinct_hosts_flag_separately():
           _entry("/users/v1/x", host="b.example.com"),
           _entry("/users/v2/x", host="b.example.com"))
     assert len(store.findings) == 2
+
+
+def test_synthetic_source_is_ignored():
+    # The live FP against VAmPI: content-discovery fuzzed /v1/graphiql, /v2/altair,
+    # etc., so distinct probe paths looked like many concurrent API versions.
+    # Scanner-synthesized traffic must not count as evidence of a live version.
+    store = _Store()
+    _feed(store, ApiVersionDetectorPlugin(),
+          _entry("/v1/graphiql", source="content-discovery"),
+          _entry("/v2/graphiql", source="content-discovery"))
+    assert store.findings == []
+
+
+def test_not_found_paths_are_ignored():
+    # A 404 does not prove a version exists — a wordlist hit on /v1/x and /v2/x
+    # that both 404 must not be reported as multiple active versions.
+    store = _Store()
+    _feed(store, ApiVersionDetectorPlugin(),
+          _entry("/users/v1/x", response_status=404),
+          _entry("/users/v2/x", response_status=404))
+    assert store.findings == []
+
+
+def test_genuine_traffic_still_flags_after_guards():
+    # Guardrails must not suppress real traffic: genuine 200s on two versions
+    # still emit exactly one finding.
+    store = _Store()
+    _feed(store, ApiVersionDetectorPlugin(),
+          _entry("/users/v1/list", source="browse", response_status=200),
+          _entry("/users/v2/list", source="crawler", response_status=200))
+    assert len(store.findings) == 1

@@ -28,6 +28,10 @@ class ScanQueueState:
         self.completed: collections.deque = collections.deque(maxlen=100)
         self._cancelled: set = set()
         self._running_tasks: Dict[str, asyncio.Task] = {}   # entry_id → Task
+        # Per-entry completion events, so a caller (e.g. the run_scan tool) can
+        # await ONE endpoint's terminal outcome instead of polling. Created on
+        # demand by completion_event(); set in finish() and cancel().
+        self._completion_events: Dict[str, asyncio.Event] = {}
 
     # ── pause / resume ─────────────────────────────────────────────────
 
@@ -100,6 +104,36 @@ class ScanQueueState:
             if reason:
                 item["reason"] = reason
             self.completed.appendleft(item)
+        self._signal_completion(entry_id)
+
+    # ── per-entry completion (for callers that await one endpoint) ─────
+
+    def completion_event(self, entry_id: str) -> asyncio.Event:
+        """Get-or-create the completion event for one entry. Call this BEFORE
+        enqueuing so a fast finish() can never fire before the event exists."""
+        event = self._completion_events.get(entry_id)
+        if event is None:
+            event = asyncio.Event()
+            self._completion_events[entry_id] = event
+        return event
+
+    def _signal_completion(self, entry_id: str) -> None:
+        event = self._completion_events.get(entry_id)
+        if event is not None:
+            event.set()
+
+    async def await_entry(self, entry_id: str, timeout: float) -> bool:
+        """Block until this entry reaches a terminal state (finish/cancel) or the
+        timeout elapses. Returns True on completion, False on timeout. Cleans up
+        the event afterwards."""
+        event = self.completion_event(entry_id)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+        finally:
+            self._completion_events.pop(entry_id, None)
 
     # ── cancellation ───────────────────────────────────────────────────
 
@@ -107,6 +141,7 @@ class ScanQueueState:
         """Cancel a pending item. For running items, use stop_running() instead."""
         self._cancelled.add(entry_id)
         self.pending = [p for p in self.pending if p["id"] != entry_id]
+        self._signal_completion(entry_id)
 
     def stop_running(self, entry_id: str) -> bool:
         """Cancel a currently-running scan task. Returns True if a task was found."""

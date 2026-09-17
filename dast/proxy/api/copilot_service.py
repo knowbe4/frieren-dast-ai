@@ -293,6 +293,11 @@ class CopilotService:
                 store=ctx.store,
                 settings=ctx.settings,
                 approved_hosts=session["approved_hosts"],
+                # Orchestration tools (crawl, run_scan) reach the live queues
+                # through the tool context. Present only in-process like this.
+                scan_queue=getattr(ctx, "scan_queue", None),
+                scan_queue_state=getattr(ctx, "scan_queue_state", None),
+                crawl_queue=getattr(ctx, "crawl_queue", None),
             )
             reply = await session["engine"].send(
                 text, tool_ctx, on_event=on_event, wait_for_human=wait_for_human,

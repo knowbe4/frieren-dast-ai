@@ -718,3 +718,212 @@ async def test_copilot_ask_requires_message():
     result = await run_tool(ToolContext(settings=_Scope(True)), "copilot_ask", {})
     assert result["ok"] is False
     assert "message" in result["error"]
+
+
+# ── crawl (orchestration primitive over the crawl worker) ───────────────────────
+
+class _CrawlEntry:
+    def __init__(self, method: str, url: str, source: str = "proxy"):
+        self.method = method
+        self.url = url
+        self.source = source
+
+
+class _CrawlStore:
+    """Fake store whose in-scope history grows when a crawl job is 'run'."""
+
+    def __init__(self, before, after):
+        self._before = list(before)
+        self._after = list(after)
+        self._crawled = False
+
+    def in_scope_entries(self):
+        return list(self._after) if self._crawled else list(self._before)
+
+    def mark_crawled(self):
+        self._crawled = True
+
+
+def test_crawl_registered_and_tagged():
+    tool = tools.get_tool("crawl")
+    assert tool is not None
+    assert "recon" in (tool.tags or [])
+    assert tool.input_schema.get("required") == ["url"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "crawl", {"url": "https://evil.example.com/"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_not_available_without_queue():
+    # In-scope but no crawl_queue (MCP / triage context) → graceful refusal.
+    ctx = ToolContext(settings=_Scope(True), store=_CrawlStore([], []))
+    result = await run_tool(ctx, "crawl", {"url": "https://api.acme-corp.com/"})
+    assert result["ok"] is False
+    assert "not available" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_enqueues_and_returns_new_endpoints():
+    import asyncio
+
+    before = [_CrawlEntry("GET", "https://api.acme-corp.com/")]
+    after = before + [
+        _CrawlEntry("GET", "https://api.acme-corp.com/users"),
+        _CrawlEntry("POST", "https://api.acme-corp.com/login"),
+        _CrawlEntry("GET", "https://api.acme-corp.com/app.js"),  # static asset → filtered
+    ]
+    store = _CrawlStore(before, after)
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def worker():
+        job = await queue.get()
+        store.mark_crawled()
+        job["done_event"].set()
+
+    ctx = ToolContext(settings=_Scope(True), store=store, crawl_queue=queue)
+    worker_task = asyncio.create_task(worker())
+    result = await run_tool(ctx, "crawl", {"url": "https://api.acme-corp.com/"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["timed_out"] is False
+    urls = {e["url"] for e in result["endpoints"]}
+    assert "https://api.acme-corp.com/users" in urls
+    assert "https://api.acme-corp.com/login" in urls
+    assert "https://api.acme-corp.com/app.js" not in urls  # static asset filtered
+    assert result["discovered_count"] == 2
+
+
+# ── run_scan (orchestration primitive over the scan pipeline) ───────────────────
+
+class _ScanEntry:
+    def __init__(self, method, url, host, source="proxy"):
+        self.id = f"e-{method}-{url}"
+        self.method = method
+        self.url = url
+        self.host = host
+        self.source = source
+        self.ai_queued = False
+        self.queued_for_scan = False
+        self.scan_result = None
+        self.findings = []
+
+
+class _ScanStore:
+    def __init__(self, entries, ai_mode=True):
+        self._entries = {e.id: e for e in entries}
+        self._order = [e.id for e in entries]
+        self.ai_mode = ai_mode
+
+    def all_entries(self):
+        return [self._entries[i] for i in self._order]
+
+    def get_entry(self, entry_id):
+        return self._entries.get(entry_id)
+
+
+def test_run_scan_registered_and_tagged():
+    tool = tools.get_tool("run_scan")
+    assert tool is not None
+    assert "active" in (tool.tags or [])
+    assert tool.input_schema.get("required") == ["url"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "run_scan", {"url": "https://evil.example.com/x"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_not_available_without_queue():
+    store = _ScanStore([])
+    ctx = ToolContext(settings=_Scope(True), store=store)  # no scan_queue/state
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "not available" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_no_matching_history_entry():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    store = _ScanStore([])
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=asyncio.Queue(), scan_queue_state=ScanQueueState())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "no matching request" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_enqueues_awaits_and_returns_findings():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    entry = _ScanEntry("GET", "https://api.acme-corp.com/users?id=1", "api.acme-corp.com")
+    store = _ScanStore([entry], ai_mode=True)
+    queue: asyncio.Queue = asyncio.Queue()
+    qs = ScanQueueState()
+
+    async def scan_worker():
+        entry_id = await queue.get()
+        # Simulate the real worker attaching a finding and finishing the entry.
+        target = store.get_entry(entry_id)
+        target.findings.append({
+            "title": "Reflected XSS", "attack_type": "xss", "parameter": "id",
+            "severity": "high", "raw_request": "x" * 9000,  # trimmed out
+        })
+        target.scan_result = "vulnerable"
+        qs.finish(entry_id, 1, "vulnerable")
+
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=queue, scan_queue_state=qs)
+    worker_task = asyncio.create_task(scan_worker())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/users?id=1"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["status"] == "vulnerable"
+    assert result["findings_count"] == 1
+    assert result["agents_ran"] is True
+    assert result["timed_out"] is False
+    assert entry.ai_queued is True  # dedup bypassed for a deliberate re-scan
+    finding = result["findings"][0]
+    assert finding["title"] == "Reflected XSS"
+    assert "raw_request" not in finding  # large blobs trimmed
+
+
+@pytest.mark.asyncio
+async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    entry = _ScanEntry("GET", "https://api.acme-corp.com/x?q=1", "api.acme-corp.com")
+    store = _ScanStore([entry], ai_mode=False)  # AI off, proxied entry → deterministic only
+    queue: asyncio.Queue = asyncio.Queue()
+    qs = ScanQueueState()
+
+    async def scan_worker():
+        entry_id = await queue.get()
+        store.get_entry(entry_id).scan_result = "safe"
+        qs.finish(entry_id, 0, "safe")
+
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=queue, scan_queue_state=qs)
+    worker_task = asyncio.create_task(scan_worker())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x?q=1"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["agents_ran"] is False
+    assert "note" in result

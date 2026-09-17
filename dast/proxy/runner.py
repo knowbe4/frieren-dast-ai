@@ -731,6 +731,13 @@ class ProxyRunner:
                 log_cb(f"Crawler error: {e}")
                 logger.error("Crawl failed", url=target_url, error=str(e))
                 log_event("crawler", "error", f"Crawl error: {e}", url=target_url, source="crawler")
+            finally:
+                # A programmatic caller (the crawl tool) can pass a done_event to
+                # block until this job finishes; UI callers omit it. Always set it
+                # so an awaiting caller is released on success, error, or cancel.
+                done_event = job.get("done_event")
+                if done_event is not None:
+                    done_event.set()
 
     async def _discovery_worker(self, discovery_queue: asyncio.Queue) -> None:
         """

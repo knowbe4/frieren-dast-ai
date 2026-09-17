@@ -17,6 +17,7 @@ from dast.tools.context import ToolContext
 # Import side effects register the built-in tools.
 from dast.tools import chain_tools as _chain_tools  # noqa: F401
 from dast.tools import copilot_tools as _copilot_tools  # noqa: F401
+from dast.tools import crawl_tools as _crawl_tools  # noqa: F401
 from dast.tools import encoding_tools as _encoding_tools  # noqa: F401
 from dast.tools import findings_tools as _findings_tools  # noqa: F401
 from dast.tools import graphql_tools as _graphql_tools  # noqa: F401
@@ -26,6 +27,7 @@ from dast.tools import oob_tools as _oob_tools  # noqa: F401
 from dast.tools import profile_tools as _profile_tools  # noqa: F401
 from dast.tools import recon_tools as _recon_tools  # noqa: F401
 from dast.tools import record_finding_tools as _record_finding_tools  # noqa: F401
+from dast.tools import scan_tools as _scan_tools  # noqa: F401
 from dast.tools import triage_tools as _triage_tools  # noqa: F401
 
 __all__ = [

@@ -305,6 +305,14 @@ class CopilotSession:
         ]
         self._context_hosts: set[str] = set()
 
+    def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
+        """Preload an authenticated session (e.g. from an activated login profile)
+        so requests carry it from the first tool call and the auth-wall gate stays
+        quiet (it fires only when ``_session_cookies`` is empty). Used by autonomous
+        runs where there is no operator to answer an auth handoff mid-run."""
+        if cookies:
+            self._session_cookies.update({str(k): str(v) for k, v in cookies.items() if k})
+
     async def send(
         self,
         operator_text: str,

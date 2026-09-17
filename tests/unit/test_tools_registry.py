@@ -607,7 +607,11 @@ async def test_graphql_introspect_reads_store(monkeypatch):
         def __init__(self):
             self.graphql_schemas = {}
 
-    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection"):
+    seen: dict = {}
+
+    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection",
+                              proxy_url=None):
+        seen["proxy_url"] = proxy_url
         store.graphql_schemas[endpoint] = {
             "introspected": True,
             "queries": {"me": {}, "user": {}},
@@ -623,6 +627,8 @@ async def test_graphql_introspect_reads_store(monkeypatch):
     result = await run_tool(ctx, "graphql_introspect",
                             {"url": "https://api.acme-corp.com/graphql"})
     assert result["ok"] is True
+    # Introspection is routed through the proxy (the "everything via Frieren" contract).
+    assert seen["proxy_url"] == ctx.proxy_url
     assert result["query_count"] == 2
     assert result["mutation_count"] == 1
     assert result["queries"] == ["me", "user"]

@@ -228,6 +228,7 @@ async def _introspect(
     headers: dict,
     store: "SessionStore",
     plugin_name: str = "GraphQL Introspection",
+    proxy_url: Optional[str] = None,
 ) -> Optional[str]:
     """
     Run introspection against `endpoint` using `headers` for auth, and store
@@ -236,6 +237,10 @@ async def _introspect(
     `headers` should carry whatever auth the caller has available (cookies,
     bearer tokens, etc.) — content-type/accept are set here regardless of
     what's passed in.
+
+    `proxy_url` routes the introspection request through the Frieren MITM proxy
+    so it is captured in history and treated like every other test request
+    (the DAST "everything through the proxy" contract). None sends direct.
 
     Returns None on success, or a human-readable error string on failure —
     every failure is ALSO logged (warn/error, source="plugin") to the global
@@ -249,12 +254,16 @@ async def _introspect(
 
     body = json.dumps({"query": _INTROSPECTION_QUERY})
 
+    client_kwargs: dict = {
+        "verify": False,
+        "timeout": httpx.Timeout(15.0),
+        "follow_redirects": False,
+    }
+    if proxy_url:
+        client_kwargs["proxy"] = proxy_url
+
     try:
-        async with httpx.AsyncClient(
-            verify=False,
-            timeout=httpx.Timeout(15.0),
-            follow_redirects=False,
-        ) as client:
+        async with httpx.AsyncClient(**client_kwargs) as client:
             resp = await client.post(endpoint, content=body, headers=headers)
 
         if resp.status_code != 200:

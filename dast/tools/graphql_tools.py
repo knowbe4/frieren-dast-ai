@@ -74,7 +74,12 @@ async def _graphql_introspect(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         try:
             from dast.plugins.graphql_introspection import _introspect
 
-            error = await _introspect(url, dict(headers), ctx.store, "Copilot Introspection")
+            # Route through the Frieren proxy so the introspection request is
+            # captured in history and treated like every other test request.
+            error = await _introspect(
+                url, dict(headers), ctx.store, "Copilot Introspection",
+                proxy_url=ctx.proxy_url,
+            )
             if error:
                 return {"ok": False, "error": error, "url": url}
             schema = ctx.store.graphql_schemas.get(url)

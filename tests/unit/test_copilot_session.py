@@ -168,6 +168,36 @@ async def test_call_tool_then_reply_runs_tool_and_observes():
 
 
 @pytest.mark.asyncio
+async def test_non_numeric_status_result_does_not_crash_turn():
+    # The auth-wall gate runs on every tool result and reads ``status`` as an HTTP
+    # code. Non-request tools (run_scan) put a non-numeric status here
+    # ("vulnerable"/"scanning"/"safe"); it must be tolerated, not int()-crashed
+    # into an "error" turn. Regression for the run_scan integration.
+    session = CopilotSession("s-scan")
+    events, on_event = _collector()
+    run_tool = AsyncMock(return_value={
+        "ok": True, "status": "vulnerable", "url": "https://in.scope/x",
+        "findings": [{"vuln_type": "sqli"}],
+    })
+
+    steps = [
+        {"action": "call_tool", "thought": "scan", "tool_name": "run_scan",
+         "tool_args": {"url": "https://in.scope/x"}},
+        {"action": "reply", "thought": "done", "message": "Scan found a vuln."},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS + [_FakeTool("run_scan", tags=["active"])]), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("scan it", _FakeCtx(in_scope=True),
+                                   on_event=on_event, wait_for_human=_deny_human())
+
+    run_tool.assert_awaited_once()
+    assert reply.blocked_reason == ""          # not "error"
+    assert reply.message == "Scan found a vuln."
+    assert reply.transcript[0]["observation"]  # the scan result was observed
+
+
+@pytest.mark.asyncio
 async def test_out_of_scope_denied_records_observation_not_call():
     session = CopilotSession("s3")
     _, on_event = _collector()

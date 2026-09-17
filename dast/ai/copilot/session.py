@@ -677,7 +677,14 @@ class CopilotSession:
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
         collected and the identical call should be allowed to retry."""
-        status_code = int(result.get("status", 0) or 0)
+        # ``status`` is the HTTP code on request-shaped tools, but this gate runs on
+        # every tool result and non-request tools (e.g. run_scan) put a non-numeric
+        # status here ("vulnerable"/"scanning"/"safe"). A non-numeric status is by
+        # definition not an HTTP auth wall, so treat it as 0 rather than crashing.
+        try:
+            status_code = int(result.get("status", 0) or 0)
+        except (TypeError, ValueError):
+            status_code = 0
         body = str(result.get("body", "") or "")
         final_url = str(result.get("final_url", "") or tool_args.get("url", ""))
         host = (urlparse(final_url).hostname or "").lower()

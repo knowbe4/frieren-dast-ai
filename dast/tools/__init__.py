@@ -20,6 +20,7 @@ from dast.tools import copilot_tools as _copilot_tools  # noqa: F401
 from dast.tools import crawl_tools as _crawl_tools  # noqa: F401
 from dast.tools import encoding_tools as _encoding_tools  # noqa: F401
 from dast.tools import findings_tools as _findings_tools  # noqa: F401
+from dast.tools import graphql_sweep_tools as _graphql_sweep_tools  # noqa: F401
 from dast.tools import graphql_tools as _graphql_tools  # noqa: F401
 from dast.tools import history_tools as _history_tools  # noqa: F401
 from dast.tools import http_tools as _http_tools  # noqa: F401

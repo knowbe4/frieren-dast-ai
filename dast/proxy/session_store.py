@@ -7,6 +7,7 @@ so the dashboard WebSocket can push updates without polling.
 
 import asyncio
 import concurrent.futures
+import re
 import threading
 import time
 import uuid
@@ -326,6 +327,21 @@ def _body_preview(raw: Optional[bytes], path: str = "") -> Optional[str]:
     return text if text.strip() else None
 
 
+_ENDPOINT_ID_SEGMENT_RE = re.compile(
+    r"^(?:\d+|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|[0-9a-fA-F]{24,})$"
+)
+
+
+def normalise_endpoint_path(path: str) -> str:
+    """Collapse an entry path to an endpoint template so ``/users/1`` and ``/users/2``
+    count as one endpoint for coverage purposes. Drops the query string and replaces
+    numeric / UUID / long-hex path segments with ``:id``. Shared by the scan_surface
+    tool and the autonomous coverage gate so both agree on what a distinct endpoint is."""
+    base = (path or "").split("?", 1)[0]
+    segments = base.split("/")
+    return "/".join(":id" if _ENDPOINT_ID_SEGMENT_RE.match(seg) else seg for seg in segments)
+
+
 @dataclass
 class NamedSession:
     """Auth context for a specific user — used by CrossSessionIdorAgent."""
@@ -478,6 +494,11 @@ class SessionStore:
         # to build correct query/mutation bodies when importing reports.
         # Value: {"types": [...], "mutations": {...}, "queries": {...}, "ts": float}
         self.graphql_schemas: Dict[str, dict] = {}
+        # GraphQL operations already exercised by the graphql_sweep tool — keyed by
+        # endpoint URL, value is a set of "kind:field" op keys (e.g. "query:me").
+        # Read by the autonomous copilot's coverage gate to know which introspected
+        # operations still need testing before a run may declare complete.
+        self.graphql_tested_ops: Dict[str, set] = {}
         # background executor for passive analysis (fingerprinting, plugins, discovery)
         # keeps the proxy hot path free — responses are returned before analysis runs
         self._bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="dast-bg")
@@ -750,6 +771,11 @@ class SessionStore:
                     "secure": bool(morsel["secure"]),
                     "httpOnly": "httponly" in cookie_str.lower(),
                 }
+
+    def get_cookie_hosts(self) -> List[str]:
+        """Return all hosts that currently have at least one cookie in the jar."""
+        with self._lock:
+            return [h for h, jar in self._cookies.items() if jar]
 
     def get_all_cookies(self) -> List[dict]:
         """Return all Playwright-compatible cookie dicts across every host."""

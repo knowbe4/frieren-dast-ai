@@ -58,6 +58,27 @@ def _host_block(store: Any, host: str) -> str:
         return ""
 
 
+def _named_sessions_block() -> str:
+    """Compact block listing login profiles that have a saved session.
+    Each line includes the privilege level so the copilot can reason about
+    which session to use for privilege-escalation tests. Returns "" when no
+    profiles with sessions exist. Never raises."""
+    try:
+        from dast.profiles.store import list_profiles
+        profiles = [p for p in list_profiles() if p.saved_session]
+    except Exception as exc:
+        logger.warning("context brief: could not load login profiles", error=str(exc))
+        return ""
+    if not profiles:
+        return ""
+    lines = []
+    for p in profiles:
+        level = p.privilege_level or "unset"
+        host = p.host_pattern or "(no host)"
+        lines.append(f"  - {p.name} (slug={p.slug}, privilege={level}, host={host})")
+    return "Named sessions with saved credentials:\n" + "\n".join(lines)
+
+
 def build_context_brief(
     store: Any,
     hosts: Sequence[str],
@@ -82,6 +103,11 @@ def build_context_brief(
             break
 
     blocks = [block for block in (_host_block(store, host) for host in ordered) if block]
+
+    sessions_block = _named_sessions_block()
+    if sessions_block:
+        blocks.append(sessions_block)
+
     if not blocks:
         return ""
 

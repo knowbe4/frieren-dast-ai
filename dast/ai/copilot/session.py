@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from dast.ai import bedrock_client
 from dast.ai.copilot.context_brief import build_context_brief
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.authorization import AUTHORIZED_ENGAGEMENT_DIRECTIVE, is_full_authorization
 from dast.ai.schemas import COPILOT_STEP_SCHEMA
 from dast.utils.logger import get_logger
 
@@ -58,6 +59,24 @@ _OBSERVATION_PRIORITY_FIELDS = (
     "ok", "status", "length", "final_url", "reflections",
     "error", "safe_variant", "hint",
 )
+
+
+def _last_steps_summary(transcript: List[Dict[str, Any]]) -> str:
+    """Build a brief "what I tried" paragraph from the last few transcript entries
+    for use in hardcoded fallback messages where the model never produced its own
+    reply text."""
+    entries = [item for item in transcript[-5:] if item.get("tool_name") or item.get("observation")]
+    if not entries:
+        return ""
+    lines: List[str] = []
+    for item in entries:
+        tool = item.get("tool_name") or item.get("action", "?")
+        obs = str(item.get("observation") or "").strip()
+        if obs:
+            lines.append(f"  {tool}: {obs[:160]}")
+    if not lines:
+        return ""
+    return "\n\nWhat I tried this turn:\n" + "\n".join(lines)
 
 
 def _summarize_result(result: Any) -> str:
@@ -124,6 +143,27 @@ Each turn, respond with a single step object:
       have (an ID, a second account, an explicit authorization), or the target is out
       of scope. Set blocked_reason in those cases so the UI can offer the right help.
       Then wait for their answer and continue from there.
+      WHEN YOU SET blocked_reason AND HAND BACK: always (1) name the specific tool and
+      the exact error you hit (e.g. "send_request returned status 302, final_url=/login");
+      (2) explain what that error means in plain English (e.g. "my session cookie is
+      stale"); (3) give 2-3 concrete steps the operator can take to unblock you (e.g.
+      "load any page on the target in your browser while the proxy is active, then
+      check the History tab for new authenticated requests"); (4) say what a working
+      response would look like (e.g. "a good response returns 200 with a JSON body
+      instead of a redirect"). Generic "I need direction" messages with no diagnosis
+      are not acceptable — always diagnose the root cause.
+
+Communication standard — applies to every reply, not just blocked ones:
+- Begin every reply with a one-sentence summary of what you did this turn and what
+  you observed (e.g. "I sent the accountSettings query as the learner user and got a
+  200 with the full account object; the same query without auth returned 401").
+- When you ask a question or report a problem, always state: (1) which tool you
+  called, (2) what it returned (status code + key fields), (3) what that result means
+  in plain English, and (4) exactly what you need from the operator to continue.
+- Avoid vague statements like "my request failed" or "I need direction" — always
+  name the actual status code or error message you received.
+- Never ask "how should I proceed" without first explaining the current state and
+  your diagnosis of what went wrong.
 
 Operational notes:
 - Out-of-scope or new hosts: just call the tool. If the host is not yet authorized
@@ -133,9 +173,26 @@ Operational notes:
   automatically.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
 - Prefer replying as soon as you have something worth the operator's attention; do
-  not pad the turn with tool calls."""
+  not pad the turn with tool calls.
+- Named sessions and privilege levels: the project context may list named sessions
+  (e.g. "alice: privilege=low", "admin: privilege=high"). Use this information
+  actively — if two sessions with different privilege levels exist, test for
+  privilege escalation (IDOR/BOLA/horizontal/vertical): make the same request as
+  both users and compare. Report a finding when a low-privilege session accesses
+  resources that should require higher privilege. Tell the operator which session
+  you are using for each request so they can follow your reasoning."""
 
 _SYSTEM_COPILOT += UNTRUSTED_CONTENT_DIRECTIVE
+
+
+def _system_prompt() -> str:
+    """The copilot system prompt for this turn. When the operator has declared full
+    authorization at startup, an authorization directive is appended so the model
+    stops handing turns back asking the operator to re-confirm scope/authorization
+    (see ``dast.authorization``). Evaluated per turn so the flag is read at run time."""
+    if is_full_authorization():
+        return _SYSTEM_COPILOT + AUTHORIZED_ENGAGEMENT_DIRECTIVE
+    return _SYSTEM_COPILOT
 
 
 @dataclass
@@ -305,6 +362,10 @@ class CopilotSession:
         ]
         self._context_hosts: set[str] = set()
 
+    def get_known_hosts(self) -> List[str]:
+        """All hosts this session has targeted (focus + any touched during tool calls)."""
+        return sorted(set(self._focus_hosts) | self._context_hosts)
+
     def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
         """Preload an authenticated session (e.g. from an activated login profile)
         so requests carry it from the first tool call and the auth-wall gate stays
@@ -366,6 +427,82 @@ class CopilotSession:
                 message=message, blocked_reason=blocked_reason, transcript=turn_transcript
             )
 
+        def _build_spin_context_hint(recent_observation: str) -> str:
+            """Build a pattern-aware hint from the most recent tool failure observation."""
+            obs = recent_observation.lower()
+            last_tool = ""
+            last_obs_snippet = recent_observation[:200]
+            for item in reversed(turn_transcript):
+                if item.get("observation"):
+                    last_tool = item.get("tool_name", "")
+                    break
+
+            tool_label = f"`{last_tool}` " if last_tool else ""
+            intro = (
+                f"My last {consecutive_tool_failures} tool calls failed or repeated "
+                "without making progress, so I'm stopping to avoid spinning.\n\n"
+            )
+
+            if ('"status": 302' in recent_observation or '"status":302' in recent_observation
+                    or ("redirect" in obs and "login" in obs)):
+                detail = (
+                    f"Root cause: {tool_label}returned HTTP 302 (redirect to a login page), "
+                    "which means the session cookie I have is stale or was never captured.\n\n"
+                    "To fix this:\n"
+                    "  1. Make sure your browser is routing through Frieren's proxy "
+                    "(check that the proxy address is set in your browser/OS network settings).\n"
+                    "  2. Load any page on the target site in your browser while the proxy is "
+                    "active — this captures a fresh session cookie.\n"
+                    "  3. Check the proxy History tab: you should see new authenticated "
+                    "requests appear before I retry.\n\n"
+                    "A working response will return 200 with the expected JSON/HTML body "
+                    "instead of the 302 redirect."
+                )
+            elif ('"status": 401' in recent_observation or '"status":401' in recent_observation
+                  or '"status": 403' in recent_observation or '"status":403' in recent_observation):
+                status = "401 (Unauthorized)" if "401" in obs else "403 (Forbidden)"
+                detail = (
+                    f"Root cause: {tool_label}returned HTTP {status}, which means the "
+                    "request lacks valid credentials or the session has expired.\n\n"
+                    "To fix this:\n"
+                    "  1. Log in through your browser (with the proxy active) to capture "
+                    "a live session.\n"
+                    "  2. Or provide an explicit Authorization header value "
+                    "(e.g. 'Bearer <token>') so I can inject it.\n"
+                    "  3. If this is a second-account test, give me the credentials or "
+                    "session cookie for that account."
+                )
+            elif "repeat" in obs or "suppressed" in obs:
+                detail = (
+                    "Root cause: I kept repeating the same tool call without getting "
+                    "new information — a value I need must be missing or ambiguous.\n\n"
+                    "To unblock me, tell me:\n"
+                    "  1. A specific resource ID or object ID to target (e.g. a user ID, "
+                    "post ID, or order number).\n"
+                    "  2. Whether I should use a second account/session for comparison.\n"
+                    "  3. The exact URL or parameter I should focus on next."
+                )
+            elif "unknown tool" in obs:
+                tool_attempted = ""
+                for item in reversed(turn_transcript):
+                    if "unknown tool" in (item.get("observation") or "").lower():
+                        tool_attempted = item.get("tool_name", "")
+                        break
+                detail = (
+                    "Root cause: I tried to call a tool that does not exist"
+                    + (f" (`{tool_attempted}`)" if tool_attempted else "")
+                    + ". This is a model error.\n\n"
+                    "Tell me what you'd like me to do next and I'll pick the right tool."
+                )
+            else:
+                detail = (
+                    f"Last failure: {last_obs_snippet}\n\n"
+                    "Tell me how you'd like me to proceed, or give me a value I'm missing "
+                    "(an ID, a second account, or an explicit scope)."
+                )
+
+            return intro + detail
+
         async def _record_tool_failure(
             entry: Dict[str, Any], observation: str
         ) -> Optional[CopilotReply]:
@@ -380,10 +517,7 @@ class CopilotSession:
                                session_id=self.session_id,
                                failures=consecutive_tool_failures)
                 reply = _finalize(
-                    "Several of my tool calls in a row failed or repeated without "
-                    "making progress, so I'm stopping to avoid spinning. Here's where "
-                    "I am — tell me how you'd like me to proceed, or give me a value "
-                    "I'm missing (an ID, a second account, or explicit scope).",
+                    _build_spin_context_hint(observation),
                     blocked_reason="need_direction",
                 )
                 await on_event({"type": "reply", "message": reply.message,
@@ -399,7 +533,7 @@ class CopilotSession:
                 user = _build_user_prompt(
                     self.messages, tool_menu, turn_transcript, context_brief
                 )
-                decision = await _llm_step(_SYSTEM_COPILOT, user)
+                decision = await _llm_step(_system_prompt(), user)
 
                 if decision is None:
                     consecutive_failures += 1
@@ -533,8 +667,9 @@ class CopilotSession:
                                "(and set message).")
                 if consecutive_failures >= _MAX_CONSECUTIVE_LLM_FAILURES:
                     reply = _finalize(
-                        "I couldn't settle on a next step this turn. Tell me how "
-                        "you'd like me to proceed.",
+                        "I couldn't settle on a next step this turn."
+                        + _last_steps_summary(turn_transcript)
+                        + "\n\nTell me how you'd like me to proceed.",
                         blocked_reason="need_direction",
                     )
                     await on_event({"type": "reply", "message": reply.message,
@@ -545,8 +680,10 @@ class CopilotSession:
             logger.warning("Copilot: tool-call ceiling reached this turn",
                            calls=_MAX_TOOL_CALLS_PER_TURN)
             reply = _finalize(
-                "I ran several tools but didn't reach a conclusion this turn. Here's "
-                "where I am — tell me how you'd like me to proceed.",
+                "I ran the maximum number of tool calls this turn without reaching a "
+                "conclusion."
+                + _last_steps_summary(turn_transcript)
+                + "\n\nTell me how you'd like me to proceed.",
                 blocked_reason="need_direction",
             )
             await on_event({"type": "reply", "message": reply.message,

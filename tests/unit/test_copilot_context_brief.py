@@ -92,12 +92,15 @@ def test_brief_dedupes_and_caps_hosts():
 
 def test_brief_survives_a_host_lookup_failure():
     # A raising engine must be swallowed and logged, never crash the turn.
-    assert build_context_brief(_Store(engine=_BoomEngine()), ["h"]) == ""
+    # Patch list_profiles so no named-session block is appended on this machine.
+    with patch("dast.ai.copilot.context_brief._named_sessions_block", return_value=""):
+        assert build_context_brief(_Store(engine=_BoomEngine()), ["h"]) == ""
 
 
 def test_brief_empty_when_store_knows_nothing():
     store = _Store(engine=None, intelligence=SessionIntelligence())
-    assert build_context_brief(store, ["unknown.example.com"]) == ""
+    with patch("dast.ai.copilot.context_brief._named_sessions_block", return_value=""):
+        assert build_context_brief(store, ["unknown.example.com"]) == ""
 
 
 # ── SessionIntelligence.peek ────────────────────────────────────────────────────

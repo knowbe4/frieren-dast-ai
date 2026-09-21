@@ -101,6 +101,7 @@ function startBackend() {
     "--proxy-port", String(PROXY_PORT),
     "--dashboard-port", String(DASHBOARD_PORT),
   ];
+  if (process.env.AUTHORIZED) args.push("--authorized");
   backendProcess = spawn("uv", args, {
     cwd: REPO_ROOT,
     env: {

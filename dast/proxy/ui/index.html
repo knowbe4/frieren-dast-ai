@@ -980,6 +980,28 @@
             <button class="tbtn" onclick="loginNewProfile()">+ New</button>
           </div>
           <div id="logins-list" style="font-size:12px"></div>
+
+          <!-- Quick Capture -->
+          <div style="margin-top:14px;border-top:1px solid var(--bd);padding-top:10px">
+            <strong style="font-size:11px">Quick Capture</strong>
+            <p style="color:var(--txt2);font-size:10px;margin:4px 0 6px">
+              Browse through the proxy, then save that session with a name and privilege level.</p>
+            <div id="qc-detected" style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px;align-items:center"></div>
+            <input id="qc-name" class="tinput" style="width:100%;margin-bottom:4px" placeholder="e.g. Admin User">
+            <input id="qc-host" class="tinput" style="width:100%;margin-bottom:4px" placeholder="e.g. app.example.com">
+            <select id="qc-privilege" class="tinput" style="width:100%;margin-bottom:6px">
+              <option value="">— privilege level —</option>
+              <option value="unauthenticated">Unauthenticated</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="admin">Admin</option>
+            </select>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="tbtn pri" onclick="loginQuickCapture()">Capture &amp; Save</button>
+              <span id="qc-status" style="font-size:10px;color:var(--txt2)"></span>
+            </div>
+          </div>
         </div>
 
         <!-- Editor -->
@@ -989,9 +1011,18 @@
               <label style="font-size:11px;color:var(--txt2)">Name
                 <input id="logins-name" class="tinput" style="width:100%" placeholder="Training App"></label>
               <label style="font-size:11px;color:var(--txt2)">Host pattern
-                <input id="logins-host" class="tinput" style="width:100%" placeholder="*.knowbe4.com"></label>
+                <input id="logins-host" class="tinput" style="width:100%" placeholder="*.example.com"></label>
               <label style="font-size:11px;color:var(--txt2)">Auth URL
-                <input id="logins-authurl" class="tinput" style="width:100%" placeholder="https://training.knowbe4.com/login"></label>
+                <input id="logins-authurl" class="tinput" style="width:100%" placeholder="https://app.example.com/login"></label>
+              <label style="font-size:11px;color:var(--txt2)">Privilege level
+                <select id="logins-privilege" class="tinput" style="width:100%">
+                  <option value="">— unset —</option>
+                  <option value="unauthenticated">Unauthenticated</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="admin">Admin</option>
+                </select></label>
 
               <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
                 <strong style="font-size:11px">Credentials</strong>
@@ -1007,6 +1038,7 @@
                 <input id="logins-token" class="tinput" style="width:100%;margin-bottom:4px" placeholder="Authorization token (Bearer ...)">
                 <textarea id="logins-storagestate" class="tinput" style="width:100%;height:60px" placeholder="storage_state JSON (optional)"></textarea>
                 <button class="tbtn" onclick="loginImportSession()" style="margin-top:4px">Import session</button>
+                <button class="tbtn" onclick="loginCaptureFromProxy()" style="margin-top:4px">Capture from proxy</button>
                 <span id="logins-session-status" style="font-size:10px;margin-left:8px;color:var(--txt2)"></span>
               </div>
 

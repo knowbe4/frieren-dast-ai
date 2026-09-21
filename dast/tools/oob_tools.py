@@ -27,7 +27,22 @@ logger = get_logger(__name__)
 
 _OOB_GENERATE_SCHEMA: Dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "origin_url": {
+            "type": "string",
+            "description": "The target URL you are about to inject this OOB URL into. "
+                           "Providing this enables automatic finding creation when a callback "
+                           "arrives, even after oob_poll has timed out.",
+        },
+        "origin_method": {
+            "type": "string",
+            "description": "HTTP method of the request to origin_url (default GET).",
+        },
+        "origin_param": {
+            "type": "string",
+            "description": "The parameter or field name you will inject the OOB URL into.",
+        },
+    },
     "required": [],
 }
 
@@ -50,8 +65,17 @@ async def _oob_generate(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     try:
         import httpx
 
+        body = {
+            "origin_url": str(args.get("origin_url", "") or "").strip(),
+            "origin_method": str(args.get("origin_method", "GET") or "GET").strip().upper() or "GET",
+            "origin_param": str(args.get("origin_param", "") or "").strip(),
+        }
+
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(f"{ctx.dashboard_base_url}/api/interactions/new")
+            resp = await client.post(
+                f"{ctx.dashboard_base_url}/api/interactions/new",
+                json=body,
+            )
             if resp.status_code == 503:
                 return {"ok": False, "error": "OOB unavailable — all interactsh servers unreachable"}
             resp.raise_for_status()
@@ -121,6 +145,9 @@ register(Tool(
         "Use this when: you suspect a BLIND bug with no in-band signal — blind SSRF, "
         "blind XXE, blind/OOB command injection, or exfil via DNS/HTTP callback. Step 1 of "
         "the flow: generate here, embed oob_url in a payload via send_request, then oob_poll.\n"
+        "ALWAYS pass origin_url (the target URL you are testing) and origin_param (the "
+        "parameter the OOB URL will go into) — this lets Frieren auto-create a finding even "
+        "if oob_poll times out before the callback arrives.\n"
         "Do NOT use this when: the vuln reflects in the response body or timing (test that "
         "directly with send_request); or just to make an HTTP request (use send_request)."
     ),

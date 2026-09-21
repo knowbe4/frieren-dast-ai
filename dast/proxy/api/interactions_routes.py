@@ -19,6 +19,7 @@ from typing import Dict, List, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from dast.proxy.api.context import DashboardContext
 from dast.utils.logger import get_logger
@@ -33,16 +34,79 @@ _MAX_CALLBACKS_PER_SESSION = 50
 _sessions: Dict[str, dict] = {}
 _tasks: Dict[str, asyncio.Task] = {}
 _broadcast_fn = None   # set to _broadcast_raw when the router is created
+_store = None           # set to ctx.store when the router is created
+
+
+class _NewSessionIn(BaseModel):
+    origin_url: str = ""
+    origin_method: str = "GET"
+    origin_param: str = ""
+    label: str = ""
+
+
+def _auto_create_finding(session: dict) -> None:
+    """Create a finding in the session store when an OOB callback is confirmed.
+
+    Only fires once per session (guarded by ``finding_created`` flag) and only
+    when the session carries an ``origin_url`` so the finding is linked to a
+    real request the operator proxied through Frieren.
+    """
+    if _store is None:
+        return
+    origin_url = session.get("origin_url", "").strip()
+    if not origin_url:
+        return
+    if session.get("finding_created"):
+        return
+    session["finding_created"] = True
+    try:
+        cb = session["callbacks"][-1] if session.get("callbacks") else {}
+        cb_type = cb.get("type", "dns/http")
+        evidence = (
+            f"OOB {cb_type.upper()} callback received on {session['oob_url']}. "
+            f"Server fetched attacker-controlled URL — confirms out-of-band interaction. "
+            f"Callback raw (truncated): {cb.get('raw', '')[:300]}"
+        )
+        finding = {
+            "title": "Out-of-Band (OOB) Interaction — Potential Blind SSRF/XXE/CMDI",
+            "severity": "high",
+            "attack_type": "ssrf",
+            "cwe": "CWE-918",
+            "parameter": session.get("origin_param", ""),
+            "evidence": evidence,
+            "confirmed": True,
+            "confidence": 0.9,
+            "validated_by": ["oob_callback"],
+            "source": "interactions",
+        }
+        if session.get("label"):
+            finding["reasoning"] = f"OOB session label: {session['label']}"
+        origin_method = (session.get("origin_method") or "GET").upper()
+        entry_id = _store.record_manual_finding(finding, origin_url, origin_method)
+        logger.info(
+            "interactions: auto-created OOB finding",
+            origin_url=origin_url,
+            entry_id=entry_id,
+            oob_url=session["oob_url"],
+        )
+    except Exception as exc:
+        logger.warning("interactions: failed to auto-create finding", error=str(exc))
 
 
 async def register_external_session(
     interactsh_session,
     label: str = "",
+    origin_url: str = "",
+    origin_method: str = "GET",
+    origin_param: str = "",
 ) -> Optional[str]:
     """
     Register an already-initialised InteractshSession into the Interactions tab.
     Returns the session_id, or None if interactsh is not registered yet.
     Call this after interactsh_session.register() succeeds.
+
+    Pass origin_url/origin_method/origin_param so that when a callback arrives the
+    system can auto-create a finding linked to the originating request.
     """
     if not interactsh_session.url:
         return None
@@ -53,6 +117,9 @@ async def register_external_session(
         "session_id": session_id,
         "oob_url": interactsh_session.url,
         "label": label,
+        "origin_url": origin_url,
+        "origin_method": origin_method,
+        "origin_param": origin_param,
         "created_at": now,
         "active": True,
         "callbacks": [],
@@ -113,6 +180,7 @@ async def _poll_loop_external(session_id: str) -> None:
                 )
                 logger.info("interactions hit", session_id=session_id,
                             type=cb["type"], raw=cb["raw"][:80])
+                _auto_create_finding(session)
                 try:
                     interactsh_session.hit_event.set()
                 except Exception:
@@ -135,7 +203,8 @@ async def _poll_loop_external(session_id: str) -> None:
 def make_router(ctx: DashboardContext) -> APIRouter:
     router = APIRouter()
     # Use module-level stores so external callers share the same sessions
-    global _broadcast_fn
+    global _broadcast_fn, _store
+    _store = getattr(ctx, "store", None)
 
     def _gc_sessions() -> None:
         if len(_sessions) > _MAX_SESSIONS:
@@ -211,6 +280,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     )
                     logger.info("interactions hit", session_id=session_id,
                                 type=cb["type"], raw=cb["raw"][:80])
+                    _auto_create_finding(session)
 
                     try:
                         interactsh_session.hit_event.set()
@@ -232,7 +302,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 logger.warning("interactions poll error", session_id=session_id, error=str(exc))
 
     @router.post("/api/interactions/new")
-    async def create_session() -> dict:
+    async def create_session(body: Optional[_NewSessionIn] = None) -> dict:
         from dast.utils.interactsh import InteractshSession
 
         session_id = str(uuid.uuid4())[:8]
@@ -249,6 +319,10 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         _sessions[session_id] = {
             "session_id": session_id,
             "oob_url": interactsh.url,
+            "origin_url": body.origin_url if body else "",
+            "origin_method": body.origin_method if body else "GET",
+            "origin_param": body.origin_param if body else "",
+            "label": body.label if body else "",
             "created_at": now,
             "active": True,
             "callbacks": [],

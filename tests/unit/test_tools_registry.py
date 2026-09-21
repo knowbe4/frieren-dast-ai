@@ -554,7 +554,7 @@ async def test_oob_generate_and_poll(monkeypatch):
         def __init__(self, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
-        async def post(self, url):
+        async def post(self, url, json=None):
             return _Resp({"session_id": "abc123", "oob_url": "http://x.oast.pro"})
         async def get(self, url):
             return _Resp({"oob_url": "http://x.oast.pro",

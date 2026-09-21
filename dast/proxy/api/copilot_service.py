@@ -20,7 +20,8 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 from dast.proxy.api.agent_triage_routes import AgentToolContext
 from dast.utils.logger import get_logger
@@ -70,14 +71,22 @@ _HYPOTHESIS_TEMPLATE = (
 # run stops on the FIRST bound reached (or when the copilot self-declares complete,
 # or the operator stops it).
 _AUTONOMOUS_DEFAULTS: Dict[str, object] = {
-    "max_tool_calls": 150,          # total tool calls across all turns
-    "max_wall_clock_seconds": 1800,  # 30 minutes of active (non-paused) run time
-    "max_stuck_turns": 3,           # consecutive turns with no new findings/endpoints
+    "max_tool_calls": 300,          # total tool calls across all turns
+    "max_wall_clock_seconds": 3600,  # 60 minutes of active (non-paused) run time
+    "max_stuck_turns": 3,           # consecutive turns with no new findings/endpoints/coverage
     "allow_scope_escalation": False,  # False = auto-deny out-of-scope; True = ask the operator
 }
 
 # How many engine-level errors in a row abort the driver (guards a wedged model).
 _MAX_DRIVER_ERRORS = 3
+
+# How many times the coverage gate may bounce a premature 'complete' before letting the
+# run end anyway (with an honest "coverage incomplete" report). Guards against a loop
+# where the copilot cannot make coverage progress; the stuck detector is the other bound.
+_MAX_COMPLETE_REJECTIONS = 8
+
+# GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
+_GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
 
 # blocked_reason values that mean "I cannot proceed without a human" — the driver
 # turns these into an operator escalation (answer / pause / abort) then resumes.
@@ -107,10 +116,18 @@ _AUTONOMOUS_START = (
     "account context, privilege escalation, mass assignment, reflected/stored XSS, parameter "
     "tampering. Non-destructive, detection-only, any time delay <= 5s. Reading an endpoint and "
     "moving on WITHOUT testing it is a failure.\n\n"
+    "COVER THE WHOLE SURFACE — breadth first, then depth. Map every endpoint (crawl) and "
+    "every GraphQL endpoint's schema (graphql_introspect), then TEST all of it: scan_surface "
+    "scans every observed-but-unscanned REST endpoint in one call, and graphql_sweep exercises "
+    "EVERY query and mutation of an introspected endpoint in one call. Do not eyeball a handful "
+    "of operations and stop — sweep the entire schema and scan the entire REST surface, then go "
+    "deep on the leads they surface.\n\n"
     "{leads}\n\n"
+    "{coverage}\n\n"
     "Signal control ONLY through blocked_reason on a reply: set it to 'complete' when the "
     "objective is fully covered AND you have actively TESTED the high-value leads (not merely "
-    "mapped them); or 'need_human' with a specific question when you genuinely cannot proceed "
+    "mapped them) AND no coverage gaps remain (every REST endpoint scanned, every GraphQL "
+    "operation swept); or 'need_human' with a specific question when you genuinely cannot proceed "
     "without me (a value only I have, or a decision) — and then also say what a vulnerable "
     "response would look like vs. a normal one, so I can help. Otherwise just report progress "
     "in the message and keep working."
@@ -118,13 +135,24 @@ _AUTONOMOUS_START = (
 
 _AUTONOMOUS_CONTINUE = (
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
-    "run_scan, crawl, param_mining, record_finding), and actively TEST leads "
-    "(IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
+    "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding), and actively "
+    "TEST leads (IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
     "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
     "{leads}\n\n"
-    "Set blocked_reason='complete' ONLY once the objective is covered and the high-value leads "
-    "have been actively tested; or 'need_human' if you are truly blocked (say what a vulnerable "
-    "vs. normal response would look like)."
+    "{coverage}\n\n"
+    "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
+    "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
+    "blocked (say what a vulnerable vs. normal response would look like)."
+)
+
+_AUTONOMOUS_COVERAGE_GATE = (
+    "You set 'complete', but you have NOT tested the whole attack surface — that is premature. "
+    "Do not stop yet.\n\n"
+    "{coverage}\n\n"
+    "Close these gaps now: run scan_surface until it reports remaining=0, and graphql_sweep on "
+    "each introspected GraphQL endpoint until operations_remaining=0 (crawl / graphql_introspect "
+    "first if the surface is not yet mapped). Then go deep on anything they flag. Budget "
+    "remaining: {budget}. Only set 'complete' once every endpoint and operation has been tested."
 )
 
 _AUTONOMOUS_GUIDANCE = (
@@ -263,6 +291,39 @@ class CopilotService:
             for sid in sorted(self._sessions.keys(),
                               key=lambda k: -self._sessions[k].get("updated_at", 0))
         ]
+
+    def refresh_session(self, sid: str) -> Dict[str, Any]:
+        """Pull the freshest cookies from the proxy jar for every host this session
+        has touched and inject them into the engine. Call this after the operator
+        logs in through the browser to give the copilot a live authenticated session.
+        Returns {ok, hosts_updated, cookies_refreshed}."""
+        session = self._sessions.get(sid)
+        if session is None:
+            return {"ok": False, "error": "session not found"}
+        engine = session["engine"]
+        store = self._ctx.store
+        if store is None:
+            return {"ok": False, "error": "proxy store not available"}
+        known_hosts: set = set(engine.get_known_hosts()) | set(session.get("approved_hosts") or set())
+        if not known_hosts:
+            return {"ok": True, "hosts_updated": [], "cookies_refreshed": 0}
+        merged_cookies: Dict[str, str] = {}
+        hosts_updated: List[str] = []
+        for host in sorted(known_hosts):
+            try:
+                jar_cookies = store.get_cookies_for_host(host) or []
+            except Exception as exc:
+                logger.warning("copilot refresh_session: jar lookup failed",
+                               sid=sid, host=host, error=str(exc))
+                continue
+            batch = {c["name"]: c.get("value", "") for c in jar_cookies if c.get("name")}
+            if batch:
+                merged_cookies.update(batch)
+                hosts_updated.append(host)
+        engine.seed_session_cookies(merged_cookies)
+        logger.info("copilot session refreshed from proxy jar",
+                    sid=sid, hosts=hosts_updated, cookies=len(merged_cookies))
+        return {"ok": True, "hosts_updated": hosts_updated, "cookies_refreshed": len(merged_cookies)}
 
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
@@ -495,6 +556,7 @@ class CopilotService:
             "tool_calls": 0,
             "turns": 0,
             "errors": 0,
+            "complete_rejections": 0,
             "started_at": time.time(),
             "status": "starting",
             "detail": "",
@@ -708,18 +770,26 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: engine session seed failed", error=str(exc))
 
-    def _progress_snapshot(self) -> Tuple[int, int]:
-        """A monotonic (findings, in-scope endpoints) tuple used by the stuck
-        detector: no change across ``max_stuck_turns`` turns means no progress."""
+    def _progress_snapshot(self) -> Tuple[int, int, int]:
+        """A monotonic (findings, in-scope endpoints, coverage units) tuple used by the
+        stuck detector: no change across ``max_stuck_turns`` turns means no progress.
+        Coverage units count scanned endpoints + swept GraphQL operations so that
+        breadth work (scan_surface / graphql_sweep), which need not add a finding, still
+        registers as progress and never trips the stuck detector."""
         store = self._ctx.store
         if store is None:
-            return (0, 0)
+            return (0, 0, 0)
         try:
             entries = store.in_scope_entries()
         except Exception:
-            return (0, 0)
+            return (0, 0, 0)
         findings = sum(len(getattr(entry, "findings", None) or []) for entry in entries)
-        return (findings, len(entries))
+        scanned = sum(1 for entry in entries if getattr(entry, "scan_result", None))
+        swept_ops = sum(
+            len(ops or ())
+            for ops in (getattr(store, "graphql_tested_ops", None) or {}).values()
+        )
+        return (findings, len(entries), scanned + swept_ops)
 
     async def _broadcast_autonomous(self, sid: str, event: str,
                                     extra: Optional[dict] = None) -> None:
@@ -799,6 +869,7 @@ class CopilotService:
         prompt = _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(auto["hosts"]),
+            coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
         )
 
         last_progress = self._progress_snapshot()
@@ -870,6 +941,7 @@ class CopilotService:
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
                         leads=self._leads_label(auto["hosts"]),
+                        coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
                     )
                     continue
 
@@ -889,9 +961,67 @@ class CopilotService:
 
                 # ── Interpret the reply's control signal ─────────────────────────
                 if blocked_reason == "complete":
-                    self._finish_autonomous(session, "complete", "objective complete")
+                    coverage = self._surface_coverage(auto["hosts"])
+                    budget_left = (time.time() < deadline
+                                   and auto["tool_calls"] < cfg["max_tool_calls"])
+                    # A 'complete' is only premature when a surface has actually been
+                    # mapped and part of it is still untested. With nothing discovered
+                    # yet there is no coverage to force (the crawl-first prompt already
+                    # pushes discovery), and a fully-tested surface is genuinely done.
+                    surface_incomplete = coverage["has_surface"] and not coverage["complete"]
+                    # Coverage gate: refuse a premature 'complete' while known surface is
+                    # not fully tested and there is budget + rejection headroom to keep
+                    # going. This is what stops the run eyeballing a few operations and
+                    # declaring done — it must sweep every op and scan every endpoint.
+                    if (surface_incomplete and budget_left
+                            and auto["complete_rejections"] < _MAX_COMPLETE_REJECTIONS):
+                        auto["complete_rejections"] += 1
+                        logger.info(
+                            "autonomous run: coverage gate rejected premature complete",
+                            session_id=sid, rejection=auto["complete_rejections"],
+                            rest_untested=len(coverage["rest_untested"]),
+                            gql_untested=len(coverage["gql_untested"]),
+                        )
+                        await self._broadcast_autonomous(sid, "coverage_gate", {
+                            "rest_untested": len(coverage["rest_untested"]),
+                            "gql_untested": len(coverage["gql_untested"]),
+                            "rejection": auto["complete_rejections"],
+                        })
+                        prompt = _AUTONOMOUS_COVERAGE_GATE.format(
+                            coverage=self._coverage_block(coverage),
+                            budget=self._budget_label(auto, cfg, deadline),
+                        )
+                        continue
+
+                    if not surface_incomplete:
+                        # Fully-covered surface, or nothing mapped to cover — honor it.
+                        message = ("objective complete; full surface covered"
+                                   if coverage["has_surface"]
+                                   else "objective complete")
+                        self._finish_autonomous(session, "complete", message)
+                        await self._broadcast_autonomous(sid, "finished", {
+                            "status": "complete", "message": reply.message,
+                        })
+                        return
+
+                    # Budget/rejection headroom is gone but the surface is not fully
+                    # covered — end honestly, naming what was left untested (no silent cap).
+                    detail = (
+                        f"objective complete but coverage incomplete: "
+                        f"{len(coverage['rest_untested'])} REST endpoint(s) and "
+                        f"{len(coverage['gql_untested'])} GraphQL operation(s) untested "
+                        f"({self._coverage_label(coverage)})"
+                    )
+                    logger.warning("autonomous run: completed with incomplete coverage",
+                                   session_id=sid,
+                                   rest_untested=len(coverage["rest_untested"]),
+                                   gql_untested=len(coverage["gql_untested"]))
+                    self._finish_autonomous(session, "complete", detail)
                     await self._broadcast_autonomous(sid, "finished", {
                         "status": "complete", "message": reply.message,
+                        "coverage_incomplete": True,
+                        "rest_untested": len(coverage["rest_untested"]),
+                        "gql_untested": len(coverage["gql_untested"]),
                     })
                     return
 
@@ -916,6 +1046,7 @@ class CopilotService:
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
                     leads=self._leads_label(auto["hosts"]),
+                    coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
                 )
         except asyncio.CancelledError:
             self._finish_autonomous(session, "stopped", "cancelled")
@@ -925,8 +1056,8 @@ class CopilotService:
             await self._broadcast_autonomous(sid, "finished", {"status": "error"})
 
     @staticmethod
-    def _progress_label(progress: Tuple[int, int]) -> str:
-        findings, endpoints = progress
+    def _progress_label(progress: Tuple[int, int, int]) -> str:
+        findings, endpoints = progress[0], progress[1]
         return f"{findings} findings across {endpoints} in-scope endpoints"
 
     @staticmethod
@@ -934,3 +1065,110 @@ class CopilotService:
         remaining = max(0, int(deadline - time.time()))
         return (f"{auto['tool_calls']}/{cfg['max_tool_calls']} tool calls used, "
                 f"{remaining}s of wall-clock left")
+
+    def _surface_coverage(self, hosts: List[str]) -> Dict[str, object]:
+        """Enumerate the discovered in-scope attack surface for the focus hosts and how
+        much of it has been tested. REST endpoints are distinct (host, method,
+        id-normalised path) over real observed traffic, tested once a representative has
+        a scan_result. GraphQL operations are every introspected query/mutation, tested
+        once graphql_sweep records them on ``store.graphql_tested_ops``.
+
+        ``complete`` is True only when a surface exists AND nothing on it is untested —
+        so 'nothing mapped yet' does not read as 'fully covered'. Best-effort: any error
+        degrades to an empty (incomplete) coverage rather than crashing the run."""
+        from dast.proxy.session_store import normalise_endpoint_path
+
+        cov: Dict[str, object] = {
+            "rest_total": 0, "rest_tested": 0, "rest_untested": [],
+            "gql_total": 0, "gql_tested": 0, "gql_untested": [],
+            "has_surface": False, "complete": False,
+        }
+        store = self._ctx.store
+        if store is None:
+            return cov
+        focus = {h.split(":")[0] for h in (hosts or []) if h}
+
+        # ── REST surface ────────────────────────────────────────────────────────
+        try:
+            entries = store.in_scope_entries()
+        except Exception as exc:  # noqa: BLE001 — coverage is best-effort
+            logger.debug("coverage: rest enumeration failed", error=str(exc))
+            entries = []
+        rest_status: Dict[Tuple[str, str, str], bool] = {}
+        for entry in entries:
+            method = (getattr(entry, "method", "") or "").upper()
+            path = getattr(entry, "path", "") or ""
+            if not method or not path:
+                continue  # not a real observed request — skip
+            if method in ("CONNECT", "OPTIONS", "HEAD"):
+                continue
+            if getattr(entry, "source", "") in ("agent", "scanner", "scan", "out-of-scope"):
+                continue
+            host = (getattr(entry, "host", "") or "").split(":")[0]
+            if focus and host not in focus:
+                continue
+            key = (host, method, normalise_endpoint_path(path))
+            tested = bool(getattr(entry, "scan_result", None))
+            rest_status[key] = rest_status.get(key, False) or tested
+        cov["rest_total"] = len(rest_status)
+        cov["rest_tested"] = sum(1 for tested in rest_status.values() if tested)
+        cov["rest_untested"] = sorted(
+            f"{method} {path}" for (_h, method, path), tested in rest_status.items() if not tested
+        )
+
+        # ── GraphQL surface ─────────────────────────────────────────────────────
+        schemas = getattr(store, "graphql_schemas", None) or {}
+        tested_ops = getattr(store, "graphql_tested_ops", None) or {}
+        for endpoint, schema in schemas.items():
+            if not isinstance(schema, dict) or not schema.get("introspected"):
+                continue
+            host = (urlparse(endpoint).hostname or "").split(":")[0]
+            if focus and host not in focus:
+                continue
+            done = tested_ops.get(endpoint) or set()
+            for kind, bucket_name in _GQL_BUCKETS.items():
+                for field_name in (schema.get(bucket_name) or {}):
+                    cov["gql_total"] += 1
+                    if f"{kind}:{field_name}" in done:
+                        cov["gql_tested"] += 1
+                    else:
+                        cov["gql_untested"].append(f"{kind} {field_name}")
+
+        cov["has_surface"] = cov["rest_total"] > 0 or cov["gql_total"] > 0
+        cov["complete"] = bool(
+            cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
+        )
+        return cov
+
+    @staticmethod
+    def _coverage_label(cov: Dict[str, object]) -> str:
+        return (f"{cov['rest_tested']}/{cov['rest_total']} REST endpoints, "
+                f"{cov['gql_tested']}/{cov['gql_total']} GraphQL operations tested")
+
+    def _coverage_block(self, cov: Dict[str, object]) -> str:
+        """Prompt block describing the remaining untested surface and which breadth tool
+        closes each gap. Injected into every autonomous turn so the copilot keeps pushing
+        toward full coverage."""
+        if not cov["has_surface"]:
+            return ("Coverage: no attack surface mapped yet — crawl the app and run "
+                    "graphql_introspect on every GraphQL endpoint to enumerate what must be tested.")
+        if cov["complete"]:
+            return ("Coverage: full — every observed REST endpoint and introspected GraphQL "
+                    "operation has been tested.")
+        lines = ["Coverage gaps remain — you have NOT tested the whole surface "
+                 f"({self._coverage_label(cov)}):"]
+        rest_untested = cov["rest_untested"]
+        if rest_untested:
+            lines.append(
+                f"- {len(rest_untested)} REST endpoint(s) unscanned. Run scan_surface (scans every "
+                f"untested endpoint) and crawl to widen the surface. Examples: "
+                + ", ".join(rest_untested[:8])
+            )
+        gql_untested = cov["gql_untested"]
+        if gql_untested:
+            lines.append(
+                f"- {len(gql_untested)} GraphQL operation(s) untested. Run graphql_sweep on the "
+                f"endpoint (covers every query/mutation) until operations_remaining is 0. Examples: "
+                + ", ".join(gql_untested[:8])
+            )
+        return "\n".join(lines)

@@ -279,6 +279,19 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "browser failed to open"}, status_code=500)
         return {"ok": True, "session_id": result.get("session_id"), "target_url": target_url}
 
+    @router.post("/api/copilot/refresh-session/{sid}")
+    async def refresh_session(sid: str):
+        """Re-read the proxy jar's current cookies for every host this session has
+        touched and inject them into the copilot engine. Call this after the operator
+        logs in via the browser to give the copilot a fresh authenticated session."""
+        session = service.get(sid)
+        if session is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        result = service.refresh_session(sid)
+        if not result.get("ok"):
+            return JSONResponse({"error": result.get("error", "refresh failed")}, status_code=500)
+        return result
+
     @router.post("/api/copilot/cancel/{sid}")
     async def cancel(sid: str):
         session = service.get(sid)

@@ -351,13 +351,16 @@ function cpRenderAutonomous(session) {
   const sid = esc(session.session_id);
   const color = cpStatusColor(st);
   const controls = running
-    ? `<div style="display:flex;gap:6px;margin-top:6px">
+    ? `<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
          ${paused
            ? `<button class="tbtn" onclick="cpAutoControl('${sid}','resume')">Resume</button>`
            : `<button class="tbtn" onclick="cpAutoControl('${sid}','pause')">Pause</button>`}
          <button class="tbtn del" onclick="cpAutoControl('${sid}','stop')">Stop</button>
+         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
        </div>`
-    : '';
+    : `<div style="display:flex;gap:6px;margin-top:6px">
+         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
+       </div>`;
   el.innerHTML = `
     <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;padding:8px 10px;margin-top:4px">
       <div style="display:flex;gap:8px;align-items:center;font-size:10px">
@@ -386,10 +389,37 @@ function cpBubble(m) {
     </div>`;
 }
 
+async function cpRefreshSession(sid, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Refreshing...'; }
+  try {
+    const r = await fetch(`/api/copilot/refresh-session/${encodeURIComponent(sid)}`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+      alert(d.error || 'Session refresh failed');
+      return;
+    }
+    const msg = d.cookies_refreshed > 0
+      ? `Session refreshed — ${d.cookies_refreshed} cookie(s) updated for: ${(d.hosts_updated || []).join(', ')}`
+      : 'No cookies found in proxy jar yet. Log in through the browser first, then try again.';
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+    alert(msg);
+  } catch (e) {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+    alert('Session refresh failed: ' + e.message);
+  }
+}
+
 function cpBlockedBadge(reason) {
+  const sid = _cpActive ? esc(_cpActive) : '';
+  const refreshBtn = sid
+    ? `<button class="tbtn" style="font-size:9px;padding:2px 8px"
+         onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>`
+    : '';
   return `<div style="align-self:flex-start;display:flex;align-items:center;gap:6px;margin-left:2px">
       <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--yellow);
                    border:1px solid #7a6000;background:#3a2d00;border-radius:3px;padding:2px 7px">blocked: ${esc(reason)}</span>
+      ${refreshBtn}
     </div>`;
 }
 

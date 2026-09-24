@@ -15,6 +15,7 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
+from dast.agents.sqli_exploit import ExploitProof, extract_db_facts
 from dast.payloads.loader import get_payloads, get_signatures, get_value
 from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_multipart, _inject_path, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
@@ -177,7 +178,7 @@ class SqliAgent(VulnAgent):
                     self.observe("waf_bypass", payload=payload, signal="payload succeeded after prior block")
                 snippet = resp.text[max(0, m.start() - 30):m.end() + 60].strip()
                 probe_request, probe_response = _fmt_http_pair(resp)
-                return AgentFinding(
+                finding = AgentFinding(
                     title="SQL Injection (Error-Based)",
                     severity="critical",
                     cwe="CWE-89",
@@ -194,6 +195,7 @@ class SqliAgent(VulnAgent):
                     probe_request=probe_request,
                     probe_response=probe_response,
                 )
+                return await self._prove_impact(target, client, param, finding, payload)
 
             # Record WAF/filter signal on EVERY seed response (not just the last),
             # so a block on any seed is seen. The central detector catches block
@@ -314,8 +316,12 @@ class SqliAgent(VulnAgent):
                         delta_ms, resp, threshold_ms,
                     )
 
+            # Turn a confirmed time-based injection into proof: attempt safe,
+            # read-only DBMS metadata extraction. Detection is unchanged — this
+            # only enriches an already-confirmed finding and never alters the
+            # verdict (a failed/blocked extraction leaves the finding intact).
             if finding is not None:
-                return finding
+                return await self._prove_impact(target, client, param, finding, payload)
 
             if resp is not None and iteration >= min(len(seed), _MAX_TIME_PAYLOADS) - 1:
                 # Only drive the (very expensive: ~5s/probe) time-based mutator
@@ -455,6 +461,53 @@ class SqliAgent(VulnAgent):
             probe_request=probe_request,
             probe_response=probe_response,
         )
+
+    async def _prove_impact(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+        finding: AgentFinding,
+        confirmed_payload: str,
+    ) -> AgentFinding:
+        """Attempt safe read-only data extraction to turn detection into proof.
+
+        On success, enrich the finding with the extracted DBMS metadata and use
+        the extraction request/response as the exploit-proof pair (stronger
+        evidence than the bare detection probe). Never raises — a failed or
+        blocked extraction leaves the confirmed finding untouched.
+        """
+        dbms_hints: Optional[list] = None
+        if target.discovery_context and target.discovery_context.tech_stack:
+            hints = target.discovery_context.tech_stack.database_hints
+            dbms_hints = list(hints) if hints else None
+
+        async def _send(payload: str):
+            return await self._send_probe(target, client, param, payload)
+
+        try:
+            proof: Optional[ExploitProof] = await extract_db_facts(
+                _send, confirmed_payload, dbms_hints
+            )
+        except Exception as exc:
+            logger.debug(
+                "SQLi exploitation failed", url=target.url,
+                parameter=param["name"], error=str(exc),
+            )
+            return finding
+
+        if proof is None:
+            return finding
+
+        finding.extracted_data = dict(proof.facts)
+        finding.evidence = f"{finding.evidence} | {proof.summary()}"
+        # The extraction pair proves data exfiltration, not just an error — use
+        # it as the exploit-proof shown in the dashboard.
+        if proof.request:
+            finding.probe_request = proof.request
+        if proof.response:
+            finding.probe_response = proof.response
+        return finding
 
     async def _timed_send(
         self,

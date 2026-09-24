@@ -1336,6 +1336,11 @@ class ProxyRunner:
                         probe_response = getattr(f, "probe_response", "")
                         if probe_response:
                             finding_dict["probe_response"] = probe_response[:6000]
+                        extracted_data = getattr(f, "extracted_data", None)
+                        if extracted_data:
+                            finding_dict["extracted_data"] = {
+                                str(k): str(v)[:200] for k, v in extracted_data.items()
+                            }
                         self._store.add_finding(entry_id, finding_dict, "vulnerable")
                         log_event(
                             getattr(f, "attack_type", "agent"),

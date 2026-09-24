@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from dast.utils.logger import get_logger
 
@@ -71,6 +71,10 @@ class AgentFinding:
     raw_response: str = ""       # original intercepted response (baseline)
     probe_request: str = ""      # exploit proof request (when a before/after pair exists)
     probe_response: str = ""     # exploit proof response
+    # Read-only data extracted while proving impact (e.g. DBMS version/name/user
+    # for SQLi). Keys are free-form; presence means the injection was exploited,
+    # not merely detected. Rendered as concrete proof in the dashboard.
+    extracted_data: Dict[str, str] = field(default_factory=dict)
 
 
 class VulnAgent(ABC):

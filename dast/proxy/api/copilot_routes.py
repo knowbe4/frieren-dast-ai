@@ -208,6 +208,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if not isinstance(value, dict):
             return JSONResponse({"error": "value must be an object"}, status_code=400)
 
+        # The answer must match the pause actually in flight. Without this a
+        # guidance answer could be posted against an approve/auth wall (or vice
+        # versa) and get read with the wrong keys — e.g. resuming a scope gate as
+        # "continue" with no decision. Reject the mismatch instead.
+        actual_kind = str(pause.get("kind", "")).strip()
+        if actual_kind and kind in ("approve", "auth", "guidance") and kind != actual_kind:
+            return JSONResponse(
+                {"error": f"session is paused on a {actual_kind} gate, not {kind or 'unknown'}"},
+                status_code=409,
+            )
+
         if kind == "approve":
             decision = str(value.get("decision", "deny")).strip().lower()
             if decision not in ("allow_once", "always_host", "deny"):

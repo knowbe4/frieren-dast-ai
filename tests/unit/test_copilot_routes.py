@@ -220,3 +220,21 @@ def test_resume_rejects_unknown_kind(auto_client):
     }
     resp = auto_client.post("/api/copilot/resume/sid-g", json={"kind": "bogus", "value": {}})
     assert resp.status_code == 400
+
+
+def test_resume_rejects_kind_mismatch_with_active_pause(auto_client):
+    # A guidance answer must not resolve an approve/auth wall: the answer would be
+    # read with the wrong keys (no decision/cookies). Reject the mismatch (409).
+    event = asyncio.Event()
+    auto_client.service.sessions["sid-g"] = {
+        "pause": {"kind": "approve", "payload": {"host": "evil.test"}},
+        "_pause_event": event,
+        "_pause_result": None,
+    }
+    resp = auto_client.post("/api/copilot/resume/sid-g", json={
+        "kind": "guidance", "value": {"answer": "go", "action": "continue"},
+    })
+    assert resp.status_code == 409
+    # The wall is untouched: no result written and the gate stays closed.
+    assert auto_client.service.sessions["sid-g"]["_pause_result"] is None
+    assert not event.is_set()

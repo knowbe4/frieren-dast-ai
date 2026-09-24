@@ -23,6 +23,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from dast.ai.prompt_safety import wrap_untrusted
 from dast.proxy.api.agent_triage_routes import AgentToolContext
 from dast.utils.logger import get_logger
 
@@ -1170,18 +1171,23 @@ class CopilotService:
                     "operation has been tested.")
         lines = ["Coverage gaps remain — you have NOT tested the whole surface "
                  f"({self._coverage_label(cov)}):"]
+        # Endpoint paths and GraphQL field names are derived from observed target
+        # traffic / introspection, so they are attacker-influenceable content — a
+        # crafted route or field name could carry prompt-injection text. Fence the
+        # examples so they cannot be read as instructions (the copilot system prompt
+        # already carries UNTRUSTED_CONTENT_DIRECTIVE).
         rest_untested = cov["rest_untested"]
         if rest_untested:
             lines.append(
                 f"- {len(rest_untested)} REST endpoint(s) unscanned. Run scan_surface (scans every "
                 f"untested endpoint) and crawl to widen the surface. Examples: "
-                + ", ".join(rest_untested[:8])
+                + wrap_untrusted(", ".join(rest_untested[:8]), "untested_rest_endpoints")
             )
         gql_untested = cov["gql_untested"]
         if gql_untested:
             lines.append(
                 f"- {len(gql_untested)} GraphQL operation(s) untested. Run graphql_sweep on the "
                 f"endpoint (covers every query/mutation) until operations_remaining is 0. Examples: "
-                + ", ".join(gql_untested[:8])
+                + wrap_untrusted(", ".join(gql_untested[:8]), "untested_gql_operations")
             )
         return "\n".join(lines)

@@ -609,6 +609,46 @@ def _extract_text_safe(result: Dict[str, Any]) -> str:
     return ""
 
 
+def _tool_use_unsupported(exc: Exception) -> bool:
+    """True when a provider rejected forced tool-use with an HTTP 400 because the
+    model/server does not support function calling. Local OpenAI-compatible
+    servers (Ollama etc.) return exactly this for tool-less models
+    ("<model> does not support tools"). Scoped to 400s that mention tools/
+    functions so genuine malformed-request 400s still surface."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    message = str(exc).lower()
+    return "tool" in message or "function" in message
+
+
+def _invoke_json_as_text(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Structured output for models that can't do forced tool-use: describe the
+    schema in the prompt, ask for raw JSON, then parse with the repair-retry.
+    Lets any local model back a schema-forced call, tool-capable or not."""
+    text_system = system
+    if "json" not in text_system.lower():
+        text_system += "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
+    text_user = user
+    if schema:
+        text_user = f"{user}\n\nReturn a JSON object matching this schema:\n{json.dumps(schema)}"
+    raw = invoke(
+        system=text_system, user=text_user, model_id=model_id, max_tokens=max_tokens,
+        temperature=temperature, cache_system=cache_system,
+    )
+    return _parse_json_or_repair(
+        raw=raw, system=text_system, user=text_user, model_id=model_id,
+        max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+    )
+
+
 def _parse_json_or_repair(
     raw: str,
     system: str,
@@ -754,10 +794,27 @@ def _invoke_json_uncached(
     # Structured path: the model is forced to call the tool, so we read the
     # validated object straight from the tool_use block.
     if schema is not None:
-        result = _invoke_raw(
-            system=system, user=user, model_id=model_id, max_tokens=max_tokens,
-            temperature=temperature, cache_system=cache_system, schema=schema,
-        )
+        from dast.ai import providers  # local import: avoids a module-level cycle
+        try:
+            result = _invoke_raw(
+                system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+                temperature=temperature, cache_system=cache_system, schema=schema,
+            )
+        except providers.ProviderError as exc:
+            # The server refused forced tool-use outright (e.g. a tool-less local
+            # model on Ollama returns HTTP 400 "does not support tools"). Retry
+            # once as a plain-text JSON call with the schema described in-prompt,
+            # so structured output works on any local model.
+            if _tool_use_unsupported(exc):
+                logger.warning(
+                    "Provider rejected forced tool-use; falling back to text JSON",
+                    error=str(exc), status=getattr(exc, "status_code", None),
+                )
+                return _invoke_json_as_text(
+                    system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+                    temperature=temperature, cache_system=cache_system, schema=schema,
+                )
+            raise
         tool_input = _extract_tool_input(result)
         if tool_input is not None:
             return tool_input

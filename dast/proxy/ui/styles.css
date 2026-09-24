@@ -17,11 +17,34 @@
   --blue:   #569cd6;
   --sel:    #264f78;
   --hov:    #2a2d2e;
+  /* --bad was referenced across index.html + login-profiles.js but never
+     defined, so error/warning/delete affordances silently lost their red.
+     Alias it to the danger colour. */
+  --bad:    #f44747;
+  /* Unified severity palette — single source of truth for every severity
+     badge/chip so Critical/High/Medium/Low/Info read the same everywhere. */
+  --sev-crit-bg: #4d0016; --sev-crit-fg: #ff5c8a;
+  --sev-high-bg: #4d0000; --sev-high-fg: #ff6b6b;
+  --sev-med-bg:  #3d2a00; --sev-med-fg:  #ffb454;
+  --sev-low-bg:  #08301f; --sev-low-fg:  #4ec994;
+  --sev-info-bg: #14203a; --sev-info-fg: #7b9cff;
+  /* Focus ring for keyboard navigation */
+  --focus-ring: #4aa3ff;
   /* Typography scale */
   --fs-base: 12px;
   --fs-sm:   11px;
   --fs-xs:   10px;
 }
+
+/* Keyboard focus visibility — replaces the bare `outline:none` overrides so
+   keyboard users can always see where they are. Mouse clicks don't trigger
+   :focus-visible, so this stays invisible for pointer users. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+*:focus:not(:focus-visible) { outline: none; }
 html, body { height: 100%; font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
              background: var(--bg); color: var(--txt); overflow: hidden; }
 
@@ -39,8 +62,8 @@ html, body { height: 100%; font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Se
         border: 1px solid var(--bdr); background: var(--bg3); color: var(--txt);
         font-family: inherit; transition: background .1s; }
 .tbtn:hover { background: var(--bg4); }
-.tbtn.pri { background: var(--acc); border-color: var(--acc); color: #fff; }
-.tbtn.pri:hover { background: var(--acc2); }
+.tbtn.pri, .tbtn.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+.tbtn.pri:hover, .tbtn.primary:hover { background: var(--acc2); }
 .tbtn.del { background: #5a1d1d; border-color: #7a2020; color: #f88; }
 .tbtn.del:hover { background: #6a2020; }
 .tbtn:disabled { opacity: .3; pointer-events: none; }
@@ -250,11 +273,11 @@ tbody tr.r-oos td { opacity: .55; }
 /* Unified severity badge */
 .sev-badge { display: inline-block; font-size: 9px; font-weight: 700; padding: 2px 8px;
              border-radius: 4px; min-width: 52px; text-align: center; text-transform: uppercase; }
-.sev-badge.sC { background: #3d0020; color: #ff4081; }
-.sev-badge.sH { background: #3d0000; color: var(--red); }
-.sev-badge.sM { background: #3d2a00; color: var(--orange); }
-.sev-badge.sL { background: #1a2a1a; color: var(--green); }
-.sev-badge.sI { background: #1a1a2a; color: var(--blue); }
+.sev-badge.sC { background: var(--sev-crit-bg); color: var(--sev-crit-fg); }
+.sev-badge.sH { background: var(--sev-high-bg); color: var(--sev-high-fg); }
+.sev-badge.sM { background: var(--sev-med-bg);  color: var(--sev-med-fg); }
+.sev-badge.sL { background: var(--sev-low-bg);  color: var(--sev-low-fg); }
+.sev-badge.sI { background: var(--sev-info-bg); color: var(--sev-info-fg); }
 /* Code analysis tabs */
 .code-rtab { padding: 6px 14px; font-size: var(--fs-xs); cursor: pointer;
              color: var(--txt2); border-bottom: 2px solid transparent; transition: color .1s; }
@@ -349,10 +372,10 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
 .ftitle { font-size: 12px; font-weight: 600; color: var(--txt); margin-bottom: 3px; }
 .fmeta  { font-size: 10px; color: var(--txt2); }
 .fsev { display: inline; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 4px; }
-.sC { background: #4d0000; color: #ff6b6b; }
-.sH { background: #3d1a00; color: #ff9944; }
-.sM { background: #3d3000; color: #ffd700; }
-.sL { background: #003020; color: var(--green); }
+.sC { background: var(--sev-crit-bg); color: var(--sev-crit-fg); }
+.sH { background: var(--sev-high-bg); color: var(--sev-high-fg); }
+.sM { background: var(--sev-med-bg);  color: var(--sev-med-fg); }
+.sL { background: var(--sev-low-bg);  color: var(--sev-low-fg); }
 .fevid { margin-top: 6px; padding: 5px 8px; background: var(--bg3); border-radius: 3px;
          font-size: 10px; color: var(--orange); white-space: pre-wrap; word-break: break-all; }
 
@@ -368,11 +391,11 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ihost-sev-bar { display: flex; gap: 5px; flex-shrink: 0; }
 .isev-chip { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px; }
-.isev-chip.c { background: #4d0000; color: #ff6b6b; }
-.isev-chip.h { background: #3d1a00; color: #ff9944; }
-.isev-chip.m { background: #3d3000; color: #ffd700; }
-.isev-chip.l { background: #003020; color: #4ec994; }
-.isev-chip.i { background: #1a1a2e; color: #7b9cff; }
+.isev-chip.c { background: var(--sev-crit-bg); color: var(--sev-crit-fg); }
+.isev-chip.h { background: var(--sev-high-bg); color: var(--sev-high-fg); }
+.isev-chip.m { background: var(--sev-med-bg);  color: var(--sev-med-fg); }
+.isev-chip.l { background: var(--sev-low-bg);  color: var(--sev-low-fg); }
+.isev-chip.i { background: var(--sev-info-bg); color: var(--sev-info-fg); }
 
 .ihost-body { padding: 8px 10px; display: flex; flex-direction: column; gap: 4px; }
 
@@ -382,11 +405,11 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
 .iissue-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px; }
 .iissue-sev { font-size: 10px; font-weight: 700; padding: 2px 8px; border-radius: 10px;
               flex-shrink: 0; min-width: 52px; text-align: center; }
-.iissue-sev.sC { background: #4d0000; color: #ff6b6b; }
-.iissue-sev.sH { background: #3d1a00; color: #ff9944; }
-.iissue-sev.sM { background: #3d3000; color: #ffd700; }
-.iissue-sev.sL { background: #003020; color: #4ec994; }
-.iissue-sev.sI { background: #1a1a2e; color: #7b9cff; }
+.iissue-sev.sC { background: var(--sev-crit-bg); color: var(--sev-crit-fg); }
+.iissue-sev.sH { background: var(--sev-high-bg); color: var(--sev-high-fg); }
+.iissue-sev.sM { background: var(--sev-med-bg);  color: var(--sev-med-fg); }
+.iissue-sev.sL { background: var(--sev-low-bg);  color: var(--sev-low-fg); }
+.iissue-sev.sI { background: var(--sev-info-bg); color: var(--sev-info-fg); }
 .iissue-info { flex: 1; min-width: 0; }
 .iissue-title { font-size: 11px; font-weight: 600; color: var(--txt);
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -422,8 +445,51 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
          border-radius: 3px; text-decoration: none; font-size: 12px; }
 .dlbtn:hover { background: var(--acc2); }
 
+/* ── REUSABLE COMPONENTS ─────────────────────────────────────────────────────
+   Shared classes so new UI stops repeating the same inline background/border/
+   padding on every <input>, modal and card. Prefer these over inline styles. */
+.input {
+  background: var(--bg); border: 1px solid var(--bdr); color: var(--txt);
+  padding: 5px 8px; border-radius: 3px; font-family: inherit; font-size: var(--fs-sm);
+}
+.input:focus { outline: none; border-color: var(--acc); }
+.input::placeholder { color: var(--txt3); }
+
+.card {
+  background: var(--bg2); border: 1px solid var(--bdr);
+  border-radius: 6px; padding: 14px 16px;
+}
+.card-title {
+  font-size: var(--fs-sm); color: var(--txt2); font-weight: 600;
+  text-transform: uppercase; letter-spacing: .4px; margin-bottom: 12px;
+}
+
+/* Modal component — replaces per-instance hand-rolled overlays. */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: var(--bg2); border: 1px solid var(--bdr); border-radius: 8px;
+  max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: 0 12px 48px #000a;
+}
+.modal-hdr {
+  padding: 14px 18px; border-bottom: 1px solid var(--bdr);
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 600; font-size: 13px;
+}
+.modal-body { padding: 14px 18px; overflow-y: auto; flex: 1; }
+
 /* MISC */
 .empty { color: var(--txt2); text-align: center; padding: 60px 20px; font-size: 12px; line-height: 1.9; }
+
+/* Enlarge previously sub-10px click targets toward the ~24px guideline without
+   changing layout density elsewhere. */
+.rep-tab-close { padding: 2px 5px; font-size: 12px; }
+.pane-view-toggle button { padding: 3px 9px; font-size: 10px; }
+.col-resizer { width: 7px; }
+.panel-resizer { width: 6px; }
 
 /* PULSE ANIMATION */
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }

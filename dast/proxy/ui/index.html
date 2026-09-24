@@ -1243,6 +1243,17 @@
               <input type="checkbox" id="sc-probe-diff" style="accent-color:var(--acc)">
               Use probe-diff pre-analysis (break/repair pairs classify injection context before agents run)
             </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-ai-response-cache" style="accent-color:var(--acc)">
+              Cache AI responses (reuse deterministic LLM decisions for identical inputs)
+            </label>
+            <p style="color:var(--yellow,#ff9800);font-size:10px;margin:2px 0 0 24px;line-height:1.4">
+              ⚠ Speeds up re-scans and cuts LLM cost by reusing a prior decision when the exact same
+              prompt (endpoint, request/response, model) is seen again. Only deterministic calls are
+              cached; the payload mutator is never affected. Trade-off: if a target's backend changes
+              out-of-band during the session, a re-scanned endpoint keeps the earlier verdict until the
+              cache is cleared (toggling this off clears it). Leave off for the most current results.
+            </p>
           </div>
         </div>
         <div style="margin-bottom:14px">

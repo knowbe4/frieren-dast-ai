@@ -118,6 +118,7 @@ class DashboardContext:
                 "confidence_threshold": 0.5,
                 "scan_budget_seconds": 300,
                 "passive_aggressive_rules": False,
+                "ai_response_cache": False,
             }
 
         # Apply tiered model defaults to bedrock_client immediately
@@ -126,6 +127,10 @@ class DashboardContext:
             fast=self._scan_cfg.get("fast_model_id", default_fast_model),
             validation=self._scan_cfg.get("validation_model_id", default_validation_model),
         )
+
+        # Apply the opt-in deterministic-response cache setting (default off).
+        from dast.ai import response_cache as _rc
+        _rc.set_enabled(bool(self._scan_cfg.get("ai_response_cache", False)))
 
     async def broadcast(self, entry) -> None:
         import json

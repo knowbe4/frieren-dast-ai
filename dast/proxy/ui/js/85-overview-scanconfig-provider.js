@@ -218,6 +218,7 @@ async function loadScanConfig() {
     if (s('sc-llm-validator'))     s('sc-llm-validator').checked   = c.llm_validator      ?? true;
     if (s('sc-discovery-llm-classify')) s('sc-discovery-llm-classify').checked = c.discovery_llm_classify ?? false;
     if (s('sc-probe-diff'))        s('sc-probe-diff').checked      = c.probe_diff          ?? false;
+    if (s('sc-ai-response-cache')) s('sc-ai-response-cache').checked = c.ai_response_cache ?? false;
     // Populate the model presets from the backend (dast.config.settings) —
     // the UI never hardcodes a model ARN/name.
     populateModelPresets(c.model_presets ?? []);
@@ -264,6 +265,7 @@ async function saveScanConfig() {
     llm_validator:        chk('sc-llm-validator', true),
     discovery_llm_classify: chk('sc-discovery-llm-classify', false),
     probe_diff:            chk('sc-probe-diff', false),
+    ai_response_cache:     chk('sc-ai-response-cache', false),
     confidence_threshold:  parseFloat(v('sc-confidence', 0.5)),
     fast_model_id:         v('sc-fast-model-id', ''),
     validation_model_id:   v('sc-validation-model-id', ''),

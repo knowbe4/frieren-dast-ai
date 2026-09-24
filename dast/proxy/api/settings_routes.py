@@ -270,6 +270,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             enabled = bool(body["passive_aggressive_rules"])
             _scan_config["passive_aggressive_rules"] = enabled
             set_aggressive_rules(enabled)
+        if "ai_response_cache" in body:
+            from dast.ai import response_cache as _rc
+            enabled = bool(body["ai_response_cache"])
+            _scan_config["ai_response_cache"] = enabled
+            _rc.set_enabled(enabled)  # toggling clears any stored decisions
         if "model_id" in body:
             new_model = str(body["model_id"]).strip()
             _scan_config["model_id"] = new_model

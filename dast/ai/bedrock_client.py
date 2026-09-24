@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+from dast.ai import response_cache
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -663,7 +664,48 @@ def invoke_json(
     fence + json.loads" path, hardened with a one-shot repair-retry: if the
     model returns text that isn't valid JSON, it is re-invoked once with an
     explicit instruction to return only the JSON object.
+
+    When the operator has opted into response caching, deterministic calls
+    (temperature=0) are memoised: an identical (provider, model, system, user,
+    schema, max_tokens) tuple returns a stored decision instead of a fresh LLM
+    call. Non-deterministic calls bypass the cache entirely.
     """
+    cache_key: Optional[str] = None
+    if temperature == 0 and response_cache.is_enabled():
+        cache_key = response_cache.make_key(
+            provider=get_active_provider(),
+            model=_resolve_model(model_id),
+            system=system,
+            user=user,
+            schema=schema,
+            max_tokens=max_tokens,
+        )
+        cached = response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    result = _invoke_json_uncached(
+        system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+        temperature=temperature, cache_system=cache_system, schema=schema,
+    )
+
+    if cache_key is not None and isinstance(result, dict):
+        response_cache.put(cache_key, result)
+    return result
+
+
+def _invoke_json_uncached(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The uncached invoke_json body — one LLM round-trip (plus repair retry on
+    the legacy text path). Wrapped by invoke_json, which layers optional
+    deterministic-response caching on top."""
     # Structured path: the model is forced to call the tool, so we read the
     # validated object straight from the tool_use block.
     if schema is not None:

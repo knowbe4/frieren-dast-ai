@@ -17,13 +17,17 @@ from dast.scanners.active_checks import (
     _HostConcurrencyLimiter,
     _HostScanGate,
     _inject_body,
+    _inject_cookie,
+    _inject_header,
     _inject_path,
     _inject_query,
     check_xss,
     check_sqli,
     check_open_redirect,
+    seed_taint_markers,
     zero_delay_variant,
 )
+from dast.scanners.taint import _MARKER_RE, TaintStore
 from dast.proxy.runner import _entry_to_check_target
 
 
@@ -384,6 +388,73 @@ class TestEntryToCheckTarget:
         assert _entry_to_check_target(entry) is None
 
 
+class TestHeaderInjection:
+    def test_overwrites_existing_header_case_insensitive(self):
+        result = _inject_header({"User-Agent": "curl", "Host": "h"}, "user-agent", "PAYLOAD")
+        # only one User-Agent survives, with the payload value; Host is untouched
+        assert result.get("user-agent") == "PAYLOAD"
+        assert result["Host"] == "h"
+        assert sum(1 for k in result if k.lower() == "user-agent") == 1
+
+    def test_adds_missing_header(self):
+        result = _inject_header({"Host": "h"}, "X-Forwarded-For", "127.0.0.1")
+        assert result["X-Forwarded-For"] == "127.0.0.1"
+
+    def test_cookie_replaces_only_target_cookie(self):
+        result = _inject_cookie({"Cookie": "pref=dark; sid=abc; lang=en"}, "pref", "PAYLOAD")
+        assert result["Cookie"] == "pref=PAYLOAD; sid=abc; lang=en"
+
+    def test_cookie_appended_when_absent(self):
+        result = _inject_cookie({"Cookie": "sid=abc"}, "tracking", "PAYLOAD")
+        assert "tracking=PAYLOAD" in result["Cookie"]
+        assert "sid=abc" in result["Cookie"]
+
+
+class TestHeaderCookieEntrypoints:
+    def test_fuzzable_header_becomes_param(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"User-Agent": "Mozilla", "Host": "example.com"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        header_params = [p for p in target.params if p["location"] == "header"]
+        assert any(p["name"] == "User-Agent" for p in header_params)
+
+    def test_structural_headers_never_fuzzed(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"Host": "example.com", "Content-Length": "0",
+                                     "Authorization": "Bearer x", "Accept-Encoding": "gzip"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        header_names = {p["name"].lower() for p in target.params if p["location"] == "header"}
+        assert header_names.isdisjoint({"host", "content-length", "authorization", "accept-encoding"})
+
+    def test_custom_x_header_is_fuzzed(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"X-Custom-Tenant": "acme"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        assert any(p["name"] == "X-Custom-Tenant" and p["location"] == "header"
+                   for p in target.params)
+
+    def test_cookies_become_params_but_session_cookie_skipped(self):
+        entry = _fake_entry(method="GET", url="https://example.com/search?q=x",
+                            headers={"Cookie": "sessionid=secret; theme=dark"})
+        entry.path = "/search"
+        target = _entry_to_check_target(entry)
+        cookie_params = {p["name"] for p in target.params if p["location"] == "cookie"}
+        assert "theme" in cookie_params
+        assert "sessionid" not in cookie_params
+
+    def test_paramless_get_not_resurrected_by_headers(self):
+        # A static-asset-style GET with no query/body params stays skipped even
+        # though it carries a fuzzable User-Agent — header fuzzing augments real
+        # endpoints, it does not resurrect every paramless GET.
+        entry = _fake_entry(method="GET", url="https://example.com/app.js",
+                            headers={"User-Agent": "Mozilla"})
+        entry.path = "/app.js"
+        assert _entry_to_check_target(entry) is None
+
+
 # ── ActiveFinding fields ───────────────────────────────────────────────────
 
 class TestActiveFinding:
@@ -529,3 +600,69 @@ class TestCheckOpenRedirect:
         async with httpx.AsyncClient() as client:
             findings = await check_open_redirect(target, client)
         assert findings == []
+
+
+# ── taint marker seeding ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+class TestSeedTaintMarkers:
+    @respx.mock
+    async def test_seeds_one_marker_per_entry_point(self):
+        target = CheckTarget(
+            method="POST",
+            url="https://example.com/comment",
+            headers={"content-type": "application/json", "user-agent": "orig",
+                     "cookie": "pref=blue"},
+            body='{"text":"hi"}',
+            params=[
+                {"name": "q", "location": "query", "value": "x"},
+                {"name": "text", "location": "body", "value": "hi"},
+                {"name": "user-agent", "location": "header", "value": "orig"},
+                {"name": "pref", "location": "cookie", "value": "blue"},
+            ],
+        )
+        route = respx.route(host="example.com").mock(
+            return_value=httpx.Response(200, text="ok")
+        )
+        store = TaintStore()
+        async with httpx.AsyncClient() as client:
+            seeded = await seed_taint_markers(target, client, store)
+
+        assert seeded == 4
+        assert route.call_count == 4
+
+        # Each request carries a marker in the location it targets.
+        sent = {}
+        for call in route.calls:
+            request = call.request
+            body_text = request.content.decode("utf-8", errors="replace")
+            haystack = f"{request.url} {dict(request.headers)} {body_text}"
+            match = _MARKER_RE.search(haystack)
+            assert match, f"no marker found in request: {haystack}"
+            sent[match.group(0)] = request
+
+        # Every minted marker is registered and correctly attributed to its source
+        # parameter — proven end-to-end by scanning a different endpoint for it.
+        located_params = set()
+        for token in sent:
+            hits = store.find_hits("https://example.com/other-page", token)
+            assert len(hits) == 1
+            assert hits[0].is_cross_location is True
+            located_params.add(hits[0].marker.source_param)
+        assert located_params == {"q", "text", "user-agent", "pref"}
+
+    @respx.mock
+    async def test_no_params_seeds_nothing(self):
+        target = CheckTarget(method="GET", url="https://example.com/", headers={},
+                             body=None, params=[])
+        store = TaintStore()
+        async with httpx.AsyncClient() as client:
+            assert await seed_taint_markers(target, client, store) == 0
+
+    async def test_none_store_is_noop(self):
+        target = CheckTarget(
+            method="GET", url="https://example.com/", headers={}, body=None,
+            params=[{"name": "q", "location": "query", "value": "x"}],
+        )
+        async with httpx.AsyncClient() as client:
+            assert await seed_taint_markers(target, client, None) == 0

@@ -1262,6 +1262,7 @@ class ProxyRunner:
                         session_intelligence=self._store.session_intelligence,
                         budget_seconds=budget_override,
                         probe_diff=bool(self._engine_config.get("probe_diff", False)),
+                        taint_store=self._store.taint_store,
                     )
                 except asyncio.CancelledError:
                     logger.info("Active scan cancelled by user", url=entry.url)

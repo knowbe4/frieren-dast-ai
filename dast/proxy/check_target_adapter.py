@@ -69,6 +69,103 @@ def _is_value_like_path_segment(segment: str) -> bool:
     return bool(_PATH_ALNUM_WITH_DIGIT_RE.match(segment))
 
 
+# Request headers that are commonly attacker-influenced and reflected/trusted by
+# the application (SQLi/XSS/SSTI/CMDi via a header). Fuzzing these turns headers
+# into first-class injection entrypoints. Kept as a curated allowlist so scans
+# don't explode across every incidental header; custom X-* headers seen on the
+# request are added on top of this list.
+_FUZZABLE_HEADERS = frozenset({
+    "user-agent",
+    "referer",
+    "origin",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-url",
+    "x-real-ip",
+    "x-client-ip",
+    "x-originating-ip",
+    "true-client-ip",
+    "forwarded",
+    "accept-language",
+    "x-api-version",
+})
+
+# Headers that must never be fuzzed: structural/transport headers (fuzzing them
+# corrupts the request), auth headers (fuzzing them destroys the session), and
+# Cookie (handled separately, one param per cookie).
+_NEVER_FUZZ_HEADERS = frozenset({
+    "host", "content-length", "content-type", "connection", "accept-encoding",
+    "transfer-encoding", "upgrade", "te", "keep-alive", "cookie", "authorization",
+    "proxy-authorization", "range", "if-match", "if-none-match",
+    "if-modified-since", "if-unmodified-since", "sec-fetch-mode",
+    "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user", "sec-ch-ua",
+    "sec-ch-ua-mobile", "sec-ch-ua-platform",
+})
+
+# Cookie names that carry the session/auth state — fuzzing them just logs the
+# scanner out, so they are skipped. Preference/tracking cookies are fair game.
+_SESSION_COOKIE_NAMES = frozenset({
+    "session", "sessionid", "session_id", "sid", "phpsessid", "jsessionid",
+    "asp.net_sessionid", "aspsessionid", "connect.sid", "csrf", "csrftoken",
+    "csrf_token", "xsrf-token", "_csrf", "auth", "token", "access_token",
+    "refresh_token", "jwt", "remember_token",
+})
+
+# Caps so a header-heavy request cannot explode the fuzz surface.
+_MAX_HEADER_PARAMS = 12
+_MAX_COOKIE_PARAMS = 12
+
+
+def _extract_header_cookie_params(entry: "ProxyEntry") -> list:
+    """
+    Extract header and cookie injection entrypoints from a request.
+
+    The data's input point is not always a query/body parameter: apps trust
+    headers (User-Agent, Referer, X-Forwarded-For) and cookie values and pass
+    them unsanitised into SQL, templates, logs or the response. This returns
+    ``location="header"`` / ``location="cookie"`` params so the agents fuzz them
+    like any other entrypoint. Structural/auth headers and session cookies are
+    skipped (fuzzing them corrupts the request or ends the session).
+    """
+    extra_params: list = []
+
+    header_count = 0
+    for header_name, header_value in entry.request_headers.items():
+        if header_count >= _MAX_HEADER_PARAMS:
+            break
+        lowered = header_name.lower()
+        if lowered in _NEVER_FUZZ_HEADERS:
+            continue
+        is_custom_x = lowered.startswith("x-") and lowered not in _FUZZABLE_HEADERS
+        if lowered not in _FUZZABLE_HEADERS and not is_custom_x:
+            continue
+        extra_params.append({"name": header_name, "location": "header", "value": header_value})
+        header_count += 1
+
+    cookie_header = ""
+    for header_name, header_value in entry.request_headers.items():
+        if header_name.lower() == "cookie":
+            cookie_header = header_value
+            break
+    if cookie_header:
+        cookie_count = 0
+        for part in cookie_header.split(";"):
+            if cookie_count >= _MAX_COOKIE_PARAMS:
+                break
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            cookie_name, _, cookie_value = part.partition("=")
+            cookie_name = cookie_name.strip()
+            if not cookie_name or cookie_name.lower() in _SESSION_COOKIE_NAMES:
+                continue
+            extra_params.append({"name": cookie_name, "location": "cookie", "value": cookie_value})
+            cookie_count += 1
+
+    return extra_params
+
+
 def _entry_to_check_target(entry: "ProxyEntry", store=None):
     """Convert a ProxyEntry into a CheckTarget for the active scanner."""
     from urllib.parse import parse_qs, urlparse
@@ -271,6 +368,12 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
         # Still no params — skip (nothing for agents to fuzz)
         if not params:
             return None
+
+    # Augment with header/cookie entrypoints. Done AFTER the paramless-GET skip
+    # so static-asset GETs (no query/body params) are not resurrected into scans
+    # just because they carry a User-Agent — header fuzzing augments endpoints
+    # that already have a real parameter surface.
+    params.extend(_extract_header_cookie_params(entry))
 
     # Build service context (Layer 2) from the service graph if available
     service_context = None

@@ -428,6 +428,43 @@ async def test_run_validation_exception_does_not_confirm_finding():
     assert result == []
 
 
+@pytest.mark.asyncio
+async def test_run_returns_held_finding_flagged_needs_review():
+    # When the validator holds a finding for review (AI offline/errored but
+    # pattern-plausible), it is NOT confirmed but IS returned, flagged so the
+    # runner can serialize it as unconfirmed and separate from confirmed vulns.
+    finding = _finding(bypass_validation=False, attack_type="_e2e_hold_test")
+
+    class _HitAgent(VulnAgent):
+        name = "Hit"
+        attack_type = "_e2e_hold_test"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return [finding]
+
+    async def _hold(f, *a, **k):
+        f.needs_review = True
+        return (False, 0.8, "AI unavailable — held for review (not AI-confirmed)")
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_HitAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=(["_e2e_hold_test"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.ai.red_team.validate", new=_hold):
+            client = MagicMock()
+            result = await Coordinator.run(_target(), client, budget_seconds=5.0)
+
+    assert len(result) == 1
+    assert result[0].needs_review is True
+    assert result[0].confirmed is True  # agent-level default; runner reads needs_review
+
+    # The held finding must NOT be logged as a confirmed outcome.
+    entry = _activity_log[0]
+    outcome = next(o for o in entry["outcomes"] if o["finding_title"] == "Reflected XSS")
+    assert outcome["confirmed"] is False
+
+
 # ── deterministic CSRF selection on state-changing endpoints ───────────────
 
 @pytest.mark.asyncio

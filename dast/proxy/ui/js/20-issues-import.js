@@ -163,7 +163,7 @@ function _buildIssueCard(host, f, globalIdx) {
     ai:'AI validated',passive:'Passive',imported:'Imported',
     browser:'Browser confirmed',time_based:'Time-based',oob_callback:'OOB callback',
     error_pattern:'Error pattern',file_match:'File match',secret_pattern:'Secret pattern',
-    response_diff:'Response diff',pattern:'Pattern match',
+    response_diff:'Response diff',pattern:'Pattern match',unvalidated:'Needs review',
     // legacy single-string values
     'passive+ai':'Passive+AI',
   };
@@ -171,7 +171,7 @@ function _buildIssueCard(host, f, globalIdx) {
     ai:'vbdg-ai',passive:'vbdg-passive',imported:'vbdg-imported',
     browser:'vbdg-browser',time_based:'vbdg-time_based',oob_callback:'vbdg-oob_callback',
     error_pattern:'vbdg-error_pattern',file_match:'vbdg-file_match',secret_pattern:'vbdg-secret_pattern',
-    response_diff:'vbdg-response_diff',pattern:'vbdg-pattern',
+    response_diff:'vbdg-response_diff',pattern:'vbdg-pattern',unvalidated:'vbdg-unvalidated',
     'passive+ai':'vbdg-pai',
   };
   const vBadge = _vbyList.map(v => {

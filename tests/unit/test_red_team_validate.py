@@ -30,6 +30,7 @@ class _FakeFinding:
     confirmed: bool = True
     bypass_validation: bool = False
     ai_validated: bool = False
+    needs_review: bool = False
     reasoning: str = ""
     raw_response_snippet: str = ""
     browser_confirmed: Optional[bool] = None
@@ -223,10 +224,12 @@ async def test_browser_confidence_can_carry_over_threshold_via_max(monkeypatch):
     assert confidence == 0.92
 
 
-# ── validate() — LLM failure fallback ───────────────────────────────────────
+# ── validate() — LLM failure fallback: HOLD FOR REVIEW, never auto-confirm ───
 
 @pytest.mark.asyncio
-async def test_llm_raises_falls_back_to_pattern_confidence_above_threshold(monkeypatch):
+async def test_llm_raises_holds_for_review_when_pattern_plausible(monkeypatch):
+    # The exploit-validator never ran, so a finding must NOT be auto-confirmed
+    # even when pattern confidence is high. Instead it is held for human review.
     def _raise(*args, **kwargs):
         raise RuntimeError("bedrock unavailable")
 
@@ -237,13 +240,16 @@ async def test_llm_raises_falls_back_to_pattern_confidence_above_threshold(monke
 
     confirmed, confidence, reasoning = await red_team.validate(finding, target, confidence_threshold=0.5)
 
-    assert confirmed is True
+    assert confirmed is False
+    assert finding.needs_review is True
     assert confidence == pytest.approx(0.80)
-    assert "pattern confidence" in reasoning.lower()
+    assert "review" in reasoning.lower()
 
 
 @pytest.mark.asyncio
-async def test_llm_raises_falls_back_to_pattern_confidence_below_threshold(monkeypatch):
+async def test_llm_raises_drops_weak_finding_without_holding(monkeypatch):
+    # Pattern confidence below threshold — nothing plausible to review, so the
+    # finding is neither confirmed nor held.
     def _raise(*args, **kwargs):
         raise RuntimeError("bedrock unavailable")
 
@@ -255,8 +261,9 @@ async def test_llm_raises_falls_back_to_pattern_confidence_below_threshold(monke
     confirmed, confidence, reasoning = await red_team.validate(finding, target, confidence_threshold=0.5)
 
     assert confirmed is False
+    assert finding.needs_review is False
     assert confidence == pytest.approx(0.40)
-    assert "pattern confidence" in reasoning.lower()
+    assert "review" in reasoning.lower()
 
 
 # ── validate() — ai_validated flag (drives the "AI validated" badge) ─────────
@@ -294,7 +301,7 @@ async def test_ai_validated_false_when_llm_raises(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ai_unavailable_skips_llm_and_uses_pattern_confidence(monkeypatch):
+async def test_ai_unavailable_skips_llm_and_holds_for_review(monkeypatch):
     called = False
 
     def _invoke_json(*args, **kwargs):
@@ -309,12 +316,27 @@ async def test_ai_unavailable_skips_llm_and_uses_pattern_confidence(monkeypatch)
     confirmed, confidence, reasoning = await red_team.validate(
         finding, _FakeTarget(), confidence_threshold=0.5)
 
-    # LLM never called; pattern confidence (0.80) confirms; flag stays False.
+    # LLM never called; plausible pattern confidence (0.80) is HELD for review,
+    # not auto-confirmed; the ai_validated flag stays False.
     assert called is False
-    assert confirmed is True
+    assert confirmed is False
+    assert finding.needs_review is True
     assert confidence == pytest.approx(0.80)
     assert finding.ai_validated is False
     assert "ai unavailable" in reasoning.lower()
+
+
+@pytest.mark.asyncio
+async def test_ai_unavailable_does_not_hold_weak_finding(monkeypatch):
+    monkeypatch.setattr(bedrock_client, "is_ai_available", lambda: False)
+
+    finding = _FakeFinding(attack_type="unknown_future_type")  # pattern_conf = 0.40
+    confirmed, confidence, reasoning = await red_team.validate(
+        finding, _FakeTarget(), confidence_threshold=0.5)
+
+    assert confirmed is False
+    assert finding.needs_review is False
+    assert confidence == pytest.approx(0.40)
 
 
 # ── _detection_method — label honesty ────────────────────────────────────────

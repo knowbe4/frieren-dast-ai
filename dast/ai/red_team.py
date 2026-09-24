@@ -257,18 +257,20 @@ async def validate(
     from dast.ai import bedrock_client
 
     # AI known to be unavailable (expired/absent credentials, a prior Bedrock
-    # failure that tripped the sticky flag). Do NOT attempt the LLM call — fall
-    # back to pattern confidence and leave finding.ai_validated False so the
-    # finding is never mislabeled "AI validated" when the AI never ran.
+    # failure that tripped the sticky flag). Do NOT attempt the LLM call, and do
+    # NOT confirm on pattern confidence alone — a finding the exploit-validator
+    # never reviewed must never be auto-confirmed. Instead HOLD it for human
+    # review when pattern confidence was plausible, and drop it otherwise.
+    # Leave finding.ai_validated False so it is never mislabeled "AI validated".
     if not bedrock_client.is_ai_available():
         finding.ai_validated = False
-        fallback_confirmed = pattern_conf >= confidence_threshold
+        finding.needs_review = pattern_conf >= confidence_threshold
         logger.debug(
-            "Red-team: AI unavailable — pattern confidence used",
+            "Red-team: AI unavailable — held for review (not confirmed)",
             attack=finding.attack_type, url=finding.url,
-            pattern_conf=round(pattern_conf, 2), confirmed=fallback_confirmed,
+            pattern_conf=round(pattern_conf, 2), needs_review=finding.needs_review,
         )
-        return fallback_confirmed, pattern_conf, "AI unavailable — pattern confidence used"
+        return False, pattern_conf, "AI unavailable — held for review (not AI-confirmed)"
 
     try:
         # Validation uses the highest-tier model — it is the final exploit-proof
@@ -322,12 +324,14 @@ async def validate(
 
     except Exception as e:
         # The LLM call did not complete — the finding was NOT AI-validated.
-        # Leave the flag False so it is labeled by pattern confidence, never "ai".
+        # Leave the flag False so it is never labeled "ai". As with the offline
+        # branch, do NOT auto-confirm on pattern confidence: hold plausible
+        # findings for human review and drop the weak ones.
         finding.ai_validated = False
-        # Conservative fallback: keep the finding but cap confidence at pattern level
-        fallback_confirmed = pattern_conf >= confidence_threshold
+        finding.needs_review = pattern_conf >= confidence_threshold
         logger.warning(
-            "Red-team LLM call failed — downgraded to pattern confidence (not AI validated)",
+            "Red-team LLM call failed — held for review (not AI validated)",
             attack=finding.attack_type, url=finding.url, error=str(e),
+            needs_review=finding.needs_review,
         )
-        return fallback_confirmed, pattern_conf, "Validation error — pattern confidence used"
+        return False, pattern_conf, "Validation error — held for review (not AI-confirmed)"

@@ -1013,6 +1013,10 @@ class Coordinator:
         raw_findings: List[AgentFinding] = []
         agent_raw: Dict[str, List[AgentFinding]] = {}  # attack_type → findings
         confirmed: List[AgentFinding] = []
+        # Findings the validator could not confirm because the AI was offline or
+        # errored, but pattern confidence deemed plausible. They are NOT confirmed
+        # vulns — they are surfaced separately for a human to review.
+        review: List[AgentFinding] = []
 
         agent_tasks = [asyncio.ensure_future(_run_and_tag(agent)) for agent in agents]
         try:
@@ -1045,13 +1049,19 @@ class Coordinator:
                             continue
                         if result:
                             confirmed.append(finding)
+                        elif getattr(finding, "needs_review", False):
+                            # Validator could not run (AI offline/errored) but the
+                            # finding is plausible — hold it for human review.
+                            review.append(finding)
                 confirmed.extend(deterministic)
 
-                # Publish the running confirmed set after every agent so a
-                # scan-budget timeout still returns everything confirmed so far.
+                # Publish the running confirmed + held-for-review set after every
+                # agent so a scan-budget timeout still returns everything decided
+                # so far (held findings survive the timeout too, flagged separately).
                 if collected is not None:
                     collected.clear()
                     collected.extend(confirmed)
+                    collected.extend(review)
         finally:
             # If the scan budget expired (this coroutine was cancelled mid-run),
             # cancel any agent still in flight so it does not run detached from
@@ -1164,6 +1174,7 @@ class Coordinator:
             url=target.url,
             raw=len(raw_findings),
             confirmed=len(confirmed),
+            needs_review=len(review),
         )
 
         # Log per-agent outcome to the Logs tab
@@ -1184,7 +1195,11 @@ class Coordinator:
                     url=target.url, source="agent",
                 )
 
-        return confirmed
+        # Return confirmed vulns plus any held-for-review findings. Held findings
+        # carry needs_review=True so the runner serializes them as unconfirmed;
+        # they are not in confirmed_titles, so session intelligence and outcome
+        # logs above never treat them as confirmed vulns.
+        return confirmed + review
 
     @classmethod
     async def _baseline_check(

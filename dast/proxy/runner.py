@@ -1291,7 +1291,12 @@ class ProxyRunner:
 
                 if findings:
                     for f in findings:
-                        validated_by = _detection_method(f)
+                        # A finding held for review (AI validator offline/errored,
+                        # pattern confidence plausible) is NOT confirmed — it is
+                        # surfaced separately with an "unvalidated" label so a human
+                        # can review it. It is never counted as an AI/pattern vuln.
+                        held = getattr(f, "needs_review", False)
+                        validated_by = ["unvalidated"] if held else _detection_method(f)
                         finding_dict = {
                             "title":        getattr(f, "title", ""),
                             "severity":     getattr(f, "severity", "info"),
@@ -1300,7 +1305,8 @@ class ProxyRunner:
                             "evidence":     (getattr(f, "evidence", "") or "")[:400],
                             "payload":      (getattr(f, "payload", "") or "")[:200],
                             "parameter":    getattr(f, "parameter", ""),
-                            "confirmed":    True,
+                            "confirmed":    not held,
+                            "needs_review": held,
                             "validated_by": validated_by,
                             "reasoning":    getattr(f, "reasoning", ""),
                         }
@@ -1339,7 +1345,15 @@ class ProxyRunner:
                             finding=getattr(f, "title", ""),
                             source="agent",
                         )
-                    logger.warning("Active scan: VULNERABLE", url=entry.url, findings=len(findings))
+                    n_held = sum(1 for f in findings if getattr(f, "needs_review", False))
+                    n_confirmed = len(findings) - n_held
+                    if n_held:
+                        log_event("scan-worker", "warn",
+                                  f"{n_held} finding(s) held for review — AI validator offline; "
+                                  "confirm manually or re-run when AI is available.",
+                                  url=entry.url, source="agent")
+                    logger.warning("Active scan: VULNERABLE", url=entry.url,
+                                   confirmed=n_confirmed, needs_review=n_held)
                     qs.finish(entry_id, len(findings), "vulnerable")
                 else:
                     self._store.add_finding(entry_id, {}, "safe")

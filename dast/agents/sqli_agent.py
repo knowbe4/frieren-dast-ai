@@ -152,12 +152,16 @@ class SqliAgent(VulnAgent):
         block_seen = False  # did an earlier probe on this param get blocked?
 
         # Capture a baseline (clean) request/response pair before sending any payload.
+        # The baseline body length feeds detect_block's size-collapse heuristic so a
+        # silent WAF (200 stub replacing a rich response) is recognised as a block.
         baseline_raw_request = ""
         baseline_raw_response = ""
+        baseline_body_len: Optional[int] = None
         try:
             baseline_resp = await self._send_probe(target, client, param, param.get("value", "1"))
             if baseline_resp is not None:
                 baseline_raw_request, baseline_raw_response = _fmt_http_pair(baseline_resp)
+                baseline_body_len = len(baseline_resp.text)
         except Exception as exc:
             logger.debug("failed to capture SQLi baseline request/response", error=str(exc))
 
@@ -200,8 +204,10 @@ class SqliAgent(VulnAgent):
             # Record WAF/filter signal on EVERY seed response (not just the last),
             # so a block on any seed is seen. The central detector catches block
             # pages even on HTTP 200, so a WAF that hides behind a 200 still
-            # surfaces as a bypass opportunity for the mutator.
-            verdict = detect_block(resp.status_code, resp.text)
+            # surfaces as a bypass opportunity for the mutator. Thread the captured
+            # baseline body length so the size-collapse heuristic activates (a 200
+            # stub returned over a rich baseline is a silent block).
+            verdict = detect_block(resp.status_code, resp.text, baseline_len=baseline_body_len)
             if verdict.is_block and not block_seen:
                 block_seen = True
                 self.observe("waf_block", payload=payload, signal=verdict.signal)

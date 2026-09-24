@@ -278,6 +278,40 @@ async def test_waf_block_then_bypass_records_waf_bypass(monkeypatch):
     assert any(a and a[0] == "waf_bypass" for a, _ in observed)
 
 
+@pytest.mark.asyncio
+async def test_silent_waf_stub_recorded_via_baseline_size_collapse(monkeypatch):
+    """A 200 stub replacing a rich baseline is recorded as waf_block.
+
+    Regression: the agent captures a baseline but never fed its length to
+    detect_block, so the size-collapse heuristic was dead — a silent WAF that
+    answers 200 with a tiny stub (no known block-page signature) slipped past.
+    """
+    target = _target(params=[{"name": "id", "location": "query", "value": "1"}])
+    responses = iter([
+        _resp(200, "A" * 3000),  # baseline: rich response
+        _resp(200, "blocked"),   # probe: collapses to a tiny 200 stub, no signature
+    ])
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        return next(responses)
+
+    monkeypatch.setattr("dast.agents.sqli_agent.get_filtered_payloads", lambda *a, **k: ["'"])
+
+    agent = SqliAgent()
+    observed = []
+    agent.observe = lambda *a, **kw: observed.append((a, kw))
+
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
+        finding = await agent._probe_error_based(
+            target, MagicMock(), target.params[0], _build_error_re(),
+        )
+
+    assert finding is None
+    waf_blocks = [kw for a, kw in observed if a and a[0] == "waf_block"]
+    assert waf_blocks, "silent 200 stub should be recorded as a waf_block"
+    assert "collapsed" in waf_blocks[0]["signal"]
+
+
 # ── body location injection ─────────────────────────────────────────────────
 
 @pytest.mark.asyncio

@@ -102,6 +102,38 @@ async def test_run_autonomous_enables_ai_mode_and_records_config():
 
 
 @pytest.mark.asyncio
+async def test_ai_mode_restored_to_prior_value_when_run_finishes():
+    # The operator had AI mode OFF; the run turns it on for ambient scan, and it
+    # must be restored to OFF when the run ends — not left permanently on.
+    store = _FakeStore()
+    assert store.ai_mode is False
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+    assert store.ai_mode is True  # forced on for the run
+
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+
+    assert session["autonomous"]["status"] == "complete"
+    assert store.ai_mode is False  # restored to the operator's prior setting
+
+
+@pytest.mark.asyncio
+async def test_ai_mode_left_on_if_operator_had_it_on():
+    store = _FakeStore()
+    store.ai_mode = True  # operator already had ambient scan enabled
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+
+    assert store.ai_mode is True  # prior True preserved, not clobbered off
+
+
+@pytest.mark.asyncio
 async def test_run_autonomous_clamps_out_of_range_budget():
     service = CopilotService(_FakeCtx())
     sid = service.run_autonomous("obj", budget={

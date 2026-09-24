@@ -566,6 +566,11 @@ class CopilotService:
         # crawls/proxies is auto-queued through the scan pipeline as well.
         if auto_ai_mode and self._ctx.store is not None:
             try:
+                # Remember the operator's prior AI-mode setting so it is restored
+                # when the run ends — an autonomous run must not permanently flip
+                # ambient auto-scan on for the whole store.
+                session["autonomous"]["_ai_mode_prev"] = bool(self._ctx.store.ai_mode)
+                session["autonomous"]["_ai_mode_forced"] = True
                 self._ctx.store.ai_mode = True
                 logger.info("autonomous run enabled AI mode for ambient auto-scan",
                             session_id=sid)
@@ -806,6 +811,14 @@ class CopilotService:
         if auto is not None:
             auto["status"] = status
             auto["detail"] = detail
+            # Restore the operator's prior AI-mode setting if this run forced it on.
+            # Guard against double-restore so re-entry is a no-op.
+            if auto.pop("_ai_mode_forced", False) and self._ctx.store is not None:
+                try:
+                    self._ctx.store.ai_mode = auto.pop("_ai_mode_prev", False)
+                except Exception as exc:
+                    logger.warning("autonomous run could not restore AI mode",
+                                   error=str(exc))
         session["status"] = "idle" if status == "complete" else status
         session["updated_at"] = time.time()
 

@@ -511,10 +511,14 @@ def _invoke_external(
             raise providers.ProviderError(f"Unknown AI provider: {provider}")
 
         except providers.ProviderError as exc:
-            # A 429 (rate limit) is worth retrying; other 4xx/5xx and config
-            # errors are not — surface them immediately.
-            if "429" in str(exc) and attempt < 2:
-                logger.warning("Provider rate-limited, backing off", provider=provider, attempt=attempt)
+            # Transient errors — a 429 (rate limit) or any 5xx (server-side) — are
+            # worth retrying with backoff, matching the Bedrock throttling path.
+            # Other 4xx and config errors are permanent — surface immediately.
+            status = getattr(exc, "status_code", None)
+            transient = status == 429 or (status is not None and 500 <= status < 600)
+            if transient and attempt < 2:
+                logger.warning("Provider transient error, backing off",
+                               provider=provider, status=status, attempt=attempt)
                 time.sleep(delay)
                 delay *= 2
                 continue

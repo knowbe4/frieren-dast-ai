@@ -99,6 +99,14 @@ def test_anthropic_http_error_raises(patch_http):
                                    api_key="k", base_url="https://x")
 
 
+def test_provider_error_carries_status_code(patch_http):
+    patch_http(_FakeResponse(503, {"error": "overloaded"}))
+    with pytest.raises(providers.ProviderError) as exc_info:
+        providers.invoke_anthropic({"messages": []}, model_id="m",
+                                   api_key="k", base_url="https://x")
+    assert exc_info.value.status_code == 503
+
+
 # ── OpenAI provider ─────────────────────────────────────────────────────────
 
 def test_openai_text_response_becomes_anthropic_envelope(patch_http):
@@ -338,3 +346,48 @@ def test_gateway_routes_invoke_json(monkeypatch):
     assert captured["model_id"] == "claude-sonnet-5"
     assert captured["base_url"] == "https://gw.example"
     assert captured["body"]["tool_choice"] == {"type": "tool", "name": "emit_result"}
+
+
+# ── _invoke_external retry policy ────────────────────────────────────────────
+
+def test_invoke_external_retries_on_5xx_then_succeeds(monkeypatch):
+    calls = {"n": 0}
+    envelope = {"content": [{"type": "text", "text": "ok"}]}
+
+    def _flaky(**_):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise providers.ProviderError("Anthropic API 503: overloaded", status_code=503)
+        return envelope
+
+    monkeypatch.setattr(providers, "invoke_anthropic", _flaky)
+    monkeypatch.setattr(bedrock_client.time, "sleep", lambda *_: None)  # no real backoff
+
+    try:
+        bedrock_client.set_provider("anthropic", anthropic_api_key="sk-ant-test")
+        result = bedrock_client._invoke_external("anthropic", {"messages": []}, "m")
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+    assert result == envelope
+    assert calls["n"] == 3  # two 503s retried, third succeeds
+
+
+def test_invoke_external_does_not_retry_on_4xx(monkeypatch):
+    calls = {"n": 0}
+
+    def _bad_request(**_):
+        calls["n"] += 1
+        raise providers.ProviderError("Anthropic API 400: bad body", status_code=400)
+
+    monkeypatch.setattr(providers, "invoke_anthropic", _bad_request)
+    monkeypatch.setattr(bedrock_client.time, "sleep", lambda *_: None)
+
+    try:
+        bedrock_client.set_provider("anthropic", anthropic_api_key="sk-ant-test")
+        with pytest.raises(providers.ProviderError):
+            bedrock_client._invoke_external("anthropic", {"messages": []}, "m")
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+    assert calls["n"] == 1  # permanent error surfaced immediately, no retry

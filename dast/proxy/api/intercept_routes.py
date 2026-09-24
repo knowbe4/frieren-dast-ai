@@ -36,7 +36,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         }
 
     @router.post("/api/intercept/toggle")
-    async def toggle(body: dict = {}):
+    async def toggle(body: dict | None = None):
+        body = body or {}
         if store is None:
             return JSONResponse({"error": "intercept not available"}, status_code=503)
         if "enabled" in body:
@@ -47,7 +48,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         return {"enabled": new_state}
 
     @router.post("/api/intercept/toggle-response")
-    async def toggle_response(body: dict = {}):
+    async def toggle_response(body: dict | None = None):
+        body = body or {}
         if store is None:
             return JSONResponse({"error": "intercept not available"}, status_code=503)
         if "enabled" in body:
@@ -65,7 +67,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         return store.get_queue()
 
     @router.post("/api/intercept/{req_id}/forward")
-    async def forward(req_id: str, body: dict = {}):
+    async def forward(req_id: str, body: dict | None = None):
         if store is None:
             return JSONResponse({"error": "intercept not available"}, status_code=503)
         modified = body if body else None
@@ -84,7 +86,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         return {"ok": True}
 
     @router.post("/api/intercept/{req_id}/forward-response")
-    async def forward_response(req_id: str, body: dict = {}):
+    async def forward_response(req_id: str, body: dict | None = None):
         if store is None:
             return JSONResponse({"error": "intercept not available"}, status_code=503)
         modified = body if body else None

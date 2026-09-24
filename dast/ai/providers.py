@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -47,7 +47,15 @@ _LOCAL_OPENAI_PLACEHOLDER_KEY = "local"
 
 
 class ProviderError(RuntimeError):
-    """Raised when an external provider returns a non-success HTTP response."""
+    """Raised when an external provider returns a non-success HTTP response.
+
+    ``status_code`` carries the HTTP status when the error came from a response
+    (None for config/network errors) so callers can decide what is retryable.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def is_public_openai(base_url: str) -> bool:
@@ -123,7 +131,8 @@ def invoke_anthropic(
         response = client.post(url, headers=headers, json=payload)
     if response.status_code >= 400:
         raise ProviderError(
-            f"Anthropic API {response.status_code}: {response.text[:500]}"
+            f"Anthropic API {response.status_code}: {response.text[:500]}",
+            status_code=response.status_code,
         )
     # The Messages API response is already {"content": [...], "usage": {...}} —
     # exactly what _extract_text/_extract_tool_input read.
@@ -355,6 +364,7 @@ def invoke_openai(
         response = client.post(url, headers=headers, json=request)
     if response.status_code >= 400:
         raise ProviderError(
-            f"OpenAI API {response.status_code}: {response.text[:500]}"
+            f"OpenAI API {response.status_code}: {response.text[:500]}",
+            status_code=response.status_code,
         )
     return _from_openai_response(response.json())

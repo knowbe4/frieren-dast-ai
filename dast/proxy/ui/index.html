@@ -625,7 +625,20 @@
           <button id="issues-tab-all" class="tbtn" style="font-size:10px;padding:2px 10px;background:var(--acc);color:#000;border-color:var(--acc)" onclick="switchIssuesTab('all')">Findings</button>
           <button id="issues-tab-fp" class="tbtn" style="font-size:10px;padding:2px 10px" onclick="switchIssuesTab('fp')">False Positives <span id="issues-fp-count" style="font-size:9px;opacity:.7"></span></button>
         </div>
-        <span style="font-size:11px;color:var(--txt2);flex:1"></span>
+        <input id="issues-filter" class="input" type="text" placeholder="Filter by title, host, path or parameter…"
+               style="flex:1;max-width:360px;padding:2px 8px;font-size:11px"
+               oninput="filterIssues()" aria-label="Filter findings">
+        <select id="issues-sev-filter" class="input" style="padding:2px 6px;font-size:11px;flex-shrink:0"
+                onchange="filterIssues()" aria-label="Filter by severity">
+          <option value="">All severities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="info">Info</option>
+        </select>
+        <span id="issues-match-count" style="font-size:10px;color:var(--txt2);flex-shrink:0"></span>
+        <span style="flex:1"></span>
         <button class="tbtn" onclick="window.open('/api/export/sarif','_blank')" title="Download findings as SARIF 2.1.0 (GitHub/GitLab Security tab)">Download SARIF</button>
         <button class="tbtn" onclick="openImportFindingsModal()" title="Import findings from external reports (JSON, Markdown, any format)">Import Findings</button>
       </div>

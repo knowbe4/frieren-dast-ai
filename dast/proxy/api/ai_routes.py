@@ -9,6 +9,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dast.proxy.api.context import DashboardContext
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:
@@ -46,8 +49,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     groups = list(data.get("payloads", {}).keys())
                     count = sum(len(v) for v in data.get("payloads", {}).values() if isinstance(v, list))
                     payload_files.append({"file": fname, "groups": groups, "count": count})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to read payload file for AI stats", file=fname, error=str(exc))
 
         ai_scanned = len([e for e in store._entries.values() if e.scan_result in ("vulnerable", "safe", "error")])
         ai_findings = [

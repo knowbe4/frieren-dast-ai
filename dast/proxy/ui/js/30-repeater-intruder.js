@@ -463,10 +463,13 @@ async function confirmSendToAI() {
     showToast('Failed to queue', 'error');
   }
 }
-// Close popover on outside click (btn-send-ai removed — triggered via context menu only)
+// Close popover on outside click (btn-send-ai removed — triggered via context menu only).
+// Ignore clicks originating inside the context menu: the same click that picks
+// "Scan with AI" opens this popover, and without this guard it would bubble to
+// document and immediately close the popover it just opened.
 document.addEventListener('click', e => {
   const pop = document.getElementById('send-ai-popover');
-  if (pop && !pop.contains(e.target)) {
+  if (pop && !pop.contains(e.target) && !e.target.closest('#ctx-menu')) {
     pop.style.display = 'none';
   }
 });

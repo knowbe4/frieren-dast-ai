@@ -17,6 +17,7 @@ from typing import List, Tuple
 
 import pytest
 
+import dast.plugins.csrf_observer as mod
 from dast.plugins.csrf_observer import CsrfObserverPlugin, _SYNTHETIC_SOURCES
 
 
@@ -32,13 +33,23 @@ class _Store:
         self.enqueued.append(entry_id)
 
 
-def _entry(source: str = "proxy") -> SimpleNamespace:
+@pytest.fixture(autouse=True)
+def _reset_flagged_endpoints():
+    # The per-endpoint dedup set lives in a module global for process lifetime;
+    # isolate each test.
+    mod._flagged_endpoints.clear()
+    yield
+    mod._flagged_endpoints.clear()
+
+
+def _entry(source: str = "proxy", entry_id: str = "e1", path: str = "/vulnerabilities/exec/") -> SimpleNamespace:
     # A tokenless, cookie-less state-changing request with a 200 response and a
     # simple content-type — the classic Check-1 trigger.
     return SimpleNamespace(
-        id="e1",
+        id=entry_id,
+        host="app.example.com",
         method="POST",
-        path="/vulnerabilities/exec/",
+        path=path,
         source=source,
         response_status=200,
         request_headers={"content-type": "application/x-www-form-urlencoded"},
@@ -71,3 +82,24 @@ def test_synthetic_sources_are_neither_flagged_nor_enqueued(source):
     store = _run(_entry(source=source))
     assert store.findings == []
     assert store.enqueued == []
+
+
+def test_repeated_requests_to_same_endpoint_flag_once():
+    # The live noise against VAmPI: eight genuine POSTs each to /users/v1/login
+    # and /users/v1/register produced 16 identical CSRF findings. The signal is
+    # per-endpoint, so it must fire once per (host, method, path).
+    store = _Store()
+    plugin = CsrfObserverPlugin()
+    for i in range(8):
+        asyncio.run(plugin.on_entry(_entry(entry_id=f"e{i}", path="/users/v1/login"), store))
+    assert len(store.findings) == 1
+    assert store.enqueued == ["e0"]
+
+
+def test_distinct_endpoints_flag_separately():
+    store = _Store()
+    plugin = CsrfObserverPlugin()
+    asyncio.run(plugin.on_entry(_entry(entry_id="a", path="/users/v1/login"), store))
+    asyncio.run(plugin.on_entry(_entry(entry_id="b", path="/users/v1/register"), store))
+    assert len(store.findings) == 2
+    assert store.enqueued == ["a", "b"]

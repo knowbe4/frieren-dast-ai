@@ -1,4 +1,4 @@
-.PHONY: install setup sso sso-configure proxy validate test test-fast test-integration evals check lint secrets-scan help \
+.PHONY: install setup sso sso-configure proxy kill validate test test-fast test-integration evals check lint secrets-scan help \
         desktop desktop-install desktop-dist desktop-dist-mac desktop-dist-win desktop-dist-linux \
         desktop-test bump-version
 
@@ -64,7 +64,12 @@ proxy:
 		$(if $(DASHBOARD_PORT),--dashboard-port $(DASHBOARD_PORT)) \
 		$(if $(AUTH_URL),--auth-url $(AUTH_URL)) \
 		$(if $(USERNAME),--username $(USERNAME)) \
-		$(if $(PASSWORD),--password $(PASSWORD))
+		$(if $(PASSWORD),--password $(PASSWORD)) \
+		$(if $(AUTHORIZED),--authorized)
+
+kill:
+	PROXY_PORT=$(or $(PROXY_PORT),8080) DASHBOARD_PORT=$(or $(DASHBOARD_PORT),8088) \
+		uv run python scripts/kill.py
 
 # ---- Validate report against live target ----------------------------------
 # Auth options (pick one):
@@ -133,6 +138,7 @@ desktop:
 	cd $(DESKTOP_DIR) && \
 		$(if $(PROXY_PORT),PROXY_PORT=$(PROXY_PORT)) \
 		$(if $(DASHBOARD_PORT),DASHBOARD_PORT=$(DASHBOARD_PORT)) \
+		$(if $(AUTHORIZED),AUTHORIZED=$(AUTHORIZED)) \
 		npm start
 
 desktop-test:
@@ -225,6 +231,7 @@ help:
 	@echo "  make sso-configure  Create AWS SSO profile (first time only)"
 	@echo "  make sso            AWS SSO login"
 	@echo "  make proxy          Start proxy + dashboard"
+	@echo "  make kill           Kill all dast-ai processes (proxy + dashboard, all ports)"
 	@echo "  make desktop-install Install Electron deps (first run only, ~200MB)"
 	@echo "  make desktop        Start the native desktop app (Burp-style window)"
 	@echo "  make desktop-dist-mac/win/linux  Build a distributable app"
@@ -239,7 +246,13 @@ help:
 	@echo ""
 	@echo "Optional variables:"
 	@echo "  PROXY_PORT=8080  DASHBOARD_PORT=8088"
+	@echo "  AUTHORIZED=1                           skip the startup authorization prompt"
 	@echo "  AUTH_URL=https://app/login  USERNAME=...  PASSWORD=..."
+	@echo ""
+	@echo "Examples:"
+	@echo "  make proxy AUTHORIZED=1"
+	@echo "  make proxy AUTHORIZED=1 AUTH_URL=https://app.example.com/login USERNAME=admin PASSWORD=secret"
+	@echo "  make desktop AUTHORIZED=1"
 	@echo "  make validate REPORT=report.md TARGET=https://app.example.com BROWSE=1"
 	@echo "  make validate REPORT=report.md TARGET=https://... COOKIE=\"name=val\""
 	@echo "  make validate REPORT=... TARGET=... BROWSE=1 SOURCE=/path/to/project"

@@ -14,9 +14,11 @@ in-process. These routes are a thin HTTP adapter over that service.
 
   POST /api/copilot/message              — send an operator message; returns session_id
   POST /api/copilot/explore-hypothesis   — open a conversation from an app-context hypothesis
+  POST /api/copilot/autonomous           — start a fully autonomous orchestrator run
+  POST /api/copilot/autonomous/{sid}/stop|pause|resume — control an autonomous run
   GET  /api/copilot/sessions             — list recent sessions
   GET  /api/copilot/session/{sid}        — full transcript + messages + pause + reply
-  POST /api/copilot/resume/{sid}         — answer a pause (approve/auth)
+  POST /api/copilot/resume/{sid}         — answer a pause (approve/auth/guidance)
   POST /api/copilot/open-browser/{sid}   — open a browser for the auth pause
   POST /api/copilot/cancel/{sid}         — cancel the running turn
   WS   /ws/copilot                       — stream step/observation/pause/reply events
@@ -36,6 +38,36 @@ from dast.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _MAX_MESSAGE_CHARS = 20_000
+
+
+def _collect_jar_cookies(ctx: DashboardContext, pause: dict) -> dict:
+    """Collect the proxy jar's session cookies for a paused auth wall's host.
+
+    The operator logs in through the browser opened for the pause; every
+    Set-Cookie on that traffic is ingested into the shared proxy jar. Return
+    them as a ``{name: value}`` map for the handoff (sanitised by the caller)."""
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return {}
+    payload = pause.get("payload") or {}
+    host = str(payload.get("host") or "").strip().lower()
+    if not host:
+        from urllib.parse import urlparse
+        host = (urlparse(str(payload.get("url") or "")).hostname or "").lower()
+    if not host:
+        return {}
+    try:
+        cookies = store.get_cookies_for_host(host)
+    except Exception as exc:
+        logger.warning("could not read proxy jar cookies", host=host, error=str(exc))
+        return {}
+    result: dict = {}
+    for cookie in cookies or []:
+        name = cookie.get("name")
+        value = cookie.get("value")
+        if name and value is not None:
+            result[name] = value
+    return result
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:
@@ -87,6 +119,63 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "could not start exploration"}, status_code=503)
         return {"session_id": sid, "status": "running"}
 
+    @router.post("/api/copilot/autonomous")
+    async def autonomous(body: dict):
+        """Start a fully autonomous orchestrator run.
+
+        Body: {objective (required), focus_hosts?: [str], profile_slug?: str,
+        auto_ai_mode?: bool (default true),
+        budget?: {max_tool_calls, max_wall_clock_seconds, max_stuck_turns,
+        allow_scope_escalation}}. Missing budget fields fall back to the defaults.
+        """
+        objective = (body.get("objective") or "").strip()
+        if not objective:
+            return JSONResponse({"error": "objective required"}, status_code=400)
+        if len(objective) > _MAX_MESSAGE_CHARS:
+            return JSONResponse(
+                {"error": f"objective too large (max {_MAX_MESSAGE_CHARS} chars)"},
+                status_code=400,
+            )
+        focus_hosts = body.get("focus_hosts")
+        if focus_hosts is not None and not isinstance(focus_hosts, list):
+            return JSONResponse({"error": "focus_hosts must be a list"}, status_code=400)
+        budget = body.get("budget")
+        if budget is not None and not isinstance(budget, dict):
+            return JSONResponse({"error": "budget must be an object"}, status_code=400)
+        profile_slug = (body.get("profile_slug") or "").strip() or None
+        auto_ai_mode = bool(body.get("auto_ai_mode", True))
+        try:
+            sid = service.run_autonomous(
+                objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
+                budget=budget, auto_ai_mode=auto_ai_mode,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except RuntimeError:
+            return JSONResponse({"error": "could not start autonomous run"}, status_code=503)
+        return {"session_id": sid, "status": "running"}
+
+    @router.post("/api/copilot/autonomous/{sid}/stop")
+    async def autonomous_stop(sid: str):
+        if not service.stop_autonomous(sid):
+            return JSONResponse({"error": "no autonomous run for this session"},
+                                status_code=404)
+        return {"ok": True}
+
+    @router.post("/api/copilot/autonomous/{sid}/pause")
+    async def autonomous_pause(sid: str):
+        if not service.pause_autonomous(sid):
+            return JSONResponse({"error": "no autonomous run for this session"},
+                                status_code=404)
+        return {"ok": True}
+
+    @router.post("/api/copilot/autonomous/{sid}/resume")
+    async def autonomous_resume(sid: str):
+        if not service.resume_autonomous(sid):
+            return JSONResponse({"error": "no autonomous run for this session"},
+                                status_code=404)
+        return {"ok": True}
+
     @router.get("/api/copilot/sessions")
     async def list_sessions():
         return service.list_summaries()
@@ -101,8 +190,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     async def resume(sid: str, body: dict):
         """Answer the current pause. Body: {kind, value}.
 
-        approve -> value.decision in allow_once|always_host|deny
-        auth    -> value.cookies {name: value}
+        approve  -> value.decision in allow_once|always_host|deny
+        auth     -> value.cookies {name: value}
+        guidance -> value.action in continue|pause|abort, value.answer (free text)
+                    — answers a need_human escalation on an autonomous run and
+                    resumes it.
         """
         session = service.get(sid)
         if session is None:
@@ -115,6 +207,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         value = body.get("value") or {}
         if not isinstance(value, dict):
             return JSONResponse({"error": "value must be an object"}, status_code=400)
+
+        # The answer must match the pause actually in flight. Without this a
+        # guidance answer could be posted against an approve/auth wall (or vice
+        # versa) and get read with the wrong keys — e.g. resuming a scope gate as
+        # "continue" with no decision. Reject the mismatch instead.
+        actual_kind = str(pause.get("kind", "")).strip()
+        if actual_kind and kind in ("approve", "auth", "guidance") and kind != actual_kind:
+            return JSONResponse(
+                {"error": f"session is paused on a {actual_kind} gate, not {kind or 'unknown'}"},
+                status_code=409,
+            )
 
         if kind == "approve":
             decision = str(value.get("decision", "deny")).strip().lower()
@@ -129,9 +232,27 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             raw = value.get("cookies") or {}
             if not isinstance(raw, dict):
                 return JSONResponse({"error": "cookies must be an object"}, status_code=400)
+            # "Login done" handoff: the browser's Set-Cookie responses were ingested
+            # into the shared proxy jar, not into the header-less UI entry list, so
+            # the client cannot read them. When it asks us to source from the jar,
+            # collect the session cookies server-side for the paused host.
+            if value.get("from_jar") and not raw:
+                raw = _collect_jar_cookies(ctx, pause)
+                logger.info(
+                    "Copilot auth resume collected cookies from proxy jar",
+                    session_id=sid, cookie_count=len(raw),
+                )
             session["_pause_result"] = {"cookies": _sanitise_cookies(raw)}
+        elif kind == "guidance":
+            action = str(value.get("action", "continue")).strip().lower()
+            if action not in ("continue", "pause", "abort"):
+                return JSONResponse(
+                    {"error": "action must be continue|pause|abort"}, status_code=400)
+            answer = str(value.get("answer", "")).strip()[:_MAX_MESSAGE_CHARS]
+            session["_pause_result"] = {"answer": answer, "action": action}
         else:
-            return JSONResponse({"error": "kind must be approve|auth"}, status_code=400)
+            return JSONResponse(
+                {"error": "kind must be approve|auth|guidance"}, status_code=400)
 
         event: asyncio.Event = session.get("_pause_event")
         if event:
@@ -168,6 +289,19 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         except asyncio.TimeoutError:
             return JSONResponse({"error": "browser failed to open"}, status_code=500)
         return {"ok": True, "session_id": result.get("session_id"), "target_url": target_url}
+
+    @router.post("/api/copilot/refresh-session/{sid}")
+    async def refresh_session(sid: str):
+        """Re-read the proxy jar's current cookies for every host this session has
+        touched and inject them into the copilot engine. Call this after the operator
+        logs in via the browser to give the copilot a fresh authenticated session."""
+        session = service.get(sid)
+        if session is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        result = service.refresh_session(sid)
+        if not result.get("ok"):
+            return JSONResponse({"error": result.get("error", "refresh failed")}, status_code=500)
+        return result
 
     @router.post("/api/copilot/cancel/{sid}")
     async def cancel(sid: str):

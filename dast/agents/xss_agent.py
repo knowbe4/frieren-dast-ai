@@ -191,8 +191,8 @@ class XssAgent(VulnAgent):
             baseline_resp, _ = await self._send_probe(target, client, param, param.get("value", "test"))
             if baseline_resp is not None:
                 baseline_raw_request, baseline_raw_response = _fmt_http_pair(baseline_resp)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to capture XSS baseline request/response", error=str(exc))
 
         mutation_iteration = 0
         block_seen = False  # did an earlier probe on this param get blocked?

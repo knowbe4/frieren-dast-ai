@@ -128,8 +128,8 @@ def coerce_payload(payload: str, inferred_type: str) -> Any:
             parsed = json.loads(payload)
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to parse object payload as JSON; using raw payload", error=str(exc))
         return payload
 
     return payload

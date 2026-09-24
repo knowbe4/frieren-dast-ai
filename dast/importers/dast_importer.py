@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from dast.ai import bedrock_client
+from dast.ai.schemas import DAST_IMPORT_SCHEMA
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -151,6 +152,7 @@ def parse_findings(
             user=prompt,
             model_id=bedrock_client.get_active_model(),
             max_tokens=8192,
+            schema=DAST_IMPORT_SCHEMA,
         )
     except Exception as exc:
         logger.error("Findings import parse failed", error=str(exc))
@@ -253,8 +255,8 @@ def _preprocess(text: str) -> str:
         try:
             data = json.loads(stripped)
             return _preprocess_orchestrator_json(data)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            logger.debug("input is not orchestrator JSON; trying Markdown strategy", error=str(exc))
 
     # ── Strategy 2: orchestrator-ai / generic Markdown ────────────────────
     if stripped.startswith("#") or "## " in stripped[:200]:

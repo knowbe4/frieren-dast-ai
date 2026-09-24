@@ -218,7 +218,7 @@ async def _second_pass_agrees(
     on any LLM failure — an unconfirmable finding is never persisted.
     """
     try:
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
 
         system = (
             "You are an independent senior security reviewer auditing another agent's "

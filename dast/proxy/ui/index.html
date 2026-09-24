@@ -980,6 +980,28 @@
             <button class="tbtn" onclick="loginNewProfile()">+ New</button>
           </div>
           <div id="logins-list" style="font-size:12px"></div>
+
+          <!-- Quick Capture -->
+          <div style="margin-top:14px;border-top:1px solid var(--bd);padding-top:10px">
+            <strong style="font-size:11px">Quick Capture</strong>
+            <p style="color:var(--txt2);font-size:10px;margin:4px 0 6px">
+              Browse through the proxy, then save that session with a name and privilege level.</p>
+            <div id="qc-detected" style="display:flex;flex-wrap:wrap;gap:3px;margin-bottom:5px;align-items:center"></div>
+            <input id="qc-name" class="tinput" style="width:100%;margin-bottom:4px" placeholder="e.g. Admin User">
+            <input id="qc-host" class="tinput" style="width:100%;margin-bottom:4px" placeholder="e.g. app.example.com">
+            <select id="qc-privilege" class="tinput" style="width:100%;margin-bottom:6px">
+              <option value="">— privilege level —</option>
+              <option value="unauthenticated">Unauthenticated</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="admin">Admin</option>
+            </select>
+            <div style="display:flex;gap:6px;align-items:center">
+              <button class="tbtn pri" onclick="loginQuickCapture()">Capture &amp; Save</button>
+              <span id="qc-status" style="font-size:10px;color:var(--txt2)"></span>
+            </div>
+          </div>
         </div>
 
         <!-- Editor -->
@@ -989,9 +1011,18 @@
               <label style="font-size:11px;color:var(--txt2)">Name
                 <input id="logins-name" class="tinput" style="width:100%" placeholder="Training App"></label>
               <label style="font-size:11px;color:var(--txt2)">Host pattern
-                <input id="logins-host" class="tinput" style="width:100%" placeholder="*.knowbe4.com"></label>
+                <input id="logins-host" class="tinput" style="width:100%" placeholder="*.example.com"></label>
               <label style="font-size:11px;color:var(--txt2)">Auth URL
-                <input id="logins-authurl" class="tinput" style="width:100%" placeholder="https://training.knowbe4.com/login"></label>
+                <input id="logins-authurl" class="tinput" style="width:100%" placeholder="https://app.example.com/login"></label>
+              <label style="font-size:11px;color:var(--txt2)">Privilege level
+                <select id="logins-privilege" class="tinput" style="width:100%">
+                  <option value="">— unset —</option>
+                  <option value="unauthenticated">Unauthenticated</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="admin">Admin</option>
+                </select></label>
 
               <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
                 <strong style="font-size:11px">Credentials</strong>
@@ -1007,6 +1038,7 @@
                 <input id="logins-token" class="tinput" style="width:100%;margin-bottom:4px" placeholder="Authorization token (Bearer ...)">
                 <textarea id="logins-storagestate" class="tinput" style="width:100%;height:60px" placeholder="storage_state JSON (optional)"></textarea>
                 <button class="tbtn" onclick="loginImportSession()" style="margin-top:4px">Import session</button>
+                <button class="tbtn" onclick="loginCaptureFromProxy()" style="margin-top:4px">Capture from proxy</button>
                 <span id="logins-session-status" style="font-size:10px;margin-left:8px;color:var(--txt2)"></span>
               </div>
 
@@ -1115,7 +1147,7 @@
 
       <!-- Model selection -->
       <h3 style="margin-bottom:4px">Model</h3>
-      <p id="sc-model-hint" style="color:var(--txt2);font-size:10px;margin-bottom:8px">Model used for the LLM planner, validator, and adaptive mutator. For Bedrock, pick a preset; for Anthropic/OpenAI, type the model name. Takes effect on the next scan.</p>
+      <p id="sc-model-hint" style="color:var(--txt2);font-size:10px;margin-bottom:8px">Model used for the LLM planner, validator, and adaptive mutator. For Bedrock and the gateway, pick from the catalogue; for Anthropic/OpenAI, type the model name. Defaults to Sonnet. Takes effect on the next scan.</p>
       <div style="margin-bottom:8px">
         <input id="sc-model-freeform" type="text" placeholder="e.g. claude-opus-4-8 or gpt-4o"
                list="sc-model-list" autocomplete="off"
@@ -1211,6 +1243,17 @@
               <input type="checkbox" id="sc-probe-diff" style="accent-color:var(--acc)">
               Use probe-diff pre-analysis (break/repair pairs classify injection context before agents run)
             </label>
+            <label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--txt);cursor:pointer">
+              <input type="checkbox" id="sc-ai-response-cache" style="accent-color:var(--acc)">
+              Cache AI responses (reuse deterministic LLM decisions for identical inputs)
+            </label>
+            <p style="color:var(--yellow,#ff9800);font-size:10px;margin:2px 0 0 24px;line-height:1.4">
+              ⚠ Speeds up re-scans and cuts LLM cost by reusing a prior decision when the exact same
+              prompt (endpoint, request/response, model) is seen again. Only deterministic calls are
+              cached; the payload mutator is never affected. Trade-off: if a target's backend changes
+              out-of-band during the session, a re-scanned endpoint keeps the earlier verdict until the
+              cache is cleared (toggling this off clears it). Leave off for the most current results.
+            </p>
           </div>
         </div>
         <div style="margin-bottom:14px">
@@ -2047,6 +2090,38 @@
         <button class="tbtn del" id="cp-cancel-btn" onclick="cpCancel()"
                 style="margin-left:auto;display:none;font-size:9px;padding:1px 7px">Cancel turn</button>
       </div>
+
+      <!-- Autonomous orchestrator run: objective + budget, then the copilot drives
+           the arsenal (crawl -> scan -> validate -> record) on its own, escalating
+           only when it truly needs a human. -->
+      <details id="cp-auto-panel" style="border-bottom:1px solid var(--bdr)">
+        <summary style="cursor:pointer;padding:8px 18px;font-size:11px;font-weight:600;color:var(--acc2)">Autonomous run</summary>
+        <div style="padding:4px 18px 12px;display:flex;flex-direction:column;gap:8px">
+          <textarea id="cp-auto-objective" rows="2"
+            placeholder="Objective (e.g. 'find broken access control on the GraphQL API')"
+            style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:7px 9px;border-radius:4px;font-size:12px;font-family:inherit;resize:vertical"></textarea>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;font-size:10px;color:var(--txt2)">
+            <label>Hosts <input id="cp-auto-hosts" placeholder="host1, host2"
+              style="width:170px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 6px;border-radius:3px;font-size:11px"></label>
+            <label>Login <select id="cp-auto-profile"
+              style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 6px;border-radius:3px;font-size:11px"><option value="">none</option></select></label>
+          </div>
+          <details style="font-size:10px;color:var(--txt2)">
+            <summary style="cursor:pointer">Budget &amp; limits</summary>
+            <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:6px;align-items:center">
+              <label>Tool calls <input id="cp-auto-tools" type="number" min="1" value="150" style="width:64px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label>Minutes <input id="cp-auto-mins" type="number" min="1" value="30" style="width:56px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label>Stuck turns <input id="cp-auto-stuck" type="number" min="1" value="3" style="width:48px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
+              <label><input id="cp-auto-escalate" type="checkbox"> Ask before out-of-scope</label>
+            </div>
+          </details>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="tbtn pri" id="cp-auto-start" onclick="cpStartAutonomous()">Start autonomous run</button>
+            <span id="cp-auto-msg" style="font-size:10px;color:var(--txt2)"></span>
+          </div>
+          <div id="cp-auto-status"></div>
+        </div>
+      </details>
 
       <!-- Needs-human inbox: pauses from other headless mechanisms (Vuln Validator
            triage today; MCP approval + login captcha next) surface here as cards. -->

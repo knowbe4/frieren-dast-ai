@@ -222,17 +222,23 @@ def _eval_header_value_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optio
             header_names = list(hdrs.keys())
 
     for hdr in header_names:
-        val = hdrs.get(hdr, "")
-        if not val or not pattern.search(val):
+        raw_val = hdrs.get(hdr, "")
+        # A header may be stored as a list when it repeats (e.g. multiple
+        # Set-Cookie). Search each occurrence and report the one that matched.
+        candidates = raw_val if isinstance(raw_val, list) else [raw_val]
+        matched_val = next((c for c in candidates if c and pattern.search(c)), None)
+        if matched_val is None:
             continue
         if also_name and also_val:
-            actual_also = hdrs.get(also_name, "").lower()
-            if also_val.lower() not in actual_also:
+            actual_also = hdrs.get(also_name, "")
+            if isinstance(actual_also, list):
+                actual_also = " ".join(actual_also)
+            if also_val.lower() not in actual_also.lower():
                 continue
         evidence = _format_evidence(
             rule.get("evidence_template", f"Header '{hdr}' value matches pattern"),
             header=hdr,
-            value=val,
+            value=matched_val,
             path=entry.path,
         )
         return (rule["title"], rule["severity"], rule["cwe"], evidence, None, None, rule.get("needs_ai_validation", False), None, rule.get("confirmed", True))
@@ -694,6 +700,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
     # credentials). Return None so the caller keeps the finding passive-only and
     # never stamps an "AI validated" badge on an unreviewed finding.
     from dast.ai import bedrock_client
+    from dast.ai.schemas import PASSIVE_VALIDATE_SCHEMA
     if not bedrock_client.is_ai_available():
         return None, ""
 
@@ -713,7 +720,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: bedrock_client.invoke_json(system=system_prompt, user=user),
+            lambda: bedrock_client.invoke_json(system=system_prompt, user=user, schema=PASSIVE_VALIDATE_SCHEMA),
         )
         # Only claim AI validation when the model EXPLICITLY confirmed. A response
         # missing the key (degraded/empty output from a misconfigured provider)
@@ -763,8 +770,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                     _record_host_fire(rule, entry, fired_hosts)
                     for f in found:
                         all_findings.append((rule.get("id", ""), f))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("passive rule evaluation failed", rule_id=rule.get("id", ""), error=str(exc))
 
         for rule_id, finding_tuple in all_findings:
             title, severity, cwe, evidence, line_no, snippet, needs_ai = finding_tuple[:7]
@@ -804,8 +811,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                         # confirmed is None — AI unavailable; keep validated_by=["passive"]
                         # and still surface the finding (fail-open on visibility,
                         # never fail-open on the "AI validated" claim).
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("AI validation of passive finding failed", title=title, error=str(exc))
 
             finding_dict: Dict[str, Any] = {
                 "title": title,

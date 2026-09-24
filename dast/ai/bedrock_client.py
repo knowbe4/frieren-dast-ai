@@ -17,6 +17,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+from dast.ai import response_cache
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +61,13 @@ _gateway_base_url: str = ""
 # Causes the scan queue to pause until credentials are refreshed.
 _ai_unavailable: bool = False
 
+# Per-provider auto-resolved default model NAME, used when a non-Bedrock provider
+# is active but no provider-appropriate model is configured (the model is empty or
+# a Bedrock ARN carried over from the Bedrock defaults). Resolved once from the
+# provider's live catalogue (preferring a Sonnet tier) and cached here; cleared on
+# any provider switch or explicit model change so it re-resolves. Keyed by provider.
+_default_model_cache: Dict[str, str] = {}
+
 
 class AiUnavailableError(RuntimeError):
     """Raised when AWS credentials are expired and cannot be refreshed."""
@@ -79,9 +87,54 @@ def mark_ai_unavailable() -> None:
     _ai_unavailable = True
 
 
+def _preferred_default_model(models: list) -> str:
+    """Pick a provider-appropriate default model NAME from a catalogue, preferring
+    a Sonnet tier (the balanced default) over Haiku/Opus. Bedrock ARNs are skipped
+    — they are only valid for the Bedrock provider. Among Sonnet options a plain
+    variant is preferred over context-window variants (e.g. ``claude-sonnet-5``
+    over ``claude-sonnet-5[1m]``). Returns "" when the catalogue has no usable name.
+    """
+    ids = [
+        str(m.get("id"))
+        for m in models
+        if m.get("id") and not _is_bedrock_arn(str(m.get("id")))
+    ]
+    if not ids:
+        return ""
+    plain_sonnet = [i for i in ids if "sonnet" in i.lower() and "[" not in i]
+    if plain_sonnet:
+        return plain_sonnet[0]
+    any_sonnet = [i for i in ids if "sonnet" in i.lower()]
+    if any_sonnet:
+        return any_sonnet[0]
+    return ids[0]
+
+
+def _resolve_default_model(provider: str) -> str:
+    """Resolve (and cache) the default model NAME for a non-Bedrock provider from
+    its live catalogue, preferring Sonnet. Cached per provider so the catalogue is
+    fetched at most once per provider between switches. Never raises — a catalogue
+    failure caches "" so callers can fall back to their own error handling."""
+    if provider == "bedrock":
+        return ""
+    if provider in _default_model_cache:
+        return _default_model_cache[provider]
+    chosen = ""
+    try:
+        catalogue = list_models()
+        chosen = _preferred_default_model(catalogue.get("models", []))
+    except Exception as exc:  # never let model listing crash an LLM call
+        logger.warning("Default-model resolution failed", provider=provider, error=str(exc))
+    if chosen:
+        logger.info("Auto-selected default model for provider", provider=provider, model=chosen)
+    _default_model_cache[provider] = chosen
+    return chosen
+
+
 def set_active_model(model_id: str) -> None:
     global _active_model_id
     _active_model_id = model_id or ""
+    _default_model_cache.clear()
 
 
 def set_tiered_models(fast: str = "", validation: str = "") -> None:
@@ -112,7 +165,7 @@ def set_provider(
     marked unavailable on expired AWS creds).
     """
     global _active_provider, _anthropic_api_key, _anthropic_base_url
-    global _openai_api_key, _openai_base_url, _gateway_base_url
+    global _openai_api_key, _openai_base_url, _gateway_base_url, _active_model_id
     _active_provider = (provider or "").strip().lower()
     _anthropic_api_key = anthropic_api_key or ""
     _anthropic_base_url = anthropic_base_url or ""
@@ -120,8 +173,27 @@ def set_provider(
     _openai_base_url = openai_base_url or ""
     _gateway_base_url = gateway_base_url or ""
     _reset_client()
+    _default_model_cache.clear()
     mark_ai_available()
-    logger.info("AI provider configured", provider=get_active_provider())
+    active_provider = get_active_provider()
+    logger.info("AI provider configured", provider=active_provider)
+
+    # Auto-heal the active model on switch: a Bedrock ARN (the Bedrock default,
+    # often carried over) is meaningless to a non-Bedrock provider and would make
+    # every LLM call fail. Eagerly resolve a provider-appropriate default NAME
+    # (preferring Sonnet) from the provider's live catalogue so the model badge,
+    # scans, and copilot all work without the operator re-picking a model.
+    if active_provider != "bedrock":
+        from dast.config import settings
+        current = _active_model_id or settings.ai_model_id
+        if not current or _is_bedrock_arn(current):
+            healed = _resolve_default_model(active_provider)
+            if healed:
+                _active_model_id = healed
+                logger.info(
+                    "Reset active model to provider default (was empty or a Bedrock ARN)",
+                    provider=active_provider, model=healed,
+                )
 
 
 def get_active_provider() -> str:
@@ -207,7 +279,15 @@ def list_models() -> Dict[str, Any]:
 
 def get_active_model() -> str:
     from dast.config import settings
-    return _active_model_id or settings.ai_model_id
+    model = _active_model_id or settings.ai_model_id
+    # A Bedrock ARN (or empty) under a non-Bedrock provider is not usable — this
+    # happens when AI_PROVIDER is set to gateway/anthropic/openai via env at boot
+    # (no provider switch runs). Lazily resolve a provider-appropriate default
+    # NAME so the badge and every LLM call reflect a model the provider accepts.
+    provider = get_active_provider()
+    if provider != "bedrock" and (not model or _is_bedrock_arn(model)):
+        return _resolve_default_model(provider) or model
+    return model
 
 
 def _is_bedrock_arn(model_id: str) -> bool:
@@ -267,6 +347,16 @@ def _resolve_model(model_id: Optional[str]) -> str:
     provider = get_active_provider()
     model = model_id or get_active_model()
     if provider != "bedrock" and (not model or _is_bedrock_arn(model)):
+        # An explicit Bedrock ARN (e.g. the coordinator planner passing model_id
+        # directly) still reaches here even though get_active_model() self-heals.
+        # Prefer a provider-appropriate default over failing the call outright.
+        healed = _resolve_default_model(provider)
+        if healed and not _is_bedrock_arn(healed):
+            logger.warning(
+                "Substituting provider default for a Bedrock ARN under non-Bedrock provider",
+                provider=provider, model=healed,
+            )
+            return healed
         mark_ai_unavailable()
         raise AiUnavailableError(
             f"No model configured for AI provider '{provider}'. A Bedrock ARN "
@@ -422,10 +512,14 @@ def _invoke_external(
             raise providers.ProviderError(f"Unknown AI provider: {provider}")
 
         except providers.ProviderError as exc:
-            # A 429 (rate limit) is worth retrying; other 4xx/5xx and config
-            # errors are not — surface them immediately.
-            if "429" in str(exc) and attempt < 2:
-                logger.warning("Provider rate-limited, backing off", provider=provider, attempt=attempt)
+            # Transient errors — a 429 (rate limit) or any 5xx (server-side) — are
+            # worth retrying with backoff, matching the Bedrock throttling path.
+            # Other 4xx and config errors are permanent — surface immediately.
+            status = getattr(exc, "status_code", None)
+            transient = status == 429 or (status is not None and 500 <= status < 600)
+            if transient and attempt < 2:
+                logger.warning("Provider transient error, backing off",
+                               provider=provider, status=status, attempt=attempt)
                 time.sleep(delay)
                 delay *= 2
                 continue
@@ -504,6 +598,91 @@ def _extract_text(result: Dict[str, Any]) -> str:
     return result["content"][0]["text"]
 
 
+def _extract_text_safe(result: Dict[str, Any]) -> str:
+    """Like _extract_text but returns "" instead of raising when the envelope
+    carries no text block (e.g. a tool-only or empty response from a local
+    OpenAI-compatible server). Used on the structured-output fallback path where
+    a missing text block must degrade to a repair retry, not a KeyError."""
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "")
+    return ""
+
+
+def _tool_use_unsupported(exc: Exception) -> bool:
+    """True when a provider rejected forced tool-use with an HTTP 400 because the
+    model/server does not support function calling. Local OpenAI-compatible
+    servers (Ollama etc.) return exactly this for tool-less models
+    ("<model> does not support tools"). Scoped to 400s that mention tools/
+    functions so genuine malformed-request 400s still surface."""
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    message = str(exc).lower()
+    return "tool" in message or "function" in message
+
+
+def _invoke_json_as_text(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Structured output for models that can't do forced tool-use: describe the
+    schema in the prompt, ask for raw JSON, then parse with the repair-retry.
+    Lets any local model back a schema-forced call, tool-capable or not."""
+    text_system = system
+    if "json" not in text_system.lower():
+        text_system += "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
+    text_user = user
+    if schema:
+        text_user = f"{user}\n\nReturn a JSON object matching this schema:\n{json.dumps(schema)}"
+    raw = invoke(
+        system=text_system, user=text_user, model_id=model_id, max_tokens=max_tokens,
+        temperature=temperature, cache_system=cache_system,
+    )
+    return _parse_json_or_repair(
+        raw=raw, system=text_system, user=text_user, model_id=model_id,
+        max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+    )
+
+
+def _parse_json_or_repair(
+    raw: str,
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+) -> Dict[str, Any]:
+    """Parse ``raw`` as JSON, repairing once via a free-text re-invocation.
+
+    Shared by the legacy (no-schema) path and the structured-output fallback
+    that fires when a model ignores the forced tool call (common with local
+    OpenAI-compatible servers that don't honor ``tool_choice``). On the first
+    parse failure the model is re-invoked once with an explicit JSON-only
+    instruction; a second failure propagates so the caller sees a real error."""
+    try:
+        return json.loads(_strip_json_fence(raw))
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("invoke_json got malformed JSON — retrying once", error=str(exc))
+        repair_system = system
+        if "json" not in repair_system.lower():
+            repair_system += "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
+        repair_user = (
+            f"{user}\n\nYour previous reply was not valid JSON:\n{raw[:500]}\n\n"
+            "Reply with ONLY the JSON object. No markdown, no prose, no code fence."
+        )
+        raw2 = invoke(
+            system=repair_system, user=repair_user, model_id=model_id,
+            max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        )
+        return json.loads(_strip_json_fence(raw2))
+
+
 def _extract_tool_input(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Pull the structured input from a forced tool_use block, if present."""
     for block in result.get("content", []):
@@ -570,21 +749,84 @@ def invoke_json(
     fence + json.loads" path, hardened with a one-shot repair-retry: if the
     model returns text that isn't valid JSON, it is re-invoked once with an
     explicit instruction to return only the JSON object.
+
+    When the operator has opted into response caching, deterministic calls
+    (temperature=0) are memoised: an identical (provider, model, system, user,
+    schema, max_tokens) tuple returns a stored decision instead of a fresh LLM
+    call. Non-deterministic calls bypass the cache entirely.
     """
+    cache_key: Optional[str] = None
+    if temperature == 0 and response_cache.is_enabled():
+        cache_key = response_cache.make_key(
+            provider=get_active_provider(),
+            model=_resolve_model(model_id),
+            system=system,
+            user=user,
+            schema=schema,
+            max_tokens=max_tokens,
+        )
+        cached = response_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    result = _invoke_json_uncached(
+        system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+        temperature=temperature, cache_system=cache_system, schema=schema,
+    )
+
+    if cache_key is not None and isinstance(result, dict):
+        response_cache.put(cache_key, result)
+    return result
+
+
+def _invoke_json_uncached(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The uncached invoke_json body — one LLM round-trip (plus repair retry on
+    the legacy text path). Wrapped by invoke_json, which layers optional
+    deterministic-response caching on top."""
     # Structured path: the model is forced to call the tool, so we read the
     # validated object straight from the tool_use block.
     if schema is not None:
-        result = _invoke_raw(
-            system=system, user=user, model_id=model_id, max_tokens=max_tokens,
-            temperature=temperature, cache_system=cache_system, schema=schema,
-        )
+        from dast.ai import providers  # local import: avoids a module-level cycle
+        try:
+            result = _invoke_raw(
+                system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+                temperature=temperature, cache_system=cache_system, schema=schema,
+            )
+        except providers.ProviderError as exc:
+            # The server refused forced tool-use outright (e.g. a tool-less local
+            # model on Ollama returns HTTP 400 "does not support tools"). Retry
+            # once as a plain-text JSON call with the schema described in-prompt,
+            # so structured output works on any local model.
+            if _tool_use_unsupported(exc):
+                logger.warning(
+                    "Provider rejected forced tool-use; falling back to text JSON",
+                    error=str(exc), status=getattr(exc, "status_code", None),
+                )
+                return _invoke_json_as_text(
+                    system=system, user=user, model_id=model_id, max_tokens=max_tokens,
+                    temperature=temperature, cache_system=cache_system, schema=schema,
+                )
+            raise
         tool_input = _extract_tool_input(result)
         if tool_input is not None:
             return tool_input
-        # Model returned text despite tool_choice (rare) — fall through to
-        # parsing the text so the caller still gets a dict rather than an error.
+        # Model returned text despite tool_choice. This is common with local
+        # OpenAI-compatible servers (Ollama, LM Studio, llama.cpp, vLLM) that
+        # don't honor forced function calling. Parse the text as JSON, repairing
+        # once so the caller gets a dict rather than an uncaught JSONDecodeError.
         logger.warning("Structured output requested but no tool_use block returned; parsing text")
-        return json.loads(_strip_json_fence(_extract_text(result)))
+        return _parse_json_or_repair(
+            raw=_extract_text_safe(result), system=system, user=user, model_id=model_id,
+            max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        )
 
     # Legacy path: instruct JSON, parse text, repair once on failure.
     if "json" not in system.lower():
@@ -594,16 +836,7 @@ def invoke_json(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system,
     )
-    try:
-        return json.loads(_strip_json_fence(raw))
-    except json.JSONDecodeError as exc:
-        logger.warning("invoke_json got malformed JSON — retrying once", error=str(exc))
-        repair_user = (
-            f"{user}\n\nYour previous reply was not valid JSON:\n{raw[:500]}\n\n"
-            "Reply with ONLY the JSON object. No markdown, no prose, no code fence."
-        )
-        raw2 = invoke(
-            system=system, user=repair_user, model_id=model_id, max_tokens=max_tokens,
-            temperature=temperature, cache_system=cache_system,
-        )
-        return json.loads(_strip_json_fence(raw2))
+    return _parse_json_or_repair(
+        raw=raw, system=system, user=user, model_id=model_id,
+        max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+    )

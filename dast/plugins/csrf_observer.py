@@ -36,6 +36,13 @@ _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # "proxy"/"browse"/"crawler"/…) is still analysed, so nothing real is missed.
 _SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
 
+# State-changing endpoints (host, method, path) already flagged for missing CSRF
+# protection. The signal is a per-endpoint property, not a per-request one: without
+# this the observer re-emits an identical finding — and re-enqueues an active CSRF
+# probe — on every genuine request to the same endpoint (16x across two VAmPI
+# endpoints in a single run). add_finding only dedupes within a single entry.
+_flagged_endpoints: set[tuple[str, str, str]] = set()
+
 _CSRF_HEADER_RE = re.compile(
     r'x-csrf-token|x-xsrf-token|x-requested-with|x-request-token',
     re.IGNORECASE,
@@ -69,7 +76,7 @@ def _has_csrf_token(entry: "ProxyEntry") -> bool:
         try:
             body = entry.request_body.decode("utf-8", errors="replace")
         except Exception:
-            pass
+            pass  # best-effort: non-decodable body treated as having no CSRF token
     if body:
         # Form-encoded or JSON param check
         for part in re.split(r'[&\n]', body):
@@ -120,6 +127,12 @@ class CsrfObserverPlugin(ProxyPlugin):
 
         # Check 1 — no CSRF token and no SameSite cookie defence
         if not _has_csrf_token(entry) and not _has_samesite_cookie(entry):
+            # Flag (and actively re-enqueue) each state-changing endpoint once, not
+            # on every genuine request to it.
+            endpoint_key = (getattr(entry, "host", "") or "", entry.method, entry.path or "")
+            if endpoint_key in _flagged_endpoints:
+                return
+            _flagged_endpoints.add(endpoint_key)
             ct = (entry.request_headers or {}).get("content-type", "")
             is_simple = bool(_SIMPLE_CT_RE.search(ct)) or not ct
             severity = "medium" if is_simple else "low"

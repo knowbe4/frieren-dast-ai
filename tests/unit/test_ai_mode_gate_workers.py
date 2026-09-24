@@ -181,3 +181,55 @@ def test_graphql_analyzer_calls_llm_in_ai_mode(monkeypatch):
     plugin = gql.GraphQLAnalyzerPlugin()
     asyncio.run(plugin.on_entry(entry, store))
     assert calls["n"] == 1, "GraphQL analyzer must route needs-AI findings to the LLM in AI mode"
+
+
+# ── Real _llm_validate_finding body (regression: it must actually call the LLM
+#    and not crash). The gate tests above monkeypatch it wholesale, so they never
+#    exercised the body — which previously awaited a synchronous invoke_json and
+#    passed an unsupported kwarg, so every call raised and the finding was dropped.
+
+def _base_gql_finding():
+    return {
+        "title": "GraphQL Mutation Without CSRF Token",
+        "severity": "medium",
+        "cwe": "CWE-352",
+        "evidence": "Mutation accepted without CSRF token.",
+        "validated_by": ["passive"],
+    }
+
+
+def test_llm_validate_finding_confirms_and_stamps_ai(monkeypatch):
+    import dast.ai.bedrock_client as bc
+
+    def _fake_invoke_json(**kwargs):
+        assert kwargs.get("schema") is not None, "must force structured output"
+        return {
+            "confirmed": True,
+            "confidence": 0.9,
+            "reasoning": "No CSRF token and cookie auth.",
+            "exploit_scenario": "Attacker autosubmits a cross-site mutation.",
+        }
+
+    monkeypatch.setattr(bc, "invoke_json", _fake_invoke_json)
+    entry = _GqlEntry()
+    out = asyncio.run(
+        gql._llm_validate_finding(_base_gql_finding(), entry, "req", "resp")
+    )
+    assert out["confirmed"] is True
+    assert out["validated_by"] == ["passive+ai"]
+    assert "Exploit scenario:" in out["evidence"]
+
+
+def test_llm_validate_finding_rejects_keeps_passive(monkeypatch):
+    import dast.ai.bedrock_client as bc
+
+    monkeypatch.setattr(
+        bc, "invoke_json",
+        lambda **k: {"confirmed": False, "confidence": 0.1, "reasoning": "Bearer auth."},
+    )
+    entry = _GqlEntry()
+    out = asyncio.run(
+        gql._llm_validate_finding(_base_gql_finding(), entry, "req", "resp")
+    )
+    assert out["confirmed"] is False
+    assert out["validated_by"] == ["passive"]

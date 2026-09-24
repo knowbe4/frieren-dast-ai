@@ -199,7 +199,12 @@ def make_router(ctx: "DashboardContext") -> APIRouter:
             headers = override_headers
         else:
             headers = _best_auth_headers_for_endpoint(endpoint)
-        error = await _introspect(endpoint, headers, store, "GraphQL Introspection")
+        # Route through the Frieren proxy so this manual introspection is captured
+        # in history like every other test request.
+        error = await _introspect(
+            endpoint, headers, store, "GraphQL Introspection",
+            proxy_url=f"http://127.0.0.1:{ctx.proxy_port}",
+        )
 
         if error:
             return JSONResponse({"ok": False, "error": error}, status_code=200)

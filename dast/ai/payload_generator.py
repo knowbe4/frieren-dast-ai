@@ -12,6 +12,8 @@ This replaces static wordlists with adaptive, context-aware fuzzing.
 from typing import List, Optional
 
 from dast.ai import bedrock_client
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import PAYLOAD_GEN_SCHEMA, PAYLOAD_MUTATION_SCHEMA
 from dast.models import AttackAttempt, AttackPayload, Endpoint
 from dast.utils.logger import get_logger
 
@@ -29,13 +31,13 @@ Rules:
 - For GraphQL endpoints, generate introspection and mutation attacks
 - For APIs with IDs (numeric, UUID), include IDOR payloads with adjacent IDs
 - Keep payloads concise and precise
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 _SYSTEM_MUTATION = """\
 You are an expert web application penetration tester running an iterative attack loop.
 You have sent an attack payload and received a response. Decide the next action.
 Respond ONLY with JSON matching the schema requested.
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 def generate_payloads(endpoint: Endpoint, attack_types: List[str]) -> List[AttackPayload]:
@@ -62,7 +64,7 @@ Respond with JSON array. Each item must have:
 Generate up to 10 payloads, prioritized by likelihood of success."""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user)
+        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user, schema=PAYLOAD_GEN_SCHEMA)
         payloads = []
         items = result if isinstance(result, list) else result.get("payloads", [])
         for item in items:
@@ -96,7 +98,7 @@ Injection point: {previous_attempt.payload.injection_point} ({previous_attempt.p
 
 Response:
   Status: {resp.status_code if resp else "N/A"}
-  Body (first 1000 chars): {_sanitize_for_prompt(resp.body, 1000) if resp else ""}
+  Body (first 1000 chars): {wrap_untrusted(resp.body, "target_response", 1000) if resp else ""}
 
 Based on this response, should we:
 A) Try a mutated payload (describe it)
@@ -117,7 +119,7 @@ Respond with JSON:
 (new_payload is required only when action is mutate or different_param)"""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user)
+        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user, schema=PAYLOAD_MUTATION_SCHEMA)
         if result.get("action") == "stop":
             return None
 
@@ -136,30 +138,6 @@ Respond with JSON:
         return None
 
 
-def _sanitize_for_prompt(text: str, max_len: int) -> str:
-    """
-    Truncate and strip prompt-injection patterns from untrusted content
-    before embedding it in an LLM prompt.
-    Removes common jailbreak / override markers while preserving normal text.
-    """
-    import re
-    truncated = text[:max_len]
-    # Remove lines that look like system-prompt override attempts
-    injection_pattern = re.compile(
-        r"(ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)"
-        r"|system\s*:\s*you\s+are"
-        r"|<\s*/?system\s*>"
-        r"|\[INST\]|\[/INST\]"
-        r"|###\s*instruction"
-        r"|---\s*new\s+prompt"
-        r"|forget\s+(everything|all)\s+(above|previous)"
-        r"|you\s+are\s+now\s+(a\s+)?(different|new)\s+(ai|assistant|model))",
-        re.IGNORECASE,
-    )
-    sanitized = injection_pattern.sub("[redacted]", truncated)
-    return sanitized
-
-
 def _describe_endpoint(endpoint: Endpoint) -> str:
     params = "\n".join(
         f"  - {p.name} ({p.location}, type={p.inferred_type}): {p.value!r}"
@@ -167,7 +145,7 @@ def _describe_endpoint(endpoint: Endpoint) -> str:
     )
     sample_resp_preview = ""
     if endpoint.sample_response:
-        sample_resp_preview = f"\nSample response ({endpoint.sample_response.status_code}):\n{_sanitize_for_prompt(endpoint.sample_response.body, 500)}"
+        sample_resp_preview = f"\nSample response ({endpoint.sample_response.status_code}):\n{wrap_untrusted(endpoint.sample_response.body, 'target_response', 500)}"
 
     return (
         f"URL: {endpoint.url}\n"

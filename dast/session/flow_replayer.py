@@ -134,8 +134,8 @@ async def replay_login_flow(
             if flow.success_url_regex:
                 try:
                     await page.wait_for_url(re.compile(flow.success_url_regex), timeout=10000)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("success URL check did not match after login flow", error=str(exc))
 
             cookies = await context.cookies()
             try:

@@ -1,10 +1,15 @@
-# Frieren DAST-AI — Claude Code Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > Deep architecture and per-feature wiring live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 > This file is only the conventions and gotchas you can't infer from the code. Keep it lean —
 > if a rule is already followed without it, delete the rule.
 
 ## What This Is
+
+Frieren DAST-AI is an internal, authorized defensive security tool of KnowBe4, built and
+maintained by the KnowBe4 InfoSec team for testing KnowBe4-owned and in-scope assets.
 
 Frieren DAST-AI is a proxy + AI-driven scanner: HTTPS MITM proxy + real-time dashboard
 (FastAPI + WebSocket), a multi-agent scanner (canary pre-probe → LLM Coordinator → parallel
@@ -127,6 +132,9 @@ proxy traffic on every entry → plugin.
 | H1 triage engine | `uv run pytest tests/unit/test_h1_parser.py tests/unit/test_h1_validator_http.py tests/unit/test_h1_validator_xss.py` |
 | Tool layer / MCP | `uv run pytest tests/unit/test_tools_registry.py`; `uv run dast-ai mcp --help` |
 
+Run a single test with `uv run pytest tests/unit/test_x.py::test_name`. `tests/evals/` is an
+opt-in LLM decision-quality harness (`make evals`) and is **not** part of the default pytest run.
+
 ---
 
 ## Common Tasks
@@ -137,9 +145,14 @@ uv run playwright install chromium        # install browsers
 uv run dast-ai proxy                      # start proxy + dashboard
 uv run dast-ai proxy --auth-url https://app.example.com/login --username admin@example.com --password secret
 uv run pytest
+make kill                                 # kill all proxy + dashboard processes (all ports)
 make bump-version VERSION=0.9.0           # bump version everywhere it's hardcoded (never hand-edit — it drifts)
 make desktop-test                         # desktop launcher e2e (real Electron + backend)
+make secrets-scan                         # full-repo secret scan (gitleaks + trufflehog)
 ```
+
+Secret-scan git hooks run on every commit and push (installed by `make setup`). Never bypass with
+`--no-verify` — the push guard and CI will still block the leak.
 
 ## Key Files
 
@@ -147,6 +160,7 @@ make desktop-test                         # desktop launcher e2e (real Electron 
 - `dast/proxy/session_store.py` — intercepted entries, cookie jar, service graph
 - `dast/proxy/dashboard_server.py` — FastAPI app assembly + router wiring (routes live in
   `dast/proxy/api/*_routes.py`); UI is external static files in `dast/proxy/ui/`
+- `dast/proxy/api/copilot_routes.py` / `copilot_service.py` — autonomous copilot orchestrator
 - `dast/ai/coordinator.py` — LLM coordinator (canary + planner + validator dispatch)
 - `dast/ai/red_team.py` / `fp_filter.py` — Red-Team Validator + deterministic FP rules
 - `dast/ai/mutator.py` — adaptive payload mutator
@@ -157,10 +171,13 @@ make desktop-test                         # desktop launcher e2e (real Electron 
 - `dast/agents/*.py` — vulnerability agents; `payload_filter.py` = tech-aware group selector
 - `dast/tools/` — shared tool registry (one definition drives internal agents AND MCP)
 - `dast/mcp/server.py` — MCP stdio server bridging the tool registry
+- `dast/profiles/` — named sessions with privilege levels (cross-session IDOR, quick capture)
+- `dast/graphql/`, `dast/chains/`, `dast/discovery/`, `dast/code_analysis/`, `dast/importers/`,
+  `dast/browser/`, `dast/scanners/`, `dast/session/` — specialised subsystems (detail in ARCHITECTURE.md)
+- `dast/hackerone/` — HackerOne report triage engine
 - `dast/payloads/*.yaml`, `dast/wordlists/*.txt`, `dast/passive_rules/**/*.yaml`,
   `dast/vuln_knowledge/*.yaml` — data-driven assets (edit to extend behavior)
 - `dast/report/sarif.py` — SARIF 2.1.0 export
-- `tests/evals/` — opt-in LLM decision-quality harness (not in default pytest)
 
 ### Session Output
 ```
@@ -219,7 +236,8 @@ Tiered helpers: `get_fast_model()` (planning/baseline, default Haiku), `get_vali
 - **Playwright not installed** → `uv run playwright install chromium`
 - **CA cert not trusted** → download `http://127.0.0.1:8088/ca.crt`, install in browser/OS trust store
 - **AWS token expiry** → set `AWS_PROFILE`; credentials auto-refresh on `ExpiredTokenException`
+- **Stuck proxy/dashboard ports** → `make kill`
 
 ---
 
-**Last Updated:** 2026-08-14 · **Version:** 0.8.2
+**Last Updated:** 2026-09-24 · **Version:** 0.8.2

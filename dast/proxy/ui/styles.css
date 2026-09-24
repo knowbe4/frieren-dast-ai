@@ -246,6 +246,7 @@ tbody tr.r-oos td { opacity: .55; }
 .vbdg-secret_pattern{ background: #1a0d30; color: #ba68c8; }
 .vbdg-response_diff{ background: #001a1a; color: #4dd0e1; }
 .vbdg-dismissed    { background: #2a1010; color: #ef5350; }
+.vbdg-unvalidated  { background: #3a2a0a; color: #ff9800; border: 1px solid #ff9800; }
 /* Unified severity badge */
 .sev-badge { display: inline-block; font-size: 9px; font-weight: 700; padding: 2px 8px;
              border-radius: 4px; min-width: 52px; text-align: center; text-transform: uppercase; }

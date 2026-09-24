@@ -8,15 +8,94 @@
 let _cpActive = null;      // active session_id
 let _cpPollTimer = null;
 let _cpWs = null;
+let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (see cpRender)
 
-const _CP_INPROGRESS = ['running', 'paused_approve', 'paused_auth'];
+const _CP_INPROGRESS = ['running', 'starting', 'paused', 'paused_approve',
+  'paused_auth', 'paused_guidance'];
 
 function cpOnOpen() {
+  _cpPauseSig = null;  // force a pause re-render — the tab DOM may be fresh
   cpConnectWs();
   cpLoadSessions();
   cpLoadHypotheses();
+  cpLoadProfiles();
   if (_cpActive) cpRefresh(_cpActive);
   else cpRender(null);
+}
+
+// ── Autonomous orchestrator run ──────────────────────────────────────────────
+// Populate the login-profile dropdown so an autonomous run can preseed auth.
+async function cpLoadProfiles() {
+  const sel = document.getElementById('cp-auto-profile');
+  if (!sel) return;
+  try {
+    const data = await (await fetch('/api/profiles')).json();
+    const profiles = (data && data.profiles) || [];
+    const current = sel.value;
+    sel.innerHTML = '<option value="">none</option>' +
+      profiles.map(p =>
+        `<option value="${esc(p.slug)}">${esc(p.name || p.slug)}${p.session_set ? '' : ' (no session)'}</option>`
+      ).join('');
+    if (current) sel.value = current;
+  } catch (e) { /* profiles are best-effort */ }
+}
+
+async function cpStartAutonomous() {
+  const objective = (document.getElementById('cp-auto-objective') || {}).value || '';
+  const msgEl = document.getElementById('cp-auto-msg');
+  if (!objective.trim()) { if (msgEl) msgEl.textContent = 'Objective is required'; return; }
+
+  const hostsRaw = (document.getElementById('cp-auto-hosts') || {}).value || '';
+  const focus_hosts = hostsRaw.split(',').map(h => h.trim()).filter(Boolean);
+  const profile_slug = (document.getElementById('cp-auto-profile') || {}).value || '';
+  const num = (id, fallback) => {
+    const v = parseInt(((document.getElementById(id) || {}).value || '').trim(), 10);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  const budget = {
+    max_tool_calls: num('cp-auto-tools', 150),
+    max_wall_clock_seconds: num('cp-auto-mins', 30) * 60,
+    max_stuck_turns: num('cp-auto-stuck', 3),
+    allow_scope_escalation: !!(document.getElementById('cp-auto-escalate') || {}).checked,
+  };
+
+  const btn = document.getElementById('cp-auto-start');
+  if (btn) btn.disabled = true;
+  if (msgEl) msgEl.textContent = 'Starting...';
+  try {
+    const r = await fetch('/api/copilot/autonomous', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        objective: objective.trim(), focus_hosts,
+        profile_slug: profile_slug || undefined, budget,
+      }),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error) { if (msgEl) msgEl.textContent = d.error || 'Failed to start'; return; }
+    if (msgEl) msgEl.textContent = '';
+    await cpSelectSession(d.session_id);
+    cpStartPoll(d.session_id);
+  } catch (e) {
+    if (msgEl) msgEl.textContent = 'Request failed';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function cpAutoControl(sid, action) {
+  try {
+    const r = await fetch(`/api/copilot/autonomous/${sid}/${action}`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok || d.error) { showToast(d.error || `Could not ${action} the run`, true); return; }
+    cpRefresh(sid);
+  } catch (e) { showToast(`Could not ${action} the run`, true); }
+}
+
+async function cpAnswerGuidance(sid, action) {
+  const box = document.getElementById('cp-guidance-answer');
+  const answer = box ? box.value.trim() : '';
+  await cpResume(sid, 'guidance', { answer, action });
 }
 
 // ── App-context hypotheses (fold-in) ─────────────────────────────────────────
@@ -232,6 +311,8 @@ function cpRender(session) {
     statusEl.style.color = cpStatusColor(st);
   }
 
+  cpRenderAutonomous(session);
+
   const bubbles = (session.messages || []).map(m => cpBubble(m)).join('');
   const blocked = session.last_reply && session.last_reply.blocked_reason && !inProgress
     ? cpBlockedBadge(session.last_reply.blocked_reason) : '';
@@ -241,7 +322,57 @@ function cpRender(session) {
   cpEnsurePulse();
   el.scrollTop = el.scrollHeight;
 
-  if (pauseEl) pauseEl.innerHTML = session.pause ? cpRenderPause(session) : '';
+  // Only rewrite the pause panel when the pause identity actually changes. The
+  // poll loop and WS nudges re-render on every tick during a paused_* status; if
+  // we rebuilt the panel each time we'd clobber live DOM state the operator set
+  // mid-pause (e.g. the "Login done" button enabled by Open Browser, and the
+  // auth status message) — which is exactly what left the button greyed out.
+  if (pauseEl) {
+    const sig = session.pause
+      ? `${session.session_id}:${session.pause.kind}:${JSON.stringify(session.pause.payload || {})}`
+      : null;
+    if (sig !== _cpPauseSig) {
+      pauseEl.innerHTML = session.pause ? cpRenderPause(session) : '';
+      _cpPauseSig = sig;
+    }
+  }
+}
+
+// Render the live autonomous-run status + controls into the run panel. Only shows
+// for sessions started as an autonomous run (session.autonomous present).
+function cpRenderAutonomous(session) {
+  const el = document.getElementById('cp-auto-status');
+  if (!el) return;
+  const auto = session && session.autonomous;
+  if (!auto) { el.innerHTML = ''; return; }
+  const st = auto.status || '';
+  const running = ['starting', 'running', 'paused'].includes(st);
+  const paused = st === 'paused';
+  const sid = esc(session.session_id);
+  const color = cpStatusColor(st);
+  const controls = running
+    ? `<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+         ${paused
+           ? `<button class="tbtn" onclick="cpAutoControl('${sid}','resume')">Resume</button>`
+           : `<button class="tbtn" onclick="cpAutoControl('${sid}','pause')">Pause</button>`}
+         <button class="tbtn del" onclick="cpAutoControl('${sid}','stop')">Stop</button>
+         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
+       </div>`
+    : `<div style="display:flex;gap:6px;margin-top:6px">
+         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
+       </div>`;
+  el.innerHTML = `
+    <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;padding:8px 10px;margin-top:4px">
+      <div style="display:flex;gap:8px;align-items:center;font-size:10px">
+        <span style="width:7px;height:7px;border-radius:50%;background:${color};flex-shrink:0"></span>
+        <span style="font-weight:600;text-transform:uppercase;letter-spacing:.3px;color:${color}">${esc(st || 'idle')}</span>
+        ${auto.detail ? `<span style="color:var(--txt2)">— ${esc(auto.detail)}</span>` : ''}
+      </div>
+      <div style="font-size:10px;color:var(--txt2);margin-top:4px">
+        ${auto.turns || 0} turns · ${auto.tool_calls || 0}/${(auto.config || {}).max_tool_calls || '?'} tool calls · ${auto.seconds_remaining || 0}s left
+      </div>
+      ${controls}
+    </div>`;
 }
 
 function cpBubble(m) {
@@ -258,10 +389,37 @@ function cpBubble(m) {
     </div>`;
 }
 
+async function cpRefreshSession(sid, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Refreshing...'; }
+  try {
+    const r = await fetch(`/api/copilot/refresh-session/${encodeURIComponent(sid)}`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+      alert(d.error || 'Session refresh failed');
+      return;
+    }
+    const msg = d.cookies_refreshed > 0
+      ? `Session refreshed — ${d.cookies_refreshed} cookie(s) updated for: ${(d.hosts_updated || []).join(', ')}`
+      : 'No cookies found in proxy jar yet. Log in through the browser first, then try again.';
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+    alert(msg);
+  } catch (e) {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
+    alert('Session refresh failed: ' + e.message);
+  }
+}
+
 function cpBlockedBadge(reason) {
+  const sid = _cpActive ? esc(_cpActive) : '';
+  const refreshBtn = sid
+    ? `<button class="tbtn" style="font-size:9px;padding:2px 8px"
+         onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>`
+    : '';
   return `<div style="align-self:flex-start;display:flex;align-items:center;gap:6px;margin-left:2px">
       <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--yellow);
                    border:1px solid #7a6000;background:#3a2d00;border-radius:3px;padding:2px 7px">blocked: ${esc(reason)}</span>
+      ${refreshBtn}
     </div>`;
 }
 
@@ -333,6 +491,20 @@ function cpRenderPause(session) {
       </div>`;
   }
 
+  if (kind === 'guidance') {
+    return `<div style="background:#3a2d00;border:1px solid #7a6000;border-radius:4px;padding:12px 14px;margin:8px 0">
+        <div style="font-size:11px;color:var(--yellow);font-weight:600;margin-bottom:6px">The copilot needs your help to continue</div>
+        <div style="font-size:11px;color:var(--txt);line-height:1.5;margin-bottom:8px;white-space:pre-wrap;word-break:break-word">${esc(payload.message || 'It is blocked and asked for guidance.')}</div>
+        <textarea id="cp-guidance-answer" rows="2" placeholder="Answer (e.g. a value it needs, or how to proceed)..."
+          style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:7px 9px;border-radius:4px;font-size:12px;font-family:inherit;resize:vertical;margin-bottom:8px"></textarea>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="tbtn pri" onclick="cpAnswerGuidance('${sid}','continue')">Answer &amp; continue</button>
+          <button class="tbtn" onclick="cpAnswerGuidance('${sid}','pause')">Answer &amp; pause</button>
+          <button class="tbtn del" onclick="cpAnswerGuidance('${sid}','abort')">Abort run</button>
+        </div>
+      </div>`;
+  }
+
   if (kind === 'auth') {
     return `<div style="background:#3a2d00;border:1px solid #7a6000;border-radius:4px;padding:12px 14px;margin:8px 0">
         <div style="font-size:11px;color:var(--yellow);font-weight:600;margin-bottom:6px">Login required</div>
@@ -385,44 +557,16 @@ async function cpOpenBrowser(sid) {
   }
 }
 
-// Collect Set-Cookie values captured by the proxy for the auth-wall domain and
-// hand them to the copilot as the session. Mirrors the vuln-validator handoff.
+// Hand the browser session to the copilot. The Set-Cookie responses from the
+// login you did in the opened browser were ingested into the proxy's cookie jar
+// (not into the header-less UI entry list), so the SERVER collects them for the
+// paused host — we just ask it to. Mirrors the vuln-validator handoff.
 async function cpLoginDone(sid) {
   const msgEl = document.getElementById('cp-auth-msg');
   const doneBtn = document.getElementById('cp-login-done-btn');
   if (doneBtn) doneBtn.disabled = true;
-  if (msgEl) msgEl.textContent = 'Collecting session cookies...';
-
-  let targetDomain = '';
-  try {
-    const session = await (await fetch(`/api/copilot/session/${sid}`)).json();
-    const url = (session.pause && session.pause.payload && session.pause.payload.url) || '';
-    if (url) targetDomain = new URL(url).hostname;
-  } catch (e) { /* fall through with empty domain */ }
-
-  const cookies = {};
-  if (targetDomain && typeof order !== 'undefined' && typeof entries !== 'undefined') {
-    for (const eid of order) {
-      const entry = entries[eid];
-      if (!entry || !entry.host) continue;
-      if (!entry.host.includes(targetDomain) && !targetDomain.includes(entry.host)) continue;
-      const setCookie = entry.response_headers?.['set-cookie'] || '';
-      if (!setCookie) continue;
-      for (const part of setCookie.split(';')) {
-        const eq = part.trim().indexOf('=');
-        if (eq > 0) {
-          const name = part.trim().slice(0, eq).trim();
-          const val = part.trim().slice(eq + 1).trim();
-          if (name && val && !['path', 'domain', 'expires', 'samesite', 'secure', 'httponly'].includes(name.toLowerCase())) {
-            cookies[name] = val;
-          }
-        }
-      }
-    }
-  }
-
-  if (msgEl) msgEl.textContent = `Sending ${Object.keys(cookies).length} cookies to the copilot...`;
-  await cpResume(sid, 'auth', { cookies });
+  if (msgEl) msgEl.textContent = 'Handing session to the copilot...';
+  await cpResume(sid, 'auth', { from_jar: true, cookies: {} });
 }
 
 async function cpCancel() {

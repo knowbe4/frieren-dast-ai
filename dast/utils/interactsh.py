@@ -221,5 +221,5 @@ class InteractshSession:
                     f"{self._server}/deregister",
                     json={"correlation-id": self._correlation_id, "secret-key": self._secret_key},
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("interactsh deregister failed", server=self._server, error=str(exc))

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 from dast.ai import bedrock_client
 from dast.ai.copilot.context_brief import build_context_brief
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.authorization import AUTHORIZED_ENGAGEMENT_DIRECTIVE, is_full_authorization
 from dast.ai.schemas import COPILOT_STEP_SCHEMA
 from dast.utils.logger import get_logger
 
@@ -36,6 +37,12 @@ _MAX_TOOL_CALLS_PER_TURN = 12
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
 # neither a tool call nor a reply) before the turn gives up and hands back.
 _MAX_CONSECUTIVE_LLM_FAILURES = 3
+
+# Consecutive tool calls that fail, repeat, or name an unknown tool before the turn
+# gives up. Distinct from the LLM-failure counter: a model that keeps firing broken
+# calls (e.g. validate_chain with empty args) resets the LLM counter every step, so
+# without this guard only the 12-call budget stops it — a long, useless loop.
+_MAX_CONSECUTIVE_TOOL_FAILURES = 4
 
 # Tool observations fed back into the turn transcript are truncated to this many
 # chars so a large response body cannot blow the context.
@@ -52,6 +59,24 @@ _OBSERVATION_PRIORITY_FIELDS = (
     "ok", "status", "length", "final_url", "reflections",
     "error", "safe_variant", "hint",
 )
+
+
+def _last_steps_summary(transcript: List[Dict[str, Any]]) -> str:
+    """Build a brief "what I tried" paragraph from the last few transcript entries
+    for use in hardcoded fallback messages where the model never produced its own
+    reply text."""
+    entries = [item for item in transcript[-5:] if item.get("tool_name") or item.get("observation")]
+    if not entries:
+        return ""
+    lines: List[str] = []
+    for item in entries:
+        tool = item.get("tool_name") or item.get("action", "?")
+        obs = str(item.get("observation") or "").strip()
+        if obs:
+            lines.append(f"  {tool}: {obs[:160]}")
+    if not lines:
+        return ""
+    return "\n\nWhat I tried this turn:\n" + "\n".join(lines)
 
 
 def _summarize_result(result: Any) -> str:
@@ -107,6 +132,10 @@ Each turn, respond with a single step object:
       response context before firing payloads. Detection only — never send a
       destructive payload (data deletion/modification, DoS, > 5s delay); the tools
       refuse these anyway. You may call several tools across a turn before replying.
+      When you CONFIRM a real, exploitable issue, call record_finding to persist it
+      to the Findings tab BEFORE you reply — a finding that only lives in your reply
+      text is not tracked, reported, or exported. Redact secrets/token values in the
+      evidence.
   action="reply" — send the operator a message and hand the turn back. Use this to
       report a confirmed finding with its evidence, to ask a question, or — this is
       important — to say honestly when you are BLOCKED and need the human: a WAF is
@@ -114,6 +143,27 @@ Each turn, respond with a single step object:
       have (an ID, a second account, an explicit authorization), or the target is out
       of scope. Set blocked_reason in those cases so the UI can offer the right help.
       Then wait for their answer and continue from there.
+      WHEN YOU SET blocked_reason AND HAND BACK: always (1) name the specific tool and
+      the exact error you hit (e.g. "send_request returned status 302, final_url=/login");
+      (2) explain what that error means in plain English (e.g. "my session cookie is
+      stale"); (3) give 2-3 concrete steps the operator can take to unblock you (e.g.
+      "load any page on the target in your browser while the proxy is active, then
+      check the History tab for new authenticated requests"); (4) say what a working
+      response would look like (e.g. "a good response returns 200 with a JSON body
+      instead of a redirect"). Generic "I need direction" messages with no diagnosis
+      are not acceptable — always diagnose the root cause.
+
+Communication standard — applies to every reply, not just blocked ones:
+- Begin every reply with a one-sentence summary of what you did this turn and what
+  you observed (e.g. "I sent the accountSettings query as the learner user and got a
+  200 with the full account object; the same query without auth returned 401").
+- When you ask a question or report a problem, always state: (1) which tool you
+  called, (2) what it returned (status code + key fields), (3) what that result means
+  in plain English, and (4) exactly what you need from the operator to continue.
+- Avoid vague statements like "my request failed" or "I need direction" — always
+  name the actual status code or error message you received.
+- Never ask "how should I proceed" without first explaining the current state and
+  your diagnosis of what went wrong.
 
 Operational notes:
 - Out-of-scope or new hosts: just call the tool. If the host is not yet authorized
@@ -123,9 +173,26 @@ Operational notes:
   automatically.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
 - Prefer replying as soon as you have something worth the operator's attention; do
-  not pad the turn with tool calls."""
+  not pad the turn with tool calls.
+- Named sessions and privilege levels: the project context may list named sessions
+  (e.g. "alice: privilege=low", "admin: privilege=high"). Use this information
+  actively — if two sessions with different privilege levels exist, test for
+  privilege escalation (IDOR/BOLA/horizontal/vertical): make the same request as
+  both users and compare. Report a finding when a low-privilege session accesses
+  resources that should require higher privilege. Tell the operator which session
+  you are using for each request so they can follow your reasoning."""
 
 _SYSTEM_COPILOT += UNTRUSTED_CONTENT_DIRECTIVE
+
+
+def _system_prompt() -> str:
+    """The copilot system prompt for this turn. When the operator has declared full
+    authorization at startup, an authorization directive is appended so the model
+    stops handing turns back asking the operator to re-confirm scope/authorization
+    (see ``dast.authorization``). Evaluated per turn so the flag is read at run time."""
+    if is_full_authorization():
+        return _SYSTEM_COPILOT + AUTHORIZED_ENGAGEMENT_DIRECTIVE
+    return _SYSTEM_COPILOT
 
 
 @dataclass
@@ -154,12 +221,40 @@ def _candidate_urls(args: Dict[str, Any]) -> List[str]:
     return urls
 
 
+def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
+    """Compact one-line argument hint from a tool's JSON Schema: ``name:type`` per
+    property, required ones marked ``*``. Without this the copilot menu shows a
+    tool's name and description but NOT its arguments, so the model guesses the
+    shape (and fires empty/malformed calls like validate_chain({}))."""
+    if not isinstance(schema, dict):
+        return ""
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return ""
+    required = set(schema.get("required") or [])
+    # anyOf/oneOf branches carry their own required lists (e.g. validate_chain
+    # requires report_text OR chain); mark those args required too so the model
+    # knows at least one is mandatory.
+    for branch in schema.get("anyOf", []) + schema.get("oneOf", []):
+        if isinstance(branch, dict):
+            required.update(branch.get("required") or [])
+    parts: List[str] = []
+    for name, spec in properties.items():
+        type_name = str(spec.get("type", "")) if isinstance(spec, dict) else ""
+        marker = "*" if name in required else ""
+        parts.append(f"{name}{marker}:{type_name}" if type_name else f"{name}{marker}")
+    return ", ".join(parts)
+
+
 def _render_tool_menu(tool_defs: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for definition in tool_defs:
         desc = (definition.get("description") or "").strip().splitlines()
         first = desc[0] if desc else ""
         lines.append(f"- {definition['name']}: {first}")
+        signature = _render_arg_signature(definition.get("input_schema"))
+        if signature:
+            lines.append(f"    args ('*' = required): {signature}")
     return "\n".join(lines)
 
 
@@ -267,6 +362,18 @@ class CopilotSession:
         ]
         self._context_hosts: set[str] = set()
 
+    def get_known_hosts(self) -> List[str]:
+        """All hosts this session has targeted (focus + any touched during tool calls)."""
+        return sorted(set(self._focus_hosts) | self._context_hosts)
+
+    def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
+        """Preload an authenticated session (e.g. from an activated login profile)
+        so requests carry it from the first tool call and the auth-wall gate stays
+        quiet (it fires only when ``_session_cookies`` is empty). Used by autonomous
+        runs where there is no operator to answer an auth handoff mid-run."""
+        if cookies:
+            self._session_cookies.update({str(k): str(v) for k, v in cookies.items() if k})
+
     async def send(
         self,
         operator_text: str,
@@ -286,7 +393,7 @@ class CopilotSession:
         # Exclude copilot-tagged tools (e.g. copilot_ask) so the copilot can never
         # call itself — those exist only to let OTHER agents/MCP clients drive it.
         tool_defs = [
-            {"name": t.name, "description": t.description}
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
             for t in all_tools()
             if "copilot" not in (t.tags or [])
         ]
@@ -304,6 +411,7 @@ class CopilotSession:
 
         turn_transcript: List[Dict[str, Any]] = []
         consecutive_failures = 0
+        consecutive_tool_failures = 0
 
         async def _observe(entry: Dict[str, Any], observation: str) -> None:
             entry["observation"] = observation
@@ -319,6 +427,104 @@ class CopilotSession:
                 message=message, blocked_reason=blocked_reason, transcript=turn_transcript
             )
 
+        def _build_spin_context_hint(recent_observation: str) -> str:
+            """Build a pattern-aware hint from the most recent tool failure observation."""
+            obs = recent_observation.lower()
+            last_tool = ""
+            last_obs_snippet = recent_observation[:200]
+            for item in reversed(turn_transcript):
+                if item.get("observation"):
+                    last_tool = item.get("tool_name", "")
+                    break
+
+            tool_label = f"`{last_tool}` " if last_tool else ""
+            intro = (
+                f"My last {consecutive_tool_failures} tool calls failed or repeated "
+                "without making progress, so I'm stopping to avoid spinning.\n\n"
+            )
+
+            if ('"status": 302' in recent_observation or '"status":302' in recent_observation
+                    or ("redirect" in obs and "login" in obs)):
+                detail = (
+                    f"Root cause: {tool_label}returned HTTP 302 (redirect to a login page), "
+                    "which means the session cookie I have is stale or was never captured.\n\n"
+                    "To fix this:\n"
+                    "  1. Make sure your browser is routing through Frieren's proxy "
+                    "(check that the proxy address is set in your browser/OS network settings).\n"
+                    "  2. Load any page on the target site in your browser while the proxy is "
+                    "active — this captures a fresh session cookie.\n"
+                    "  3. Check the proxy History tab: you should see new authenticated "
+                    "requests appear before I retry.\n\n"
+                    "A working response will return 200 with the expected JSON/HTML body "
+                    "instead of the 302 redirect."
+                )
+            elif ('"status": 401' in recent_observation or '"status":401' in recent_observation
+                  or '"status": 403' in recent_observation or '"status":403' in recent_observation):
+                status = "401 (Unauthorized)" if "401" in obs else "403 (Forbidden)"
+                detail = (
+                    f"Root cause: {tool_label}returned HTTP {status}, which means the "
+                    "request lacks valid credentials or the session has expired.\n\n"
+                    "To fix this:\n"
+                    "  1. Log in through your browser (with the proxy active) to capture "
+                    "a live session.\n"
+                    "  2. Or provide an explicit Authorization header value "
+                    "(e.g. 'Bearer <token>') so I can inject it.\n"
+                    "  3. If this is a second-account test, give me the credentials or "
+                    "session cookie for that account."
+                )
+            elif "repeat" in obs or "suppressed" in obs:
+                detail = (
+                    "Root cause: I kept repeating the same tool call without getting "
+                    "new information — a value I need must be missing or ambiguous.\n\n"
+                    "To unblock me, tell me:\n"
+                    "  1. A specific resource ID or object ID to target (e.g. a user ID, "
+                    "post ID, or order number).\n"
+                    "  2. Whether I should use a second account/session for comparison.\n"
+                    "  3. The exact URL or parameter I should focus on next."
+                )
+            elif "unknown tool" in obs:
+                tool_attempted = ""
+                for item in reversed(turn_transcript):
+                    if "unknown tool" in (item.get("observation") or "").lower():
+                        tool_attempted = item.get("tool_name", "")
+                        break
+                detail = (
+                    "Root cause: I tried to call a tool that does not exist"
+                    + (f" (`{tool_attempted}`)" if tool_attempted else "")
+                    + ". This is a model error.\n\n"
+                    "Tell me what you'd like me to do next and I'll pick the right tool."
+                )
+            else:
+                detail = (
+                    f"Last failure: {last_obs_snippet}\n\n"
+                    "Tell me how you'd like me to proceed, or give me a value I'm missing "
+                    "(an ID, a second account, or an explicit scope)."
+                )
+
+            return intro + detail
+
+        async def _record_tool_failure(
+            entry: Dict[str, Any], observation: str
+        ) -> Optional[CopilotReply]:
+            """Record a failed/repeated/unknown tool call and bail out of the turn
+            once too many pile up in a row. Returns a reply to return, or None to
+            keep going."""
+            nonlocal consecutive_tool_failures
+            consecutive_tool_failures += 1
+            await _observe(entry, observation)
+            if consecutive_tool_failures >= _MAX_CONSECUTIVE_TOOL_FAILURES:
+                logger.warning("Copilot: too many failed tool calls this turn",
+                               session_id=self.session_id,
+                               failures=consecutive_tool_failures)
+                reply = _finalize(
+                    _build_spin_context_hint(observation),
+                    blocked_reason="need_direction",
+                )
+                await on_event({"type": "reply", "message": reply.message,
+                                "blocked_reason": reply.blocked_reason})
+                return reply
+            return None
+
         try:
             step = 0
             tool_calls_used = 0
@@ -327,7 +533,7 @@ class CopilotSession:
                 user = _build_user_prompt(
                     self.messages, tool_menu, turn_transcript, context_brief
                 )
-                decision = await _llm_step(_SYSTEM_COPILOT, user)
+                decision = await _llm_step(_system_prompt(), user)
 
                 if decision is None:
                     consecutive_failures += 1
@@ -360,7 +566,19 @@ class CopilotSession:
                 if action == "reply":
                     message = str(decision.get("message", "")).strip()
                     if not message:
-                        message = "(the copilot produced an empty reply)"
+                        # The schema only requires thought+action, so a reply can
+                        # arrive with all the substance in `thought` and message
+                        # left blank (a common failure with schema-forced steps).
+                        # Surface the thought rather than a useless placeholder so
+                        # the operator still gets the copilot's actual conclusion.
+                        if thought:
+                            message = thought
+                            logger.info(
+                                "Copilot: reply had empty message; used thought as fallback",
+                                session_id=self.session_id, step=step,
+                            )
+                        else:
+                            message = "(the copilot produced an empty reply)"
                     blocked_reason = str(decision.get("blocked_reason", "") or "").strip()
                     reply = _finalize(message, blocked_reason)
                     await on_event({"type": "reply", "message": reply.message,
@@ -389,25 +607,28 @@ class CopilotSession:
                             self._context_hosts.add(touched)
 
                     if tool_name not in tool_names:
-                        await _observe(entry, f"Unknown tool '{tool_name}'. Choose one "
-                                       f"of: {', '.join(sorted(tool_names))}.")
+                        reply = await _record_tool_failure(
+                            entry, f"Unknown tool '{tool_name}'. Choose one of: "
+                            f"{', '.join(sorted(tool_names))}.")
+                        if reply is not None:
+                            return reply
                         continue
 
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
-                        await _observe(entry, "Repeat of an earlier identical call — "
-                                       "suppressed. Try a different request or reply.")
+                        reply = await _record_tool_failure(
+                            entry, "Repeat of an earlier identical call — suppressed. "
+                            "Try a different request or reply.")
+                        if reply is not None:
+                            return reply
                         continue
                     self._seen_calls.add(call_key)
 
-                    # Apply any collected session cookies to a request-shaped call.
-                    if self._session_cookies and "url" in tool_args:
-                        headers = dict(tool_args.get("headers") or {})
-                        if not any(k.lower() == "cookie" for k in headers):
-                            headers["Cookie"] = "; ".join(
-                                f"{k}={v}" for k, v in self._session_cookies.items()
-                            )
-                            tool_args["headers"] = headers
+                    # Reuse the operator's already-captured session (proxy cookie jar
+                    # + borrowed auth headers) on a request-shaped call. Runs after
+                    # the anti-repeat key is computed so the injected session never
+                    # changes the dedup identity of the model's intended call.
+                    self._apply_session_auth(tool_ctx, tool_args)
 
                     if await self._scope_gate(
                         tool_name, tool_args, tool_ctx, approved_hosts,
@@ -421,8 +642,16 @@ class CopilotSession:
                         result, tool_args, entry, wait_for_human, _observe,
                         _looks_like_auth_wall, _sanitise_cookies, call_key,
                     ):
+                        consecutive_tool_failures = 0  # session applied — progress made
                         continue  # session applied — retry allowed
 
+                    if not result.get("ok"):
+                        reply = await _record_tool_failure(entry, _summarize_result(result))
+                        if reply is not None:
+                            return reply
+                        continue
+
+                    consecutive_tool_failures = 0
                     await _observe(entry, _summarize_result(result))
                     continue
 
@@ -438,8 +667,9 @@ class CopilotSession:
                                "(and set message).")
                 if consecutive_failures >= _MAX_CONSECUTIVE_LLM_FAILURES:
                     reply = _finalize(
-                        "I couldn't settle on a next step this turn. Tell me how "
-                        "you'd like me to proceed.",
+                        "I couldn't settle on a next step this turn."
+                        + _last_steps_summary(turn_transcript)
+                        + "\n\nTell me how you'd like me to proceed.",
                         blocked_reason="need_direction",
                     )
                     await on_event({"type": "reply", "message": reply.message,
@@ -450,8 +680,10 @@ class CopilotSession:
             logger.warning("Copilot: tool-call ceiling reached this turn",
                            calls=_MAX_TOOL_CALLS_PER_TURN)
             reply = _finalize(
-                "I ran several tools but didn't reach a conclusion this turn. Here's "
-                "where I am — tell me how you'd like me to proceed.",
+                "I ran the maximum number of tool calls this turn without reaching a "
+                "conclusion."
+                + _last_steps_summary(turn_transcript)
+                + "\n\nTell me how you'd like me to proceed.",
                 blocked_reason="need_direction",
             )
             await on_event({"type": "reply", "message": reply.message,
@@ -463,6 +695,74 @@ class CopilotSession:
         except Exception as exc:
             logger.error("Copilot turn error", session_id=self.session_id, error=str(exc))
             return _finalize(f"Internal error: {str(exc)[:300]}", blocked_reason="error")
+
+    def _apply_session_auth(self, tool_ctx: Any, tool_args: Dict[str, Any]) -> None:
+        """Reuse the operator's already-captured session on a request-shaped call.
+
+        Frieren has usually already seen the operator log in through the proxy, so
+        the session it needs is sitting in the store: the cookie jar for the target
+        host, plus the auth headers (Authorization / X-Auth-Token / X-Api-Key) of
+        the most recent real request to that host. This sources both and injects
+        whatever the model did not set itself — so the copilot picks up the logged-in
+        session from history instead of bouncing off a login wall on every request.
+
+        Precedence: browser-handoff cookies (collected on an auth-wall pause) beat
+        the passive jar; anything the model set explicitly beats both (never
+        overwritten). Cookies are host-scoped via the jar; borrowed non-cookie auth
+        headers come from the freshest matching request to the same host.
+        """
+        urls = _candidate_urls(tool_args)
+        if not urls:
+            return
+        host = (urlparse(urls[0]).hostname or "").lower()
+        if not host:
+            return
+
+        store = getattr(tool_ctx, "store", None)
+
+        # Cookies: passive proxy jar for the host, overlaid with fresh handoff cookies.
+        cookies: Dict[str, str] = {}
+        if store is not None:
+            try:
+                for cookie in store.get_cookies_for_host(host):
+                    name = cookie.get("name")
+                    if name:
+                        cookies[name] = cookie.get("value", "")
+            except Exception as exc:
+                logger.warning("Copilot: cookie-jar lookup failed",
+                               host=host, error=str(exc))
+        cookies.update(self._session_cookies)  # handoff cookies win
+
+        # Auth headers: the freshest real request to this host.
+        borrowed_headers: Dict[str, str] = {}
+        if store is not None:
+            try:
+                from dast.proxy.auth_headers import extract_auth_headers
+                recent_first = list(reversed(store.all_entries()))
+                borrowed_headers = extract_auth_headers(
+                    recent_first, host=host, limit=200
+                )
+            except Exception as exc:
+                logger.warning("Copilot: auth-header lookup failed",
+                               host=host, error=str(exc))
+
+        if not cookies and not borrowed_headers:
+            return
+
+        headers = dict(tool_args.get("headers") or {})
+        present = {key.lower() for key in headers}
+
+        if cookies and "cookie" not in present:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+        for name, value in borrowed_headers.items():
+            if name.lower() == "cookie":
+                continue  # cookies come from the host-scoped jar above
+            if name.lower() not in present:
+                headers[name] = value
+
+        if headers:
+            tool_args["headers"] = headers
 
     async def _scope_gate(
         self,
@@ -514,7 +814,14 @@ class CopilotSession:
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
         collected and the identical call should be allowed to retry."""
-        status_code = int(result.get("status", 0) or 0)
+        # ``status`` is the HTTP code on request-shaped tools, but this gate runs on
+        # every tool result and non-request tools (e.g. run_scan) put a non-numeric
+        # status here ("vulnerable"/"scanning"/"safe"). A non-numeric status is by
+        # definition not an HTTP auth wall, so treat it as 0 rather than crashing.
+        try:
+            status_code = int(result.get("status", 0) or 0)
+        except (TypeError, ValueError):
+            status_code = 0
         body = str(result.get("body", "") or "")
         final_url = str(result.get("final_url", "") or tool_args.get("url", ""))
         host = (urlparse(final_url).hostname or "").lower()

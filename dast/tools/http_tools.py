@@ -28,6 +28,31 @@ _MAX_REFLECTIONS = 6
 _REFLECTION_CONTEXT_CHARS = 80
 
 
+def _all_set_cookies(resp: Any) -> List[str]:
+    """Every Set-Cookie value from the response and any redirect hop.
+
+    ``dict(resp.headers)`` collapses repeated headers to a single value, hiding
+    multi-cookie issuance (e.g. three CloudFront signed cookies); ``follow_redirects``
+    also hides cookies set on an intermediate 3xx hop. This gathers them all.
+    Tolerant of non-httpx response shapes (a plain-dict ``headers``, no ``history``)
+    so the handler never raises.
+    """
+    cookies: List[str] = []
+    hops = list(getattr(resp, "history", None) or [])
+    hops.append(resp)
+    for hop in hops:
+        headers = getattr(hop, "headers", None)
+        if headers is None:
+            continue
+        if hasattr(headers, "get_list"):
+            cookies.extend(headers.get_list("set-cookie"))
+        else:
+            value = headers.get("set-cookie") if hasattr(headers, "get") else None
+            if value:
+                cookies.append(value)
+    return cookies
+
+
 def _reflection_context(text: str, needle: str) -> str:
     """A short snippet of ``text`` around the first occurrence of ``needle``."""
     idx = text.find(needle)
@@ -153,6 +178,14 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                 content=request_body.encode("utf-8") if request_body else None,
             )
         full_text = resp.text
+        # dict(resp.headers) collapses repeated headers to a single value, which
+        # hides multi-cookie issuance (e.g. CloudFront signed cookies set as three
+        # separate Set-Cookie headers). Surface EVERY Set-Cookie value explicitly,
+        # including cookies set on any redirect hop (follow_redirects is on, so those
+        # would otherwise be invisible on the final response), so a caller can observe
+        # and reuse them.
+        set_cookies = _all_set_cookies(resp)
+        history = list(getattr(resp, "history", None) or [])
         result: Dict[str, Any] = {
             "ok": True,
             "status": resp.status_code,
@@ -161,6 +194,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
+        if set_cookies:
+            result["set_cookies"] = set_cookies
+        if history:
+            result["redirects"] = [
+                {"status": hop.status_code, "url": str(hop.url)} for hop in history
+            ]
         # Reflection signal computed on the FULL body (before truncation) so a
         # reflected value deep in a large page is still reported to the caller.
         reflections = _detect_reflections(url, request_body, full_text)
@@ -177,7 +216,10 @@ register(Tool(
         "Send a single HTTP request through the Frieren proxy and return the response "
         "(status, headers, body). This is the repeater primitive: it routes through the "
         "proxy so the request is captured, rate-limited and circuit-broken, enforces scope, "
-        "and refuses destructive payloads (offering a safe detection-only variant).\n"
+        "and refuses destructive payloads (offering a safe detection-only variant). Every "
+        "Set-Cookie the server issued is returned as the 'set_cookies' list (including cookies "
+        "set on any redirect hop) -- read that, not 'headers', to observe issued cookies, since "
+        "'headers' collapses repeated Set-Cookie to one value.\n"
         "Use this when: reproducing or probing a specific endpoint, testing whether a "
         "payload reflects/changes behavior, replaying a captured request with a tweak, or "
         "delivering an SSRF/XXE payload that embeds an OOB URL from oob_generate.\n"

@@ -50,7 +50,7 @@ def _extract_tokens(entry: "ProxyEntry") -> list[str]:
             for m in _JWT_RE.finditer(body):
                 tokens.append(m.group(0))
         except Exception:
-            pass
+            pass  # best-effort: non-decodable body simply yields no tokens
 
     return list(set(tokens))
 

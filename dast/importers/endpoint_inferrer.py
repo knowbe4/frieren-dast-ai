@@ -21,6 +21,7 @@ import json
 from typing import Optional, Tuple
 
 from dast.ai import bedrock_client
+from dast.ai.schemas import ENDPOINT_INFER_SCHEMA
 from dast.models import AttackPayload, Endpoint, EndpointParameter, HttpRequest
 from dast.utils.logger import get_logger
 
@@ -119,6 +120,7 @@ def infer_endpoint(
             system=_SYSTEM,
             user=prompt,
             max_tokens=1024,
+            schema=ENDPOINT_INFER_SCHEMA,
         )
     except Exception as e:
         logger.error(

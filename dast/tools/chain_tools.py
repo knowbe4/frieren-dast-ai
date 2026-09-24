@@ -27,25 +27,110 @@ from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+_CHAIN_STEP_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "Short label for this step."},
+        "method": {"type": "string", "description": "HTTP method (GET/POST/...). Defaults to GET."},
+        "url": {
+            "type": "string",
+            "description": (
+                "Absolute URL. May contain {{var}} placeholders bound by an earlier step's "
+                "extractor."
+            ),
+        },
+        "headers": {
+            "type": "object",
+            "description": (
+                "Request headers. Use {{var}} to inject an extracted value, e.g. "
+                '{"authorization": "Bearer {{zenkaJwt}}"}.'
+            ),
+        },
+        "body": {"type": "string", "description": "Request body (e.g. a JSON GraphQL query) for POST/PUT/PATCH."},
+        "send_cookies": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Cookie names to send. Omit to send the whole accumulated jar; use [] to send "
+                "NO cookies (a control step that proves a token, not the cookie, grants access)."
+            ),
+        },
+        "extract": {
+            "type": "array",
+            "description": "Bind values out of this step's response into variables for later steps.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "description": "json | regex | set_cookie | b64json | jwt_claim"},
+                    "var": {"type": "string", "description": "Variable name to bind; reference it later as {{var}}."},
+                    "expr": {"type": "string", "description": "Dotted JSON path / regex / cookie name, per kind (e.g. user.attributes.zenkaJwt)."},
+                    "from": {"type": "string", "description": "body (default) | header:<Name> | var:<name>"},
+                },
+                "required": ["kind", "var"],
+            },
+        },
+        "assertions": {
+            "type": "array",
+            "description": "Conditions that must hold for this step to pass.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": (
+                            "status_eq | status_in | header_contains | body_contains | "
+                            "body_not_contains | var_present | var_contains | var_equals"
+                        ),
+                    },
+                    "value": {"description": "Operand for status_eq / var_equals / var_contains."},
+                    "values": {"type": "array", "description": "Operand for status_in."},
+                    "name": {"type": "string", "description": "Header name for header_contains."},
+                    "needle": {"type": "string", "description": "Substring for *_contains."},
+                    "var": {"type": "string", "description": "Variable name for var_* assertions."},
+                },
+                "required": ["kind"],
+            },
+        },
+    },
+    "required": ["name", "url"],
+}
+
 _VALIDATE_CHAIN_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "chain": {
-            "type": "object",
-            "description": (
-                "A ready chain spec: {name, vuln_type, description, steps:[...]}. Each step is "
-                "{name, method, url, headers, body, send_cookies, max_range_bytes, extract:[...], "
-                "assertions:[...]}. Provide this OR report_text."
-            ),
-        },
         "report_text": {
             "type": "string",
             "description": (
-                "Free-text multi-step report (e.g. a HackerOne submission). The planner turns it "
-                "into an executable chain, including a control step. Provide this OR chain."
+                "PREFERRED. A free-text description of the multi-step attack (a HackerOne report, "
+                "or your own prose listing the ordered requests). The planner turns it into an "
+                "executable chain, including the control step. Use this whenever you can describe "
+                "the steps in words — it is far more reliable than hand-building `chain`."
             ),
         },
+        "chain": {
+            "type": "object",
+            "description": (
+                "A ready, explicit chain spec. Only use this if you already have exact steps; "
+                "otherwise pass report_text and let the planner build it."
+            ),
+            "properties": {
+                "name": {"type": "string", "description": "Short name for the chain."},
+                "vuln_type": {"type": "string", "description": "Vulnerability class, e.g. broken_access_control."},
+                "description": {"type": "string", "description": "One-line summary of what the chain proves."},
+                "steps": {
+                    "type": "array",
+                    "items": _CHAIN_STEP_SCHEMA,
+                    "description": (
+                        "Ordered steps. A later step may reference {{var}} bound by an earlier "
+                        "step's extractor (e.g. extract zenkaJwt from /spa/session, then send it "
+                        "as a Bearer header to /reports/graphql)."
+                    ),
+                },
+            },
+            "required": ["steps"],
+        },
     },
+    "anyOf": [{"required": ["report_text"]}, {"required": ["chain"]}],
 }
 
 

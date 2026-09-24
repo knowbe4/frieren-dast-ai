@@ -310,8 +310,8 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
                 app_profile_hint += f"\nblazor_handler_ids: {ids_str}"
             if input_fields:
                 app_profile_hint += f"\nblazor_input_fields: {','.join(input_fields[:10])}"
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to append Blazor circuit intelligence to hint", host=entry.host, error=str(exc))
 
     # Build threat model hint — architectural constraints for red-team validator
     threat_model_hint = ""
@@ -330,8 +330,8 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
         _url_path = _urlparse(entry.url).path
         if _url_path and _url_path != "/":
             code_hint = lookup_code_for_path(_url_path)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("code lookup for target path failed", url=entry.url, error=str(exc))
 
     named_sessions = store.get_named_sessions() if store is not None else []
 

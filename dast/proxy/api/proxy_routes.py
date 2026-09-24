@@ -333,8 +333,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                                     m = _re.search(r'\b(query|mutation|subscription)\s+(\w+)', data.get("query", ""))
                                     if m:
                                         operation = f"{m.group(1)} {m.group(2)}"
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("failed to extract GraphQL operation while enqueueing scan", error=str(exc))
                     scan_queue_state.enqueue(e.id, e.method, e.url, e.host, operation=operation)
                 await scan_queue.put(e.id)
                 queued += 1
@@ -394,6 +394,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         note = str(body.get("note", "")).strip()
         entry = store.get_entry(entry_id)
         if not entry:
+            logger.warning("manual send-to-ai: entry not found", entry_id=entry_id)
             return JSONResponse({"error": "entry not found"}, status_code=404)
         entry.ai_queued = True
         entry.manual_note = note or None
@@ -402,6 +403,19 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             if scan_queue_state:
                 scan_queue_state.enqueue(entry.id, entry.method, entry.url, entry.host)
             await scan_queue.put(entry.id)
+            logger.info(
+                "manual send-to-ai: enqueued for scan",
+                entry_id=entry.id,
+                method=entry.method,
+                url=entry.url,
+                has_note=bool(note),
+            )
+        else:
+            logger.info(
+                "manual send-to-ai: entry already queued, note updated",
+                entry_id=entry.id,
+                has_note=bool(note),
+            )
         store._notify(entry)
         return {"ok": True, "entry_id": entry_id}
 

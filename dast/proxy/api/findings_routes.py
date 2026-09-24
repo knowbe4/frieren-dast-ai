@@ -101,8 +101,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     m = _re.search(r'\b(query|mutation|subscription)\s+(\w+)', data.get("query", ""))
                     if m:
                         return f"{m.group(1)} {m.group(2)}"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to extract GraphQL operation name from body", error=str(exc))
             return ""
 
         _AUTH_HEADERS = frozenset({
@@ -355,6 +355,26 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         findings[finding_index]["dismissed"] = False
         store._notify(entry)
         return {"ok": True}
+
+    @router.post("/api/findings/manual")
+    async def record_manual_finding_api(request: Request):
+        """Persist a finding produced outside the scan pipeline (the record_finding
+        tool's external/MCP path). Links it to the most recent proxied request for
+        the url, or creates a lightweight synthetic entry so it still shows up."""
+        body = await request.json()
+        finding = body.get("finding") or {}
+        url = str(body.get("url", "")).strip()
+        method = str(body.get("method", "GET")).strip() or "GET"
+        if not isinstance(finding, dict) or not finding.get("title"):
+            return JSONResponse({"error": "finding.title is required"}, status_code=400)
+        if not url:
+            return JSONResponse({"error": "url is required"}, status_code=400)
+        entry_id = store.record_manual_finding(finding, url, method)
+        if not entry_id:
+            return JSONResponse({"error": "could not record finding"}, status_code=400)
+        logger.info("manual finding recorded", entry_id=entry_id,
+                    title=finding.get("title"), severity=finding.get("severity"))
+        return {"ok": True, "entry_id": entry_id}
 
     @router.get("/api/findings")
     async def list_findings():

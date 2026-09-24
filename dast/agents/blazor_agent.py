@@ -280,8 +280,8 @@ class BlazorAgent(VulnAgent):
                     # Webcil-wrapped assemblies in .NET 8+ have .wasm extension
                     # but are distinguishable from the runtime by not starting with "dotnet"
                     wasm_names.append(k)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to parse Blazor boot manifest resources", error=str(exc))
 
         all_assemblies = dll_names + wasm_names
         format_note = (

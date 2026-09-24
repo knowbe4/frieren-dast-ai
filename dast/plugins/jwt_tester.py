@@ -24,6 +24,9 @@ import httpx
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.proxy.plugin_manager import log_event
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 # JWT/base64url primitives live in dast.utils.jwt. Re-exported under the local
 # underscore names below for backward compatibility (tests import them here).
 from dast.utils.jwt import b64url_decode, b64url_encode, build_token, decode_jwt
@@ -176,8 +179,8 @@ class JwtTesterPlugin(ProxyPlugin):
                               "Skipping JWT tests — endpoint accessible without auth token",
                               url=entry.url, source="plugin")
                     return
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("no-auth baseline check failed; proceeding with JWT tests", url=entry.url, error=str(exc))
 
             def _accepted(resp) -> bool:
                 if resp is None:

@@ -61,6 +61,8 @@ class AgentFinding:
     confirmed: bool = True
     bypass_validation: bool = False  # skip LLM validator for deterministic findings
     ai_validated: bool = False  # True only when the red-team LLM call succeeded and returned a verdict
+    needs_review: bool = False  # True when the AI validator could not run (offline/errored) but
+                                # pattern confidence was plausible — held for human review, NOT confirmed
     reasoning: str = ""
     raw_response_snippet: str = ""
     browser_confirmed: Optional[bool] = None   # None = not attempted, True/False = browser result

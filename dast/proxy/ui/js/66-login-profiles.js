@@ -13,6 +13,34 @@ function loadLoginProfiles() {
       data.crypto_available ? 'none' : 'inline';
     loginRenderList();
   }).catch(e => console.error('loadLoginProfiles', e));
+  _loginLoadDetectedHosts();
+}
+
+function _loginLoadDetectedHosts() {
+  fetch('/api/profiles/detected-hosts').then(r => r.json()).then(data => {
+    const hosts = data.hosts || [];
+    const el = document.getElementById('qc-detected');
+    if (!el) return;
+    if (!hosts.length) { el.innerHTML = ''; return; }
+    el.innerHTML = '<span style="font-size:10px;color:var(--txt2)">Detected in proxy: </span>'
+      + hosts.map(h =>
+          `<span onclick="document.getElementById('qc-host').value='${_esc(h)}'"
+                 style="cursor:pointer;font-size:10px;padding:1px 7px;background:var(--bg3);
+                        border:1px solid var(--bd);border-radius:3px;margin:1px">${_esc(h)}</span>`
+        ).join('');
+  }).catch(() => {});
+}
+
+const _PRIV_COLORS = {
+  unauthenticated: '#666', low: 'var(--blue)', medium: 'var(--yellow)',
+  high: 'var(--orange)', admin: 'var(--bad)',
+};
+
+function _privBadge(level) {
+  if (!level) return '';
+  const color = _PRIV_COLORS[level] || 'var(--txt2)';
+  return `<span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.3px;
+    color:${color};border:1px solid ${color};border-radius:3px;padding:1px 5px;margin-left:4px">${_esc(level)}</span>`;
 }
 
 function loginRenderList() {
@@ -29,7 +57,7 @@ function loginRenderList() {
       p.flow_set ? 'flow' : '',
     ].filter(Boolean).join(' · ');
     return `<div onclick="loginSelectProfile('${p.slug}')" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;margin-bottom:4px;cursor:pointer;${active}">
-      <div style="font-weight:600">${_esc(p.name)}</div>
+      <div style="font-weight:600;display:flex;align-items:center">${_esc(p.name)}${_privBadge(p.privilege_level)}</div>
       <div style="color:var(--txt2);font-size:10px">${_esc(p.host_pattern || '(no host pattern)')}</div>
       <div style="color:var(--txt2);font-size:10px">${badges}</div>
     </div>`;
@@ -42,6 +70,7 @@ function loginNewProfile() {
   document.getElementById('logins-name').value = '';
   document.getElementById('logins-host').value = '';
   document.getElementById('logins-authurl').value = '';
+  document.getElementById('logins-privilege').value = '';
   document.getElementById('logins-creds').innerHTML = '';
   document.getElementById('logins-session-status').textContent = '';
   document.getElementById('logins-editor-status').textContent = '';
@@ -59,6 +88,7 @@ function loginSelectProfile(slug) {
   document.getElementById('logins-name').value = p.name || '';
   document.getElementById('logins-host').value = p.host_pattern || '';
   document.getElementById('logins-authurl').value = p.auth_url || '';
+  document.getElementById('logins-privilege').value = p.privilege_level || '';
   document.getElementById('logins-creds').innerHTML = '';
   (p.credentials.length ? p.credentials : [{label: 'default', username: '', secret_set: false}])
     .forEach(c => loginAddCred(c));
@@ -105,6 +135,7 @@ function loginSaveProfile() {
     name: document.getElementById('logins-name').value.trim(),
     host_pattern: document.getElementById('logins-host').value.trim(),
     auth_url: document.getElementById('logins-authurl').value.trim(),
+    privilege_level: document.getElementById('logins-privilege').value,
     credentials: _loginCollectCreds(),
   };
   if (!body.name) { _loginStatus('Name is required.', true); return; }
@@ -246,6 +277,45 @@ function _loginConnectWs() {
   } catch (e) { /* best-effort */ }
 }
 _loginConnectWs();
+
+function loginCaptureFromProxy() {
+  if (!_loginCurrentSlug) { _loginStatus('Save the profile first, then capture.', true); return; }
+  const host = document.getElementById('logins-host').value.trim().replace(/^\*\./, '');
+  const st = document.getElementById('logins-session-status');
+  st.textContent = 'Capturing...'; st.style.color = 'var(--txt2)';
+  fetch(`/api/profiles/${_loginCurrentSlug}/capture-from-proxy`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({host}),
+  }).then(r => r.json()).then(p => {
+    if (p.error) { st.textContent = p.error; st.style.color = 'var(--bad)'; return; }
+    const c = p.captured || {};
+    st.textContent = `Captured — ${c.cookies || 0} cookie(s) from ${c.host || host}.`;
+    st.style.color = 'var(--txt2)';
+    loadLoginProfiles();
+  }).catch(e => { st.textContent = 'Capture failed: ' + e; st.style.color = 'var(--bad)'; });
+}
+
+function loginQuickCapture() {
+  const name = (document.getElementById('qc-name') || {}).value?.trim();
+  const host = (document.getElementById('qc-host') || {}).value?.trim().toLowerCase();
+  const privilege_level = (document.getElementById('qc-privilege') || {}).value || '';
+  const st = document.getElementById('qc-status');
+  if (!name || !host) { st.textContent = 'Name and host are required.'; st.style.color = 'var(--bad)'; return; }
+  st.textContent = 'Capturing...'; st.style.color = 'var(--txt2)';
+  fetch('/api/profiles/quick-capture', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, host, privilege_level}),
+  }).then(r => r.json()).then(p => {
+    if (p.error) { st.textContent = p.error; st.style.color = 'var(--bad)'; return; }
+    const c = p.captured || {};
+    st.textContent = `Saved "${p.name}" — ${c.cookies || 0} cookie(s) captured.`;
+    st.style.color = 'var(--txt2)';
+    document.getElementById('qc-name').value = '';
+    document.getElementById('qc-host').value = '';
+    document.getElementById('qc-privilege').value = '';
+    loadLoginProfiles();
+  }).catch(e => { st.textContent = 'Capture failed: ' + e; st.style.color = 'var(--bad)'; });
+}
 
 function _loginStatus(msg, isError) {
   const el = document.getElementById('logins-editor-status');

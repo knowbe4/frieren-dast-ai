@@ -32,6 +32,10 @@ class ScanOrchestrator:
             size=config.parallel_workers,
             headless=config.browser_headless,
         )
+        # Auth storage_state (cookies + localStorage) captured from the context
+        # that actually logged in — see _authenticate for why it must be read
+        # there and not from a freshly-acquired pool context.
+        self._auth_state: dict | None = None
 
     async def run(self) -> ScanResult:
         start = time.time()
@@ -68,10 +72,8 @@ class ScanOrchestrator:
                 ok = await self._authenticate(audit)
                 if not ok:
                     raise RuntimeError("Authentication failed. Check credentials and --auth-url.")
-                if self._session.has_checkpoint:
-                    async with self._pool.acquire() as ctx:
-                        state = await ctx.storage_state()
-                    await self._pool.apply_auth_state(state)
+                if self._auth_state:
+                    await self._pool.apply_auth_state(self._auth_state)
 
             # Stage 2: Crawl
             result.status = ScanStatus.CRAWLING
@@ -142,6 +144,15 @@ class ScanOrchestrator:
                 username=self._config.username,
                 success=ok,
             )
+            if ok:
+                # Capture the authenticated storage_state HERE, from the very
+                # context that just logged in. The pool hands out contexts
+                # round-robin (FIFO queue), so reading storage_state from a
+                # separately-acquired context would almost always read an
+                # unauthenticated one when parallel_workers > 1 — the auth
+                # cookies would then never propagate and every crawl/attack
+                # request would silently hit the login page.
+                self._auth_state = await ctx.storage_state()
             return ok
 
     async def _crawl(self, audit: AuditLog) -> list:

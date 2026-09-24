@@ -719,10 +719,16 @@ def verify(
 @click.option("--confidence", default=0.7, show_default=True, help="Min confidence to report finding")
 @click.option("--output-dir", default="./scan-results", show_default=True, help="Output directory")
 @click.option("--attack-types", default=None, help="Comma-separated attack types (default: all)")
+@click.option("--authorized", "authorized", is_flag=True, default=False,
+              help="Declare full written authorization for all targets under test and "
+                   "accept full responsibility for the testing performed. Skips the "
+                   "startup authorization prompt. Use only in an environment you are "
+                   "authorized to test.")
 def proxy(
     proxy_port, proxy_host, dashboard_port,
     auth_url, username, password,
     workers, iterations, confidence, output_dir, attack_types,
+    authorized,
 ):
     """
     Start HTTP/HTTPS proxy + web dashboard.
@@ -739,7 +745,40 @@ def proxy(
     """
     from dast.proxy.runner import ProxyRunner
     from dast.utils.logger import set_log_file
+    from dast import authorization
     import datetime
+
+    # Active testing requires an explicit authorization declaration before anything
+    # starts. --authorized declares it up front (for authorized/headless environments);
+    # otherwise the operator must confirm the term interactively or the tool aborts.
+    if authorized:
+        authorization.set_full_authorization(True)
+        console.print("[green]Authorized engagement declared via --authorized "
+                      "(full authorization and responsibility accepted).[/green]\n")
+    else:
+        console.print(
+            "\n[bold yellow]AUTHORIZATION REQUIRED[/bold yellow]\n"
+            "Frieren DAST-AI performs active security testing: it sends attack payloads\n"
+            "to every target you route through it. You must be authorized to test them.\n\n"
+            "By continuing you confirm that:\n"
+            "  - You hold explicit written authorization to test every target you use\n"
+            "    with this tool.\n"
+            "  - You accept full responsibility and liability for all testing performed.\n"
+            "[dim]Run with --authorized to skip this prompt in an authorized environment.[/dim]\n"
+        )
+        try:
+            confirmed = click.confirm(
+                "Do you confirm you are fully authorized and accept full responsibility?",
+                default=False,
+            )
+        except click.Abort:
+            confirmed = False
+        if not confirmed:
+            console.print("\n[red]Authorization not confirmed - aborting. "
+                          "Nothing was started.[/red]")
+            raise SystemExit(1)
+        authorization.set_full_authorization(True)
+        console.print("[green]Authorization confirmed.[/green]")
 
     enabled = _parse_attack_types(attack_types)
 

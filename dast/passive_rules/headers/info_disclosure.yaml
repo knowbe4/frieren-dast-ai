@@ -23,6 +23,7 @@ rules:
         - x-generator
     conditions:
       content_type: any
+      one_per_host: true
     evidence_template: "Header '{header}: {value}' reveals server/framework version"
     needs_ai_validation: false
 
@@ -38,6 +39,7 @@ rules:
       body_max_scan_bytes: 8192
     conditions:
       content_type: html
+      one_per_host: true
     evidence_template: "Response contains debug mode indicator"
     needs_ai_validation: true
 
@@ -52,6 +54,7 @@ rules:
       header_present: x-powered-by
     conditions:
       content_type: any
+      one_per_host: true
     evidence_template: "Header 'x-powered-by: {value}' discloses technology stack"
     needs_ai_validation: false
 
@@ -66,6 +69,7 @@ rules:
       header_present: x-aspnet-version
     conditions:
       content_type: any
+      one_per_host: true
     evidence_template: "Header 'x-aspnet-version: {value}' discloses ASP.NET version"
     needs_ai_validation: false
 
@@ -80,5 +84,6 @@ rules:
       header_present: x-generator
     conditions:
       content_type: any
+      one_per_host: true
     evidence_template: "Header 'x-generator: {value}' discloses generator technology"
     needs_ai_validation: false

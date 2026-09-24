@@ -150,11 +150,13 @@ function buildFindingsHtml(d) {
       ai:'AI validated','passive+ai':'Passive+AI',pattern:'Pattern match',passive:'Passive',imported:'Imported',
       browser:'Browser confirmed',time_based:'Time-based',oob_callback:'OOB callback',
       error_pattern:'Error pattern',file_match:'File match',secret_pattern:'Secret pattern',response_diff:'Response diff',
+      unvalidated:'Needs review',
     };
     const _VBY2_CLASS = {
       ai:'vbdg-ai','passive+ai':'vbdg-pai',pattern:'vbdg-pattern',passive:'vbdg-passive',imported:'vbdg-imported',
       browser:'vbdg-browser',time_based:'vbdg-time_based',oob_callback:'vbdg-oob_callback',
       error_pattern:'vbdg-error_pattern',file_match:'vbdg-file_match',secret_pattern:'vbdg-secret_pattern',response_diff:'vbdg-response_diff',
+      unvalidated:'vbdg-unvalidated',
     };
     const _vbyRaw3 = f.validated_by;
     const _vbyList3 = Array.isArray(_vbyRaw3) ? _vbyRaw3 : (_vbyRaw3 ? [_vbyRaw3] : ['passive']);

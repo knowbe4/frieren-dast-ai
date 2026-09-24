@@ -180,8 +180,8 @@ def parse_report(text: str) -> H1Report:
                 return True
             if _OOB_SUFFIX_RE.search(host):
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not classify reference URL", error=str(exc))
         return False
 
     # Backward compat alias used below
@@ -244,7 +244,8 @@ def parse_report(text: str) -> H1Report:
             else:
                 # Bare domain (e.g. from dig extraction) — store as-is
                 report.target_url = report.proof_url.split("?")[0]
-        except Exception:
+        except Exception as exc:
+            logger.debug("Could not parse proof URL for target URL", error=str(exc))
             report.target_url = report.proof_url.split("?")[0]
 
     # ── 5. Payload ────────────────────────────────────────────────────────
@@ -275,8 +276,8 @@ def parse_report(text: str) -> H1Report:
     if report.payload and "%" in report.payload:
         try:
             report.payload = unquote(report.payload)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Could not URL-decode H1 payload", error=str(exc))
 
     return report
 

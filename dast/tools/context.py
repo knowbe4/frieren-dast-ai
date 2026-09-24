@@ -35,6 +35,14 @@ class ToolContext:
     # ProxySettings (scope enforcement). Lazily constructed from disk if None so
     # the MCP process inherits the same scope rules the running proxy uses.
     settings: Optional[Any] = None
+    # Async plumbing for orchestration tools (``crawl``, ``run_scan``). Present
+    # ONLY for the in-process copilot driver; left None for the MCP process and
+    # the internal triage loop, so those callers get a graceful "not available in
+    # this context" from those tools instead of a crash. These are the same queue
+    # objects ProxyRunner hands to the scan worker and crawl worker.
+    scan_queue: Optional[Any] = None
+    scan_queue_state: Optional[Any] = None
+    crawl_queue: Optional[Any] = None
 
     def get_settings(self) -> Any:
         """Return the scope settings, building a disk-backed default on first use."""

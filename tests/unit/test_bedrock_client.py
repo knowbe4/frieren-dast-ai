@@ -87,6 +87,81 @@ def test_structured_path_falls_back_to_text_when_no_tool_block(install_fake_clie
     assert result == {"ok": False}
 
 
+def test_structured_path_repairs_prose_from_local_model(install_fake_client, caplog):
+    # A local OpenAI-compatible server (Ollama etc.) that ignores forced
+    # tool_choice and answers with prose used to hard-fail with an uncaught
+    # JSONDecodeError. It must now repair once and still return a dict.
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    fake = install_fake_client([
+        _text_response("Sure! Here is the analysis you asked for: not json at all."),
+        _text_response('{"ok": true}'),
+    ])
+
+    with caplog.at_level("WARNING"):
+        result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"ok": True}
+    assert len(fake.bodies) == 2  # original structured call + one text repair
+
+
+def test_structured_path_repairs_when_response_has_no_text_block(install_fake_client):
+    # A tool-only / empty envelope with no text block must not raise (KeyError)
+    # on the fallback — it degrades to a repair round-trip instead.
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    fake = install_fake_client([
+        {"content": []},
+        _text_response('{"ok": false}'),
+    ])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"ok": False}
+    assert len(fake.bodies) == 2
+
+
+def test_structured_path_falls_back_when_tool_use_unsupported(monkeypatch):
+    # A tool-less local model (e.g. codellama on Ollama) returns HTTP 400
+    # "does not support tools" for a forced tool_choice. The schema call must
+    # degrade to a plain-text JSON call rather than hard-failing.
+    from dast.ai import providers
+
+    calls = {"schema": 0, "text": 0}
+
+    def fake_invoke_raw(*, schema=None, **kwargs):
+        if schema is not None:
+            calls["schema"] += 1
+            raise providers.ProviderError(
+                'OpenAI API 400: {"error":{"message":"model does not support tools"}}',
+                status_code=400,
+            )
+        calls["text"] += 1
+        return _text_response('{"verdict": "VULNERABLE"}')
+
+    monkeypatch.setattr(bedrock_client, "_invoke_raw", fake_invoke_raw)
+
+    result = bedrock_client.invoke_json("sys", "user", schema={"type": "object"})
+
+    assert result == {"verdict": "VULNERABLE"}
+    assert calls == {"schema": 1, "text": 1}  # forced tool-use rejected, then text
+
+
+def test_structured_path_reraises_unrelated_400(monkeypatch):
+    # A 400 that is NOT about tools/functions is a genuine bad request and must
+    # surface, not be silently retried as text.
+    from dast.ai import providers
+
+    def fake_invoke_raw(*, schema=None, **kwargs):
+        raise providers.ProviderError(
+            'OpenAI API 400: {"error":{"message":"invalid request body"}}',
+            status_code=400,
+        )
+
+    monkeypatch.setattr(bedrock_client, "_invoke_raw", fake_invoke_raw)
+
+    with pytest.raises(providers.ProviderError):
+        bedrock_client.invoke_json("sys", "user", schema={"type": "object"})
+
+
 # ── repair-retry on malformed JSON (legacy path) ──────────────────────────────
 
 def test_repair_retry_recovers_from_malformed_json(install_fake_client, caplog):

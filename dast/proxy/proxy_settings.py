@@ -178,8 +178,8 @@ def _apply_rule(
             text = body.decode("utf-8", errors="replace")
             text = _sub(text)
             body = text.encode("utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to apply match/replace to request body", error=str(exc))
 
     return url, headers, body
 
@@ -240,8 +240,8 @@ class ProxySettings:
                     self._bind_port = int(data.get("bind_port", 0) or 0)
                 except (TypeError, ValueError):
                     self._bind_port = 0
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("failed to load proxy settings; using defaults", error=str(exc))
 
     def _save(self) -> None:
         _SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)

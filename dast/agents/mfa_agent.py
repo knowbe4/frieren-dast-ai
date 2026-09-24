@@ -61,8 +61,8 @@ def _find_otp_param(body: Optional[str]) -> Optional[str]:
         for key in data:
             if _OTP_PARAM_RE.search(key):
                 return key
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to parse request body while locating OTP parameter", error=str(exc))
     return None
 
 

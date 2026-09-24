@@ -154,8 +154,8 @@ def _extract_operation(target: "CheckTarget") -> str:
                 m2 = _re.search(r'(?:query|mutation)\s*\{?\s*(\w+)', data["query"])
                 if m2:
                     return m2.group(1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to extract GraphQL operation label", error=str(exc))
 
     from urllib.parse import urlparse as _urlparse
     parts = [p for p in _urlparse(target.url).path.split("/") if p]
@@ -654,8 +654,8 @@ class Coordinator:
             if session_intelligence is not None:
                 try:
                     _host_intel0 = session_intelligence.get(_h0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to read session intelligence for budget", host=_h0, error=str(exc))
             effective_budget = min(
                 cls._adaptive_budget(target, _host_intel0),
                 cls.SCAN_BUDGET_SECONDS,
@@ -720,8 +720,8 @@ class Coordinator:
             try:
                 host_intel = session_intelligence.get(_host)
                 intel_hint = host_intel.to_planner_hint(_path, target.params)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to build planner hint from session intelligence", host=_host, error=str(exc))
 
         # Early abort: auth/SSO/OIDC endpoint — path-based detection.
         # These endpoints process cryptographic tokens (SAML assertions, OIDC codes,
@@ -889,8 +889,8 @@ class Coordinator:
                             operation=_operation,
                             structural_error=baseline_abort,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("failed to record baseline structural error in session intelligence", host=_host, path=_path, error=str(exc))
                 _log_event(
                     "coordinator", "warn",
                     f"Baseline check failed — aborting scan: {baseline_abort}",
@@ -1013,6 +1013,10 @@ class Coordinator:
         raw_findings: List[AgentFinding] = []
         agent_raw: Dict[str, List[AgentFinding]] = {}  # attack_type → findings
         confirmed: List[AgentFinding] = []
+        # Findings the validator could not confirm because the AI was offline or
+        # errored, but pattern confidence deemed plausible. They are NOT confirmed
+        # vulns — they are surfaced separately for a human to review.
+        review: List[AgentFinding] = []
 
         agent_tasks = [asyncio.ensure_future(_run_and_tag(agent)) for agent in agents]
         try:
@@ -1045,13 +1049,19 @@ class Coordinator:
                             continue
                         if result:
                             confirmed.append(finding)
+                        elif getattr(finding, "needs_review", False):
+                            # Validator could not run (AI offline/errored) but the
+                            # finding is plausible — hold it for human review.
+                            review.append(finding)
                 confirmed.extend(deterministic)
 
-                # Publish the running confirmed set after every agent so a
-                # scan-budget timeout still returns everything confirmed so far.
+                # Publish the running confirmed + held-for-review set after every
+                # agent so a scan-budget timeout still returns everything decided
+                # so far (held findings survive the timeout too, flagged separately).
                 if collected is not None:
                     collected.clear()
                     collected.extend(confirmed)
+                    collected.extend(review)
         finally:
             # If the scan budget expired (this coroutine was cancelled mid-run),
             # cancel any agent still in flight so it does not run detached from
@@ -1164,6 +1174,7 @@ class Coordinator:
             url=target.url,
             raw=len(raw_findings),
             confirmed=len(confirmed),
+            needs_review=len(review),
         )
 
         # Log per-agent outcome to the Logs tab
@@ -1184,7 +1195,11 @@ class Coordinator:
                     url=target.url, source="agent",
                 )
 
-        return confirmed
+        # Return confirmed vulns plus any held-for-review findings. Held findings
+        # carry needs_review=True so the runner serializes them as unconfirmed;
+        # they are not in confirmed_titles, so session intelligence and outcome
+        # logs above never treat them as confirmed vulns.
+        return confirmed + review
 
     @classmethod
     async def _baseline_check(
@@ -1223,10 +1238,15 @@ class Coordinator:
             _resp_body_preview = resp.text[:1200]
         except Exception:
             _resp_body_preview = ""
+        # The body is target-controlled (untrusted) and this summary is fed
+        # verbatim into the planner prompt — fence it in an XML tag so injected
+        # instructions in the response cannot hijack agent selection. Status and
+        # content-type are scanner-derived and safe to interpolate directly.
         response_summary = (
             f"Baseline response: HTTP {resp.status_code}\n"
             f"Content-Type: {resp.headers.get('content-type', 'unknown')}\n"
-            f"Body ({len(_resp_body_preview)} chars shown):\n{_resp_body_preview}"
+            f"Body ({len(_resp_body_preview)} chars shown):\n"
+            f"{wrap_untrusted(_resp_body_preview, 'target_response')}"
         )
 
         # ── Fast deterministic abort ──────────────────────────────────────
@@ -1261,8 +1281,8 @@ class Coordinator:
                         msg = err.get("message", "")
                         if code in _STRUCTURAL_CODES or any(p in msg for p in _STRUCTURAL_PHRASES):
                             return f"GraphQL schema error: {msg[:120]}", response_summary
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to parse GraphQL errors in baseline response", error=str(exc))
 
         # 401/403 on a baseline request — auth wall, abort to avoid 401 flooding.
         if resp.status_code in (401, 403):
@@ -1385,8 +1405,8 @@ class Coordinator:
             # discovery aims at the proven syntactic context, not just the class.
             try:
                 target.probe_diff_hint = "Probe-diff injection-context analysis:\n" + summary
-            except Exception:  # pragma: no cover - defensive; target is a dataclass
-                pass
+            except Exception as exc:  # pragma: no cover - defensive; target is a dataclass
+                logger.debug("failed to attach probe-diff hint to target", error=str(exc))
             from dast.proxy.plugin_manager import log_event as _le_probe
             _le_probe(
                 "coordinator", "info",
@@ -1459,8 +1479,8 @@ class Coordinator:
         )
         try:
             target.param_mining_hint = hint
-        except Exception:  # pragma: no cover - defensive; target is a dataclass
-            pass
+        except Exception as exc:  # pragma: no cover - defensive; target is a dataclass
+            logger.debug("failed to attach param-mining hint to target", error=str(exc))
 
         from dast.proxy.plugin_manager import log_event as _le_mine
         _le_mine(

@@ -34,9 +34,9 @@ def test_registry_lists_builtin_tools():
     names = {t.name for t in tools.all_tools()}
     assert {"send_request", "get_history", "content_discovery",
             "param_mining", "triage_report", "validate_chain", "list_login_profiles",
-            "get_findings", "oob_generate", "oob_poll",
+            "get_findings", "record_finding", "oob_generate", "oob_poll",
             "url_encode", "url_decode", "base64_encode", "base64_decode",
-            "html_encode", "html_decode"} <= names
+            "html_encode", "html_decode", "graphql_introspect"} <= names
 
 
 def test_every_tool_has_object_schema_and_handler():
@@ -122,6 +122,75 @@ async def test_send_request_success(monkeypatch):
     assert result["ok"] is True
     assert result["status"] == 200
     assert result["body"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_send_request_surfaces_all_set_cookies(monkeypatch):
+    # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced
+    # as a list, not collapsed by dict(resp.headers). A cookie set on a redirect hop
+    # must also be included, since follow_redirects hides it from the final response.
+    hop = httpx.Response(
+        302,
+        headers=[("set-cookie", "CloudFront-Policy=abc"),
+                 ("set-cookie", "CloudFront-Signature=def"),
+                 ("location", "https://api.acme-corp.com/final")],
+        request=httpx.Request("GET", "https://api.acme-corp.com/spa/session"),
+    )
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+        url = "https://api.acme-corp.com/final"
+        headers = httpx.Headers([("set-cookie", "CloudFront-Key-Pair-Id=ghi"),
+                                 ("content-type", "text/plain")])
+        history = [hop]
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request",
+                            {"url": "https://api.acme-corp.com/spa/session"})
+
+    assert result["ok"] is True
+    cookies = result["set_cookies"]
+    # All three CloudFront cookies present, across the redirect hop and the final hop.
+    joined = "; ".join(cookies)
+    assert "CloudFront-Policy=abc" in joined
+    assert "CloudFront-Signature=def" in joined
+    assert "CloudFront-Key-Pair-Id=ghi" in joined
+    assert result["redirects"] == [
+        {"status": 302, "url": "https://api.acme-corp.com/spa/session"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_request_omits_set_cookies_when_none(monkeypatch):
+    class _Resp:
+        status_code = 200
+        text = "ok"
+        url = "https://api.acme-corp.com/x"
+        headers = httpx.Headers([("content-type", "text/plain")])
+        history: list = []
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "send_request", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is True
+    assert "set_cookies" not in result
+    assert "redirects" not in result
 
 
 @pytest.mark.asyncio
@@ -359,6 +428,95 @@ async def test_get_findings_http_fallback(monkeypatch):
     assert result["findings"][0]["title"] == "XSS"
 
 
+# ── record_finding (write, both paths) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_record_finding_writes_store():
+    class _Store:
+        def __init__(self):
+            self.calls = []
+        def record_manual_finding(self, finding, url, method="GET"):
+            self.calls.append((finding, url, method))
+            return "e-42"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Missing access control on ldapToken",
+        "severity": "high", "url": "https://acme-corp.com/graphql",
+        "method": "POST", "evidence": "Both fields PRESENT with HTTP 200.",
+        "attack_type": "broken-access-control", "cwe": "CWE-284",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "e-42"
+    finding, url, method = store.calls[0]
+    assert url == "https://acme-corp.com/graphql" and method == "POST"
+    assert finding["title"] == "Missing access control on ldapToken"
+    assert finding["severity"] == "high"
+    assert finding["confirmed"] is True
+    assert finding["validated_by"] == ["copilot"]
+
+
+@pytest.mark.asyncio
+async def test_record_finding_requires_core_fields():
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    # Missing url
+    r1 = await run_tool(ctx, "record_finding",
+                        {"title": "x", "severity": "high", "evidence": "e"})
+    assert r1["ok"] is False and "url" in r1["error"]
+    # Missing evidence
+    r2 = await run_tool(ctx, "record_finding",
+                        {"title": "x", "severity": "high", "url": "https://acme-corp.com/"})
+    assert r2["ok"] is False and "evidence" in r2["error"]
+
+
+@pytest.mark.asyncio
+async def test_record_finding_invalid_severity_defaults_medium():
+    class _Store:
+        def __init__(self): self.finding = None
+        def record_manual_finding(self, finding, url, method="GET"):
+            self.finding = finding
+            return "e1"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "t", "severity": "spicy", "url": "https://acme-corp.com/x",
+        "evidence": "observed",
+    })
+    assert result["ok"] is True
+    assert store.finding["severity"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_record_finding_http_fallback(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"ok": True, "entry_id": "srv-1"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None):
+            posted["url"] = url
+            posted["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store -> HTTP path
+    result = await run_tool(ctx, "record_finding", {
+        "title": "t", "severity": "critical", "url": "https://acme-corp.com/x",
+        "evidence": "observed",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "srv-1"
+    assert posted["url"].endswith("/api/findings/manual")
+    assert posted["json"]["finding"]["title"] == "t"
+
+
 # ── encoders (pure) ─────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -396,7 +554,7 @@ async def test_oob_generate_and_poll(monkeypatch):
         def __init__(self, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
-        async def post(self, url):
+        async def post(self, url, json=None):
             return _Resp({"session_id": "abc123", "oob_url": "http://x.oast.pro"})
         async def get(self, url):
             return _Resp({"oob_url": "http://x.oast.pro",
@@ -481,6 +639,119 @@ async def test_validate_chain_out_of_scope_blocked():
     assert "out of scope" in result["error"]
 
 
+def test_validate_chain_schema_specifies_steps_and_requires_one_of():
+    # The schema must describe chain.steps concretely (so an LLM builds a valid
+    # spec instead of an empty {}), and forbid empty args via anyOf so a caller
+    # cannot satisfy it with neither report_text nor chain.
+    from dast.tools.chain_tools import _VALIDATE_CHAIN_SCHEMA
+
+    props = _VALIDATE_CHAIN_SCHEMA["properties"]
+    assert "report_text" in props and "chain" in props
+    steps = props["chain"]["properties"]["steps"]
+    assert steps["type"] == "array"
+    step_item = steps["items"]
+    assert step_item["required"] == ["name", "url"]
+    assert "extract" in step_item["properties"]
+    assert "assertions" in step_item["properties"]
+    branches = _VALIDATE_CHAIN_SCHEMA["anyOf"]
+    assert {"required": ["report_text"]} in branches
+    assert {"required": ["chain"]} in branches
+
+
+# ── graphql_introspect (dedicated introspection path, both callers) ─────────────
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_out_of_scope_blocked():
+    # store set (in-process) so no interactive approval is attempted.
+    ctx = ToolContext(store=object(), settings=_Scope(False))
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://evil.example.com/graphql"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_reads_store(monkeypatch):
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {}
+
+    seen: dict = {}
+
+    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection",
+                              proxy_url=None):
+        seen["proxy_url"] = proxy_url
+        store.graphql_schemas[endpoint] = {
+            "introspected": True,
+            "queries": {"me": {}, "user": {}},
+            "mutations": {"login": {}},
+        }
+        return None  # success
+
+    monkeypatch.setattr(
+        "dast.plugins.graphql_introspection._introspect", fake_introspect
+    )
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is True
+    # Introspection is routed through the proxy (the "everything via Frieren" contract).
+    assert seen["proxy_url"] == ctx.proxy_url
+    assert result["query_count"] == 2
+    assert result["mutation_count"] == 1
+    assert result["queries"] == ["me", "user"]
+    assert result["mutations"] == ["login"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_disabled_surfaces_error(monkeypatch):
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {}
+
+    async def fake_introspect(endpoint, headers, store, name="GraphQL Introspection"):
+        return "Introspection disabled on this endpoint"
+
+    monkeypatch.setattr(
+        "dast.plugins.graphql_introspection._introspect", fake_introspect
+    )
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is False
+    assert "disabled" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_graphql_introspect_http_fallback(monkeypatch):
+    posted = {}
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self):
+            return {"ok": True, "schema": {"introspected": True,
+                    "queries": {"me": {}}, "mutations": {}}}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json=None):
+            posted["url"] = url
+            posted["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store -> HTTP path
+    result = await run_tool(ctx, "graphql_introspect",
+                            {"url": "https://api.acme-corp.com/graphql"})
+    assert result["ok"] is True
+    assert result["queries"] == ["me"]
+    assert posted["url"].endswith("/api/graphql/introspect")
+    assert posted["json"]["endpoint"] == "https://api.acme-corp.com/graphql"
+
+
 # ── MCP conversion (pure, no mcp import) ────────────────────────────────────────
 
 def test_tool_definitions_shape():
@@ -516,3 +787,212 @@ async def test_copilot_ask_requires_message():
     result = await run_tool(ToolContext(settings=_Scope(True)), "copilot_ask", {})
     assert result["ok"] is False
     assert "message" in result["error"]
+
+
+# ── crawl (orchestration primitive over the crawl worker) ───────────────────────
+
+class _CrawlEntry:
+    def __init__(self, method: str, url: str, source: str = "proxy"):
+        self.method = method
+        self.url = url
+        self.source = source
+
+
+class _CrawlStore:
+    """Fake store whose in-scope history grows when a crawl job is 'run'."""
+
+    def __init__(self, before, after):
+        self._before = list(before)
+        self._after = list(after)
+        self._crawled = False
+
+    def in_scope_entries(self):
+        return list(self._after) if self._crawled else list(self._before)
+
+    def mark_crawled(self):
+        self._crawled = True
+
+
+def test_crawl_registered_and_tagged():
+    tool = tools.get_tool("crawl")
+    assert tool is not None
+    assert "recon" in (tool.tags or [])
+    assert tool.input_schema.get("required") == ["url"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "crawl", {"url": "https://evil.example.com/"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_not_available_without_queue():
+    # In-scope but no crawl_queue (MCP / triage context) → graceful refusal.
+    ctx = ToolContext(settings=_Scope(True), store=_CrawlStore([], []))
+    result = await run_tool(ctx, "crawl", {"url": "https://api.acme-corp.com/"})
+    assert result["ok"] is False
+    assert "not available" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_crawl_enqueues_and_returns_new_endpoints():
+    import asyncio
+
+    before = [_CrawlEntry("GET", "https://api.acme-corp.com/")]
+    after = before + [
+        _CrawlEntry("GET", "https://api.acme-corp.com/users"),
+        _CrawlEntry("POST", "https://api.acme-corp.com/login"),
+        _CrawlEntry("GET", "https://api.acme-corp.com/app.js"),  # static asset → filtered
+    ]
+    store = _CrawlStore(before, after)
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def worker():
+        job = await queue.get()
+        store.mark_crawled()
+        job["done_event"].set()
+
+    ctx = ToolContext(settings=_Scope(True), store=store, crawl_queue=queue)
+    worker_task = asyncio.create_task(worker())
+    result = await run_tool(ctx, "crawl", {"url": "https://api.acme-corp.com/"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["timed_out"] is False
+    urls = {e["url"] for e in result["endpoints"]}
+    assert "https://api.acme-corp.com/users" in urls
+    assert "https://api.acme-corp.com/login" in urls
+    assert "https://api.acme-corp.com/app.js" not in urls  # static asset filtered
+    assert result["discovered_count"] == 2
+
+
+# ── run_scan (orchestration primitive over the scan pipeline) ───────────────────
+
+class _ScanEntry:
+    def __init__(self, method, url, host, source="proxy"):
+        self.id = f"e-{method}-{url}"
+        self.method = method
+        self.url = url
+        self.host = host
+        self.source = source
+        self.ai_queued = False
+        self.queued_for_scan = False
+        self.scan_result = None
+        self.findings = []
+
+
+class _ScanStore:
+    def __init__(self, entries, ai_mode=True):
+        self._entries = {e.id: e for e in entries}
+        self._order = [e.id for e in entries]
+        self.ai_mode = ai_mode
+
+    def all_entries(self):
+        return [self._entries[i] for i in self._order]
+
+    def get_entry(self, entry_id):
+        return self._entries.get(entry_id)
+
+
+def test_run_scan_registered_and_tagged():
+    tool = tools.get_tool("run_scan")
+    assert tool is not None
+    assert "active" in (tool.tags or [])
+    assert tool.input_schema.get("required") == ["url"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "run_scan", {"url": "https://evil.example.com/x"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_not_available_without_queue():
+    store = _ScanStore([])
+    ctx = ToolContext(settings=_Scope(True), store=store)  # no scan_queue/state
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "not available" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_no_matching_history_entry():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    store = _ScanStore([])
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=asyncio.Queue(), scan_queue_state=ScanQueueState())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "no matching request" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_scan_enqueues_awaits_and_returns_findings():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    entry = _ScanEntry("GET", "https://api.acme-corp.com/users?id=1", "api.acme-corp.com")
+    store = _ScanStore([entry], ai_mode=True)
+    queue: asyncio.Queue = asyncio.Queue()
+    qs = ScanQueueState()
+
+    async def scan_worker():
+        entry_id = await queue.get()
+        # Simulate the real worker attaching a finding and finishing the entry.
+        target = store.get_entry(entry_id)
+        target.findings.append({
+            "title": "Reflected XSS", "attack_type": "xss", "parameter": "id",
+            "severity": "high", "raw_request": "x" * 9000,  # trimmed out
+        })
+        target.scan_result = "vulnerable"
+        qs.finish(entry_id, 1, "vulnerable")
+
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=queue, scan_queue_state=qs)
+    worker_task = asyncio.create_task(scan_worker())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/users?id=1"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["status"] == "vulnerable"
+    assert result["findings_count"] == 1
+    assert result["agents_ran"] is True
+    assert result["timed_out"] is False
+    assert entry.ai_queued is True  # dedup bypassed for a deliberate re-scan
+    finding = result["findings"][0]
+    assert finding["title"] == "Reflected XSS"
+    assert "raw_request" not in finding  # large blobs trimmed
+
+
+@pytest.mark.asyncio
+async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
+    from dast.proxy.scan_queue_state import ScanQueueState
+    import asyncio
+
+    entry = _ScanEntry("GET", "https://api.acme-corp.com/x?q=1", "api.acme-corp.com")
+    store = _ScanStore([entry], ai_mode=False)  # AI off, proxied entry → deterministic only
+    queue: asyncio.Queue = asyncio.Queue()
+    qs = ScanQueueState()
+
+    async def scan_worker():
+        entry_id = await queue.get()
+        store.get_entry(entry_id).scan_result = "safe"
+        qs.finish(entry_id, 0, "safe")
+
+    ctx = ToolContext(settings=_Scope(True), store=store,
+                      scan_queue=queue, scan_queue_state=qs)
+    worker_task = asyncio.create_task(scan_worker())
+    result = await run_tool(ctx, "run_scan", {"url": "https://api.acme-corp.com/x?q=1"})
+    await worker_task
+
+    assert result["ok"] is True
+    assert result["agents_ran"] is False
+    assert "note" in result

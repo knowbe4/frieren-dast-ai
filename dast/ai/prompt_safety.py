@@ -21,9 +21,38 @@ The denylist sanitizer still runs underneath as a cheap second layer
 
 from __future__ import annotations
 
+import re
+
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Known prompt-injection / jailbreak phrasings stripped from untrusted content as
+# a cheap second layer beneath the structural tag fence. A denylist cannot win
+# against a determined attacker (rephrasing, other languages, encodings) — the
+# XML delimiting in wrap_untrusted is the primary defense; this just raises the
+# cost of the most common override attempts.
+_INJECTION_PATTERN = re.compile(
+    r"(ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)"
+    r"|system\s*:\s*you\s+are"
+    r"|<\s*/?system\s*>"
+    r"|\[INST\]|\[/INST\]"
+    r"|###\s*instruction"
+    r"|---\s*new\s+prompt"
+    r"|forget\s+(everything|all)\s+(above|previous)"
+    r"|you\s+are\s+now\s+(a\s+)?(different|new)\s+(ai|assistant|model))",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_for_prompt(text: str, max_len: int) -> str:
+    """
+    Truncate and strip prompt-injection patterns from untrusted content before
+    embedding it in an LLM prompt. Removes common jailbreak / override markers
+    while preserving normal text.
+    """
+    truncated = text[:max_len]
+    return _INJECTION_PATTERN.sub("[redacted]", truncated)
 
 # Appended to system prompts whose user message embeds target-controlled content.
 # Language-agnostic on purpose: the rule is about the tag boundary, not about
@@ -72,9 +101,7 @@ def wrap_untrusted(content: str, tag: str, max_len: int = 0, sanitize: bool = Tr
         logger.warning("Neutralised forged delimiter in untrusted content", tag=tag)
 
     if sanitize:
-        # Second layer: strip known injection phrasings. Import here to avoid a
-        # module-load cycle with payload_generator.
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        # Second layer: strip known injection phrasings.
         text = _sanitize_for_prompt(text, len(text) or 1)
 
     return f"<{tag}>\n{text}\n</{tag}>\n"

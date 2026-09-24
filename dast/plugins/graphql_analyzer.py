@@ -258,7 +258,7 @@ async def _llm_validate_finding(
     """Run the finding through an LLM to confirm or reject. Returns updated finding dict."""
     try:
         from dast.ai.bedrock_client import invoke_json, get_fast_model
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
         from dast.ai.schemas import GQL_VALIDATE_SCHEMA
     except ImportError:
         return finding

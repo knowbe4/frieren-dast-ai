@@ -235,7 +235,7 @@ async def validate(
     # response snippet as untrusted data (wrap_untrusted also applies the denylist
     # sanitizer as a second layer). Finding metadata (title, severity) is
     # scanner-derived and safe to interpolate directly.
-    from dast.ai.payload_generator import _sanitize_for_prompt
+    from dast.ai.prompt_safety import _sanitize_for_prompt
     response_snippet = getattr(finding, "raw_response_snippet", "") or ""
     user = (
         f"Finding: {finding.title}\n"

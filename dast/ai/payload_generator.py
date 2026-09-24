@@ -138,30 +138,6 @@ Respond with JSON:
         return None
 
 
-def _sanitize_for_prompt(text: str, max_len: int) -> str:
-    """
-    Truncate and strip prompt-injection patterns from untrusted content
-    before embedding it in an LLM prompt.
-    Removes common jailbreak / override markers while preserving normal text.
-    """
-    import re
-    truncated = text[:max_len]
-    # Remove lines that look like system-prompt override attempts
-    injection_pattern = re.compile(
-        r"(ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)"
-        r"|system\s*:\s*you\s+are"
-        r"|<\s*/?system\s*>"
-        r"|\[INST\]|\[/INST\]"
-        r"|###\s*instruction"
-        r"|---\s*new\s+prompt"
-        r"|forget\s+(everything|all)\s+(above|previous)"
-        r"|you\s+are\s+now\s+(a\s+)?(different|new)\s+(ai|assistant|model))",
-        re.IGNORECASE,
-    )
-    sanitized = injection_pattern.sub("[redacted]", truncated)
-    return sanitized
-
-
 def _describe_endpoint(endpoint: Endpoint) -> str:
     params = "\n".join(
         f"  - {p.name} ({p.location}, type={p.inferred_type}): {p.value!r}"

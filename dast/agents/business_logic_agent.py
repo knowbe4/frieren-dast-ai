@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
-from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import _sanitize_for_prompt
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import BL_EVAL_SCHEMA, BL_HINT_PROBES_SCHEMA
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send

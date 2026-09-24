@@ -117,7 +117,7 @@ async def llm_verdict_http(
     """
     try:
         from dast.ai import bedrock_client
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
         from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
         from dast.ai.schemas import H1_VERDICT_SCHEMA
 
@@ -158,7 +158,7 @@ async def llm_analyse_response(report: H1Report, body: str, status_code: int) ->
     """Free-text advisory analysis of a response (never flips an XSS verdict)."""
     try:
         from dast.ai import bedrock_client
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
 
         user = (
             f"Vuln type: {report.vuln_type}\n"
@@ -193,7 +193,7 @@ async def llm_repair_proof_url(report: H1Report, proof_url: str, page_content: s
     """
     try:
         from dast.ai import bedrock_client
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
 
         user = (
             f"Proof URL as received:\n{_sanitize_for_prompt(proof_url, 500)}\n\n"
@@ -229,7 +229,7 @@ async def llm_dns_verdict(report: H1Report, domain: str, dns_evidence: str) -> s
     """Free-text LLM verdict on collected DNS evidence."""
     try:
         from dast.ai import bedrock_client
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
 
         user = (
             f"Target domain: {domain}\n\n"
@@ -257,7 +257,7 @@ async def llm_ssrf_assessment(report: H1Report) -> str:
     """
     try:
         from dast.ai import bedrock_client
-        from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.prompt_safety import _sanitize_for_prompt
 
         user = f"Full report (first 4000 chars):\n{_sanitize_for_prompt(report.raw_text, 4000)}\n"
         loop = asyncio.get_running_loop()

@@ -21,7 +21,7 @@ import httpx
 
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
-from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import _sanitize_for_prompt
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import CROSS_SESSION_IDOR_SCHEMA
 from dast.scanners.active_checks import _fmt_http_pair

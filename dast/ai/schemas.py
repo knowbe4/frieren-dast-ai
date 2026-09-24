@@ -682,3 +682,17 @@ PASSIVE_VALIDATE_SCHEMA: Dict[str, Any] = {
     },
     "required": ["confirmed", "reasoning"],
 }
+
+# GraphQL passive-finding validation — dast/plugins/graphql_analyzer.py
+# _SYSTEM_GQL_VALIDATE / _llm_validate_finding(). exploit_scenario is populated
+# only when confirmed, so it is optional.
+GQL_VALIDATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "confirmed": {"type": "boolean", "description": "True only when the evidence proves a real, exploitable issue."},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Certainty of the verdict."},
+        "reasoning": {"type": "string", "description": "One paragraph explaining why this is or is not a real finding."},
+        "exploit_scenario": {"type": "string", "description": "Realistic attack scenario in 1-2 sentences; only when confirmed."},
+    },
+    "required": ["confirmed", "confidence", "reasoning"],
+}

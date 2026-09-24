@@ -259,6 +259,7 @@ async def _llm_validate_finding(
     try:
         from dast.ai.bedrock_client import invoke_json, get_fast_model
         from dast.ai.payload_generator import _sanitize_for_prompt
+        from dast.ai.schemas import GQL_VALIDATE_SCHEMA
     except ImportError:
         return finding
 
@@ -279,11 +280,17 @@ async def _llm_validate_finding(
     )
 
     try:
-        result = await invoke_json(
-            system=_SYSTEM_GQL_VALIDATE,
-            user=user_msg,
-            model_id=get_fast_model(),
-            required_keys=["confirmed", "confidence", "reasoning"],
+        import asyncio
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: invoke_json(
+                system=_SYSTEM_GQL_VALIDATE,
+                user=user_msg,
+                model_id=get_fast_model(),
+                temperature=0,
+                schema=GQL_VALIDATE_SCHEMA,
+            ),
         )
         updated = dict(finding)
         updated["confirmed"] = bool(result.get("confirmed"))

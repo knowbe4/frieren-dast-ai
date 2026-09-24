@@ -108,18 +108,30 @@ class PluginManager:
                 logger.warning("Plugin teardown error", name=p.name, error=str(e))
 
     async def dispatch(self, entry: "ProxyEntry", store: "SessionStore") -> None:
+        """Run on_entry() on every enabled plugin and log the findings each one added.
+
+        Plugins record findings through ``store.add_finding`` (the single locked
+        mutation path). ``entry.findings`` is only ever read here via the store's
+        locked snapshot, so a concurrent add/remove cannot tear the read.
+        """
         for p in self._plugins:
             if not p.enabled:
                 continue
-            before = len(entry.findings)
+            # Keep the snapshot list alive so object ids cannot be recycled
+            # before the comparison below.
+            findings_before = store.snapshot_findings(entry)
+            ids_before = {id(finding) for finding in findings_before}
             try:
                 await p.on_entry(entry, store)
             except Exception as e:
                 logger.warning("Plugin on_entry error", name=p.name, error=str(e))
                 log_event(p.name, "error", str(e), url=entry.url)
                 continue
-            after = len(entry.findings)
-            for f in entry.findings[before:after]:
+            added_findings = [
+                finding for finding in store.snapshot_findings(entry)
+                if id(finding) not in ids_before
+            ]
+            for f in added_findings:
                 log_event(
                     plugin=p.name,
                     level="finding",

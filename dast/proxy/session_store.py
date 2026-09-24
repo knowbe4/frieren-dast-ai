@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from dast.proxy.service_graph import ServiceGraph
@@ -21,310 +21,36 @@ from dast.discovery.engine import DiscoveryEngine
 # Re-exported for backward compatibility: raw HTTP evidence formatting now lives
 # in dast.proxy.http_format. Existing callers still import these names from here.
 from dast.proxy.http_format import _format_raw_request, _format_raw_response
-from dast.proxy.signalr import SIGNALR_SEPARATOR, is_signalr_binary, read_varint
+from dast.proxy.signalr import (
+    SIGNALR_SEPARATOR,
+    annotate_blazor_args,
+    body_preview,
+    decode_body,
+    decode_msgpack_signalr,
+    decode_signalr_body,
+    is_signalr_binary,
+    is_signalr_body,
+    is_signalr_path,
+)
 from dast.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from dast.proxy.plugin_manager import PluginManager
+    from dast.proxy.proxy_settings import ProxySettings
 
 logger = get_logger(__name__)
 
+# Re-exported for backward compatibility: SignalR / Blazor body decoding now lives
+# in dast.proxy.signalr. These private aliases keep the historical names importable.
 _SIGNALR_SEP = SIGNALR_SEPARATOR
-
-
-def _annotate_blazor_args(target: str, args) -> str:
-    """
-    Return a human-readable annotation for known Blazor circuit management calls.
-    Raw args are often opaque tokens — we label them so the reader knows what they are.
-    """
-    import json as _json
-
-    def _fmt(v) -> str:
-        return _json.dumps(v, ensure_ascii=False, default=str)
-
-    # ConnectCircuit args[0] is an ASP.NET Core Data Protection token (CfDJ8... prefix).
-    # It is AES-256-CBC + HMAC-SHA256 encrypted with the server's key ring —
-    # cannot be decrypted without the server private key. It authenticates the circuit.
-    if target == "ConnectCircuit":
-        if isinstance(args, (list, tuple)) and args:
-            token = str(args[0])
-            is_dp = token.startswith("CfDJ8")
-            label = "ASP.NET DataProtection token (encrypted, not decodable)" if is_dp else "circuit token"
-            rest = _fmt(list(args[1:])) if len(args) > 1 else ""
-            return f'"{token[:24]}…" [{label}]{(", " + rest) if rest else ""}'
-        return _fmt(args)
-
-    # UpdateRootComponents: args contain component descriptors
-    if target == "UpdateRootComponents":
-        if isinstance(args, (list, tuple)) and args:
-            try:
-                ops = _json.loads(args[0]) if isinstance(args[0], str) else args[0]
-                if isinstance(ops, list):
-                    summary = [f"{op.get('type','?')}:{op.get('marker','?')}" for op in ops[:3]]
-                    return f"[{', '.join(summary)}{'…' if len(ops)>3 else ''}] ({len(ops)} ops)"
-            except Exception:
-                pass
-
-    # OnNavigate: URL the user navigated to
-    if target == "OnNavigate":
-        if isinstance(args, (list, tuple)) and args:
-            url = args[0]
-            return f'"{url}"'
-
-    # JsInitialized, AttachWebRendererInterop etc — just show arg count
-    _KNOWN_INFRA = {
-        "JsInitialized", "AttachWebRendererInterop", "SetHasLocationChangingHandlers",
-        "OnAfterRenderComplete", "AcknowledgeRenderer",
-    }
-    if target in _KNOWN_INFRA:
-        if isinstance(args, (list, tuple)):
-            return f"({len(args)} args)"
-        return _fmt(args)
-
-    return _fmt(args)
-
-
-def _decode_msgpack_signalr(raw: bytes) -> str:
-    """
-    Decode SignalR binary (MessagePack / blazorpack) protocol frames using msgpack lib.
-
-    Each frame: <varint-length><msgpack-payload>
-    SignalR msgpack array layout by type:
-      1 = Invocation:  [1, headers, invId|null, target, args, streamIds?]
-      3 = Completion:  [3, headers, invId, resultKind, payload?]
-      6 = Ping:        [6]
-      7 = Close:       [7, error?]
-    """
-    import json as _json
-    try:
-        import msgpack as _mp
-    except ImportError:
-        return ""
-
-    _read_varint = read_varint
-
-    def _unpack(payload: bytes):
-        return _mp.unpackb(payload, raw=False, strict_map_key=False)
-
-    def _fmt(v) -> str:
-        return _json.dumps(v, ensure_ascii=False, default=str)
-
-    lines = []
-    pos = 0
-    while pos < len(raw):
-        frame_len, pos = _read_varint(raw, pos)
-        if frame_len == 0 or pos + frame_len > len(raw):
-            break
-        frame = raw[pos:pos+frame_len]; pos += frame_len
-        if not frame:
-            continue
-        try:
-            msg = _unpack(frame)
-        except Exception:
-            continue
-        if not isinstance(msg, (list, tuple)) or not msg:
-            continue
-
-        msg_type = msg[0]
-
-        if msg_type == 1:  # Invocation: [1, headers, invId, target, args, streamIds?]
-            if len(msg) < 5:
-                continue
-            inv_id = msg[2]
-            target = msg[3] or ""
-            args = msg[4]
-            id_part = f" [{inv_id}]" if inv_id else ""
-
-            if target == "BeginInvokeDotNetFromJS" and isinstance(args, (list, tuple)) and len(args) >= 5:
-                # args = [callId, assembly, method, dotNetObjectId, argsJson]
-                call_id = args[0]
-                assembly = args[1] or ""
-                method = args[2] or "?"
-                args_json_str = args[4]
-                try:
-                    inner = _json.loads(args_json_str) if isinstance(args_json_str, str) else args_json_str
-                    inner_str = _fmt(inner)
-                except Exception:
-                    inner_str = str(args_json_str)[:300]
-                ns = f"{assembly}::" if assembly else ""
-                lines.append(f"[dotnet-invoke]{id_part} {ns}{method}({inner_str})")
-
-            elif target == "EndInvokeJSFromDotNet" and isinstance(args, (list, tuple)) and len(args) >= 2:
-                call_id = args[0]
-                ok = "ok" if args[1] else "error"
-                result = args[2] if len(args) > 2 else None
-                try:
-                    if isinstance(result, str) and result.startswith(("[", "{")):
-                        result = _json.loads(result)
-                except Exception:
-                    pass
-                lines.append(f"[js-result] [{call_id}] {ok} {_fmt(result)}")
-
-            elif target in ("OnRenderCompleted", "OnAfterRenderAsync"):
-                batch = args[0] if isinstance(args, (list, tuple)) and args else args
-                lines.append(f"[render] {target} batch={batch}")
-
-            else:
-                # Annotate well-known Blazor Server circuit management calls
-                annotated_args = _annotate_blazor_args(target, args)
-                lines.append(f"[invoke]{id_part} {target}({annotated_args})")
-
-        elif msg_type == 3:  # Completion: [3, headers, invId, resultKind, payload?]
-            if len(msg) < 4:
-                lines.append("[result:void]"); continue
-            result_kind = msg[3]
-            if result_kind == 1 and len(msg) > 4:
-                lines.append(f"[result:error] {msg[4]}")
-            elif result_kind == 2 and len(msg) > 4:
-                lines.append(f"[result] {_fmt(msg[4])[:300]}")
-            else:
-                lines.append("[result:void]")
-
-        elif msg_type == 6:
-            lines.append("[ping]")
-
-        elif msg_type == 7:
-            err = msg[1] if len(msg) > 1 else ""
-            lines.append(f"[close] {err}" if err else "[close]")
-
-        else:
-            lines.append(f"[type{msg_type}]")
-
-    return "\n".join(lines) if lines else ""
-
-
-def _decode_signalr_body(raw: bytes) -> str:
-    """
-    Decode a SignalR body — auto-detects text (JSON+0x1e) vs binary (MessagePack) protocol.
-
-    Text protocol: JSON objects separated by 0x1e record separator.
-    Binary protocol (blazorpack): varint-length-prefixed MessagePack frames.
-    """
-    import json
-    import re as _re
-
-    # --- Binary protocol (blazorpack / MessagePack) — check BEFORE text ---
-    # Must come first because varint length bytes can coincidentally equal 0x1e
-    if _is_signalr_binary(raw):
-        decoded = _decode_msgpack_signalr(raw)
-        if decoded:
-            return decoded
-
-    # --- Text protocol (0x1e record separator) ---
-    if _SIGNALR_SEP.encode() in raw:
-        try:
-            text = raw.decode("utf-8", errors="replace")
-        except Exception:
-            text = raw.decode("latin-1", errors="replace")
-
-        _TYPE_LABELS = {1: "invoke", 2: "stream", 3: "result", 4: "stream-item",
-                        5: "cancel", 6: "ping", 7: "close"}
-        lines = []
-        for segment in text.split(_SIGNALR_SEP):
-            segment = segment.strip()
-            if not segment:
-                continue
-            json_start = next((i for i, ch in enumerate(segment) if ch in ('{', '[')), -1)
-            if json_start == -1:
-                readable = _re.sub(r"[^\x20-\x7e]", "", segment)
-                if readable.strip():
-                    lines.append(f"[binary] {readable[:120]}")
-                continue
-            try:
-                msg = json.loads(segment[json_start:])
-            except (json.JSONDecodeError, ValueError):
-                readable = _re.sub(r"[^\x20-\x7e]", "", segment)
-                if readable.strip():
-                    lines.append(readable[:120])
-                continue
-            msg_type = msg.get("type", "?")
-            if msg_type == 1:
-                target = msg.get("target", "?")
-                args = json.dumps(msg.get("arguments", []), ensure_ascii=False)
-                inv_id = msg.get("invocationId", "")
-                id_part = f" [{inv_id}]" if inv_id else ""
-                lines.append(f"[invoke]{id_part} {target}({args})")
-            elif msg_type == 3:
-                err = msg.get("error")
-                if err:
-                    lines.append(f"[result:error] {err[:200]}")
-                else:
-                    result = json.dumps(msg.get("result", ""), ensure_ascii=False)
-                    lines.append(f"[result] {result[:300]}")
-            elif msg_type == 6:
-                lines.append("[ping]")
-            elif msg_type == 7:
-                lines.append(f"[close] {msg.get('error','')}" if msg.get("error") else "[close]")
-            else:
-                label = _TYPE_LABELS.get(msg_type, f"type{msg_type}")
-                lines.append(f"[{label}] {segment[json_start:][:200]}")
-        return "\n".join(lines) if lines else ""
-
-    return ""
-
-
+_annotate_blazor_args = annotate_blazor_args
+_decode_msgpack_signalr = decode_msgpack_signalr
+_decode_signalr_body = decode_signalr_body
 _is_signalr_binary = is_signalr_binary
-
-
-def _is_signalr_body(raw: bytes) -> bool:
-    """Return True if the body looks like SignalR (text or binary protocol)."""
-    if _is_signalr_binary(raw):
-        return True
-    # Text protocol: contains record separator AND the content around it looks like JSON
-    sep = _SIGNALR_SEP.encode()
-    if sep in raw:
-        idx = raw.index(sep)
-        before = raw[max(0, idx-1):idx]
-        after = raw[idx+1:idx+2]
-        # Record separator should be adjacent to JSON delimiters
-        if before and before[-1:] in (b'}', b']') or after and after[:1] in (b'{', b'['):
-            return True
-        # Or it's the terminator at end of a JSON message
-        if before and before[-1:] in (b'}', b']'):
-            return True
-        # Fallback: if most content around sep is printable ASCII
-        sample = raw[:min(200, len(raw))].decode("utf-8", errors="replace")
-        printable = sum(1 for c in sample if 0x20 <= ord(c) <= 0x7e or c in '\n\r\t')
-        if printable > len(sample) * 0.5:
-            return True
-    return False
-
-
-def _is_signalr_path(path: str) -> bool:
-    p = (path or "").lower()
-    return "_blazor" in p or "/signalr" in p or "/hub" in p or "/hubs/" in p
-
-
-def _decode_body(raw: Optional[bytes], path: str = "") -> Optional[str]:
-    """Decode a request/response body, applying SignalR decoding when appropriate."""
-    if not raw:
-        return None
-    import re as _re
-    if _is_signalr_body(raw):
-        decoded = _decode_signalr_body(raw)
-        if decoded:
-            return decoded
-        logger.debug(
-            "SignalR body decode failed — showing raw fallback",
-            path=path, first_bytes=raw[:16].hex(), body_len=len(raw),
-        )
-    text = raw.decode("utf-8", errors="replace")
-    if _is_signalr_path(path):
-        import re as _re2
-        text = _re2.sub(r"^[\x00-\x08\x0b-\x1f\x7f�]+", "", text)
-    return _re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text)
-
-
-def _body_preview(raw: Optional[bytes], path: str = "") -> Optional[str]:
-    """Generate a short body preview for the HTTP history table column."""
-    if not raw:
-        return None
-    if _is_signalr_body(raw):
-        decoded = _decode_signalr_body(raw)
-        if decoded:
-            first_line = decoded.split("\n")[0]
-            return first_line[:120] if first_line else None
-    import re as _re
-    text = raw[:120].decode("utf-8", errors="replace")
-    text = _re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", text)
-    return text if text.strip() else None
+_is_signalr_body = is_signalr_body
+_is_signalr_path = is_signalr_path
+_decode_body = decode_body
+_body_preview = body_preview
 
 
 _ENDPOINT_ID_SEGMENT_RE = re.compile(
@@ -400,7 +126,7 @@ class ProxyEntry:
             "queued_for_scan": self.queued_for_scan,
             "scan_result": self.scan_result,
             "findings": self.findings,
-            "body_preview": _body_preview(self.request_body, self.path),
+            "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
             "manual_note": self.manual_note,
@@ -408,9 +134,9 @@ class ProxyEntry:
         }
         if include_bodies:
             d["request_headers"] = self.request_headers
-            d["request_body"] = _decode_body(self.request_body, self.path)
+            d["request_body"] = decode_body(self.request_body, self.path)
             d["response_headers"] = self.response_headers
-            d["response_body"] = _decode_body(self.response_body, self.path)
+            d["response_body"] = decode_body(self.response_body, self.path)
         return d
 
     @classmethod
@@ -463,9 +189,11 @@ class SessionStore:
     Listeners (async callables) are notified on every new/updated entry.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._entries: Dict[str, ProxyEntry] = {}
         self._order: List[str] = []
+        # Guards _entries, _order, _cookies and every mutation of ProxyEntry.findings.
+        # Finding appends must go through _append_finding_locked (see add_finding).
         self._lock = threading.Lock()
         self._listeners: List[Callable] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -476,19 +204,13 @@ class SessionStore:
         self.active_browse_session_id: Optional[str] = None
         # active crawler session tag — set while SpaCrawler is running
         self.active_crawler_session_id: Optional[str] = None
-        # service graph — auto-detects multi-host application boundaries
-        self.service_graph = ServiceGraph()
-        # discovery engine — enriches CheckTarget with tech stack, JS endpoints, call chains
-        self.discovery_engine = DiscoveryEngine()
+        # service graph, discovery engine and session intelligence
+        self._init_passive_analysers()
         # Active suggestions from AppContextWorker — hypotheses with no matching
         # proxy entry yet. Shown in dashboard AI Suggestions tab with "Test Now" option.
         self.active_suggestions: List[dict] = []
         # When True, new suggestions are automatically queued for scan
         self.auto_scan_suggestions: bool = False
-        # Session-wide scan intelligence — accumulated across all endpoints/hosts.
-        # The Coordinator reads and writes this on every scan.
-        from dast.ai.session_intelligence import SessionIntelligence
-        self.session_intelligence = SessionIntelligence()
         # GraphQL schemas discovered via introspection — keyed by endpoint URL.
         # Populated by the graphql_introspection plugin; read by the findings importer
         # to build correct query/mutation bodies when importing reports.
@@ -514,6 +236,19 @@ class SessionStore:
         # Passive scanner one_per_host state — keyed by rule_id → set of hosts.
         # Lives on SessionStore so plugin re-instantiation doesn't reset deduplication.
         self.passive_fired_hosts: Dict[str, set] = {}
+
+    def _init_passive_analysers(self) -> None:
+        """Instantiate the per-store passive analysers fed from complete_entry()."""
+        # Imported lazily: session_intelligence pulls in the AI layer.
+        from dast.ai.session_intelligence import SessionIntelligence
+
+        # service graph — auto-detects multi-host application boundaries
+        self.service_graph = ServiceGraph()
+        # discovery engine — enriches CheckTarget with tech stack, JS endpoints, call chains
+        self.discovery_engine = DiscoveryEngine()
+        # Session-wide scan intelligence — accumulated across all endpoints/hosts.
+        # The Coordinator reads and writes this on every scan.
+        self.session_intelligence = SessionIntelligence()
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -541,48 +276,48 @@ class SessionStore:
         matched = []
         remaining = []
 
-        for pf in self.pending_import_findings:
-            pf_path = (pf.get("path") or "/").split("?")[0].lower()
-            pf_method = (pf.get("method") or "GET").upper()
-            # Match if: same method AND (exact path, or pf_path is prefix of entry path,
-            # or the last non-template segment of pf_path appears in entry_path)
-            pf_static = pf_path.split("{")[0].rstrip("/")
-            path_match = (
-                entry_path == pf_path
-                or (pf_static and entry_path.startswith(pf_static))
-                or (pf_static and pf_static in entry_path)
-            )
-            method_match = (pf_method == entry.method or pf_method == "GET")
-            if path_match and method_match:
-                matched.append(pf)
-            else:
-                remaining.append(pf)
+        with self._lock:
+            for pf in self.pending_import_findings:
+                pf_path = (pf.get("path") or "/").split("?")[0].lower()
+                pf_method = (pf.get("method") or "GET").upper()
+                # Match if: same method AND (exact path, or pf_path is prefix of entry path,
+                # or the last non-template segment of pf_path appears in entry_path)
+                pf_static = pf_path.split("{")[0].rstrip("/")
+                path_match = (
+                    entry_path == pf_path
+                    or (pf_static and entry_path.startswith(pf_static))
+                    or (pf_static and pf_static in entry_path)
+                )
+                method_match = (pf_method == entry.method or pf_method == "GET")
+                if path_match and method_match:
+                    matched.append(pf)
+                else:
+                    remaining.append(pf)
 
-        if not matched:
-            return
+            if not matched:
+                return
 
-        self.pending_import_findings = remaining
+            self.pending_import_findings = remaining
 
-        # Inject hints from all matched pending findings into this entry
-        existing_hints = list(entry.import_hints or [])
-        for pf in matched:
-            for hint in (pf.get("hints") or []):
-                if hint not in existing_hints:
-                    existing_hints.append(hint)
-            # Add stub finding so the UI shows it before the scan completes
-            stub = pf.get("stub")
-            if stub and stub.get("title"):
-                key = (stub.get("title", ""), stub.get("attack_type", ""), stub.get("parameter", ""))
-                if not any(
-                    (f.get("title", ""), f.get("attack_type", ""), f.get("parameter", "")) == key
-                    for f in entry.findings
-                ):
-                    entry.findings.append(stub)
+            # Inject hints from all matched pending findings into this entry
+            existing_hints = list(entry.import_hints or [])
+            for pf in matched:
+                for hint in (pf.get("hints") or []):
+                    if hint not in existing_hints:
+                        existing_hints.append(hint)
+                # Add stub finding so the UI shows it before the scan completes.
+                # Stubs carry no raw evidence — the scan fills that in later.
+                stub = pf.get("stub")
+                if stub and stub.get("title"):
+                    self._append_finding_locked(entry, stub, attach_evidence=False)
 
-        entry.import_hints = existing_hints
+            entry.import_hints = existing_hints
 
-        if not entry.queued_for_scan and not entry.scan_result:
-            entry.queued_for_scan = True
+            should_queue = not entry.queued_for_scan and not entry.scan_result
+            if should_queue:
+                entry.queued_for_scan = True
+
+        if should_queue:
             self.enqueue_for_scan(entry.id)
             logger.info(
                 "Pending import findings matched — queued for scan",
@@ -662,8 +397,8 @@ class SessionStore:
         self._notify(entry)
         return entry_id
 
-    def set_plugin_manager(self, pm) -> None:
-        self._plugin_manager = pm
+    def set_plugin_manager(self, plugin_manager: "PluginManager") -> None:
+        self._plugin_manager = plugin_manager
 
     def complete_entry(
         self,
@@ -697,7 +432,7 @@ class SessionStore:
         plugin_manager = getattr(self, "_plugin_manager", None)
         store_ref = self
 
-        def _bg_analyse():
+        def _bg_analyse() -> None:
             try:
                 service_graph.observe(
                     host=entry.host,
@@ -760,7 +495,8 @@ class SessionStore:
             sc = SimpleCookie()
             try:
                 sc.load(cookie_str)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to parse set-cookie header", host=host, error=str(exc))
                 continue
             for name, morsel in sc.items():
                 jar[name] = {
@@ -926,6 +662,59 @@ class SessionStore:
                 self._notify(e)
         return queued
 
+    @staticmethod
+    def _finding_dedup_key(finding: dict) -> tuple:
+        """Identity of a finding for deduplication: title + attack_type + parameter."""
+        return (finding.get("title", ""), finding.get("attack_type", ""), finding.get("parameter", ""))
+
+    def _append_finding_locked(self, entry: ProxyEntry, finding: dict, attach_evidence: bool) -> bool:
+        """Single mutation path for ``entry.findings``. Caller MUST hold ``self._lock``.
+
+        Skips the finding when one with the same dedup key is already recorded.
+        With ``attach_evidence`` the parent entry's raw request/response is copied
+        onto the finding when it did not supply its own. Returns True if appended.
+        """
+        key = self._finding_dedup_key(finding)
+        for idx, existing in enumerate(entry.findings):
+            if self._finding_dedup_key(existing) != key:
+                continue
+            # A confirmed finding upgrades a previously held-for-review duplicate
+            # (recorded while the AI validator was offline). This lets a re-scan
+            # promote "Needs review" to a real confirmation instead of being
+            # silently deduped away. All other duplicates are skipped as before.
+            if finding.get("confirmed") and not existing.get("confirmed"):
+                if attach_evidence:
+                    self._attach_evidence_locked(entry, finding)
+                entry.findings[idx] = finding
+                return True
+            return False
+        if attach_evidence:
+            self._attach_evidence_locked(entry, finding)
+        entry.findings.append(finding)
+        return True
+
+    def _attach_evidence_locked(self, entry: ProxyEntry, finding: dict) -> None:
+        """Auto-populate raw HTTP evidence from the parent entry when the finding
+        (agent or plugin) did not supply it. Ensures every finding carries at
+        least the intercepted baseline pair for the report. Caller holds the lock."""
+        if not finding.get("raw_request") and entry.method and entry.url:
+            try:
+                finding["raw_request"] = _format_raw_request(entry)[:6000]
+            except Exception as exc:
+                logger.debug("Failed to attach raw request evidence to finding",
+                             entry_id=entry.id, error=str(exc))
+        if not finding.get("raw_response") and entry.response_status:
+            try:
+                finding["raw_response"] = _format_raw_response(entry)[:6000]
+            except Exception as exc:
+                logger.debug("Failed to attach raw response evidence to finding",
+                             entry_id=entry.id, error=str(exc))
+
+    def snapshot_findings(self, entry: ProxyEntry) -> List[dict]:
+        """Return a consistent copy of ``entry.findings`` taken under the store lock."""
+        with self._lock:
+            return list(entry.findings)
+
     def add_finding(self, entry_id: str, finding: dict, scan_result: str) -> None:
         with self._lock:
             e = self._entries.get(entry_id)
@@ -934,23 +723,8 @@ class SessionStore:
                 return
             if finding.get("title"):
                 # Deduplicate: skip if same title + attack_type + parameter already recorded
-                key = (finding.get("title", ""), finding.get("attack_type", ""), finding.get("parameter", ""))
-                if any((f.get("title", ""), f.get("attack_type", ""), f.get("parameter", "")) == key for f in e.findings):
+                if not self._append_finding_locked(e, finding, attach_evidence=True):
                     return
-                # Auto-populate raw HTTP evidence from the parent entry when the
-                # finding (agent or plugin) did not supply it. This ensures every
-                # finding has at least the intercepted baseline pair for the report.
-                if not finding.get("raw_request") and e.method and e.url:
-                    try:
-                        finding["raw_request"] = _format_raw_request(e)[:6000]
-                    except Exception:
-                        pass
-                if not finding.get("raw_response") and e.response_status:
-                    try:
-                        finding["raw_response"] = _format_raw_response(e)[:6000]
-                    except Exception:
-                        pass
-                e.findings.append(finding)
             # Never downgrade a confirmed vulnerable entry to safe/error via an empty sentinel
             if scan_result == "vulnerable" or e.scan_result != "vulnerable":
                 e.scan_result = scan_result
@@ -1051,14 +825,14 @@ class SessionStore:
         try:
             from dast.scanners.active_checks import reset_host_reachability
             reset_host_reachability()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to reset host reachability after store clear", error=str(exc))
 
     def load_from_session_data(
         self,
         entries_data: list,
         cookies_data: dict,
-        settings=None,
+        settings: Optional["ProxySettings"] = None,
     ) -> int:
         """Replace store contents with entries from a saved session. Returns entry count."""
         with self._lock:

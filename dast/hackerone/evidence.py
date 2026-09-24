@@ -19,6 +19,10 @@ from __future__ import annotations
 from typing import List, Optional
 from urllib.parse import urlparse
 
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 # One-line risk summaries per attack type, written for a triager. Redirect XSS
 # has its own line because its impact (credential/cookie exfiltration via forced
 # navigation) differs from stored/reflected script execution.
@@ -256,7 +260,8 @@ def _canon(vuln_type: str) -> str:
 def _host(url: str) -> str:
     try:
         return urlparse(url).netloc or url
-    except Exception:
+    except Exception as exc:
+        logger.debug("Could not parse URL host for evidence", error=str(exc))
         return url
 
 

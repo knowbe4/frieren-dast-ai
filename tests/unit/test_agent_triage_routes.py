@@ -79,8 +79,19 @@ async def _wait_for(client, job_id, predicate, tries=50):
 # ── AgentToolContext scope ────────────────────────────────────────────────────
 
 def test_agent_tool_context_honors_approved_hosts():
-    ctx = AgentToolContext(proxy_port=1, dashboard_port=2, store=None, settings=None)
-    # No settings → base scope is False; an approved host flips it to True.
+    # Use an explicit restrictive scope (include only in.example) so base scope is
+    # deterministically False for out.example. Passing settings=None makes the
+    # context lazily build a disk-backed ProxySettings(), and a settings object with
+    # no include rules is allow-all (is_in_scope=True) — that made this test depend
+    # on the machine's on-disk scope config and flake in CI's clean environment.
+    from dast.proxy.proxy_settings import ProxySettings
+    settings = ProxySettings()
+    settings._scope_rules = [{
+        "enabled": True, "protocol": "any", "host": "in.example",
+        "port": "", "file": "", "kind": "include",
+    }]
+    ctx = AgentToolContext(proxy_port=1, dashboard_port=2, store=None, settings=settings)
+    # Base scope excludes out.example; an approved host flips it to True.
     assert ctx.is_in_scope("https://out.example/x") is False
     ctx.approved_hosts.add("out.example")
     assert ctx.is_in_scope("https://out.example/x") is True

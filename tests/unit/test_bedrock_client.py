@@ -87,6 +87,38 @@ def test_structured_path_falls_back_to_text_when_no_tool_block(install_fake_clie
     assert result == {"ok": False}
 
 
+def test_structured_path_repairs_prose_from_local_model(install_fake_client, caplog):
+    # A local OpenAI-compatible server (Ollama etc.) that ignores forced
+    # tool_choice and answers with prose used to hard-fail with an uncaught
+    # JSONDecodeError. It must now repair once and still return a dict.
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    fake = install_fake_client([
+        _text_response("Sure! Here is the analysis you asked for: not json at all."),
+        _text_response('{"ok": true}'),
+    ])
+
+    with caplog.at_level("WARNING"):
+        result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"ok": True}
+    assert len(fake.bodies) == 2  # original structured call + one text repair
+
+
+def test_structured_path_repairs_when_response_has_no_text_block(install_fake_client):
+    # A tool-only / empty envelope with no text block must not raise (KeyError)
+    # on the fallback — it degrades to a repair round-trip instead.
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    fake = install_fake_client([
+        {"content": []},
+        _text_response('{"ok": false}'),
+    ])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"ok": False}
+    assert len(fake.bodies) == 2
+
+
 # ── repair-retry on malformed JSON (legacy path) ──────────────────────────────
 
 def test_repair_retry_recovers_from_malformed_json(install_fake_client, caplog):

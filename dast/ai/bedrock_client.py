@@ -598,6 +598,51 @@ def _extract_text(result: Dict[str, Any]) -> str:
     return result["content"][0]["text"]
 
 
+def _extract_text_safe(result: Dict[str, Any]) -> str:
+    """Like _extract_text but returns "" instead of raising when the envelope
+    carries no text block (e.g. a tool-only or empty response from a local
+    OpenAI-compatible server). Used on the structured-output fallback path where
+    a missing text block must degrade to a repair retry, not a KeyError."""
+    for block in result.get("content", []):
+        if block.get("type") == "text":
+            return block.get("text", "")
+    return ""
+
+
+def _parse_json_or_repair(
+    raw: str,
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+) -> Dict[str, Any]:
+    """Parse ``raw`` as JSON, repairing once via a free-text re-invocation.
+
+    Shared by the legacy (no-schema) path and the structured-output fallback
+    that fires when a model ignores the forced tool call (common with local
+    OpenAI-compatible servers that don't honor ``tool_choice``). On the first
+    parse failure the model is re-invoked once with an explicit JSON-only
+    instruction; a second failure propagates so the caller sees a real error."""
+    try:
+        return json.loads(_strip_json_fence(raw))
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("invoke_json got malformed JSON — retrying once", error=str(exc))
+        repair_system = system
+        if "json" not in repair_system.lower():
+            repair_system += "\n\nRespond ONLY with valid JSON. No markdown, no explanation."
+        repair_user = (
+            f"{user}\n\nYour previous reply was not valid JSON:\n{raw[:500]}\n\n"
+            "Reply with ONLY the JSON object. No markdown, no prose, no code fence."
+        )
+        raw2 = invoke(
+            system=repair_system, user=repair_user, model_id=model_id,
+            max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        )
+        return json.loads(_strip_json_fence(raw2))
+
+
 def _extract_tool_input(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Pull the structured input from a forced tool_use block, if present."""
     for block in result.get("content", []):
@@ -716,10 +761,15 @@ def _invoke_json_uncached(
         tool_input = _extract_tool_input(result)
         if tool_input is not None:
             return tool_input
-        # Model returned text despite tool_choice (rare) — fall through to
-        # parsing the text so the caller still gets a dict rather than an error.
+        # Model returned text despite tool_choice. This is common with local
+        # OpenAI-compatible servers (Ollama, LM Studio, llama.cpp, vLLM) that
+        # don't honor forced function calling. Parse the text as JSON, repairing
+        # once so the caller gets a dict rather than an uncaught JSONDecodeError.
         logger.warning("Structured output requested but no tool_use block returned; parsing text")
-        return json.loads(_strip_json_fence(_extract_text(result)))
+        return _parse_json_or_repair(
+            raw=_extract_text_safe(result), system=system, user=user, model_id=model_id,
+            max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        )
 
     # Legacy path: instruct JSON, parse text, repair once on failure.
     if "json" not in system.lower():
@@ -729,16 +779,7 @@ def _invoke_json_uncached(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system,
     )
-    try:
-        return json.loads(_strip_json_fence(raw))
-    except json.JSONDecodeError as exc:
-        logger.warning("invoke_json got malformed JSON — retrying once", error=str(exc))
-        repair_user = (
-            f"{user}\n\nYour previous reply was not valid JSON:\n{raw[:500]}\n\n"
-            "Reply with ONLY the JSON object. No markdown, no prose, no code fence."
-        )
-        raw2 = invoke(
-            system=system, user=repair_user, model_id=model_id, max_tokens=max_tokens,
-            temperature=temperature, cache_system=cache_system,
-        )
-        return json.loads(_strip_json_fence(raw2))
+    return _parse_json_or_repair(
+        raw=raw, system=system, user=user, model_id=model_id,
+        max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+    )

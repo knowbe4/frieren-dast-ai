@@ -49,20 +49,36 @@
   <button class="tbtn del" onclick="clearSession()">Clear</button>
 </div>
 
-<!-- MAIN TAB BAR -->
+<!-- MAIN TAB BAR — grouped: Triage | Capture | Analyze | Tools.
+     Group icons are inline SVG (no emoji, themeable via currentColor). -->
 <div id="tabbar">
-  <div class="mtab on"  id="mt-overview" onclick="switchMain('overview')">Dashboard</div>
-  <div class="mtab"     id="mt-proxy"    onclick="switchMain('proxy')">Proxy</div>
-  <div class="mtab"    id="mt-browse"   onclick="switchMain('browse')">Discovery</div>
-  <div class="mtab"    id="mt-ai"       onclick="switchMain('ai')">AI</div>
-  <div class="mtab"    id="mt-scan"     onclick="switchMain('scan')">Scan</div>
-  <div class="mtab"    id="mt-plugins"  onclick="switchMain('plugins')">Plugins</div>
-  <div class="mtab"    id="mt-graphql"  onclick="switchMain('graphql')">GraphQL</div>
-  <div class="mtab"    id="mt-repeater" onclick="switchMain('repeater')">Repeater</div>
-  <div class="mtab"    id="mt-intruder"      onclick="switchMain('intruder')">Intruder</div>
-  <div class="mtab"    id="mt-logs"     onclick="switchMain('logs')">Logs</div>
-  <div class="mtab"    id="mt-extras"   onclick="switchMain('extras')">Extras</div>
-  <div class="mtab"    id="mt-copilot"  onclick="switchMain('copilot')">Copilot</div>
+  <div class="tab-group" title="Triage">
+    <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span>
+    <div class="mtab on"  id="mt-overview" onclick="switchMain('overview')">Dashboard</div>
+    <div class="mtab"     id="mt-copilot"  onclick="switchMain('copilot')">Copilot</div>
+  </div>
+  <div class="tab-group-sep"></div>
+  <div class="tab-group" title="Capture">
+    <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c2 2 2 10 0 12M8 2c-2 2-2 10 0 12"/></svg></span>
+    <div class="mtab"     id="mt-proxy"    onclick="switchMain('proxy')">Proxy</div>
+    <div class="mtab"     id="mt-browse"   onclick="switchMain('browse')">Discovery</div>
+    <div class="mtab"     id="mt-repeater" onclick="switchMain('repeater')">Repeater</div>
+    <div class="mtab"     id="mt-intruder" onclick="switchMain('intruder')">Intruder</div>
+  </div>
+  <div class="tab-group-sep"></div>
+  <div class="tab-group" title="Analyze">
+    <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg></span>
+    <div class="mtab"     id="mt-ai"       onclick="switchMain('ai')">AI</div>
+    <div class="mtab"     id="mt-scan"     onclick="switchMain('scan')">Scan</div>
+    <div class="mtab"     id="mt-graphql"  onclick="switchMain('graphql')">GraphQL</div>
+    <div class="mtab"     id="mt-plugins"  onclick="switchMain('plugins')">Plugins</div>
+  </div>
+  <div class="tab-group-sep"></div>
+  <div class="tab-group" title="Tools">
+    <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5a3 3 0 00-4 4L2 11v3h3l4.5-4.5a3 3 0 004-4l-2 2-2-2z"/></svg></span>
+    <div class="mtab"     id="mt-logs"     onclick="switchMain('logs')">Logs</div>
+    <div class="mtab"     id="mt-extras"   onclick="switchMain('extras')">Extras</div>
+  </div>
 </div>
 
 <!-- hidden file inputs for OS file picker -->

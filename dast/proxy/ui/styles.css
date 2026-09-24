@@ -70,10 +70,17 @@ html, body { height: 100%; font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Se
 
 /* MAIN TAB BAR */
 #tabbar { height: 30px; background: var(--bg2); border-bottom: 1px solid var(--bdr);
-          display: flex; align-items: flex-end; padding: 0 4px; gap: 1px; flex-shrink: 0; }
-.mtab { padding: 4px 14px 4px; cursor: pointer; color: var(--txt2); font-size: 11px;
+          display: flex; align-items: flex-end; padding: 0 4px; gap: 1px; flex-shrink: 0;
+          overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+#tabbar::-webkit-scrollbar { height: 0; }
+.tab-group { display: flex; align-items: flex-end; gap: 1px; flex-shrink: 0; }
+.tab-group-icon { display: flex; align-items: center; align-self: center;
+                  color: var(--txt3); padding: 0 3px 0 5px; flex-shrink: 0; }
+.tab-group-sep { width: 1px; height: 16px; background: var(--bdr); align-self: center;
+                 margin: 0 5px; flex-shrink: 0; }
+.mtab { padding: 4px 12px 4px; cursor: pointer; color: var(--txt2); font-size: 11px;
         border: 1px solid transparent; border-bottom: none; border-radius: 3px 3px 0 0;
-        position: relative; bottom: -1px; user-select: none; }
+        position: relative; bottom: -1px; user-select: none; white-space: nowrap; }
 .mtab:hover { color: var(--txt); }
 .mtab.on { background: var(--bg); border-color: var(--bdr); color: var(--txt); }
 

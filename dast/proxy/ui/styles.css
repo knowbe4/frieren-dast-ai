@@ -509,3 +509,34 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
 #ai-offline-banner strong { color: #faa; }
 #ai-offline-banner code { background: #3a1010; padding: 1px 5px; border-radius: 3px;
   color: var(--orange); font-family: inherit; }
+
+/* ── RESPONSIVE ───────────────────────────────────────────────────────────────
+   The 3-pane workspace (hosts | list | detail) is built for wide screens. On a
+   small laptop or a split/resized window we progressively reclaim horizontal
+   space instead of letting panes clip. This applies to the desktop shell too:
+   Electron runs the same Chromium engine, so the media queries behave identically.
+
+   Topbar: it carries many controls and must never clip them. Rather than wrap
+   (which would grow its height and break #workspace's `calc(100vh - 70px)`), we
+   let it scroll horizontally like #tabbar — height stays 40px, the spacer still
+   grows to fill on wide screens, and children keep their natural size. */
+#topbar { overflow-x: auto; overflow-y: hidden; scrollbar-width: none; }
+#topbar::-webkit-scrollbar { height: 0; }
+#topbar > * { flex-shrink: 0; }
+
+@media (max-width: 1200px) {
+  .hosts-col  { width: 168px; }
+  .detail-col { width: 46%; }
+}
+@media (max-width: 980px) {
+  .hosts-col  { width: 132px; }
+  .detail-col { width: 50%; min-width: 240px; }
+  #session-name { width: 120px; }
+}
+@media (max-width: 760px) {
+  /* Tightest layout: shrink the session input and drop the hosts sidebar to an
+     icon-narrow strip so the request list and detail pane stay usable. */
+  .hosts-col  { width: 104px; min-width: 88px; }
+  .detail-col { width: 52%; min-width: 220px; }
+  #session-name { width: 92px; }
+}

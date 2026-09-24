@@ -131,8 +131,8 @@ def _remove_param_from_body(body: str, param: str) -> str:
             data_copy = dict(data)
             del data_copy[param]
             return _json.dumps(data_copy)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to remove param from JSON body; falling back to form parsing", param=param, error=str(exc))
     # Form body
     pairs = [(k, v) for part in body.split("&") if "=" in part
              for k, v in [part.split("=", 1)] if k != param]
@@ -150,8 +150,8 @@ def _replace_param_in_body(body: str, param: str, value: str) -> str:
             data_copy = dict(data)
             data_copy[param] = value
             return _json.dumps(data_copy)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to replace param in JSON body; falling back to form parsing", param=param, error=str(exc))
     pairs = []
     for part in body.split("&"):
         if "=" in part:

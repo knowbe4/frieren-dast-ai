@@ -157,8 +157,8 @@ class SqliAgent(VulnAgent):
             baseline_resp = await self._send_probe(target, client, param, param.get("value", "1"))
             if baseline_resp is not None:
                 baseline_raw_request, baseline_raw_response = _fmt_http_pair(baseline_resp)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to capture SQLi baseline request/response", error=str(exc))
 
         for iteration, payload in enumerate(payloads_to_try):
             if payload in tried:

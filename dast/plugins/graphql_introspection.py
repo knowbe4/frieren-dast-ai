@@ -82,8 +82,8 @@ def _is_graphql_endpoint(entry: "ProxyEntry") -> bool:
                     q = data["query"].strip()
                     if q.startswith(("query ", "mutation ", "subscription ", "{")):
                         return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to parse request body for GraphQL detection", error=str(exc))
     return False
 
 

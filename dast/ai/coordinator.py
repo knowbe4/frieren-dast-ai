@@ -154,8 +154,8 @@ def _extract_operation(target: "CheckTarget") -> str:
                 m2 = _re.search(r'(?:query|mutation)\s*\{?\s*(\w+)', data["query"])
                 if m2:
                     return m2.group(1)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to extract GraphQL operation label", error=str(exc))
 
     from urllib.parse import urlparse as _urlparse
     parts = [p for p in _urlparse(target.url).path.split("/") if p]
@@ -654,8 +654,8 @@ class Coordinator:
             if session_intelligence is not None:
                 try:
                     _host_intel0 = session_intelligence.get(_h0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to read session intelligence for budget", host=_h0, error=str(exc))
             effective_budget = min(
                 cls._adaptive_budget(target, _host_intel0),
                 cls.SCAN_BUDGET_SECONDS,
@@ -720,8 +720,8 @@ class Coordinator:
             try:
                 host_intel = session_intelligence.get(_host)
                 intel_hint = host_intel.to_planner_hint(_path, target.params)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to build planner hint from session intelligence", host=_host, error=str(exc))
 
         # Early abort: auth/SSO/OIDC endpoint — path-based detection.
         # These endpoints process cryptographic tokens (SAML assertions, OIDC codes,
@@ -889,8 +889,8 @@ class Coordinator:
                             operation=_operation,
                             structural_error=baseline_abort,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("failed to record baseline structural error in session intelligence", host=_host, path=_path, error=str(exc))
                 _log_event(
                     "coordinator", "warn",
                     f"Baseline check failed — aborting scan: {baseline_abort}",
@@ -1281,8 +1281,8 @@ class Coordinator:
                         msg = err.get("message", "")
                         if code in _STRUCTURAL_CODES or any(p in msg for p in _STRUCTURAL_PHRASES):
                             return f"GraphQL schema error: {msg[:120]}", response_summary
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to parse GraphQL errors in baseline response", error=str(exc))
 
         # 401/403 on a baseline request — auth wall, abort to avoid 401 flooding.
         if resp.status_code in (401, 403):
@@ -1405,8 +1405,8 @@ class Coordinator:
             # discovery aims at the proven syntactic context, not just the class.
             try:
                 target.probe_diff_hint = "Probe-diff injection-context analysis:\n" + summary
-            except Exception:  # pragma: no cover - defensive; target is a dataclass
-                pass
+            except Exception as exc:  # pragma: no cover - defensive; target is a dataclass
+                logger.debug("failed to attach probe-diff hint to target", error=str(exc))
             from dast.proxy.plugin_manager import log_event as _le_probe
             _le_probe(
                 "coordinator", "info",
@@ -1479,8 +1479,8 @@ class Coordinator:
         )
         try:
             target.param_mining_hint = hint
-        except Exception:  # pragma: no cover - defensive; target is a dataclass
-            pass
+        except Exception as exc:  # pragma: no cover - defensive; target is a dataclass
+            logger.debug("failed to attach param-mining hint to target", error=str(exc))
 
         from dast.proxy.plugin_manager import log_event as _le_mine
         _le_mine(

@@ -253,8 +253,8 @@ def _preprocess(text: str) -> str:
         try:
             data = json.loads(stripped)
             return _preprocess_orchestrator_json(data)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            logger.debug("input is not orchestrator JSON; trying Markdown strategy", error=str(exc))
 
     # ── Strategy 2: orchestrator-ai / generic Markdown ────────────────────
     if stripped.startswith("#") or "## " in stripped[:200]:

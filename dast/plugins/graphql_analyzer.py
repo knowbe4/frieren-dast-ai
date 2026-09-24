@@ -63,8 +63,8 @@ def _is_graphql(entry: "ProxyEntry") -> bool:
                         isinstance(item, dict) and isinstance(item.get("query"), str)
                         for item in items
                     )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to parse request body for GraphQL detection", error=str(exc))
     return False
 
 

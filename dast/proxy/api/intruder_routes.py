@@ -11,6 +11,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from dast.proxy.api.context import DashboardContext
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:
@@ -59,8 +62,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                         if p not in _seen:
                             _seen.add(p)
                             payloads.append(p)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to load YAML payloads for attack type", attack_type=atype, error=str(exc))
         elif payload_src == "llm":
             try:
                 from dast.ai import bedrock_client as _bc
@@ -90,8 +93,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                             if p not in _seen2:
                                 _seen2.add(p)
                                 payloads.append(p)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("failed to load fallback YAML payloads for attack type", attack_type=atype, error=str(exc))
 
         if not payloads:
             return JSONResponse({"error": "No payloads available for the selected configuration."}, status_code=400)
@@ -218,8 +221,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                             if _findings:
                                 finding_title = _findings[0].title
                                 hit = True
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("intruder active-check on payload response failed", error=str(exc))
 
                     job["results"].append({
                         "n":            idx + 1,

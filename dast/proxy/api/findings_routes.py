@@ -101,8 +101,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     m = _re.search(r'\b(query|mutation|subscription)\s+(\w+)', data.get("query", ""))
                     if m:
                         return f"{m.group(1)} {m.group(2)}"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to extract GraphQL operation name from body", error=str(exc))
             return ""
 
         _AUTH_HEADERS = frozenset({

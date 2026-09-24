@@ -16,6 +16,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 _SESSIONS_DIR = Path.home() / ".dast-ai" / "sessions"
 
 
@@ -98,13 +102,13 @@ def save_session(
         try:
             for host, profile in getattr(discovery, "_app_profiles", {}).items():
                 app_profiles[host] = profile.__dict__ if hasattr(profile, "__dict__") else profile
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to serialize app profiles for session save", error=str(exc))
         try:
             for host, tm in getattr(discovery, "_threat_models", {}).items():
                 threat_models[host] = tm.__dict__ if hasattr(tm, "__dict__") else tm
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to serialize threat models for session save", error=str(exc))
         data["app_profiles"] = app_profiles
         data["threat_models"] = threat_models
 
@@ -132,8 +136,8 @@ def save_session(
     if plugin_mgr is not None:
         try:
             data["event_log"] = list(getattr(plugin_mgr, "_event_log", []))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to serialize event log for session save", error=str(exc))
 
     path.write_text(json.dumps(data, indent=2, default=str))
     return _meta(data, path)

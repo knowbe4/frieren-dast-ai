@@ -273,8 +273,8 @@ def _inject_body(body: str, param: str, value: str, content_type: str,
                     else:
                         data[param] = value
                 return json.dumps(data)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to inject payload into JSON body; falling back to form-urlencoded", error=str(exc))
     # form-urlencoded fallback
     pairs = {}
     for part in body.split("&"):
@@ -1232,8 +1232,8 @@ def _idor_confirmed(baseline_status: int, baseline_text: str,
         if _json.dumps(b, sort_keys=True) == _json.dumps(p, sort_keys=True):
             return False  # identical data → same object
         return True
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to compare responses as JSON; falling back to text comparison", error=str(exc))
     # Fallback: text length changed significantly and content differs
     if probe_text.strip() == baseline_text.strip():
         return False

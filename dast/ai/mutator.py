@@ -95,8 +95,8 @@ def build_mutator_context(target: object, attack_type: str) -> Optional[str]:
             summary = discovery.to_agent_summary()
             if summary:
                 sections.append(summary)
-        except Exception:  # pragma: no cover - defensive; never break the scan
-            pass
+        except Exception as exc:  # pragma: no cover - defensive; never break the scan
+            logger.debug("failed to add discovery summary to mutator context", error=str(exc))
 
     host_intel = getattr(target, "host_intel", None)
     if host_intel is not None:
@@ -104,8 +104,8 @@ def build_mutator_context(target: object, attack_type: str) -> Optional[str]:
             waf_hint = host_intel.to_mutator_hint(attack_type)
             if waf_hint:
                 sections.append(waf_hint)
-        except Exception:  # pragma: no cover - defensive
-            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("failed to add WAF hint to mutator context", attack_type=attack_type, error=str(exc))
 
     probe_hint = getattr(target, "probe_diff_hint", "")
     if probe_hint:

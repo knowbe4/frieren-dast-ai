@@ -333,8 +333,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                                     m = _re.search(r'\b(query|mutation|subscription)\s+(\w+)', data.get("query", ""))
                                     if m:
                                         operation = f"{m.group(1)} {m.group(2)}"
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("failed to extract GraphQL operation while enqueueing scan", error=str(exc))
                     scan_queue_state.enqueue(e.id, e.method, e.url, e.host, operation=operation)
                 await scan_queue.put(e.id)
                 queued += 1

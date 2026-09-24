@@ -64,8 +64,8 @@ def _restore_extra(store, data: dict, ctx: "DashboardContext") -> None:
                     if not worker.get_profile(host):
                         profile = AppProfile(**{k: v for k, v in raw.items() if k in fields})
                         worker._profiles[host] = profile
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to restore app profile from session", host=host, error=str(exc))
 
     threat_models = data.get("threat_models", {})
     if threat_models:
@@ -79,8 +79,8 @@ def _restore_extra(store, data: dict, ctx: "DashboardContext") -> None:
                     if not tm_worker.get_model(host):
                         tm = ThreatModel(**{k: v for k, v in raw.items() if k in fields})
                         tm_worker._models[host] = tm
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to restore threat model from session", host=host, error=str(exc))
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:

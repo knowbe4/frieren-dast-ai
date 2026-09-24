@@ -21,6 +21,10 @@ import asyncio
 import random
 from typing import Optional, Set
 
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 class CollaboratorService:
     def __init__(self, host: str = "127.0.0.1", port: int = 0):
@@ -81,10 +85,10 @@ class CollaboratorService:
                     self._hits.add(path)
             writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
             await writer.drain()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to handle inbound OOB interaction", error=str(exc))
         finally:
             try:
                 writer.close()
             except Exception:
-                pass
+                pass  # best-effort: socket teardown

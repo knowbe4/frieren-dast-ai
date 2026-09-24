@@ -143,8 +143,8 @@ def _is_confirmed(response_text: str, injected_param: str = "") -> tuple[bool, s
                 data = _json.loads(response_text)
                 if not _find_in_output_fields(data, _NUMERIC_CANARY, injected_leaf):
                     return False, ""
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to parse response while verifying numeric canary", error=str(exc))
         return True, f"numeric canary {_NUMERIC_CANARY!r} found isolated in response"
 
     return False, ""
@@ -396,8 +396,8 @@ class LlmInjectionAgent(VulnAgent):
                                     client, target.method, target.url,
                                     target.headers, json.dumps(data),
                                 )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("failed to inject payload into JSON body; sending raw payload", error=str(exc))
             return await _send(client, target.method, target.url, target.headers, payload)
         return None
 

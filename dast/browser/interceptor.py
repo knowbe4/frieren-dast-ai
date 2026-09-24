@@ -110,8 +110,8 @@ class NetworkInterceptor:
             resp_body = ""
             try:
                 resp_body = await response.text()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to read intercepted response body", error=str(exc))
 
             resp = HttpResponse(
                 status_code=response.status,

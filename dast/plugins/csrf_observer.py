@@ -76,7 +76,7 @@ def _has_csrf_token(entry: "ProxyEntry") -> bool:
         try:
             body = entry.request_body.decode("utf-8", errors="replace")
         except Exception:
-            pass
+            pass  # best-effort: non-decodable body treated as having no CSRF token
     if body:
         # Form-encoded or JSON param check
         for part in re.split(r'[&\n]', body):

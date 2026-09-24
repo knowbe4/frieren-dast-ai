@@ -496,8 +496,8 @@ async def _poll_once(interactsh_session) -> List[dict]:
                     interaction_type = "http"
                 elif proto == "dns":
                     interaction_type = "dns"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to parse interactsh interaction protocol", error=str(exc))
 
             results.append(
                 {

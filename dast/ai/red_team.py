@@ -211,8 +211,8 @@ async def validate(
             _path2 = _urlp2(finding.url).path
             if _path2 and _path2 != "/":
                 code_hint = lookup_code_for_path(_path2, max_snippets=3)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("code lookup for finding path failed", url=finding.url, error=str(exc))
     code_section = (
         f"Source code context (relevant to this endpoint):\n{wrap_untrusted(code_hint, 'source_code')}"
         if code_hint else ""

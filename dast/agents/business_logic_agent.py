@@ -444,8 +444,8 @@ def _coerce_probe_value(value_str: str) -> Any:
     if (value_str.startswith("[") or value_str.startswith("{")):
         try:
             return _j.loads(value_str)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("failed to coerce value as JSON; falling back to scalar parsing", error=str(exc))
     try:
         if "." in value_str:
             return float(value_str)

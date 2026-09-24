@@ -769,8 +769,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                     _record_host_fire(rule, entry, fired_hosts)
                     for f in found:
                         all_findings.append((rule.get("id", ""), f))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("passive rule evaluation failed", rule_id=rule.get("id", ""), error=str(exc))
 
         for rule_id, finding_tuple in all_findings:
             title, severity, cwe, evidence, line_no, snippet, needs_ai = finding_tuple[:7]
@@ -810,8 +810,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                         # confirmed is None — AI unavailable; keep validated_by=["passive"]
                         # and still surface the finding (fail-open on visibility,
                         # never fail-open on the "AI validated" claim).
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning("AI validation of passive finding failed", title=title, error=str(exc))
 
             finding_dict: Dict[str, Any] = {
                 "title": title,

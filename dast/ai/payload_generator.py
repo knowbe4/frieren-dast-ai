@@ -12,6 +12,7 @@ This replaces static wordlists with adaptive, context-aware fuzzing.
 from typing import List, Optional
 
 from dast.ai import bedrock_client
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.models import AttackAttempt, AttackPayload, Endpoint
 from dast.utils.logger import get_logger
 
@@ -29,13 +30,13 @@ Rules:
 - For GraphQL endpoints, generate introspection and mutation attacks
 - For APIs with IDs (numeric, UUID), include IDOR payloads with adjacent IDs
 - Keep payloads concise and precise
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 _SYSTEM_MUTATION = """\
 You are an expert web application penetration tester running an iterative attack loop.
 You have sent an attack payload and received a response. Decide the next action.
 Respond ONLY with JSON matching the schema requested.
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 def generate_payloads(endpoint: Endpoint, attack_types: List[str]) -> List[AttackPayload]:
@@ -96,7 +97,7 @@ Injection point: {previous_attempt.payload.injection_point} ({previous_attempt.p
 
 Response:
   Status: {resp.status_code if resp else "N/A"}
-  Body (first 1000 chars): {_sanitize_for_prompt(resp.body, 1000) if resp else ""}
+  Body (first 1000 chars): {wrap_untrusted(resp.body, "target_response", 1000) if resp else ""}
 
 Based on this response, should we:
 A) Try a mutated payload (describe it)
@@ -167,7 +168,7 @@ def _describe_endpoint(endpoint: Endpoint) -> str:
     )
     sample_resp_preview = ""
     if endpoint.sample_response:
-        sample_resp_preview = f"\nSample response ({endpoint.sample_response.status_code}):\n{_sanitize_for_prompt(endpoint.sample_response.body, 500)}"
+        sample_resp_preview = f"\nSample response ({endpoint.sample_response.status_code}):\n{wrap_untrusted(endpoint.sample_response.body, 'target_response', 500)}"
 
     return (
         f"URL: {endpoint.url}\n"

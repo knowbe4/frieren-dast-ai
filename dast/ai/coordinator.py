@@ -1223,10 +1223,15 @@ class Coordinator:
             _resp_body_preview = resp.text[:1200]
         except Exception:
             _resp_body_preview = ""
+        # The body is target-controlled (untrusted) and this summary is fed
+        # verbatim into the planner prompt — fence it in an XML tag so injected
+        # instructions in the response cannot hijack agent selection. Status and
+        # content-type are scanner-derived and safe to interpolate directly.
         response_summary = (
             f"Baseline response: HTTP {resp.status_code}\n"
             f"Content-Type: {resp.headers.get('content-type', 'unknown')}\n"
-            f"Body ({len(_resp_body_preview)} chars shown):\n{_resp_body_preview}"
+            f"Body ({len(_resp_body_preview)} chars shown):\n"
+            f"{wrap_untrusted(_resp_body_preview, 'target_response')}"
         )
 
         # ── Fast deterministic abort ──────────────────────────────────────

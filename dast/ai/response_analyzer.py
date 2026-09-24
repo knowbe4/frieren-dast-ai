@@ -13,7 +13,7 @@ Also extracts evidence string and suggests whether to keep iterating.
 from typing import Tuple
 
 from dast.ai import bedrock_client
-from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.models import AttackAttempt, AttackVerdict
 
 _SYSTEM_ANALYZER = """\
@@ -21,7 +21,7 @@ You are an expert web application security analyst.
 Analyze the HTTP request/response pair for evidence of a successful attack.
 Be precise: report VULNERABLE only if there is clear evidence in the response.
 Respond ONLY with JSON.
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 def analyze_attempt(attempt: AttackAttempt) -> Tuple[AttackVerdict, str, float]:
@@ -44,12 +44,12 @@ Injection point: {attempt.payload.injection_point} ({attempt.payload.injection_l
 Request:
   {req.method} {req.url}
   Headers: {dict(list(req.headers.items())[:5])}
-  Body: {_sanitize_for_prompt(req.body or "", 500)}
+  Body: {wrap_untrusted(req.body or "", "request_body", 500)}
 
 Response:
   Status: {resp.status_code}
   Headers: {dict(list(resp.headers.items())[:5])}
-  Body: {_sanitize_for_prompt(resp.body, 2000)}
+  Body: {wrap_untrusted(resp.body, "target_response", 2000)}
   Duration: {resp.duration_ms:.0f}ms
 
 Classify the result and respond with JSON:

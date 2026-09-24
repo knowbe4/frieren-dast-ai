@@ -22,6 +22,7 @@ import httpx
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.scanners.active_checks import _fmt_http_pair
 from dast.utils.logger import get_logger
 
@@ -52,7 +53,7 @@ confirmed=false when:
 - Probe response returns Session B's own data (different user data, not Session A's)
 - Endpoint is a public resource intentionally accessible to all authenticated users
 - Responses differ significantly in content — different objects, not the same resource leaked
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 async def _llm_evaluate(
@@ -70,9 +71,9 @@ async def _llm_evaluate(
             f"Session A (owner): {session_a_name}\n"
             f"Session B (attacker): {session_b_name}\n\n"
             f"--- Baseline response (Session A, status {baseline_status}) ---\n"
-            f"{_sanitize_for_prompt(baseline_text, 800)}\n\n"
+            f"{wrap_untrusted(baseline_text, 'target_response', 800)}\n"
             f"--- Probe response (Session B, status {probe_status}) ---\n"
-            f"{_sanitize_for_prompt(probe_text, 800)}\n"
+            f"{wrap_untrusted(probe_text, 'target_response', 800)}\n"
         )
         import asyncio
         loop = asyncio.get_running_loop()

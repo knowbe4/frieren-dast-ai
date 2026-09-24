@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
 from dast.utils.jwt import b64url_encode_json, decode_jwt_claims, decode_jwt_header
 from dast.utils.logger import get_logger
@@ -153,7 +154,7 @@ Severity guide:
 - high:     privilege escalation to elevated role, bypass of security control
 - medium:   workflow bypass, minor limit bypass, data exposure
 - low:      informational anomaly with limited exploitability
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 _JWT_RE = re.compile(
@@ -682,7 +683,7 @@ Respond ONLY with valid JSON:
     }}
   ]
 }}
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 async def _llm_hint_probes(
@@ -704,9 +705,9 @@ async def _llm_hint_probes(
     user = (
         f"Method: {target.method}\n"
         f"URL: {_sanitize_for_prompt(target.url, 300)}\n"
-        f"Request body: {_sanitize_for_prompt(target.body or '', 400)}\n"
+        f"Request body: {wrap_untrusted(target.body or '', 'request_body', 400)}\n"
         f"Baseline status: {baseline_status}\n"
-        f"Baseline response (first 600 chars):\n{_sanitize_for_prompt(baseline_text, 600)}\n"
+        f"Baseline response (first 600 chars):\n{wrap_untrusted(baseline_text, 'target_response', 600)}\n"
         f"Already testing these fields (skip them): {existing_params}\n"
     )
     try:
@@ -750,9 +751,9 @@ async def _llm_evaluate(
         f"Probe description: {_sanitize_for_prompt(probe.get('description', ''), 200)}\n"
         f"Parameter modified: {probe.get('param_name', '')} → {_sanitize_for_prompt(str(probe.get('probe_value', '')), 100)}\n\n"
         f"--- Baseline response (status {baseline_status}) ---\n"
-        f"{_sanitize_for_prompt(baseline_text, 600)}\n\n"
+        f"{wrap_untrusted(baseline_text, 'target_response', 600)}\n"
         f"--- Probe response (status {probe_status}) ---\n"
-        f"{_sanitize_for_prompt(probe_text, 600)}\n"
+        f"{wrap_untrusted(probe_text, 'target_response', 600)}\n"
     )
     try:
         loop = asyncio.get_running_loop()

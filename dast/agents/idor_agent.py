@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, List, Optional
 from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.scanners.active_checks import (
     _fmt_http_pair,
     _inject_body,
@@ -59,7 +60,7 @@ confirmed=false when:
 - Data looks identical or is clearly a public/shared resource
 - Response contains only non-sensitive metadata that any user could access
 - The endpoint appears to be intentionally public (search results, product listings, etc.)
-"""
+""" + UNTRUSTED_CONTENT_DIRECTIVE
 
 
 async def _llm_evaluate(
@@ -78,9 +79,9 @@ async def _llm_evaluate(
             f"Original ID: {_sanitize_for_prompt(original_id, 100)}\n"
             f"Probe ID:    {_sanitize_for_prompt(probe_id, 100)}\n\n"
             f"--- Baseline response (original ID) ---\n"
-            f"{_sanitize_for_prompt(baseline_text, 800)}\n\n"
+            f"{wrap_untrusted(baseline_text, 'target_response', 800)}\n"
             f"--- Probe response (neighbour ID) ---\n"
-            f"{_sanitize_for_prompt(probe_text, 800)}\n"
+            f"{wrap_untrusted(probe_text, 'target_response', 800)}\n"
         )
         import asyncio
         loop = asyncio.get_running_loop()

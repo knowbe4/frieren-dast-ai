@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from dast.ai import bedrock_client
+from dast.ai.schemas import DAST_IMPORT_SCHEMA
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -151,6 +152,7 @@ def parse_findings(
             user=prompt,
             model_id=bedrock_client.get_active_model(),
             max_tokens=8192,
+            schema=DAST_IMPORT_SCHEMA,
         )
     except Exception as exc:
         logger.error("Findings import parse failed", error=str(exc))

@@ -23,6 +23,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import CROSS_SESSION_IDOR_SCHEMA
 from dast.scanners.active_checks import _fmt_http_pair
 from dast.utils.logger import get_logger
 
@@ -84,6 +85,7 @@ async def _llm_evaluate(
                 user=user,
                 model_id=bedrock_client.get_validation_model(),
                 max_tokens=512,
+                schema=CROSS_SESSION_IDOR_SCHEMA,
             ),
         )
         return bool(result.get("confirmed", False)), str(result.get("reasoning", ""))

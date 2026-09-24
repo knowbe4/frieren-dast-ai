@@ -14,6 +14,7 @@ from typing import Tuple
 
 from dast.ai import bedrock_client
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import RESPONSE_ANALYZER_SCHEMA
 from dast.models import AttackAttempt, AttackVerdict
 
 _SYSTEM_ANALYZER = """\
@@ -77,7 +78,7 @@ NEEDS_RETRY: response gives clues but is ambiguous (try a different payload vari
 INCONCLUSIVE: no signal either way"""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_ANALYZER, user=user)
+        result = bedrock_client.invoke_json(system=_SYSTEM_ANALYZER, user=user, schema=RESPONSE_ANALYZER_SCHEMA)
         verdict_str = result.get("verdict", "INCONCLUSIVE").upper()
         verdict = AttackVerdict(verdict_str) if verdict_str in AttackVerdict._value2member_map_ else AttackVerdict.INCONCLUSIVE
         evidence = str(result.get("evidence", ""))

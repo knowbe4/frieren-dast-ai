@@ -341,6 +341,7 @@ async def _extract_endpoints_for_chunk(
 ) -> List[DiscoveredEndpoint]:
     """Call Haiku to extract endpoints from a single file chunk."""
     from dast.ai import bedrock_client
+    from dast.ai.schemas import ENDPOINT_EXTRACTION_SCHEMA
 
     chunk_text = _build_file_chunk_text(files)
     user_prompt = f"Extract all HTTP route definitions from the following source code:\n\n{chunk_text}"
@@ -353,6 +354,7 @@ async def _extract_endpoints_for_chunk(
                 user=user_prompt,
                 model_id=bedrock_client.get_fast_model(),
                 max_tokens=2000,
+                schema=ENDPOINT_EXTRACTION_SCHEMA,
             ),
         )
         return _parse_endpoint_response(raw)

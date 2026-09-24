@@ -13,6 +13,7 @@ from typing import List, Optional
 
 from dast.ai import bedrock_client
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import PAYLOAD_GEN_SCHEMA, PAYLOAD_MUTATION_SCHEMA
 from dast.models import AttackAttempt, AttackPayload, Endpoint
 from dast.utils.logger import get_logger
 
@@ -63,7 +64,7 @@ Respond with JSON array. Each item must have:
 Generate up to 10 payloads, prioritized by likelihood of success."""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user)
+        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user, schema=PAYLOAD_GEN_SCHEMA)
         payloads = []
         items = result if isinstance(result, list) else result.get("payloads", [])
         for item in items:
@@ -118,7 +119,7 @@ Respond with JSON:
 (new_payload is required only when action is mutate or different_param)"""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user)
+        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user, schema=PAYLOAD_MUTATION_SCHEMA)
         if result.get("action") == "stop":
             return None
 

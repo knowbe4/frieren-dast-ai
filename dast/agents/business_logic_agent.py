@@ -28,6 +28,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import BL_EVAL_SCHEMA, BL_HINT_PROBES_SCHEMA
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
 from dast.utils.jwt import b64url_encode_json, decode_jwt_claims, decode_jwt_header
 from dast.utils.logger import get_logger
@@ -719,6 +720,7 @@ async def _llm_hint_probes(
                 user=user,
                 model_id=bedrock_client.get_fast_model(),
                 max_tokens=512,
+                schema=BL_HINT_PROBES_SCHEMA,
             ),
         )
         probes = result.get("probes") or []
@@ -764,6 +766,7 @@ async def _llm_evaluate(
                 user=user,
                 model_id=bedrock_client.get_validation_model(),
                 max_tokens=512,
+                schema=BL_EVAL_SCHEMA,
             ),
         )
         confirmed = bool(result.get("confirmed", False))

@@ -334,10 +334,11 @@ class AppContextWorker:
 
         try:
             from dast.ai import bedrock_client
+            from dast.ai.schemas import APP_CONTEXT_SCHEMA
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=3000),
+                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=3000, schema=APP_CONTEXT_SCHEMA),
             )
             self._apply_result(host, result, len(entries))
             logger.info(

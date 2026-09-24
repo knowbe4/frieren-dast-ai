@@ -231,10 +231,11 @@ class ThreatModelWorker:
 
         try:
             from dast.ai import bedrock_client
+            from dast.ai.schemas import THREAT_MODEL_SCHEMA
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=800),
+                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=800, schema=THREAT_MODEL_SCHEMA),
             )
             self._apply_result(host, result)
             logger.info(

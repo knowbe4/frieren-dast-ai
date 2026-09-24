@@ -700,6 +700,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
     # credentials). Return None so the caller keeps the finding passive-only and
     # never stamps an "AI validated" badge on an unreviewed finding.
     from dast.ai import bedrock_client
+    from dast.ai.schemas import PASSIVE_VALIDATE_SCHEMA
     if not bedrock_client.is_ai_available():
         return None, ""
 
@@ -719,7 +720,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: bedrock_client.invoke_json(system=system_prompt, user=user),
+            lambda: bedrock_client.invoke_json(system=system_prompt, user=user, schema=PASSIVE_VALIDATE_SCHEMA),
         )
         # Only claim AI validation when the model EXPLICITLY confirmed. A response
         # missing the key (degraded/empty output from a misconfigured provider)

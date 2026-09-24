@@ -24,6 +24,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.payload_generator import _sanitize_for_prompt
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+from dast.ai.schemas import IDOR_SCHEMA
 from dast.scanners.active_checks import (
     _fmt_http_pair,
     _inject_body,
@@ -87,7 +88,7 @@ async def _llm_evaluate(
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: bedrock_client.invoke_json(system=_SYSTEM_IDOR, user=user),
+            lambda: bedrock_client.invoke_json(system=_SYSTEM_IDOR, user=user, schema=IDOR_SCHEMA),
         )
         confirmed = bool(result.get("confirmed", False))
         reasoning = str(result.get("reasoning", ""))

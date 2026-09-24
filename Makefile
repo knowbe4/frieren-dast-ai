@@ -1,4 +1,4 @@
-.PHONY: install setup sso sso-configure proxy validate test test-fast test-integration evals check lint secrets-scan help \
+.PHONY: install setup sso sso-configure proxy kill validate test test-fast test-integration evals check lint secrets-scan help \
         desktop desktop-install desktop-dist desktop-dist-mac desktop-dist-win desktop-dist-linux \
         desktop-test bump-version
 
@@ -66,6 +66,10 @@ proxy:
 		$(if $(USERNAME),--username $(USERNAME)) \
 		$(if $(PASSWORD),--password $(PASSWORD)) \
 		$(if $(AUTHORIZED),--authorized)
+
+kill:
+	PROXY_PORT=$(or $(PROXY_PORT),8080) DASHBOARD_PORT=$(or $(DASHBOARD_PORT),8088) \
+		uv run python scripts/kill.py
 
 # ---- Validate report against live target ----------------------------------
 # Auth options (pick one):
@@ -227,6 +231,7 @@ help:
 	@echo "  make sso-configure  Create AWS SSO profile (first time only)"
 	@echo "  make sso            AWS SSO login"
 	@echo "  make proxy          Start proxy + dashboard"
+	@echo "  make kill           Kill all dast-ai processes (proxy + dashboard, all ports)"
 	@echo "  make desktop-install Install Electron deps (first run only, ~200MB)"
 	@echo "  make desktop        Start the native desktop app (Burp-style window)"
 	@echo "  make desktop-dist-mac/win/linux  Build a distributable app"

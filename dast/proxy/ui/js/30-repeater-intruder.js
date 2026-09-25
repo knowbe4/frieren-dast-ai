@@ -546,7 +546,7 @@ function itrMarkSelection() {
   const ta = document.getElementById('itr-body');
   const start = ta.selectionStart;
   const end   = ta.selectionEnd;
-  if (start === end) { alert('Select text in the Body field first, then click Mark selection.'); return; }
+  if (start === end) { showToast('Select text in the Body field first, then click Mark selection.', true); return; }
   const before  = ta.value.slice(0, start);
   const sel     = ta.value.slice(start, end);
   const after   = ta.value.slice(end);
@@ -596,12 +596,12 @@ function _itrResetResults() {
 async function itrStartAttack() {
   const method  = document.getElementById('itr-method').value;
   const url     = document.getElementById('itr-url').value.trim();
-  if (!url) { alert('Enter a target URL first.'); return; }
+  if (!url) { showToast('Enter a target URL first.', true); return; }
 
   const headersRaw = document.getElementById('itr-headers').value;
   const body       = document.getElementById('itr-body').value;
   const attackTypes = Array.from(document.querySelectorAll('.itr-type-cb:checked')).map(cb => cb.value);
-  if (attackTypes.length === 0) { alert('Select at least one attack type.'); return; }
+  if (attackTypes.length === 0) { showToast('Select at least one attack type.', true); return; }
 
   const aiMode       = document.querySelector('input[name="itr-ai-mode"]:checked')?.value || 'full';
   const payloadSrc   = document.querySelector('input[name="itr-payload-src"]:checked')?.value || 'yaml';

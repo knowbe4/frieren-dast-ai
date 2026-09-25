@@ -9,6 +9,30 @@ let _issuesPage = 0;
 let _issuesAll = [];      // confirmed findings
 let _issuesFP = [];       // dismissed / AI-rejected false positives
 let _issuesActiveTab = 'all';  // 'all' | 'fp'
+let _issuesFilterText = '';    // free-text filter over title/host/path/parameter
+let _issuesFilterSev = '';     // '' = all, else a severity name
+
+// Read the filter controls and re-render. Wired to the Issues filter input/select.
+function filterIssues() {
+  const box = document.getElementById('issues-filter');
+  const sev = document.getElementById('issues-sev-filter');
+  _issuesFilterText = (box ? box.value : '').trim().toLowerCase();
+  _issuesFilterSev = sev ? sev.value : '';
+  _renderIssuesPage();
+}
+
+// Apply the active text + severity filter to an issues list.
+function _applyIssuesFilter(list) {
+  const text = _issuesFilterText;
+  const sev = _issuesFilterSev;
+  if (!text && !sev) return list;
+  return list.filter(({ host, f }) => {
+    if (sev && (f.severity || 'info').toLowerCase() !== sev) return false;
+    if (!text) return true;
+    const hay = [f.title, host, f._path, f.parameter].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(text);
+  });
+}
 
 function switchIssuesTab(tab) {
   _issuesActiveTab = tab;
@@ -75,13 +99,24 @@ function _renderIssuesPage() {
   const wrap = document.getElementById('issues-wrap');
   const pager = document.getElementById('issues-pager');
   const lbl = document.getElementById('issues-page-lbl');
-  const list = _issuesActiveTab === 'fp' ? _issuesFP : _issuesAll;
+  const fullList = _issuesActiveTab === 'fp' ? _issuesFP : _issuesAll;
+  const list = _applyIssuesFilter(fullList);
   const total = list.length;
 
+  // Match counter reflects how many pass the current filter, out of the total.
+  const matchLbl = document.getElementById('issues-match-count');
+  if (matchLbl) {
+    const filtering = _issuesFilterText || _issuesFilterSev;
+    matchLbl.textContent = filtering ? `${total} of ${fullList.length}` : '';
+  }
+
   if (!total) {
-    wrap.innerHTML = _issuesActiveTab === 'fp'
-      ? '<div class="empty">No false positives yet.\nDismissed findings appear here.</div>'
-      : '<div class="empty">No findings yet.\nScan requests to discover vulnerabilities.</div>';
+    const filtering = _issuesFilterText || _issuesFilterSev;
+    wrap.innerHTML = filtering
+      ? '<div class="empty">No findings match the current filter.</div>'
+      : (_issuesActiveTab === 'fp'
+          ? '<div class="empty">No false positives yet.\nDismissed findings appear here.</div>'
+          : '<div class="empty">No findings yet.\nScan requests to discover vulnerabilities.</div>');
     if (pager) pager.style.display = 'none';
     return;
   }

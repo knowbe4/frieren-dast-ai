@@ -115,6 +115,11 @@ validate:
 #
 # Requires Node.js + npm. First run 'make desktop-install', then 'make desktop'.
 #
+# On launch the app shows a graphical authorization prompt (you must attest you
+# are authorized to test your targets and accept full responsibility) before the
+# backend starts. Pass AUTHORIZED=1 to pre-authorize and skip that prompt — handy
+# for repeated dev runs and required for automation/CI.
+#
 # Port overrides pass through to the backend:
 #   make desktop PROXY_PORT=9090 DASHBOARD_PORT=9099
 
@@ -252,7 +257,8 @@ help:
 	@echo "Examples:"
 	@echo "  make proxy AUTHORIZED=1"
 	@echo "  make proxy AUTHORIZED=1 AUTH_URL=https://app.example.com/login USERNAME=admin PASSWORD=secret"
-	@echo "  make desktop AUTHORIZED=1"
+	@echo "  make desktop                (prompts for authorization on launch)"
+	@echo "  make desktop AUTHORIZED=1   (pre-authorized, skips the prompt)"
 	@echo "  make validate REPORT=report.md TARGET=https://app.example.com BROWSE=1"
 	@echo "  make validate REPORT=report.md TARGET=https://... COOKIE=\"name=val\""
 	@echo "  make validate REPORT=... TARGET=... BROWSE=1 SOURCE=/path/to/project"

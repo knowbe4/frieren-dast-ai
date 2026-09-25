@@ -497,10 +497,14 @@ function fmtBytes(n) {
 }
 
 // Returns a Promise<boolean> — resolves true on Confirm, false on Cancel.
+// Keyboard: Escape cancels, Enter confirms, Tab is trapped inside the dialog.
 function confirmDlg(message) {
   return new Promise(resolve => {
     const overlay = document.createElement('div');
-    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9999;display:flex;align-items:center;justify-content:center';
+    overlay.className = 'modal-overlay';
+    overlay.style.zIndex = '9999';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
     const box = document.createElement('div');
     box.style.cssText = 'background:var(--bg);border:1px solid var(--bdr);border-radius:4px;padding:20px 24px;min-width:300px;max-width:420px;display:flex;flex-direction:column;gap:16px;box-shadow:0 8px 32px rgba(0,0,0,.5)';
     box.innerHTML = `
@@ -511,11 +515,22 @@ function confirmDlg(message) {
       </div>`;
     overlay.appendChild(box);
     document.body.appendChild(overlay);
-    const cleanup = val => { overlay.remove(); resolve(val); };
-    box.querySelector('#_cdlg_cancel').onclick  = () => cleanup(false);
-    box.querySelector('#_cdlg_confirm').onclick = () => cleanup(true);
+    const cleanup = val => { document.removeEventListener('keydown', onKey, true); overlay.remove(); resolve(val); };
+    const cancelBtn = box.querySelector('#_cdlg_cancel');
+    const confirmBtn = box.querySelector('#_cdlg_confirm');
+    cancelBtn.onclick  = () => cleanup(false);
+    confirmBtn.onclick = () => cleanup(true);
     overlay.onclick = e => { if (e.target === overlay) cleanup(false); };
-    box.querySelector('#_cdlg_cancel').focus();
+    function onKey(e) {
+      if (e.key === 'Escape') { e.preventDefault(); cleanup(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); cleanup(true); }
+      else if (e.key === 'Tab') {  // trap focus between the two buttons
+        e.preventDefault();
+        (document.activeElement === confirmBtn ? cancelBtn : confirmBtn).focus();
+      }
+    }
+    document.addEventListener('keydown', onKey, true);
+    cancelBtn.focus();
   });
 }
 

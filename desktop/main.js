@@ -12,6 +12,7 @@ const { app, BrowserWindow, Tray, Menu, shell, dialog, nativeImage } = require("
 const { spawn } = require("child_process");
 const net = require("net");
 const path = require("path");
+const fs = require("fs");
 
 // Set the app name before anything else reads it. In dev (`npm start`) the
 // process runs inside Electron.app, so without this the macOS application menu
@@ -101,7 +102,11 @@ function startBackend() {
     "--proxy-port", String(PROXY_PORT),
     "--dashboard-port", String(DASHBOARD_PORT),
   ];
-  if (process.env.AUTHORIZED) args.push("--authorized");
+  // Always declare authorization to the backend. The launcher spawns it with
+  // stdin ignored (see stdio below), so the backend's own interactive prompt
+  // could never be answered. Operator consent is instead collected up front by
+  // confirmAuthorization() in the GUI, which must pass before we get here.
+  args.push("--authorized");
   backendProcess = spawn("uv", args, {
     cwd: REPO_ROOT,
     env: {
@@ -347,6 +352,11 @@ function rebuildTrayMenu() {
     },
     { type: "separator" },
     {
+      label: "Reset authorization prompt",
+      toolTip: "Ask for authorization again on the next launch",
+      click: () => resetAuthorizationConsent(),
+    },
+    {
       label: "Quit Frieren DAST-AI",
       click: () => {
         isQuitting = true;
@@ -358,12 +368,85 @@ function rebuildTrayMenu() {
 }
 
 // ---------------------------------------------------------------------------
+// Authorization gate
+// ---------------------------------------------------------------------------
+// Frieren performs active security testing, so the operator must attest they
+// are authorized before anything starts — the GUI equivalent of the CLI's
+// startup prompt. The backend can't prompt (its stdin is ignored), so we ask
+// here, in Electron, and only start the backend once consent is given.
+const CONSENT_FILE = path.join(app.getPath("userData"), "authorization-accepted");
+
+function authorizationPreconfirmed() {
+  // Non-interactive pre-authorization for automation/CI/e2e (AUTHORIZED=1), or a
+  // prior "Don't ask again on this machine" choice persisted to userData.
+  if (process.env.AUTHORIZED === "1" || process.env.AUTHORIZED === "true") return true;
+  try {
+    return fs.existsSync(CONSENT_FILE);
+  } catch (err) {
+    console.error("Could not read authorization consent file:", err.message);
+    return false;
+  }
+}
+
+// Returns true if the operator is authorized (pre-confirmed or confirmed in the
+// dialog), false if they declined — in which case the caller must not start the
+// backend.
+async function confirmAuthorization() {
+  if (authorizationPreconfirmed()) return true;
+  const { response, checkboxChecked } = await dialog.showMessageBox({
+    type: "warning",
+    title: "Authorization required",
+    message: "Frieren DAST-AI performs active security testing",
+    detail:
+      "This tool sends attack payloads to every target you route through it.\n\n" +
+      "By continuing you confirm that:\n" +
+      "  • You hold explicit written authorization to test every target you use\n" +
+      "    with this tool.\n" +
+      "  • You accept full responsibility and liability for all testing performed.\n\n" +
+      "Only continue if you are fully authorized.",
+    buttons: ["Cancel", "I am authorized — continue"],
+    defaultId: 1,
+    cancelId: 0,
+    noLink: true,
+    checkboxLabel: "Don't ask again on this machine",
+    checkboxChecked: false,
+    icon: appIcon.isEmpty() ? undefined : appIcon,
+  });
+  const confirmed = response === 1;
+  if (confirmed && checkboxChecked) {
+    try {
+      fs.writeFileSync(CONSENT_FILE, new Date().toISOString() + "\n");
+    } catch (err) {
+      // Best effort — failing to persist just means we ask again next launch.
+      console.error("Could not persist authorization consent:", err.message);
+    }
+  }
+  return confirmed;
+}
+
+function resetAuthorizationConsent() {
+  try {
+    if (fs.existsSync(CONSENT_FILE)) fs.unlinkSync(CONSENT_FILE);
+  } catch (err) {
+    console.error("Could not reset authorization consent:", err.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(async () => {
   // macOS dock icon (packaged builds use the .icns; this covers `npm start` dev runs).
   if (process.platform === "darwin" && app.dock && !appIcon.isEmpty()) {
     app.dock.setIcon(appIcon);
+  }
+
+  // Gate on operator authorization before starting anything. If declined, quit
+  // without ever spawning the backend or opening a window.
+  if (!(await confirmAuthorization())) {
+    isQuitting = true;
+    app.quit();
+    return;
   }
 
   // Resolve free ports BEFORE createTray/createWindow/startBackend, all of

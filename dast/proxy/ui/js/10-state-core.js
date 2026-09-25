@@ -11,6 +11,8 @@ let selSmHost = null;
 let selSmId   = null;
 let smDtab    = 'rr';
 let smDetail  = null;
+let smSortCol = null;   // null = insertion order; else 'method'|'path'|'status'|'ms'
+let smSortDir = 'asc';
 let sortCol   = null;   // null = newest-first (insertion order)
 let sortDir   = 'desc'; // 'asc' | 'desc'
 
@@ -852,6 +854,59 @@ function renderSmContents(host) {
       <td class="cs ${sc}">${e.status || ''}</td>
       <td class="cz">${e.duration_ms != null ? e.duration_ms.toFixed(0) : ''}</td>`;
   }
+  // Reorder the DOM rows (appendChild moves existing nodes, so listeners and
+  // selection state are preserved). With no active sort we fall back to the
+  // host's insertion order, matching the HTTP-history table's "sort off" state.
+  const rows = [...tbody.querySelectorAll('tr')];
+  if (smSortCol) {
+    rows.sort((ra, rb) => {
+      const va = _smSortValue(entries[ra.id.replace('smrow-', '')], smSortCol);
+      const vb = _smSortValue(entries[rb.id.replace('smrow-', '')], smSortCol);
+      if (va < vb) return smSortDir === 'asc' ? -1 : 1;
+      if (va > vb) return smSortDir === 'asc' ? 1 : -1;
+      return 0;
+    });
+  } else {
+    const seq = new Map(h.ids.map((id, i) => [id, i]));
+    rows.sort((ra, rb) =>
+      (seq.get(ra.id.replace('smrow-', '')) ?? 0) - (seq.get(rb.id.replace('smrow-', '')) ?? 0));
+  }
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+function _smSortValue(e, col) {
+  if (!e) return col === 'status' || col === 'ms' ? -1 : '';
+  switch (col) {
+    case 'method': return (e.method || '').toLowerCase();
+    case 'path':   return (e.path || '').toLowerCase();
+    case 'status': return e.status || 0;
+    case 'ms':     return e.duration_ms != null ? e.duration_ms : -1;
+  }
+  return '';
+}
+
+// Header click: asc -> desc -> off, mirroring the HTTP-history table.
+function setSmSort(col) {
+  if (smSortCol === col) {
+    if (smSortDir === 'asc') { smSortDir = 'desc'; }
+    else { smSortCol = null; smSortDir = 'asc'; }
+  } else {
+    smSortCol = col; smSortDir = 'asc';
+  }
+  ['method', 'path', 'status', 'ms'].forEach(c => {
+    const th = document.getElementById('smth-' + c);
+    if (!th) return;
+    th.classList.toggle('sort-on', smSortCol === c);
+    const existing = th.querySelector('.sort-arrow');
+    if (existing) existing.remove();
+    if (smSortCol === c) {
+      const arrow = document.createElement('span');
+      arrow.className = 'sort-arrow';
+      arrow.textContent = smSortDir === 'asc' ? '▲' : '▼';
+      th.appendChild(arrow);
+    }
+  });
+  if (selSmHost) renderSmContents(selSmHost);
 }
 
 function selectSmRow(id) {

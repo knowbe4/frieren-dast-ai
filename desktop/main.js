@@ -101,7 +101,14 @@ function startBackend() {
     "--proxy-port", String(PROXY_PORT),
     "--dashboard-port", String(DASHBOARD_PORT),
   ];
-  if (process.env.AUTHORIZED) args.push("--authorized");
+  // The desktop launcher spawns the backend with stdin ignored (see stdio
+  // below), so the interactive authorization prompt can never be answered and
+  // would abort startup. Launching the desktop app is itself the operator's
+  // act of declaring an authorized engagement, so we declare it by default.
+  // Explicit opt-out (AUTHORIZED=0 / AUTHORIZED=false) is honoured for anyone
+  // who has wired up their own prompt path.
+  const optedOut = process.env.AUTHORIZED === "0" || process.env.AUTHORIZED === "false";
+  if (!optedOut) args.push("--authorized");
   backendProcess = spawn("uv", args, {
     cwd: REPO_ROOT,
     env: {

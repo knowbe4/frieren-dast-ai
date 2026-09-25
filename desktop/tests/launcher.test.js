@@ -73,6 +73,9 @@ test("desktop launcher spawns the real backend and loads the dashboard", { skip:
       ...process.env,
       PROXY_PORT: String(PROXY_PORT),
       DASHBOARD_PORT: String(DASHBOARD_PORT),
+      // Pre-authorize non-interactively so the startup authorization dialog is
+      // skipped — there is no operator to click through it in the e2e.
+      AUTHORIZED: "1",
     },
     timeout: 60_000,
   });

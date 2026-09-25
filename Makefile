@@ -115,11 +115,10 @@ validate:
 #
 # Requires Node.js + npm. First run 'make desktop-install', then 'make desktop'.
 #
-# Authorization is declared automatically (AUTHORIZED defaults to 1): the
-# desktop launcher spawns the backend with stdin ignored, so the interactive
-# authorization prompt can never be answered and would otherwise abort startup.
-# By running the desktop app you attest you are authorized to test your targets.
-# Override with AUTHORIZED= only if you have wired up your own prompt path.
+# On launch the app shows a graphical authorization prompt (you must attest you
+# are authorized to test your targets and accept full responsibility) before the
+# backend starts. Pass AUTHORIZED=1 to pre-authorize and skip that prompt — handy
+# for repeated dev runs and required for automation/CI.
 #
 # Port overrides pass through to the backend:
 #   make desktop PROXY_PORT=9090 DASHBOARD_PORT=9099
@@ -144,7 +143,7 @@ desktop:
 	cd $(DESKTOP_DIR) && \
 		$(if $(PROXY_PORT),PROXY_PORT=$(PROXY_PORT)) \
 		$(if $(DASHBOARD_PORT),DASHBOARD_PORT=$(DASHBOARD_PORT)) \
-		AUTHORIZED=$(or $(AUTHORIZED),1) \
+		$(if $(AUTHORIZED),AUTHORIZED=$(AUTHORIZED)) \
 		npm start
 
 desktop-test:
@@ -258,7 +257,8 @@ help:
 	@echo "Examples:"
 	@echo "  make proxy AUTHORIZED=1"
 	@echo "  make proxy AUTHORIZED=1 AUTH_URL=https://app.example.com/login USERNAME=admin PASSWORD=secret"
-	@echo "  make desktop                (authorization declared automatically)"
+	@echo "  make desktop                (prompts for authorization on launch)"
+	@echo "  make desktop AUTHORIZED=1   (pre-authorized, skips the prompt)"
 	@echo "  make validate REPORT=report.md TARGET=https://app.example.com BROWSE=1"
 	@echo "  make validate REPORT=report.md TARGET=https://... COOKIE=\"name=val\""
 	@echo "  make validate REPORT=... TARGET=... BROWSE=1 SOURCE=/path/to/project"

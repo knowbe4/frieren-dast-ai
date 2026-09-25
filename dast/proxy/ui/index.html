@@ -614,10 +614,10 @@
         <div style="flex:1;overflow-y:auto;border-bottom:3px solid var(--bdr);min-height:100px;">
           <table>
             <thead><tr>
-              <th class="cm">Method</th>
-              <th>Path</th>
-              <th class="cs">St</th>
-              <th class="cz">ms</th>
+              <th class="cm sortable" id="smth-method" onclick="setSmSort('method')">Method</th>
+              <th class="sortable"    id="smth-path"   onclick="setSmSort('path')">Path</th>
+              <th class="cs sortable" id="smth-status" onclick="setSmSort('status')">St</th>
+              <th class="cz sortable" id="smth-ms"     onclick="setSmSort('ms')">ms</th>
             </tr></thead>
             <tbody id="sm-tbody"></tbody>
           </table>

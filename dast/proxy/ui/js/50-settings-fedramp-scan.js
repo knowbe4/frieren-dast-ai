@@ -83,7 +83,7 @@ async function submitAddScopeRule(kind) {
     file:     document.getElementById(`inp-${kind}-file`).value.trim(),
     kind:     kind,
   };
-  if (!rule.host) { alert('Host is required'); return; }
+  if (!rule.host) { showToast('Host is required', true); return; }
   await fetch('/api/settings/scope', {
     method: 'POST',
     headers: {'content-type': 'application/json'},
@@ -347,7 +347,7 @@ async function fedrampExport() {
 }
 
 async function fedrampReset() {
-  if (!confirm('Reset all FedRAMP checklist progress?')) return;
+  if (!(await confirmDlg('Reset all FedRAMP checklist progress?'))) return;
   await fetch('/api/fedramp/reset', {method:'POST'});
   fedrampLoad();
   showToast('Assessment reset');

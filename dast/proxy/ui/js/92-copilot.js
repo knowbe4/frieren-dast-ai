@@ -396,17 +396,17 @@ async function cpRefreshSession(sid, btnEl) {
     const d = await r.json();
     if (!r.ok || !d.ok) {
       if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
-      alert(d.error || 'Session refresh failed');
+      showToast(d.error || 'Session refresh failed', true);
       return;
     }
     const msg = d.cookies_refreshed > 0
       ? `Session refreshed — ${d.cookies_refreshed} cookie(s) updated for: ${(d.hosts_updated || []).join(', ')}`
       : 'No cookies found in proxy jar yet. Log in through the browser first, then try again.';
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
-    alert(msg);
+    showToast(msg, d.cookies_refreshed === 0);
   } catch (e) {
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = 'Refresh Session'; }
-    alert('Session refresh failed: ' + e.message);
+    showToast('Session refresh failed: ' + e.message, true);
   }
 }
 

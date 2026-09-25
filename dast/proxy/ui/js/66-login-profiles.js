@@ -179,9 +179,9 @@ function loginActivateProfile() {
     }).catch(e => _loginStatus('Activate failed: ' + e, true));
 }
 
-function loginDeleteProfile() {
+async function loginDeleteProfile() {
   if (!_loginCurrentSlug) return;
-  if (!confirm('Delete this login profile?')) return;
+  if (!(await confirmDlg('Delete this login profile?'))) return;
   fetch(`/api/profiles/${_loginCurrentSlug}`, {method: 'DELETE'})
     .then(r => r.json()).then(() => {
       _loginCurrentSlug = null;

@@ -65,7 +65,7 @@ async function scanBrowseSession() {
   const ids = Object.values(entries)
     .filter(e => e.browse_session_id === activeBrowseSessionId && !e.queued_for_scan)
     .map(e => e.id);
-  if (!ids.length) { alert('No unscanned requests in this session.'); return; }
+  if (!ids.length) { showToast('No unscanned requests in this session.', true); return; }
   await fetch('/api/scan', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

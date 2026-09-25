@@ -35,7 +35,11 @@ function _mcpApprovalEnsureModal() {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({decision}),
-    }).catch(() => {}).finally(() => { overlay.style.display = 'none'; });
+    }).catch((err) => {
+      // A silent failure here would leave the user thinking their decision
+      // registered when the backend never received it — surface it.
+      showToast('Failed to send MCP approval decision: ' + (err && err.message || err), true);
+    }).finally(() => { overlay.style.display = 'none'; });
   };
   overlay.querySelector('#mcp-approval-deny').onclick = () => send('deny');
   overlay.querySelector('#mcp-approval-once').onclick = () => send('allow_once');

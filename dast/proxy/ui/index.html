@@ -83,6 +83,11 @@
   </div>
 </div>
 
+<!-- Persistent copilot-paused banner. Hidden until the copilot broadcasts a
+     pause event over /ws/copilot; visible on every tab so the operator never
+     misses a run waiting for input. Clicking it jumps to the Copilot tab. -->
+<div id="cp-pause-banner" style="display:none" onclick="cpBannerGoto()" role="button" tabindex="0"></div>
+
 <!-- hidden file inputs for OS file picker -->
 <input type="file" id="session-file-input"  accept=".json" style="display:none" onchange="onSessionFileSelected(event)">
 <input type="file" id="settings-file-input" accept=".json" style="display:none" onchange="onSettingsFileSelected(event)">

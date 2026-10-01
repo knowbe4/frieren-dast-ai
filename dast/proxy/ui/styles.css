@@ -202,6 +202,20 @@ tbody tr.r-c td.c0 { border-left: 2px solid #7b9fff; }
 .src-copilot  { background: #2a1a30; color: #e39ff6; }
 .src-oos      { background: #28201a; color: #888; }
 tbody tr.r-oos td { opacity: .55; }
+/* Persistent copilot-paused banner (below the main tab bar, all tabs) */
+#cp-pause-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 14px; font-size: 12px; font-weight: 600;
+  background: #3a2e12; color: #ffd666; cursor: pointer;
+  border-bottom: 1px solid #5a4a1e;
+  animation: cp-banner-pulse 2s ease-in-out infinite;
+}
+#cp-pause-banner:hover { background: #46380f; }
+#cp-pause-banner .cp-banner-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #ffd666; flex-shrink: 0;
+}
+#cp-pause-banner .cp-banner-hint { margin-left: auto; font-weight: 400; opacity: .8; font-size: 11px; }
+@keyframes cp-banner-pulse { 0%,100% { opacity: 1; } 50% { opacity: .82; } }
 .src-imported { background: #1a0d30; color: #ce93d8; }
 /* Repeater drag handles */
 .rep-vdrag {

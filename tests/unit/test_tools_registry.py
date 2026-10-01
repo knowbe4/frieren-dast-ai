@@ -923,6 +923,35 @@ async def test_crawl_enqueues_and_returns_new_endpoints():
     assert result["discovered_count"] == 2
 
 
+@pytest.mark.asyncio
+async def test_crawl_session_safe_caps_click_budget():
+    import asyncio
+
+    from dast.tools import crawl_tools
+
+    store = _CrawlStore([], [])
+    queue: asyncio.Queue = asyncio.Queue()
+    jobs = []
+
+    async def worker():
+        job = await queue.get()
+        jobs.append(job)
+        store.mark_crawled()
+        job["done_event"].set()
+
+    ctx = ToolContext(settings=_Scope(True), store=store, crawl_queue=queue, session_safe=True)
+    worker_task = asyncio.create_task(worker())
+    result = await run_tool(ctx, "crawl", {
+        "url": "https://api.acme-corp.com/", "max_clicks": 300,
+        "extra_seeds": ["https://api.acme-corp.com/other"],
+    })
+    await worker_task
+
+    assert result["ok"] is True
+    assert jobs[0]["max_clicks"] == crawl_tools._SESSION_SAFE_MAX_CLICKS
+    assert jobs[0]["extra_seeds"] is None  # extra seeds dropped in session-safe mode
+
+
 # ── run_scan (orchestration primitive over the scan pipeline) ───────────────────
 
 class _ScanEntry:

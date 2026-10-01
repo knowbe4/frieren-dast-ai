@@ -79,6 +79,7 @@ async function cpStartAutonomous() {
       body: JSON.stringify({
         objective: objective.trim(), focus_hosts,
         profile_slug: profile_slug || undefined, budget,
+        session_safe: !!(document.getElementById('cp-auto-session-safe') || {}).checked,
       }),
     });
     const d = await r.json();

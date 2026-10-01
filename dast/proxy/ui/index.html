@@ -2165,6 +2165,7 @@
               <label>Minutes <input id="cp-auto-mins" type="number" min="1" value="30" style="width:56px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
               <label>Stuck turns <input id="cp-auto-stuck" type="number" min="1" value="3" style="width:48px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
               <label><input id="cp-auto-escalate" type="checkbox"> Ask before out-of-scope</label>
+              <label title="For targets with strict/single-concurrent sessions (e.g. ASP.NET). Skips ambient auto-scan and caps crawl volume so the shared login cookie isn't invalidated."><input id="cp-auto-session-safe" type="checkbox"> Session-safe (strict sessions)</label>
             </div>
           </details>
           <div style="display:flex;gap:8px;align-items:center">

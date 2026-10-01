@@ -453,6 +453,7 @@ class CopilotService:
             scan_queue_state=getattr(ctx, "scan_queue_state", None),
             crawl_queue=getattr(ctx, "crawl_queue", None),
             source_label="copilot",
+            session_safe=bool((session.get("autonomous") or {}).get("session_safe", False)),
         )
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,
@@ -527,6 +528,7 @@ class CopilotService:
         profile_slug: Optional[str] = None,
         budget: Optional[dict] = None,
         auto_ai_mode: bool = True,
+        session_safe: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -552,6 +554,7 @@ class CopilotService:
             "config": cfg,
             "hosts": hosts,
             "profile": profile_slug or None,
+            "session_safe": session_safe,
             "stop_event": asyncio.Event(),
             "pause_gate": pause_gate,
             "paused_at": None,
@@ -566,6 +569,14 @@ class CopilotService:
 
         # Ambient auto-scan: with AI mode on, every in-scope entry the copilot
         # crawls/proxies is auto-queued through the scan pipeline as well.
+        # Session-safe mode suppresses this — the param-mining/agent probes it
+        # fans out share the one logged-in cookie and trip concurrent-session
+        # detection on strict targets (ASP.NET single-session), logging the run
+        # (and the operator's browser) out mid-objective.
+        if session_safe and auto_ai_mode:
+            logger.info("session-safe mode: skipping ambient auto-scan (ai_mode)",
+                        session_id=sid)
+            auto_ai_mode = False
         if auto_ai_mode and self._ctx.store is not None:
             try:
                 # Remember the operator's prior AI-mode setting so it is restored

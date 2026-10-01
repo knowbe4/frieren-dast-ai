@@ -47,6 +47,11 @@ class ToolContext:
     # set, send-style tools stamp the x-dast-source header so the operator can
     # tell copilot-generated traffic apart from manual browsing in the history.
     source_label: Optional[str] = None
+    # Session-safe mode: the target enforces strict/single-concurrent sessions,
+    # so heavy automated traffic (ambient auto-scan, large crawls) would trip
+    # concurrent-session detection and log the shared cookie out. Tools consult
+    # this to throttle their own volume (e.g. crawl caps its click budget).
+    session_safe: bool = False
 
     def get_settings(self) -> Any:
         """Return the scope settings, building a disk-backed default on first use."""

@@ -479,7 +479,9 @@ class ProxyRunner:
                     await _active.stop()
 
                 def on_stop():
+                    nonlocal _active
                     self._store.active_browse_session_id = None
+                    _active = None
 
                 session = BrowseSession(
                     proxy_port=self._proxy_port,

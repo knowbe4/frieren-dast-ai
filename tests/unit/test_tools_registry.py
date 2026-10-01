@@ -304,6 +304,60 @@ async def test_get_history_reads_store():
     assert result["entries"][0]["host"] == "a.acme-corp.com"
 
 
+class _HistEntry:
+    def __init__(self, eid, method, path, source):
+        self._d = {"id": eid, "method": method, "path": path, "host": "h.acme-corp.com",
+                   "url": f"https://h.acme-corp.com{path}", "source": source}
+    def to_dict(self, include_bodies=False):
+        d = dict(self._d)
+        if include_bodies:
+            d["request_body"] = "x=1"
+        return d
+
+
+class _HistStore:
+    def __init__(self):
+        self._entries = [
+            _HistEntry("1", "GET",  "/a", "proxy"),
+            _HistEntry("2", "POST", "/compose/send", "copilot"),
+            _HistEntry("3", "GET",  "/probe", "scan"),
+        ]
+    def all_entries(self):
+        return list(self._entries)
+    def get_entry(self, eid):
+        return next((e for e in self._entries if e._d["id"] == eid), None)
+
+
+@pytest.mark.asyncio
+async def test_get_history_method_path_source_filters():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    result = await run_tool(ctx, "get_history",
+                            {"method": "post", "path": "/compose", "source": "copilot"})
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["entries"][0]["id"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_get_history_newest_first_ordering():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    newest = await run_tool(ctx, "get_history", {"limit": 1})
+    assert newest["entries"][0]["id"] == "3"  # last appended = most recent
+    oldest = await run_tool(ctx, "get_history", {"limit": 1, "newest_first": False})
+    assert oldest["entries"][0]["id"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_get_history_entry_id_lookup():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    result = await run_tool(ctx, "get_history", {"entry_id": "2"})
+    assert result["ok"] is True
+    assert result["entry"]["id"] == "2"
+    assert result["entry"]["request_body"] == "x=1"  # full detail with bodies
+    missing = await run_tool(ctx, "get_history", {"entry_id": "999"})
+    assert missing["ok"] is False
+
+
 # ── recon tools delegate to the scanners (mocked) ───────────────────────────────
 
 @pytest.mark.asyncio

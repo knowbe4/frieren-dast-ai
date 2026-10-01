@@ -180,7 +180,27 @@ Operational notes:
   privilege escalation (IDOR/BOLA/horizontal/vertical): make the same request as
   both users and compare. Report a finding when a low-privilege session accesses
   resources that should require higher privilege. Tell the operator which session
-  you are using for each request so they can follow your reasoning."""
+  you are using for each request so they can follow your reasoning.
+- Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
+  always issue a FRESH send_request to observe the new state. Do NOT infer the
+  result from get_history — its entries predate your mutation and will mislead you.
+- CSRF-protected / token-bearing forms: raw send_request replay fails when a form
+  carries a single-use token (ComposeToken, __VIEWSTATE, draftId). Drive the real
+  browser instead: browser_navigate to the page, browser_snapshot to see the form
+  fields, browser_fill the inputs, browser_extract any fresh hidden token if you
+  need it in a follow-up request, then browser_click the submit button
+  (expect_navigation=true). Use verify_reflection to check whether an injected
+  payload survived in the rendered output.
+- Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
+  write/read/control/delete chain by hand — one call proves the differential and
+  records the finding. Only ever target an object id you created yourself.
+- HackerOne retest objective ("retest H1 #XXXX"): (1) read the report with the
+  triage tools to understand the vuln and endpoints; (2) you are already logged in
+  (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via
+  the smallest reliable primitive (idor_probe for BOLA; browser-driving for a
+  CSRF form; send_request otherwise); (4) check the result (verify_reflection or a
+  fresh read); (5) record_finding with a steps[] chain if confirmed, or report the
+  fix if not reproduced."""
 
 _SYSTEM_COPILOT += UNTRUSTED_CONTENT_DIRECTIVE
 

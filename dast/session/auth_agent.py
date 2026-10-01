@@ -42,6 +42,27 @@ class AuthAgent:
         'button:has-text("Sign in")',
         'button:has-text("Login")',
     ]
+    # A landing page may show only a "Sign in" button that redirects to the real
+    # IdP (SSO/ADFS). Clicked ONLY when no username field is found on the page.
+    SSO_ENTRY_SELECTORS = [
+        '#signin-btn',
+        'a:has-text("Sign in")',
+        'button:has-text("Sign in")',
+        'a:has-text("Sign In")',
+        'a:has-text("Log in")',
+        'a:has-text("Continue")',
+        'a:has-text("Single sign-on")',
+        'button:has-text("SSO")',
+    ]
+    # Staged logins (e.g. ASP.NET WebForms) ask for the email first, then reveal
+    # the password after a "Continue"/"Next" postback.
+    CONTINUE_SELECTORS = [
+        '#btnContinue',
+        'input[value="Continue"]',
+        'button:has-text("Continue")',
+        'button:has-text("Next")',
+        'input[value="Next"]',
+    ]
 
     def __init__(
         self,
@@ -96,14 +117,67 @@ class AuthAgent:
 
     async def _fill_credentials(self, page: Page) -> bool:
         username_input = await self._find_element(page, self.LOGIN_SELECTORS)
+
+        # No username field on the landing page — it may be behind an SSO "Sign in"
+        # button that redirects to the IdP. Click it once and re-detect.
+        if not username_input and await self._click_sso_entry(page):
+            try:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            except Exception:
+                pass
+            username_input = await self._find_element(page, self.LOGIN_SELECTORS)
+
+        if not username_input:
+            return False
+        await username_input.fill(self._username)
+
         password_input = await self._find_element(page, self.PASSWORD_SELECTORS)
 
-        if not username_input or not password_input:
-            return False
+        # Staged flow: the password field appears only after submitting the email.
+        if not password_input:
+            await self._advance_stage(page, username_input)
+            password_input = await self._find_element(page, self.PASSWORD_SELECTORS)
 
-        await username_input.fill(self._username)
+        if not password_input:
+            return False
         await password_input.fill(self._password)
         return True
+
+    async def _click_sso_entry(self, page: Page) -> bool:
+        """Click a sign-in/SSO entry control that redirects to the real IdP."""
+        entry = await self._find_element(page, self.SSO_ENTRY_SELECTORS)
+        if not entry:
+            return False
+        logger.info("Clicking SSO sign-in entry to reach the IdP login form")
+        try:
+            await entry.click()
+            return True
+        except Exception as exc:
+            logger.warning("SSO entry click failed", error=str(exc))
+            return False
+
+    async def _advance_stage(self, page: Page, username_input) -> None:
+        """Submit the username-only stage to reveal the password field (staged
+        logins). Clicks a Continue/Next control, else presses Enter."""
+        cont = await self._find_element(page, self.CONTINUE_SELECTORS)
+        try:
+            if cont:
+                await cont.click()
+            else:
+                await username_input.press("Enter")
+        except Exception as exc:
+            logger.warning("Could not advance staged login", error=str(exc))
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
+        # Postback may reveal the password in-place without a full navigation.
+        try:
+            await page.wait_for_selector(
+                ", ".join(self.PASSWORD_SELECTORS) + ":visible", timeout=8_000
+            )
+        except Exception:
+            pass
 
     async def _submit_and_wait(self, page: Page) -> None:
         submit = await self._find_element(page, self.SUBMIT_SELECTORS)

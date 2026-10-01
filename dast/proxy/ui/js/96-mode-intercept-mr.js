@@ -397,9 +397,23 @@ async function toggleMrRule(idx, enabled) {
   await loadMatchReplace();
 }
 
+// Scroll a Proxy Settings section into view from the sticky jump-nav.
+function settingsJump(id) {
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 function _renderMrTable() {
   const tbody = document.getElementById('tbody-mr');
   const empty = document.getElementById('empty-mr');
+  // Reflect active-rule count on the jump-nav badge so an operator sees at a
+  // glance that match & replace is live even when the section is scrolled away.
+  const badge = document.getElementById('mr-active-badge');
+  if (badge) {
+    const active = _mrRules.filter(r => r.enabled).length;
+    badge.textContent = String(active);
+    badge.style.display = active > 0 ? '' : 'none';
+  }
   if (!tbody) return;
   if (!_mrRules.length) {
     tbody.innerHTML = '';

@@ -349,8 +349,17 @@
           </select>
         </div>
 
+        <!-- Section jump-nav: every settings section is listed here so nothing is
+             hidden below the fold (Match & Replace used to be easy to miss). -->
+        <div id="settings-nav">
+          <button class="settings-nav-link" onclick="settingsJump('sec-scope')">Scope</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-bypass')">Bypass &amp; Extensions</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-matchreplace')">Match &amp; Replace<span id="mr-active-badge" class="settings-nav-badge" style="display:none">0</span></button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-setup')">Setup</button>
+        </div>
+
         <!-- Include in scope -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div id="sec-scope" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
           <h3 style="margin:0">Include in scope</h3>
           <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('include')">+ Add rule</button>
         </div>
@@ -402,6 +411,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:14px">
 
         <!-- Bypass + Hidden Ext side by side -->
+        <h3 id="sec-bypass" style="scroll-margin-top:8px;margin:0 0 8px">Bypass &amp; Extensions</h3>
         <div style="display:flex;gap:20px">
           <div style="flex:1;min-width:0">
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
@@ -433,7 +443,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin:14px 0">
 
         <!-- Match & Replace -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div id="sec-matchreplace" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
           <h3 style="margin:0">Match and Replace</h3>
           <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddMrForm()">+ Add rule</button>
         </div>
@@ -500,7 +510,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
 
         <!-- ── Setup (formerly its own top-level tab) ── -->
-        <h2>Setup</h2>
+        <h2 id="sec-setup" style="scroll-margin-top:8px">Setup</h2>
 
         <h3>1. Configure browser proxy</h3>
         <p style="color:var(--txt2);font-size:11px;margin:0 0 8px">

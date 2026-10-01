@@ -460,14 +460,16 @@ function switchProxySub(sub) {
   const isIntercept = sub === 'intercept';
   const isSitemap   = sub === 'sitemap';
   const isSettings  = sub === 'psettings';
-  document.getElementById('proxy-history').style.display   = isHistory   ? 'flex' : 'none';
-  document.getElementById('proxy-intercept').style.display = isIntercept ? 'flex' : 'none';
-  document.getElementById('proxy-sitemap').style.display   = isSitemap   ? 'flex' : 'none';
-  document.getElementById('proxy-settings').style.display  = isSettings  ? 'flex' : 'none';
-  document.getElementById('st-history').classList.toggle('on',   isHistory);
-  document.getElementById('st-intercept').classList.toggle('on', isIntercept);
-  document.getElementById('st-sitemap').classList.toggle('on',   isSitemap);
-  document.getElementById('st-psettings').classList.toggle('on', isSettings);
+  const setDisp = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? 'flex' : 'none'; };
+  const setOn   = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', on); };
+  setDisp('proxy-history', isHistory);
+  setDisp('proxy-intercept', isIntercept);
+  setDisp('proxy-sitemap', isSitemap);
+  setDisp('proxy-settings', isSettings);
+  setOn('st-history', isHistory);
+  setOn('st-intercept', isIntercept);
+  setOn('st-sitemap', isSitemap);
+  setOn('st-psettings', isSettings);
   if (isSettings) { loadSettings(); loadScanConfig(); loadMatchReplace(); updateSetupPort(); updateSetupAiStatus(); }
   if (isIntercept) { interceptLoadStatus(); }
   if (isSitemap) renderSmHostList();

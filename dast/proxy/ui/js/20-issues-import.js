@@ -251,7 +251,7 @@ function _buildIssueCard(host, f, globalIdx) {
              <div style="font-size:10.5px;color:var(--txt);line-height:1.5">${esc(f.reasoning)}</div>
            </div>`
         : `<div style="margin-top:6px;padding:5px 8px;background:#1a1a2a;border-left:3px solid var(--acc);border-radius:2px">
-             <div style="font-size:9px;font-weight:600;color:var(--acc);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">AI validator reasoning</div>
+             <div style="font-size:9px;font-weight:600;color:var(--acc);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">${_vbyList.includes('ai') ? 'AI validator reasoning' : 'Reasoning'}</div>
              <div style="font-size:10.5px;color:var(--txt);line-height:1.5">${esc(f.reasoning)}</div>
            </div>`)
     : '';
@@ -301,7 +301,11 @@ function _buildIssueCard(host, f, globalIdx) {
   const hostBadge = `<span style="font-size:9px;color:var(--txt2);margin-left:6px">${esc(host)}</span>`;
   const hasAiValidation = _vbyList.includes('ai');
   const fidx = f._fidx ?? globalIdx;
-  const validateBtn = !hasAiValidation
+  // Only offer AI validation for findings that are NOT already confirmed and have
+  // not been AI-validated. A finding already confirmed (by the copilot, operator,
+  // browser, OOB, etc.) does not need re-validation — showing the button there
+  // was confusing.
+  const validateBtn = (!hasAiValidation && !f.confirmed && !f.dismissed)
     ? `<button class="tbtn" id="vbtn-${uid}" style="font-size:9px;padding:1px 7px;flex-shrink:0;color:var(--acc);border-color:var(--acc)"
         title="Ask the Red-Team Validator (LLM) to confirm or reject this finding"
         onclick="event.stopPropagation();validateFindingWithAI('${entryId}',${fidx},'${uid}')">Validate with AI</button>`
@@ -436,8 +440,8 @@ function toggleIssue(uid, entryId) {
 }
 
 function goToEntry(id) {
-  switchProxySub('history');
   switchMain('proxy');
+  switchProxySub('history');
   selectRow(id);
   setDTab('findings');
   setTimeout(() => document.getElementById('row-' + id)?.scrollIntoView({ block: 'nearest' }), 50);

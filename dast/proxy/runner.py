@@ -275,7 +275,16 @@ class ProxyRunner:
                 if ok:
                     state = await ctx.storage_state()
                     await self._pool.apply_auth_state(state)
-                    logger.info("Auth state applied to proxy scan pool")
+                    # Seed the shared cookie jar too, so the copilot's send_request
+                    # and the crawler (which read the store jar, not the scan pool)
+                    # are authenticated — not just the scanner's browser contexts.
+                    try:
+                        seeded = self._store.import_playwright_cookies(state.get("cookies", []))
+                        logger.info("Auth state applied to proxy scan pool and cookie jar",
+                                    jar_cookies=seeded)
+                    except Exception as exc:
+                        logger.warning("Could not seed cookie jar from login", error=str(exc))
+                        logger.info("Auth state applied to proxy scan pool")
                 else:
                     logger.warning("Proxy auth failed — scanning unauthenticated")
 

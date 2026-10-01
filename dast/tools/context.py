@@ -43,6 +43,10 @@ class ToolContext:
     scan_queue: Optional[Any] = None
     scan_queue_state: Optional[Any] = None
     crawl_queue: Optional[Any] = None
+    # Proxy-history source tag for request-sending tools (e.g. "copilot"). When
+    # set, send-style tools stamp the x-dast-source header so the operator can
+    # tell copilot-generated traffic apart from manual browsing in the history.
+    source_label: Optional[str] = None
 
     def get_settings(self) -> Any:
         """Return the scope settings, building a disk-backed default on first use."""

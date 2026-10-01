@@ -452,6 +452,7 @@ class CopilotService:
             scan_queue=getattr(ctx, "scan_queue", None),
             scan_queue_state=getattr(ctx, "scan_queue_state", None),
             crawl_queue=getattr(ctx, "crawl_queue", None),
+            source_label="copilot",
         )
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,

@@ -199,6 +199,7 @@ tbody tr.r-c td.c0 { border-left: 2px solid #7b9fff; }
 .src-crawler  { background: #1a1a3d; color: #7b9fff; }
 .src-agent    { background: #1a1a40; color: #9b9bef; }
 .src-scan     { background: #1a2a1a; color: #7ec87e; }
+.src-copilot  { background: #2a1a30; color: #e39ff6; }
 .src-oos      { background: #28201a; color: #888; }
 tbody tr.r-oos td { opacity: .55; }
 .src-imported { background: #1a0d30; color: #ce93d8; }

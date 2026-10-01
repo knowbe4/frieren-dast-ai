@@ -459,21 +459,17 @@ function switchProxySub(sub) {
   const isHistory   = sub === 'history';
   const isIntercept = sub === 'intercept';
   const isSitemap   = sub === 'sitemap';
-  const isIssues    = sub === 'issues';
   const isSettings  = sub === 'psettings';
   document.getElementById('proxy-history').style.display   = isHistory   ? 'flex' : 'none';
   document.getElementById('proxy-intercept').style.display = isIntercept ? 'flex' : 'none';
   document.getElementById('proxy-sitemap').style.display   = isSitemap   ? 'flex' : 'none';
-  document.getElementById('proxy-issues').style.display    = isIssues    ? 'flex' : 'none';
   document.getElementById('proxy-settings').style.display  = isSettings  ? 'flex' : 'none';
   document.getElementById('st-history').classList.toggle('on',   isHistory);
   document.getElementById('st-intercept').classList.toggle('on', isIntercept);
   document.getElementById('st-sitemap').classList.toggle('on',   isSitemap);
-  document.getElementById('st-issues').classList.toggle('on',    isIssues);
   document.getElementById('st-psettings').classList.toggle('on', isSettings);
   if (isSettings) { loadSettings(); loadScanConfig(); loadMatchReplace(); updateSetupPort(); updateSetupAiStatus(); }
   if (isIntercept) { interceptLoadStatus(); }
   if (isSitemap) renderSmHostList();
-  if (isIssues) renderAllIssues();
 }
 

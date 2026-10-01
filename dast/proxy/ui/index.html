@@ -57,6 +57,7 @@
   <div class="tab-group" title="Triage">
     <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span>
     <div class="mtab on"  id="mt-overview" onclick="switchMain('overview')">Dashboard</div>
+    <div class="mtab"     id="mt-findings" onclick="switchMain('findings')">Findings<span id="findings-tab-badge" class="findings-tab-badge" style="display:none">0</span></div>
     <div class="mtab"     id="mt-copilot"  onclick="switchMain('copilot')">Copilot</div>
   </div>
   <div class="tab-group-sep"></div>
@@ -173,7 +174,6 @@
         Intercept<span id="intercept-badge"></span>
       </div>
       <div class="stab"    id="st-sitemap"   onclick="switchProxySub('sitemap')">Site map</div>
-      <div class="stab"    id="st-issues"    onclick="switchProxySub('issues')">Issues</div>
       <div class="stab"    id="st-psettings" onclick="switchProxySub('psettings')">Settings</div>
       <div class="sp"></div>
       <button id="intercept-toggle-btn" class="intercept-btn" onclick="interceptToggle()"
@@ -656,8 +656,11 @@
     </div>
 
 
-    <!-- Issues: all findings grouped by host -->
-    <div id="proxy-issues" style="display:none;flex:1;overflow:hidden;flex-direction:column;">
+  </div><!-- /panel-proxy -->
+
+  <!-- Findings: consolidated vuln findings — promoted from the Proxy > Issues
+       sub-tab to a top-level tab so findings are visible at a glance. -->
+  <div class="tpanel" id="panel-findings" style="flex-direction:column;overflow:hidden">
       <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--bg2);
                   border-bottom:1px solid var(--bdr);flex-shrink:0;">
         <div style="display:flex;gap:4px;">
@@ -690,7 +693,6 @@
         <span id="issues-page-lbl" style="color:var(--txt2)"></span>
         <button class="tbtn" onclick="issuesPage(1)">Next ›</button>
       </div>
-    </div>
   </div>
 
   <!-- ══ IMPORT FINDINGS MODAL ══ -->

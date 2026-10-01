@@ -526,5 +526,7 @@ function updateStats() {
   const total   = realEntries.length;
   const vuln    = realEntries.filter(id => entries[id]?.scan_result === 'vulnerable').length;
   const queued  = order.filter(id => entries[id]?.queued_for_scan && !entries[id]?.scan_result).length;
+  // Keep the top-level Findings tab badge in sync with every entry update.
+  if (typeof updateFindingsBadge === 'function') updateFindingsBadge();
 }
 

@@ -401,6 +401,33 @@ function renderAllIssues() {
   _renderIssuesPage();
 }
 
+// Live count badge on the top-level Findings tab, so open findings are visible
+// at a glance from any tab. Colored by the highest severity present. Counts
+// non-dismissed, in-scope findings straight from the entries state so it stays
+// current on every WS entry update (called from updateStats), not only when the
+// Findings tab is open.
+function updateFindingsBadge() {
+  const badge = document.getElementById('findings-tab-badge');
+  if (!badge || typeof entries === 'undefined') return;
+  const rank = { critical: 0, high: 1, medium: 2, low: 3, info: 4, informational: 4 };
+  let count = 0, top = 99;
+  for (const id in entries) {
+    const e = entries[id];
+    if (!e || e.source === 'out-of-scope') continue;
+    for (const f of (e.findings || [])) {
+      if (f.dismissed) continue;
+      count++;
+      const r = rank[(f.severity || 'info').toLowerCase()] ?? 4;
+      if (r < top) top = r;
+    }
+  }
+  if (!count) { badge.style.display = 'none'; return; }
+  badge.textContent = count > 99 ? '99+' : String(count);
+  badge.style.display = '';
+  badge.style.background = top <= 1 ? 'var(--bad, #e5484d)'
+    : top === 2 ? 'var(--orange, #e5a23b)' : 'var(--txt2, #8b949e)';
+}
+
 function toggleIssue(uid, entryId) {
   const el = document.getElementById('iissue-' + uid);
   if (!el) return;
@@ -595,7 +622,7 @@ async function _pollImportJob(jobId, statusEl, btn) {
     statusEl.textContent = msg;
     statusEl.style.color = '#4caf50';
 
-    if (document.getElementById('st-issues').classList.contains('on')) renderAllIssues();
+    if (document.getElementById('mt-findings')?.classList.contains('on')) renderAllIssues();
 
     // Parsing is done and the scan is now queued on the server — it runs in the
     // background whether or not this modal stays open. Auto-close and surface the

@@ -1,6 +1,6 @@
 // ── tab switching ──────────────────────────────────────────────────────
 function switchMain(tab) {
-  ['overview', 'proxy', 'browse', 'ai', 'scan', 'plugins', 'graphql', 'repeater', 'intruder', 'logs', 'extras', 'copilot'].forEach(t => {
+  ['overview', 'findings', 'proxy', 'browse', 'ai', 'scan', 'plugins', 'graphql', 'repeater', 'intruder', 'logs', 'extras', 'copilot'].forEach(t => {
     document.getElementById('panel-' + t).classList.toggle('on', t === tab);
     document.getElementById('mt-' + t).classList.toggle('on', t === tab);
   });
@@ -18,6 +18,7 @@ function switchMain(tab) {
   if (tab === 'scan')     loadScanQueue();
   if (tab === 'ai')       { loadAiPanel(); loadScanConfig(); }
   if (tab === 'copilot')  cpOnOpen();
+  if (tab === 'findings') renderAllIssues();
   if (tab === 'overview') loadOverview();
   if (tab === 'browse') {
     // Re-fire the currently active Browse sub-tab's load call.

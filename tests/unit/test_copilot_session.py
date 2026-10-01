@@ -613,6 +613,35 @@ _REQ_TOOLS = [
 
 
 @pytest.mark.asyncio
+async def test_missing_required_arg_is_repaired_via_forced_schema():
+    """When the model emits send_request with no url, the forced-schema repair
+    supplies it and the call executes — no failure, no spin."""
+    session = CopilotSession("s-repair")
+    events, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200, "body": "ok"})
+    repair = AsyncMock(return_value={"url": "https://in.scope/load", "method": "GET"})
+
+    steps = [
+        {"action": "call_tool", "thought": "read it", "tool_name": "send_request",
+         "tool_args": {"method": "GET"}},  # url dropped by the model
+        {"action": "reply", "thought": "done", "message": "done"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_REQ_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._repair_tool_args", new=repair), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("probe", _FakeCtx(in_scope=True),
+                                   on_event=on_event, wait_for_human=_deny_human())
+
+    repair.assert_awaited_once()
+    run_tool.assert_awaited_once()
+    # the executed call carried the repaired url
+    _ctx, name, args = run_tool.await_args.args
+    assert name == "send_request" and args.get("url") == "https://in.scope/load"
+    assert reply.message == "done"
+
+
+@pytest.mark.asyncio
 async def test_missing_required_arg_is_caught_before_execution_and_retried():
     """A send_request with no url must not reach run_tool, must not poison the
     anti-repeat set, and the corrected call (with url) must then execute."""
@@ -627,8 +656,10 @@ async def test_missing_required_arg_is_caught_before_execution_and_retried():
          "tool_args": {"url": "https://in.scope/load", "method": "GET"}},
         {"action": "reply", "thought": "done", "message": "done"},
     ]
+    # Force the schema-repair to fail so this exercises the nudge fallback path.
     with patch("dast.tools.all_tools", return_value=_REQ_TOOLS), \
          patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._repair_tool_args", new=AsyncMock(return_value=None)), \
          patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
         reply = await session.send("probe", _FakeCtx(in_scope=True),
                                    on_event=on_event, wait_for_human=_deny_human())

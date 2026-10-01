@@ -340,6 +340,43 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _repair_tool_args(
+    tool_name: str, tool_schema: Dict[str, Any], thought: str,
+    prior_args: Dict[str, Any], missing: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Re-ask the model for a tool call's arguments, FORCING them through the
+    tool's own JSON Schema so required fields (e.g. send_request's url) cannot be
+    omitted. The free-form step schema lets the model emit empty tool_args; this
+    forced second pass closes that gap deterministically. Returns the repaired
+    args, or None on failure."""
+    system = (
+        "You are repairing a malformed tool call. Return ONLY the arguments object "
+        "for the tool, fully populated and matching its schema. Every required field "
+        "MUST be present and non-empty — in particular any URL must be the complete "
+        "absolute https URL. Do not add commentary."
+    )
+    user = (
+        f"Tool: {tool_name}\n"
+        f"What you are trying to do: {thought}\n"
+        f"The arguments you sent were missing required field(s): {', '.join(missing)}.\n"
+        f"Arguments you sent: {_canonical(prior_args)}\n"
+        "Return the complete, corrected arguments now."
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        repaired = await loop.run_in_executor(
+            None,
+            lambda: bedrock_client.invoke_json(
+                system=system, user=user, model_id=bedrock_client.get_fast_model(),
+                max_tokens=1024, temperature=0, schema=tool_schema,
+            ),
+        )
+        return repaired if isinstance(repaired, dict) else None
+    except Exception as exc:
+        logger.warning("Copilot: tool-arg repair failed", tool=tool_name, error=str(exc))
+        return None
+
+
 class CopilotSession:
     """A conversational exploration thread.
 
@@ -404,6 +441,7 @@ class CopilotSession:
         required_args = {
             t["name"]: list(t["input_schema"].get("required") or []) for t in tool_defs
         }
+        schema_by_tool = {t["name"]: t["input_schema"] for t in tool_defs}
         tool_menu = _render_tool_menu(tool_defs)
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
@@ -626,10 +664,25 @@ class CopilotSession:
                     # result — give a precise correction and do NOT add it to the
                     # anti-repeat set, so the corrected call (with the field filled)
                     # is not later suppressed as a duplicate.
-                    missing_required = [
-                        field for field in required_args.get(tool_name, [])
-                        if not str(tool_args.get(field, "")).strip()
-                    ]
+                    def _missing_for(a: Dict[str, Any]) -> List[str]:
+                        return [field for field in required_args.get(tool_name, [])
+                                if not str(a.get(field, "")).strip()]
+
+                    missing_required = _missing_for(tool_args)
+                    if missing_required:
+                        # Force the args through the tool's own schema (required
+                        # fields cannot be empty) before giving up — this beats the
+                        # model intermittently dropping url on an otherwise valid call.
+                        repaired = await _repair_tool_args(
+                            tool_name, schema_by_tool.get(tool_name, {}),
+                            thought, tool_args, missing_required,
+                        )
+                        if repaired is not None and not _missing_for(repaired):
+                            tool_args = repaired
+                            entry["tool_args"] = tool_args
+                            missing_required = []
+                            logger.info("Copilot: repaired malformed tool args",
+                                        session_id=self.session_id, tool=tool_name)
                     if missing_required:
                         reply = await _record_tool_failure(
                             entry,

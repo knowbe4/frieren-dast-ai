@@ -45,7 +45,16 @@ def profiles_dir() -> Path:
 
 
 def get_or_create_key() -> bytes:
-    """Load the Fernet key, generating and persisting one (0600) on first use."""
+    """Load the Fernet key, generating and persisting one (0600) on first use.
+
+    An operator who wants the key hardware-bound (not a flat file) can supply it via
+    the ``DAST_PROFILES_KEY`` env var — e.g. sourced from the macOS Keychain:
+    ``export DAST_PROFILES_KEY=$(security find-generic-password -s dast-ai-profiles -w)``.
+    When set it takes precedence and nothing is written to disk; otherwise the
+    portable 0600 key file is used (default, cross-platform)."""
+    env_key = os.environ.get("DAST_PROFILES_KEY", "").strip()
+    if env_key:
+        return env_key.encode("ascii")
     profiles_dir()
     if _KEY_PATH.exists():
         return _KEY_PATH.read_bytes()

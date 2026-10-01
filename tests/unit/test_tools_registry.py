@@ -987,6 +987,118 @@ async def test_verify_reflection_out_of_scope_blocked():
     assert "out of scope" in result["error"]
 
 
+# ── idor_probe (deterministic BOLA/IDOR differential runner) ────────────────────
+
+class _FakeResp:
+    def __init__(self, status, text=""):
+        self.status_code = status
+        self.text = text
+
+
+class _FakeHttpClient:
+    """Returns queued responses per (METHOD, url); pops in call order so a url read
+    twice (read, then post-delete read) can return different statuses."""
+    def __init__(self, routes):
+        self._routes = {k: list(v) for k, v in routes.items()}
+        self.calls = []
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def request(self, method, url, headers=None, content=None):
+        self.calls.append((method.upper(), url, dict(headers or {})))
+        q = self._routes.get((method.upper(), url))
+        if not q:
+            return _FakeResp(599, "no route")
+        return q.pop(0) if len(q) > 1 else q[0]
+
+
+class _IdorStore:
+    def __init__(self):
+        self.recorded = []
+        self.cookies = [{"name": "SESS", "value": "abc"}]
+    def get_cookies_for_host(self, host):
+        return list(self.cookies)
+    def record_manual_finding(self, finding, url, method="GET"):
+        self.recorded.append((finding, url, method))
+        return "entry-idor-1"
+
+
+def _idor_routes(base, marker, control_present=True, delete_present=True):
+    routes = {
+        ("POST", f"{base}/save/probe"): [_FakeResp(200, "")],
+        ("GET", f"{base}/load/probe"): [_FakeResp(200, f'[{{"v":"{marker}"}}]'),
+                                        _FakeResp(500, "Failed to load form data.")],
+    }
+    if control_present:
+        routes[("GET", f"{base}/load/never")] = [_FakeResp(500, "Failed to load form data.")]
+    if delete_present:
+        routes[("DELETE", f"{base}/delete/probe")] = [_FakeResp(200, "")]
+    return routes
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_confirmed_records_finding(monkeypatch):
+    import httpx
+    base = "https://api.acme-corp.com/t"
+    marker = "frieren-123"
+    client = _FakeHttpClient(_idor_routes(base, marker))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client)
+
+    store = _IdorStore()
+    ctx = ToolContext(settings=_Scope(True), store=store, source_label="copilot")
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": f"{base}/save/probe", "read_url": f"{base}/load/probe",
+        "control_read_url": f"{base}/load/never", "delete_url": f"{base}/delete/probe",
+        "marker": marker, "write_body": f'[{{"v":"{marker}"}}]',
+    })
+
+    assert result["ok"] is True
+    assert result["confirmed"] is True
+    assert len(result["steps"]) == 5
+    assert [s["status"] for s in result["steps"]] == [200, 200, 500, 200, 500]
+    # finding recorded with the step chain
+    assert len(store.recorded) == 1
+    finding = store.recorded[0][0]
+    assert finding["attack_type"] == "broken-access-control"
+    assert len(finding["steps"]) == 5
+    # cookies from the jar were attached to every sub-request
+    assert all("SESS=abc" in c[2].get("cookie", "") for c in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_echo_not_confirmed(monkeypatch):
+    import httpx
+    base = "https://api.acme-corp.com/t"
+    marker = "frieren-123"
+    routes = _idor_routes(base, marker, delete_present=False)
+    # Control ALSO returns the marker => echo/public, must NOT confirm.
+    routes[("GET", f"{base}/load/never")] = [_FakeResp(200, f'[{{"v":"{marker}"}}]')]
+    client = _FakeHttpClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client)
+
+    store = _IdorStore()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": f"{base}/save/probe", "read_url": f"{base}/load/probe",
+        "control_read_url": f"{base}/load/never",
+        "marker": marker, "write_body": f'[{{"v":"{marker}"}}]',
+    })
+    assert result["ok"] is True
+    assert result["confirmed"] is False
+    assert "echo" in result["verdict"].lower() or "public" in result["verdict"].lower()
+    assert store.recorded == []  # nothing recorded when not confirmed
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": "https://evil.example.com/save/x", "read_url": "https://evil.example.com/load/x",
+        "marker": "m", "write_body": "m",
+    })
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
 # ── run_scan (orchestration primitive over the scan pipeline) ───────────────────
 
 class _ScanEntry:

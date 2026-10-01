@@ -24,6 +24,7 @@ from dast.tools import graphql_sweep_tools as _graphql_sweep_tools  # noqa: F401
 from dast.tools import graphql_tools as _graphql_tools  # noqa: F401
 from dast.tools import history_tools as _history_tools  # noqa: F401
 from dast.tools import http_tools as _http_tools  # noqa: F401
+from dast.tools import idor_tools as _idor_tools  # noqa: F401
 from dast.tools import oob_tools as _oob_tools  # noqa: F401
 from dast.tools import profile_tools as _profile_tools  # noqa: F401
 from dast.tools import recon_tools as _recon_tools  # noqa: F401

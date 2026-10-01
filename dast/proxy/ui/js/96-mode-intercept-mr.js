@@ -59,6 +59,7 @@ let _interceptRespEnabled = false;
 let _interceptQueue       = [];
 let _interceptSelId       = null;
 let _interceptActiveTab   = 'request';   // 'request' | 'response'
+let _interceptDiffMode    = false;       // show original-vs-modified diff instead of the editor
 
 async function interceptLoadStatus() {
   try {
@@ -161,44 +162,116 @@ function _interceptSelectReq(id) {
   _interceptPopulateEditor(req);
 }
 
+// Build the raw HTTP text for a request/response, from either the current
+// (possibly operator-edited / match-replaced) fields or the original snapshot.
+// `which` is 'cur' or 'orig'. Shared by the editor and the diff view.
+function _interceptBuildRaw(req, which) {
+  const pick = (cur, orig) => which === 'orig' ? orig : cur;
+  const dropHdr = (k) => ['host','content-length','transfer-encoding','connection'].includes(k.toLowerCase());
+  if (_interceptActiveTab === 'response' && req.resp_status != null) {
+    const status  = pick(req.resp_status, req.orig_resp_status);
+    const headers = pick(req.resp_headers, req.orig_resp_headers) || {};
+    const body    = pick(req.resp_body, req.orig_resp_body);
+    const hdrs = Object.entries(headers)
+      .filter(([k]) => !['content-length','transfer-encoding','connection'].includes(k.toLowerCase()))
+      .map(([k,v]) => `${k}: ${v}`).join('\r\n');
+    return `HTTP/1.1 ${status} OK\r\n${hdrs}${body ? `\r\n\r\n${body}` : ''}`;
+  }
+  const method  = pick(req.method, req.orig_method);
+  const url     = pick(req.url, req.orig_url);
+  const headers = pick(req.headers, req.orig_headers) || {};
+  const body    = pick(req.body, req.orig_body);
+  const hdrs = Object.entries(headers)
+    .filter(([k]) => !dropHdr(k))
+    .map(([k,v]) => `${k}: ${v}`).join('\r\n');
+  return `${method} ${url}\r\nhost: ${req.host}\r\n${hdrs}${body ? `\r\n\r\n${body}` : ''}`;
+}
+
+// Is the current (match-replaced) request different from what was first
+// intercepted? Drives whether the Diff toggle is meaningful.
+function _interceptHasChanges(req) {
+  return _interceptBuildRaw(req, 'cur') !== _interceptBuildRaw(req, 'orig');
+}
+
 function _interceptPopulateEditor(req) {
   const titleEl   = document.getElementById('ie-title');
   const dropBtn   = document.getElementById('ie-drop-btn');
   const fwdBtn    = document.getElementById('ie-fwd-btn');
+  const diffBtn   = document.getElementById('ie-diff-btn');
   const textarea  = document.getElementById('intercept-raw');
   if (!textarea) return;
 
   if (titleEl) titleEl.textContent = `${req.method} ${req.host}${req.path}`;
   if (dropBtn) dropBtn.disabled = false;
   if (fwdBtn)  fwdBtn.disabled  = false;
-
-  if (_interceptActiveTab === 'response' && req.resp_status != null) {
-    // Render response
-    const hdrs = Object.entries(req.resp_headers || {})
-      .filter(([k]) => !['content-length','transfer-encoding','connection'].includes(k.toLowerCase()))
-      .map(([k,v]) => `${k}: ${v}`).join('\r\n');
-    const bodyPart = req.resp_body ? `\r\n\r\n${req.resp_body}` : '';
-    textarea.value = `HTTP/1.1 ${req.resp_status} OK\r\n${hdrs}${bodyPart}`;
-  } else {
-    // Render request
-    const hdrs = Object.entries(req.headers || {})
-      .filter(([k]) => !['host','content-length','transfer-encoding','connection'].includes(k.toLowerCase()))
-      .map(([k,v]) => `${k}: ${v}`).join('\r\n');
-    const hostHdr  = `host: ${req.host}`;
-    const bodyPart = req.body ? `\r\n\r\n${req.body}` : '';
-    textarea.value = `${req.method} ${req.url}\r\n${hostHdr}\r\n${hdrs}${bodyPart}`;
+  if (diffBtn) {
+    diffBtn.disabled = false;
+    // Hint when the proxy already changed the request (e.g. match & replace).
+    diffBtn.classList.toggle('on', _interceptDiffMode);
+    diffBtn.title = _interceptHasChanges(req)
+      ? 'Toggle diff — this request was modified before you saw it'
+      : 'Toggle original-vs-modified diff';
   }
+
+  textarea.value = _interceptBuildRaw(req, 'cur');
+  if (_interceptDiffMode) _interceptRenderDiff(req);
+}
+
+// Toggle between the raw editor and the original-vs-modified diff view. The
+// "original" is the backend snapshot (as first intercepted); the "modified" is
+// the operator's live edits in the textarea.
+function _interceptToggleDiff() {
+  const req = _interceptQueue.find(r => r.id === _interceptSelId);
+  if (!req) return;
+  _interceptDiffMode = !_interceptDiffMode;
+  const diffBtn = document.getElementById('ie-diff-btn');
+  if (diffBtn) diffBtn.classList.toggle('on', _interceptDiffMode);
+  if (_interceptDiffMode) {
+    _interceptRenderDiff(req);
+  } else {
+    const textarea = document.getElementById('intercept-raw');
+    const diffEl   = document.getElementById('intercept-diff');
+    if (textarea) textarea.style.display = '';
+    if (diffEl)   diffEl.style.display = 'none';
+  }
+}
+
+// Line-by-line diff of the original snapshot vs the current editor content.
+function _interceptRenderDiff(req) {
+  const textarea = document.getElementById('intercept-raw');
+  const diffEl   = document.getElementById('intercept-diff');
+  if (!diffEl || !textarea) return;
+  const origLines = _interceptBuildRaw(req, 'orig').split(/\r?\n/);
+  const curLines  = (textarea.value || '').split(/\r?\n/);
+  const origSet = new Set(origLines);
+  const curSet  = new Set(curLines);
+  const row = (sign, text, color, bg) =>
+    `<div style="padding:0 14px;white-space:pre-wrap;word-break:break-all;color:${color};background:${bg}">`
+    + `${sign} ${esc(text)}</div>`;
+  const parts = [];
+  // Removed lines (in original, not in current), then added (in current, not original).
+  origLines.forEach(l => { if (!curSet.has(l)) parts.push(row('-', l, '#ff8f8f', '#2a1414')); });
+  curLines.forEach(l  => { if (!origSet.has(l)) parts.push(row('+', l, '#9fe09f', '#14240f')); });
+  if (!parts.length) parts.push(`<div style="padding:8px 14px;color:var(--txt2)">No changes from the originally intercepted request.</div>`);
+  diffEl.innerHTML = parts.join('');
+  textarea.style.display = 'none';
+  diffEl.style.display = 'block';
 }
 
 function _interceptClearEditor() {
   const el = document.getElementById('intercept-raw');
-  if (el) el.value = '';
+  if (el) { el.value = ''; el.style.display = ''; }
   const t = document.getElementById('ie-title');
   if (t) t.textContent = '';
   const d = document.getElementById('ie-drop-btn');
   if (d) d.disabled = true;
   const f = document.getElementById('ie-fwd-btn');
   if (f) f.disabled = true;
+  const diffBtn = document.getElementById('ie-diff-btn');
+  if (diffBtn) { diffBtn.disabled = true; diffBtn.classList.remove('on'); }
+  const diffEl = document.getElementById('intercept-diff');
+  if (diffEl) diffEl.style.display = 'none';
+  _interceptDiffMode = false;
 }
 
 function _interceptParseRaw(raw) {

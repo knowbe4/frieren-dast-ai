@@ -42,37 +42,62 @@ class PendingRequest:
     resp_body: Optional[bytes] = None
     resp_action: str = "pending"   # "forward" | "forward_modified"
 
+    # Immutable snapshot of the request as first intercepted, so the UI can show
+    # an original-vs-modified diff (Burp-style) even after the operator edits the
+    # mutable fields above. Captured in __post_init__; never touched by forward().
+    orig_method: str = ""
+    orig_url: str = ""
+    orig_headers: dict = field(default_factory=dict)
+    orig_body: Optional[bytes] = None
+    # Same idea for the response phase, captured in begin_response_intercept().
+    orig_resp_status: Optional[int] = None
+    orig_resp_headers: dict = field(default_factory=dict)
+    orig_resp_body: Optional[bytes] = None
+
     # Not serialised — lives only in memory
     _event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _resp_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
+    def __post_init__(self) -> None:
+        # Snapshot the as-received request before any operator edit.
+        self.orig_method = self.method
+        self.orig_url = self.url
+        self.orig_headers = dict(self.headers)
+        self.orig_body = self.body
+
+    @staticmethod
+    def _decode(raw: Optional[bytes]) -> Optional[str]:
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
     def to_dict(self) -> dict:
-        body_str: Optional[str] = None
-        if self.body:
-            try:
-                body_str = self.body.decode("utf-8", errors="replace")
-            except Exception:
-                body_str = ""
-        resp_body_str: Optional[str] = None
-        if self.resp_body is not None:
-            try:
-                resp_body_str = self.resp_body.decode("utf-8", errors="replace")
-            except Exception:
-                resp_body_str = ""
+        body_str = self._decode(self.body) if self.body else None
+        resp_body_str = self._decode(self.resp_body)
         return {
-            "id":           self.id,
-            "method":       self.method,
-            "url":          self.url,
-            "host":         self.host,
-            "path":         self.path,
-            "headers":      self.headers,
-            "body":         body_str,
-            "ts":           self.ts,
-            "action":       self.action,
-            "resp_status":  self.resp_status,
-            "resp_headers": self.resp_headers,
-            "resp_body":    resp_body_str,
-            "resp_action":  self.resp_action,
+            "id":                self.id,
+            "method":            self.method,
+            "url":               self.url,
+            "host":              self.host,
+            "path":              self.path,
+            "headers":           self.headers,
+            "body":              body_str,
+            "ts":                self.ts,
+            "action":            self.action,
+            "resp_status":       self.resp_status,
+            "resp_headers":      self.resp_headers,
+            "resp_body":         resp_body_str,
+            "resp_action":       self.resp_action,
+            "orig_method":       self.orig_method,
+            "orig_url":          self.orig_url,
+            "orig_headers":      self.orig_headers,
+            "orig_body":         self._decode(self.orig_body) if self.orig_body else None,
+            "orig_resp_status":  self.orig_resp_status,
+            "orig_resp_headers": self.orig_resp_headers,
+            "orig_resp_body":    self._decode(self.orig_resp_body),
         }
 
 
@@ -181,6 +206,10 @@ class InterceptStore:
         req.resp_headers = dict(headers)
         req.resp_body = body
         req.resp_action = "pending"
+        # Snapshot the as-received response for the original-vs-modified diff.
+        req.orig_resp_status = status
+        req.orig_resp_headers = dict(headers)
+        req.orig_resp_body = body
         with self._lock:
             self._resp_queue[req.id] = req
         self._notify()

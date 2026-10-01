@@ -313,6 +313,8 @@
           <div class="sp"></div>
           <span id="ie-title" style="font-size:10px;color:var(--txt2);padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px"></span>
           <div class="sp"></div>
+          <button id="ie-diff-btn" class="tbtn" style="font-size:10px;padding:2px 8px;margin:3px 4px"
+                  onclick="_interceptToggleDiff()" disabled title="Toggle original-vs-modified diff">Diff</button>
           <button id="ie-drop-btn" class="tbtn" style="font-size:10px;padding:2px 8px;margin:3px 4px;background:#4a100020;color:#ff6b6b;border-color:#7a202060"
                   onclick="interceptDrop()" disabled>Drop</button>
           <button id="ie-fwd-btn" class="tbtn pri" style="font-size:10px;padding:2px 8px;margin:3px 8px 3px 0"
@@ -323,6 +325,9 @@
                  font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;
                  padding:10px 14px;overflow:auto"
           placeholder="Select a request above to edit its headers and body, then click Forward."></textarea>
+        <!-- Original-vs-modified diff view, shown when the Diff toggle is on. -->
+        <div id="intercept-diff" style="display:none;flex:1;overflow:auto;background:var(--bg);
+             font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;padding:10px 0"></div>
       </div>
     </div>
 

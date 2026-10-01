@@ -398,6 +398,12 @@ class CopilotSession:
             if "copilot" not in (t.tags or [])
         ]
         tool_names = {t["name"] for t in tool_defs}
+        # Required args per tool (from each schema) so a malformed call with a
+        # missing required field (e.g. send_request with no url) is caught with a
+        # precise nudge BEFORE it is deduped/executed, instead of spinning.
+        required_args = {
+            t["name"]: list(t["input_schema"].get("required") or []) for t in tool_defs
+        }
         tool_menu = _render_tool_menu(tool_defs)
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
@@ -614,6 +620,28 @@ class CopilotSession:
                             return reply
                         continue
 
+                    # Validate required args from the tool's schema BEFORE deduping
+                    # or executing. A missing required field (e.g. an empty url on
+                    # send_request) is a model arg-building slip, not a server
+                    # result — give a precise correction and do NOT add it to the
+                    # anti-repeat set, so the corrected call (with the field filled)
+                    # is not later suppressed as a duplicate.
+                    missing_required = [
+                        field for field in required_args.get(tool_name, [])
+                        if not str(tool_args.get(field, "")).strip()
+                    ]
+                    if missing_required:
+                        reply = await _record_tool_failure(
+                            entry,
+                            f"Invalid arguments for {tool_name}: missing required "
+                            f"{', '.join(missing_required)}. This call was NOT sent. "
+                            f"Re-issue it with {missing_required[0]} set to the full "
+                            f"value (for a URL, the complete absolute https URL).",
+                        )
+                        if reply is not None:
+                            return reply
+                        continue
+
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
                         reply = await _record_tool_failure(
@@ -653,6 +681,16 @@ class CopilotSession:
 
                     consecutive_tool_failures = 0
                     await _observe(entry, _summarize_result(result))
+                    # A successful state-changing request invalidates earlier read
+                    # dedup keys: the copilot must be able to re-issue a prior read
+                    # to observe the NEW state (e.g. GET /load after DELETE). Reset
+                    # the anti-repeat set so that confirming re-read is not wrongly
+                    # suppressed as a duplicate (which previously made it misread a
+                    # stale get_history entry as the live post-mutation response).
+                    if tool_name == "send_request" and str(
+                        tool_args.get("method", "")
+                    ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                        self._seen_calls.clear()
                     continue
 
                 # ── no committed action: a planning-only step ─────────────────────

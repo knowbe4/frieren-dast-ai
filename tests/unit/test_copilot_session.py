@@ -598,3 +598,75 @@ def test_tool_menu_includes_arg_signatures():
     assert "- send_request: Send one HTTP request." in menu
     assert "url*:string" in menu
     assert "More detail here." not in menu  # only the first description line
+
+
+# ── B2: malformed args (missing required field) are repaired, not spun on ───────
+
+_REQ_TOOLS = [
+    _FakeTool("send_request", input_schema={
+        "type": "object",
+        "properties": {"url": {"type": "string"}, "method": {"type": "string"}},
+        "required": ["url"],
+    }),
+    _FakeTool("get_history"),
+]
+
+
+@pytest.mark.asyncio
+async def test_missing_required_arg_is_caught_before_execution_and_retried():
+    """A send_request with no url must not reach run_tool, must not poison the
+    anti-repeat set, and the corrected call (with url) must then execute."""
+    session = CopilotSession("s-missing")
+    events, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200, "body": "ok"})
+
+    steps = [
+        {"action": "call_tool", "thought": "go", "tool_name": "send_request",
+         "tool_args": {"method": "GET"}},  # missing url
+        {"action": "call_tool", "thought": "fixed", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/load", "method": "GET"}},
+        {"action": "reply", "thought": "done", "message": "done"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_REQ_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("probe", _FakeCtx(in_scope=True),
+                                   on_event=on_event, wait_for_human=_deny_human())
+
+    # Only the corrected call reached run_tool.
+    run_tool.assert_awaited_once()
+    assert reply.message == "done"
+    obs = [e.get("observation", "") for e in events if e.get("type") == "observation"]
+    assert any("missing required" in o and "url" in o for o in obs)
+    assert not any("suppressed" in o for o in obs)  # the empty call never deduped
+
+
+# ── B3: a mutation clears the anti-repeat set so a confirming re-read runs ───────
+
+@pytest.mark.asyncio
+async def test_mutation_allows_repeated_read_to_observe_new_state():
+    """GET load, DELETE, then the SAME GET load again (to confirm destruction):
+    the post-mutation re-read must NOT be suppressed as a duplicate."""
+    session = CopilotSession("s-mut")
+    events, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200, "body": "x"})
+
+    load = {"url": "https://in.scope/load/u", "method": "GET"}
+    steps = [
+        {"action": "call_tool", "thought": "read", "tool_name": "send_request", "tool_args": dict(load)},
+        {"action": "call_tool", "thought": "delete", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/delete/u", "method": "DELETE"}},
+        {"action": "call_tool", "thought": "confirm", "tool_name": "send_request", "tool_args": dict(load)},
+        {"action": "reply", "thought": "done", "message": "confirmed"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_REQ_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("retest", _FakeCtx(in_scope=True),
+                                   on_event=on_event, wait_for_human=_deny_human())
+
+    # All three request calls ran — the repeated GET was not suppressed.
+    assert run_tool.await_count == 3
+    assert reply.message == "confirmed"
+    obs = [e.get("observation", "") for e in events if e.get("type") == "observation"]
+    assert not any("suppressed" in o for o in obs)

@@ -952,6 +952,41 @@ async def test_crawl_session_safe_caps_click_budget():
     assert jobs[0]["extra_seeds"] is None  # extra seeds dropped in session-safe mode
 
 
+# ── verify_reflection (payload-survival classification) ─────────────────────────
+
+def test_verify_reflection_classify_raw():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div><script>alert(1)</script></div>", "<script>alert(1)</script>")
+    assert r["classification"] == "rendered_raw"
+    assert r["raw_payload_present"] is True
+    assert "<script" in r["dangerous_tokens_raw"]
+    assert r["evidence"]
+
+
+def test_verify_reflection_classify_encoded():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div>&lt;script&gt;alert(1)&lt;/script&gt;</div>", "<script>alert(1)</script>")
+    assert r["classification"] == "encoded"
+    assert r["raw_payload_present"] is False
+    assert r["html_encoded_present"] is True
+
+
+def test_verify_reflection_classify_stripped():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div>hello world</div>", "<script>alert(1)</script>")
+    assert r["classification"] == "stripped"
+    assert r["dangerous_tokens_raw"] == []
+
+
+@pytest.mark.asyncio
+async def test_verify_reflection_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "verify_reflection",
+                            {"url": "https://evil.example.com/p/1", "payload": "<script>"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
 # ── run_scan (orchestration primitive over the scan pipeline) ───────────────────
 
 class _ScanEntry:

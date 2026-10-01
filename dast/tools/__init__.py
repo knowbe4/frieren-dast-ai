@@ -30,6 +30,7 @@ from dast.tools import recon_tools as _recon_tools  # noqa: F401
 from dast.tools import record_finding_tools as _record_finding_tools  # noqa: F401
 from dast.tools import scan_tools as _scan_tools  # noqa: F401
 from dast.tools import triage_tools as _triage_tools  # noqa: F401
+from dast.tools import verify_tools as _verify_tools  # noqa: F401
 
 __all__ = [
     "Tool",

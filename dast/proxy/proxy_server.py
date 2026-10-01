@@ -247,6 +247,10 @@ class ProxyServer:
         if self._settings and headers.get(_SOURCE_HEADER) is None and headers.get(_CRAWLER_HEADER) is None:
             url, headers, body = self._settings.apply_to_request(url, headers, body)
             _path = _urlparse(url).path
+            # Body may have changed size — keep content-length in sync so the
+            # upstream server doesn't hang waiting for bytes that will never arrive.
+            if body is not None and "content-length" in headers:
+                headers["content-length"] = str(len(body))
         # ── End Match & Replace ────────────────────────────────────────────────
 
         hidden = self._settings and self._settings.is_hidden(_path)

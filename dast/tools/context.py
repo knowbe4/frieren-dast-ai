@@ -52,6 +52,10 @@ class ToolContext:
     # concurrent-session detection and log the shared cookie out. Tools consult
     # this to throttle their own volume (e.g. crawl caps its click budget).
     session_safe: bool = False
+    # Live browser the agent can drive (navigate/fill/click/snapshot) for form
+    # workflows that need fresh CSRF tokens. Present only for the in-process
+    # copilot; None elsewhere, so the browser_* tools degrade gracefully.
+    browser: Optional[Any] = None
 
     def get_settings(self) -> Any:
         """Return the scope settings, building a disk-backed default on first use."""

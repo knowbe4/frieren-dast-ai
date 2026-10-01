@@ -987,6 +987,58 @@ async def test_verify_reflection_out_of_scope_blocked():
     assert "out of scope" in result["error"]
 
 
+# ── browser_* tools (agent browser-driving) ─────────────────────────────────────
+
+class _FakeBrowser:
+    def __init__(self):
+        self.calls = []
+    async def navigate(self, url, timeout_ms=20000):
+        self.calls.append(("navigate", url)); return {"ok": True, "url": url, "status": 200, "title": "T"}
+    async def snapshot(self):
+        self.calls.append(("snapshot",)); return {"ok": True, "url": "u", "title": "T", "forms": [], "buttons": [], "links": []}
+    async def fill(self, selector, value, timeout_ms=10000):
+        self.calls.append(("fill", selector, value)); return {"ok": True, "selector": selector}
+    async def click(self, selector, timeout_ms=10000, expect_nav=False):
+        self.calls.append(("click", selector, expect_nav)); return {"ok": True, "selector": selector, "url": "u"}
+    async def extract(self, selector, attribute="value"):
+        self.calls.append(("extract", selector, attribute)); return {"ok": True, "value": "tok123"}
+
+
+@pytest.mark.asyncio
+async def test_browser_tools_not_available_without_browser():
+    ctx = ToolContext(settings=_Scope(True))  # no browser attached
+    for name, args in [("browser_navigate", {"url": "https://api.acme-corp.com/"}),
+                       ("browser_snapshot", {}), ("browser_fill", {"selector": "#x", "value": "y"})]:
+        r = await run_tool(ctx, name, args)
+        assert r["ok"] is False and "not available" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_navigate_scope_gated_and_drives():
+    b = _FakeBrowser()
+    ctx = ToolContext(settings=_Scope(True), browser=b)
+    oos = await run_tool(ToolContext(settings=_Scope(False), browser=b), "browser_navigate",
+                         {"url": "https://evil.example.com/"})
+    assert oos["ok"] is False and "out of scope" in oos["error"]
+    ok = await run_tool(ctx, "browser_navigate", {"url": "https://api.acme-corp.com/login"})
+    assert ok["ok"] is True and ok["status"] == 200
+    assert ("navigate", "https://api.acme-corp.com/login") in b.calls
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_click_extract_delegate():
+    b = _FakeBrowser()
+    ctx = ToolContext(settings=_Scope(True), browser=b)
+    assert (await run_tool(ctx, "browser_fill", {"selector": "#tbEmail", "value": "a@b.c"}))["ok"]
+    assert (await run_tool(ctx, "browser_click", {"selector": "#btnContinue", "expect_navigation": True}))["ok"]
+    ex = await run_tool(ctx, "browser_extract", {"selector": "#token", "attribute": "value"})
+    assert ex["ok"] and ex["value"] == "tok123"
+    assert ("fill", "#tbEmail", "a@b.c") in b.calls
+    assert ("click", "#btnContinue", True) in b.calls
+    # selector required
+    assert (await run_tool(ctx, "browser_fill", {"value": "x"}))["ok"] is False
+
+
 # ── idor_probe (deterministic BOLA/IDOR differential runner) ────────────────────
 
 class _FakeResp:

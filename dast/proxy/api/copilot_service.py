@@ -443,6 +443,17 @@ class CopilotService:
         run_scan) reach the live queues through the extra fields; they are present
         only for the in-process copilot, so the tools degrade gracefully elsewhere."""
         ctx = self._ctx
+        # One AgentBrowser per session, created lazily and reused across turns so
+        # multi-step form state (and a fresh CSRF token) survives between tool calls.
+        browser = session.get("_agent_browser")
+        if browser is None:
+            try:
+                from dast.browser.agent_browser import AgentBrowser
+                browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store)
+                session["_agent_browser"] = browser
+            except Exception as exc:
+                logger.warning("could not create AgentBrowser", error=str(exc))
+                browser = None
         return AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
@@ -454,6 +465,7 @@ class CopilotService:
             crawl_queue=getattr(ctx, "crawl_queue", None),
             source_label="copilot",
             session_safe=bool((session.get("autonomous") or {}).get("session_safe", False)),
+            browser=browser,
         )
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,

@@ -40,7 +40,7 @@ _GET_FINDINGS_SCHEMA: Dict[str, Any] = {
 _FINDING_FIELDS = (
     "title", "severity", "cwe", "attack_type", "evidence", "confidence",
     "confirmed", "validated_by", "validated_at", "parameter", "payload",
-    "reasoning", "rule_id", "dismissed",
+    "reasoning", "rule_id", "dismissed", "steps",
 )
 
 

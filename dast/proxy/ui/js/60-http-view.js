@@ -110,6 +110,39 @@ function _buildHttpEvidenceDetails(f) {
   </details>`;
 }
 
+// Render a finding's multi-request evidence chain (f.steps) as a clean numbered
+// table instead of a wall of text. Each step is one request in the proof
+// (e.g. a BOLA differential: foreign-write, foreign-read, control, delete). This
+// is what makes a multi-request finding legible — the evidence is no longer
+// pinned to a single request. Shared by the detail panel and the Findings tab.
+function _buildFindingSteps(f) {
+  const steps = Array.isArray(f.steps) ? f.steps : null;
+  if (!steps || !steps.length) return '';
+  const mColor = m => ({ GET: '#4ec9b0', POST: '#569cd6', PUT: '#d7ba7d',
+    PATCH: '#d7ba7d', DELETE: '#ff6b6b' }[(m || '').toUpperCase()] || 'var(--txt)');
+  const sColor = s => {
+    const n = parseInt(s, 10);
+    return n >= 500 ? '#ff6b6b' : n >= 400 ? '#e5a23b'
+      : (n >= 200 && n < 300) ? '#7ec87e' : 'var(--txt2)';
+  };
+  const rows = steps.map((s, i) => {
+    const note = s.note ? `<div style="color:var(--txt2);font-size:9px;margin-top:1px">${esc(s.note)}</div>` : '';
+    return `<tr style="border-bottom:1px solid var(--bdr)">
+      <td style="padding:3px 6px;color:var(--txt2);text-align:right;vertical-align:top">${i + 1}</td>
+      <td style="padding:3px 6px;font-weight:600;color:${mColor(s.method)};vertical-align:top">${esc((s.method || '').toUpperCase())}</td>
+      <td style="padding:3px 6px;font-family:monospace;word-break:break-all;vertical-align:top">${esc(s.url || '')}${note}</td>
+      <td style="padding:3px 6px;color:${sColor(s.status)};font-weight:600;text-align:right;vertical-align:top">${esc(String(s.status ?? ''))}</td>
+      <td style="padding:3px 6px;color:var(--txt2);vertical-align:top">${esc(s.label || '')}</td>
+    </tr>`;
+  }).join('');
+  return `<div style="margin-top:8px">
+    <div style="font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px">Evidence — ${steps.length}-request chain</div>
+    <table style="width:100%;border-collapse:collapse;font-size:10px;background:#111;border:1px solid var(--bdr);border-radius:3px">
+      <tbody>${rows}</tbody>
+    </table>
+  </div>`;
+}
+
 function buildFindingsHtml(d) {
   const fs = d.findings || [];
   if (!fs.length) {
@@ -179,7 +212,9 @@ function buildFindingsHtml(d) {
       <span style="color:var(--txt2)">Payload:</span>
       <code style="color:var(--yellow);margin-left:4px;word-break:break-all">${esc(f.payload)}</code>
     </div>`);
-    if (f.evidence) metaRows.push(`<div style="margin-top:6px;font-size:10px;color:var(--txt2);line-height:1.5;word-break:break-all">${esc(f.evidence)}</div>`);
+    const stepsHtml = _buildFindingSteps(f);
+    if (stepsHtml) metaRows.push(stepsHtml);
+    if (f.evidence) metaRows.push(`<div style="margin-top:6px;font-size:10px;color:var(--txt2);line-height:1.5;word-break:break-all;white-space:pre-wrap">${esc(f.evidence)}</div>`);
     if (f.snippet) {
       const lineLabel = f.line_no ? `Line ${f.line_no}` : 'Context';
       metaRows.push(`<div style="margin-top:6px">

@@ -325,6 +325,7 @@ function _buildIssueCard(host, f, globalIdx) {
       <span class="iissue-arrow" style="margin-left:6px">▶</span>
     </div>
     <div class="iissue-detail" onclick="event.stopPropagation()">
+      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f) : ''}
       <div class="iissue-evidence">${evidence}</div>
       ${paramHtml}${snippetHtml}${reasoningHtml}${cwe}${payload}${httpDetails}
       <span class="iissue-goto" onclick="goToEntry('${entryId}')">Go to request →</span>

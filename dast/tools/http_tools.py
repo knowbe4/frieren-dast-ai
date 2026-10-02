@@ -123,7 +123,7 @@ def _destructive_reason(text: str) -> Dict[str, str] | None:
     """Return {reason, safe_variant} if the text is destructive, else None."""
     if not text:
         return None
-    from dast.hackerone import payload_safety
+    from dast.triage import payload_safety
     verdict = payload_safety.classify(text)
     if verdict.is_destructive:
         return {"reason": verdict.reason, "safe_variant": verdict.safe_variant or ""}

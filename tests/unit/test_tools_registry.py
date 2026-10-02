@@ -388,8 +388,8 @@ async def test_param_mining_out_of_scope_blocked():
 
 @pytest.mark.asyncio
 async def test_triage_report_delegates(monkeypatch):
-    from dast.hackerone.parser import H1Report
-    from dast.hackerone.validator import ValidationResult
+    from dast.triage.parser import H1Report
+    from dast.triage.validator import ValidationResult
 
     def fake_parse(text):
         return H1Report(vuln_type="idor",
@@ -400,8 +400,8 @@ async def test_triage_report_delegates(monkeypatch):
                                 proof_url=report.proof_url, payload="1",
                                 evidence="reflected", severity="high")
 
-    monkeypatch.setattr("dast.hackerone.parser.parse_report", fake_parse)
-    monkeypatch.setattr("dast.hackerone.validator.validate", fake_validate)
+    monkeypatch.setattr("dast.triage.parser.parse_report", fake_parse)
+    monkeypatch.setattr("dast.triage.validator.validate", fake_validate)
     ctx = ToolContext(settings=_Scope(True))
     result = await run_tool(ctx, "triage_report", {"report_text": "idor on users"})
     assert result["ok"] is True

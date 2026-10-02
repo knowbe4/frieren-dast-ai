@@ -1,5 +1,5 @@
 """
-HackerOne report parser — extracts structured fields from free-form report text.
+external report parser — extracts structured fields from free-form report text.
 
 Supports two modes:
   1. Pattern extraction: URL regex, payload regex, vuln-type keyword scan
@@ -69,14 +69,14 @@ _VULN_TYPE_RE: list[tuple[re.Pattern, str]] = [
 ]
 
 _SYSTEM_PARSE = """\
-You are a security triage assistant. Extract structured fields from a HackerOne vulnerability report.
+You are a security triage assistant. Extract structured fields from a external vulnerability report.
 
 Rules for proof_url and target_url:
 - Must be the VULNERABLE TARGET — the organization's own host/API being attacked.
 - NEVER use attacker-controlled domains (oastify.com, interactsh.com,
   attacker.com, evil.com, ngrok.io, etc.) — these are OOB listeners, not the target.
 - NEVER use reference/documentation URLs (medium.com, owasp.org, docs.aws.amazon.com,
-  github.com, wikipedia.org, hackerone.com).
+  github.com, wikipedia.org, triage.com).
 - For SSRF: proof_url is the vulnerable API endpoint on the target server (e.g. the endpoint
   that makes the outbound call), NOT the OOB listener URL.
 - For dns_takeover: proof_url is the dangling subdomain from "dig X" / "nslookup X" commands.
@@ -162,7 +162,7 @@ def parse_report(text: str) -> H1Report:
         "127.0.0.1",
         # Reference / documentation
         "medium.com", "owasp.org", "docs.aws.amazon.com", "aws.amazon.com",
-        "hackerone.com", "github.com", "google.com", "wikipedia.org",
+        "triage.com", "github.com", "google.com", "wikipedia.org",
         "virustotal.com",
     }
 

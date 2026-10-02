@@ -1,12 +1,10 @@
 """
 Exploration Copilot routes — the conversational exploration surface.
 
-Where ``agent_triage_routes.py`` drives an autonomous loop to a stored verdict,
-this drives a *dialogue* (``dast/ai/copilot/session.py``): the operator sends a
+Drives a *dialogue* (``dast/ai/copilot/session.py``): the operator sends a
 message, the copilot runs tools and replies, and the thread continues. Mid-turn it
-pauses on the same two human walls as the triage agent — an out-of-scope host
-(approve) and an auth wall/captcha (browser handoff) — reusing the identical
-pause/resume plumbing.
+pauses on two human walls — an out-of-scope host (approve) and an auth wall/captcha
+(browser handoff).
 
 Session state and the turn runner live in ``CopilotService`` (``ctx.copilot``) so
 the scanner can escalate a WAF-disabled attack type into a live conversation
@@ -231,7 +229,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 )
             session["_pause_result"] = {"decision": decision}
         elif kind == "auth":
-            from dast.hackerone.validator import _sanitise_cookies
+            from dast.triage.validator import _sanitise_cookies
             raw = value.get("cookies") or {}
             if not isinstance(raw, dict):
                 return JSONResponse({"error": "cookies must be an object"}, status_code=400)

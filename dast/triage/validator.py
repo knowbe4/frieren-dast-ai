@@ -1,5 +1,5 @@
 """
-HackerOne vulnerability validator.
+external vulnerability validator.
 
 Given a parsed H1Report, attempts to reproduce the vulnerability and returns
 a structured verdict. Validation strategy depends on vuln_type:
@@ -38,29 +38,29 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
-from dast.hackerone import evidence, payload_safety
-from dast.hackerone.auth_wall import looks_like_auth_wall as _looks_like_auth_wall
-from dast.hackerone.dns_checks import collect_dns_evidence
-from dast.hackerone.dns_checks import extract_domain as _extract_domain
-from dast.hackerone.llm_verdict import llm_analyse_response as _llm_analyse_response
-from dast.hackerone.llm_verdict import llm_dns_verdict as _llm_dns_verdict
-from dast.hackerone.llm_verdict import llm_repair_proof_url as _llm_repair_proof_url
-from dast.hackerone.llm_verdict import llm_ssrf_assessment as _llm_ssrf_assessment
-from dast.hackerone.llm_verdict import llm_verdict_http as _llm_verdict_http
-from dast.hackerone.llm_verdict import parse_llm_verdict as _parse_llm_verdict
-from dast.hackerone.oob import H1InteractshSession as _InteractshSession
-from dast.hackerone.parser import H1Report
-from dast.hackerone.url_safety import is_safe_url as _is_safe_url
-from dast.hackerone.url_safety import repair_proof_url as _repair_proof_url
-from dast.hackerone.url_safety import sanitise_cookies as _sanitise_cookies
-from dast.hackerone.url_safety import substitute_payload_in_url as _substitute_payload_in_url
-from dast.hackerone.xss_browser import (
+from dast.triage import evidence, payload_safety
+from dast.triage.auth_wall import looks_like_auth_wall as _looks_like_auth_wall
+from dast.triage.dns_checks import collect_dns_evidence
+from dast.triage.dns_checks import extract_domain as _extract_domain
+from dast.triage.llm_verdict import llm_analyse_response as _llm_analyse_response
+from dast.triage.llm_verdict import llm_dns_verdict as _llm_dns_verdict
+from dast.triage.llm_verdict import llm_repair_proof_url as _llm_repair_proof_url
+from dast.triage.llm_verdict import llm_ssrf_assessment as _llm_ssrf_assessment
+from dast.triage.llm_verdict import llm_verdict_http as _llm_verdict_http
+from dast.triage.llm_verdict import parse_llm_verdict as _parse_llm_verdict
+from dast.triage.oob import H1InteractshSession as _InteractshSession
+from dast.triage.parser import H1Report
+from dast.triage.url_safety import is_safe_url as _is_safe_url
+from dast.triage.url_safety import repair_proof_url as _repair_proof_url
+from dast.triage.url_safety import sanitise_cookies as _sanitise_cookies
+from dast.triage.url_safety import substitute_payload_in_url as _substitute_payload_in_url
+from dast.triage.xss_browser import (
     XssBrowserRun,
     observed_execution_mechanism,
     run_xss_in_browser,
 )
-from dast.hackerone.xss_browser import payload_exfil_hosts as _payload_exfil_hosts
-from dast.hackerone.xss_browser import trigger_interaction_xss as _trigger_interaction_xss
+from dast.triage.xss_browser import payload_exfil_hosts as _payload_exfil_hosts
+from dast.triage.xss_browser import trigger_interaction_xss as _trigger_interaction_xss
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)

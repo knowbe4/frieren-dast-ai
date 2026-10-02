@@ -217,7 +217,6 @@ def build_app(
     from dast.proxy.api.repeater_routes import make_router as repeater_router
     from dast.proxy.api.intruder_routes import make_router as intruder_router
     from dast.proxy.api.status_routes import make_router as status_router, prefetch_ai_status
-    from dast.proxy.api.hackerone_routes import make_router as hackerone_router
     from dast.proxy.api.code_routes import make_router as code_router
     from dast.proxy.api.intercept_routes import make_router as intercept_router
     from dast.proxy.api.graphql_routes import make_router as graphql_router
@@ -227,7 +226,6 @@ def build_app(
     from dast.proxy.api.profiles_routes import make_router as profiles_router
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
-    from dast.proxy.api.agent_triage_routes import make_router as agent_triage_router
     from dast.proxy.api.copilot_routes import make_router as copilot_router
     from dast.proxy.api.copilot_service import CopilotService
 
@@ -290,7 +288,6 @@ def build_app(
     app.include_router(repeater_router(ctx))
     app.include_router(intruder_router(ctx))
     app.include_router(status_router(ctx))
-    app.include_router(hackerone_router(ctx))
     app.include_router(code_router(ctx))
     app.include_router(intercept_router(ctx))
     app.include_router(graphql_router(ctx))
@@ -300,7 +297,6 @@ def build_app(
     app.include_router(profiles_router(ctx))
     app.include_router(login_flow_router(ctx))
     app.include_router(mcp_approval_router(ctx))
-    app.include_router(agent_triage_router(ctx))
     app.include_router(copilot_router(ctx))
 
     return app

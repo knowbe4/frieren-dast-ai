@@ -17,7 +17,7 @@ from dast.graphql.variable_fuzzer import (
     extract_variables,
     run_fuzz_job,
 )
-from dast.hackerone import payload_safety
+from dast.triage import payload_safety
 from dast.payloads.loader import get_all_payloads
 
 
@@ -26,7 +26,7 @@ class TestGraphqlPayloadsAreNeverDestructive:
     Safety-policy regression: dast/payloads/graphql.yaml must never contain a
     destructive payload (SQL writes, OS-destructive commands, etc.) — this
     fuzzer sends every payload here for real, against a live target, with no
-    per-payload review step (unlike the HackerOne validator's report-driven
+    per-payload review step (unlike the external validator's report-driven
     flow). A destructive string ('; DROP TABLE ...) briefly existed in this
     file and must never reappear.
     """

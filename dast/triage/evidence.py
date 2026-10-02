@@ -2,7 +2,7 @@
 Evidence formatting for H1 validation results.
 
 The evidence string is what a triager reads (and what gets pasted into a
-HackerOne report), so it must state plainly WHAT happened, WHERE (from which
+external report), so it must state plainly WHAT happened, WHERE (from which
 origin to which host), the RISK in one line, and how to REPRODUCE. When a result
 is inconclusive or errored, the evidence must instead explain WHY, how to test
 MANUALLY, and suggest payload variations to try.

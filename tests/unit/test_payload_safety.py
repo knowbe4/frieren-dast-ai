@@ -12,7 +12,7 @@ itself trip repo command-safety hooks.
 
 from __future__ import annotations
 
-from dast.hackerone import payload_safety as ps
+from dast.triage import payload_safety as ps
 
 
 # Assemble destructive strings without writing the literal patterns inline.

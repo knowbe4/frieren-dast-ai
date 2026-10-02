@@ -2,10 +2,9 @@
 Confirmed-triage persistence — turn a reproduced vulnerability into a dashboard
 finding (which also flows to SARIF export).
 
-Both triage surfaces persist through here so a confirmed verdict looks identical
-in the dashboard and SARIF regardless of which one produced it:
-  - the single-shot H1 validator (``dast/proxy/api/hackerone_routes.py``), and
-  - the agentic Vuln Validator loop (``dast/ai/triage_agent.py``).
+Triage verdicts persist through here so a confirmed finding looks identical
+in the dashboard and SARIF regardless of which surface produced it (copilot,
+triage tool, or external caller).
 
 A confirmed triage is written as a synthetic ``source=<source>`` entry for the
 proof URL plus a finding dict in the shape the dashboard and ``report/sarif.py``
@@ -78,7 +77,7 @@ def persist_confirmed_finding(
             return
         severity_norm = (severity or "high").lower()
         finding = {
-            "title": f"HackerOne triage confirmed: {vuln_type}",
+            "title": f"external triage confirmed: {vuln_type}",
             "severity": severity_norm,
             "attack_type": vuln_type,
             "cwe": H1_CWE_MAP.get(vuln_type, ""),

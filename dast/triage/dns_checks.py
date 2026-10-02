@@ -1,5 +1,5 @@
 """
-DNS evidence collection for HackerOne DNS/subdomain-takeover reports.
+DNS evidence collection for external DNS/subdomain-takeover reports.
 
 Resolves NS and CNAME records for the reported domain and flags dangling
 pointers (NXDOMAIN on a nameserver or CNAME target). Uses dnspython when it is
@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import List
 from urllib.parse import urlparse
 
-from dast.hackerone.parser import H1Report
+from dast.triage.parser import H1Report
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)

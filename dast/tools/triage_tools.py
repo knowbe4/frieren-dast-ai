@@ -1,7 +1,7 @@
 """
 triage_report tool — parse a pasted vulnerability report and reproduce it.
 
-Wraps the Phase-3 AI triage engine (``dast/hackerone/``): parse the report
+Wraps the Phase-3 AI triage engine (``dast/triage/``): parse the report
 (schema-forced LLM enrichment), then reproduce it against the live target through
 the proxy. The verdict is the same schema-forced, payload-safety-gated path the
 Extras > H1 tab uses — so an MCP client and the dashboard triage identically.
@@ -20,7 +20,7 @@ logger = get_logger(__name__)
 _TRIAGE_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "report_text": {"type": "string", "description": "Full vulnerability report text (HackerOne or free-form)."},
+        "report_text": {"type": "string", "description": "Full vulnerability report text (external or free-form)."},
         "override_url": {"type": "string", "description": "Optional proof URL override when the report's is wrong/missing."},
     },
     "required": ["report_text"],
@@ -34,8 +34,8 @@ async def _triage_report(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     try:
         import asyncio
 
-        from dast.hackerone.parser import parse_report
-        from dast.hackerone.validator import validate
+        from dast.triage.parser import parse_report
+        from dast.triage.validator import validate
 
         loop = asyncio.get_running_loop()
         report = await loop.run_in_executor(None, lambda: parse_report(report_text))
@@ -70,9 +70,9 @@ register(Tool(
     name="triage_report",
     description=(
         "Triage an externally-reported vulnerability: parse a free-text report (e.g. a "
-        "HackerOne submission), reproduce the described request against the target, and "
+        "external submission), reproduce the described request against the target, and "
         "return an LLM-backed verdict (confirmed/not, severity, evidence). Wraps the full "
-        "HackerOne triage engine.\n"
+        "external triage engine.\n"
         "Use this when: you have a written vulnerability report and want to confirm whether "
         "it actually reproduces — the primary tool for validating incoming external reports.\n"
         "Do NOT use this to: run a raw request yourself (use send_request); scan for new "

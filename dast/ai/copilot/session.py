@@ -194,7 +194,7 @@ Operational notes:
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
-- HackerOne retest objective ("retest H1 #XXXX"): (1) read the report with the
+- external retest objective ("retest H1 #XXXX"): (1) read the report with the
   triage tools to understand the vuln and endpoints; (2) you are already logged in
   (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via
   the smallest reliable primitive (idor_probe for BOLA; browser-driving for a
@@ -443,7 +443,7 @@ class CopilotSession:
         reply to the history; returns the reply. Never raises — a fatal error is
         surfaced as a reply message with blocked_reason='error'."""
         from dast.tools import all_tools, run_tool
-        from dast.hackerone.validator import _looks_like_auth_wall, _sanitise_cookies
+        from dast.triage.validator import _looks_like_auth_wall, _sanitise_cookies
 
         self.messages.append({"role": "operator", "content": operator_text})
 

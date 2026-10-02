@@ -1,5 +1,5 @@
 """
-Input safety helpers for the HackerOne validator.
+Input safety helpers for the external validator.
 
 Everything here is pure and deterministic: deciding whether a proof URL is
 safe to drive, repairing common copy/paste breakage in proof URLs, swapping a

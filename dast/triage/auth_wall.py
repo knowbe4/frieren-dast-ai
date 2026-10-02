@@ -1,5 +1,5 @@
 """
-Authentication-wall detection for the HackerOne validator.
+Authentication-wall detection for the external validator.
 
 Decides whether a response (status + final URL + body) is a login page,
 permission denial, session-expired message or CAPTCHA challenge, so the

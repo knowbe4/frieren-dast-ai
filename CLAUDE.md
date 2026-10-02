@@ -129,7 +129,7 @@ proxy traffic on every entry → plugin.
 | Cache poisoning | `uv run pytest tests/unit/test_cache_poisoning_agent.py` |
 | JWT editor route | `uv run pytest tests/unit/test_jwt_routes.py` |
 | Vuln knowledge | `uv run python -c "from dast.vuln_knowledge import known_attack_types; print(known_attack_types())"` |
-| H1 triage engine | `uv run pytest tests/unit/test_h1_parser.py tests/unit/test_h1_validator_http.py tests/unit/test_h1_validator_xss.py` |
+| Triage engine | `uv run pytest tests/unit/test_payload_safety.py` |
 | Tool layer / MCP | `uv run pytest tests/unit/test_tools_registry.py`; `uv run dast-ai mcp --help` |
 
 Run a single test with `uv run pytest tests/unit/test_x.py::test_name`. `tests/evals/` is an
@@ -174,7 +174,7 @@ Secret-scan git hooks run on every commit and push (installed by `make setup`). 
 - `dast/profiles/` — named sessions with privilege levels (cross-session IDOR, quick capture)
 - `dast/graphql/`, `dast/chains/`, `dast/discovery/`, `dast/code_analysis/`, `dast/importers/`,
   `dast/browser/`, `dast/scanners/`, `dast/session/` — specialised subsystems (detail in ARCHITECTURE.md)
-- `dast/hackerone/` — HackerOne report triage engine
+- `dast/triage/` — report triage engine
 - `dast/payloads/*.yaml`, `dast/wordlists/*.txt`, `dast/passive_rules/**/*.yaml`,
   `dast/vuln_knowledge/*.yaml` — data-driven assets (edit to extend behavior)
 - `dast/report/sarif.py` — SARIF 2.1.0 export

@@ -26,7 +26,7 @@ from dast.chains.models import (
     Extractor,
     StepResult,
 )
-from dast.hackerone import payload_safety
+from dast.triage import payload_safety
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)

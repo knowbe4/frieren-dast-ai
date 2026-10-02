@@ -77,7 +77,7 @@ def persist_confirmed_finding(
             return
         severity_norm = (severity or "high").lower()
         finding = {
-            "title": f"HackerOne triage confirmed: {vuln_type}",
+            "title": f"external triage confirmed: {vuln_type}",
             "severity": severity_norm,
             "attack_type": vuln_type,
             "cwe": H1_CWE_MAP.get(vuln_type, ""),

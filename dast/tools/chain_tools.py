@@ -101,7 +101,7 @@ _VALIDATE_CHAIN_SCHEMA: Dict[str, Any] = {
         "report_text": {
             "type": "string",
             "description": (
-                "PREFERRED. A free-text description of the multi-step attack (a HackerOne report, "
+                "PREFERRED. A free-text description of the multi-step attack (a external report, "
                 "or your own prose listing the ordered requests). The planner turns it into an "
                 "executable chain, including the control step. Use this whenever you can describe "
                 "the steps in words — it is far more reliable than hand-building `chain`."

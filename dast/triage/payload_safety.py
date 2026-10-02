@@ -2,7 +2,7 @@
 Payload safety gate for the H1 report validator.
 
 The validator reproduces attacks against a LIVE target to confirm them. A
-HackerOne report can contain a destructive payload — ``'; DROP TABLE users--``,
+external report can contain a destructive payload — ``'; DROP TABLE users--``,
 ``; rm -rf /``, ``; shutdown -h now`` — and sending it verbatim to production to
 "validate" would cause real damage. That violates the detection-only safety
 policy the agents follow (no destructive payloads; detection only).

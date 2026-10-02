@@ -3,7 +3,7 @@ Attack-chain planner.
 
 Turns a free-text multi-step vulnerability report into an executable
 :class:`Chain`. This is what lets a "chain of attack" described in prose (a
-HackerOne submission, an internal write-up) become something ChainEngine can
+external submission, an internal write-up) become something ChainEngine can
 run and confirm. The report text is untrusted evidence, so it is fenced with
 ``wrap_untrusted`` and the system prompt carries the injection-defense directive.
 

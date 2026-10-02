@@ -1,5 +1,5 @@
 """
-LLM helpers for the HackerOne validator: prompts, calls and verdict parsing.
+LLM helpers for the external validator: prompts, calls and verdict parsing.
 
 Every call degrades gracefully (returns an empty/negative result on failure) so
 an LLM outage never crashes a validation run. For XSS the LLM is advisory only
@@ -12,7 +12,7 @@ import asyncio
 import re
 from urllib.parse import urlparse
 
-from dast.hackerone.parser import H1Report
+from dast.triage.parser import H1Report
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -66,7 +66,7 @@ Rules:
 """
 
 SYSTEM_SSRF_ASSESS = """\
-You are a senior application security engineer reviewing a HackerOne SSRF report.
+You are a senior application security engineer reviewing a external SSRF report.
 
 The automatic OOB callback test did not receive a hit (interactsh unavailable or
 target did not call back). Assess the report on its own merits:

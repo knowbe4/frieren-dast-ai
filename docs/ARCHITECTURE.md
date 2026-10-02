@@ -737,19 +737,19 @@ dast/
 - Examples are our own trusted content — interpolated directly, NOT `wrap_untrusted()`
 - Add a vuln class: drop a new `<attack_type>.yaml` — no code changes
 
-### AI Triage Engine (HackerOne / pasted reports)
-- `dast/hackerone/parser.py::parse_report(text)` — regex first, LLM enrichment second
+### AI Triage Engine (pasted reports)
+- `dast/triage/parser.py::parse_report(text)` — regex first, LLM enrichment second
   (SCHEMA-FORCED via `H1_PARSE_SCHEMA`, fast tier, text fenced with `wrap_untrusted(..,
   "h1_report")`). Runs on a worker thread, so `_llm_enrich` calls `invoke_json`
   SYNCHRONOUSLY — never `asyncio.get_running_loop()` (raised on the loopless thread;
   regression-tested). Extracts `http_method`, `request_headers` (Authorization/Cookie DROPPED
   — session supplies auth), `request_body`. LLM failure degrades to regex.
-- `dast/hackerone/validator.py::_validate_http` reproduces the report's ACTUAL request
+- `dast/triage/validator.py::_validate_http` reproduces the report's ACTUAL request
   (branches on method, sends body, merges headers with auth stripped). `payload_safety.make_safe`
   gates BOTH URL and body — destructive payload substituted with safe variant, else nothing
   sent (`needs_manual`). Verdict SCHEMA-FORCED via `H1_VERDICT_SCHEMA`; confirmed iff
   `reproduced AND confidence >= 0.95`. `ValidationResult` carries `severity`.
-- `dast/proxy/api/hackerone_routes.py` — on `needs_auth`, `_try_profile_auth` matches a Phase-1
+- `copilot (via triage_report tool)` — on `needs_auth`, `_try_profile_auth` matches a Phase-1
   login profile and authenticates via `session/profile_reauth.reauth_from_profile` (flow replay
   → saved-session fallback) before manual browser login. On `confirmed`, `_persist_finding`
   creates a synthetic `source="agent"` entry + finding → dashboard → SARIF. Both best-effort.

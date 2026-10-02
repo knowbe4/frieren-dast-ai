@@ -116,7 +116,7 @@ RED_TEAM_SCHEMA: Dict[str, Any] = {
     "required": ["confirmed", "confidence", "exploit_scenario", "reasoning"],
 }
 
-# HackerOne report parser — dast/hackerone/parser.py _llm_enrich()
+# external report parser — dast/triage/parser.py _llm_enrich()
 # Structured extraction from free-form report text. Extends the legacy field set
 # with the full HTTP request (method/headers/body) so POST/PUT/JSON PoCs can be
 # reproduced faithfully, not just GET proof URLs.
@@ -160,7 +160,7 @@ H1_PARSE_SCHEMA: Dict[str, Any] = {
     "required": ["vuln_type", "proof_url", "payload", "target_url", "summary"],
 }
 
-# HackerOne reproduction verdict — dast/hackerone/validator.py schema-forced verdict.
+# external reproduction verdict — dast/triage/validator.py schema-forced verdict.
 H1_VERDICT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {

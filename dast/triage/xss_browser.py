@@ -1,5 +1,5 @@
 """
-Headless-browser XSS execution for the HackerOne validator.
+Headless-browser XSS execution for the external validator.
 
 This module drives Playwright against a proof URL and reports what the browser
 OBSERVED — a JavaScript dialog firing, an off-origin navigation to a host
@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import unquote, urlparse
 
-from dast.hackerone.auth_wall import looks_like_auth_wall
+from dast.triage.auth_wall import looks_like_auth_wall
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)

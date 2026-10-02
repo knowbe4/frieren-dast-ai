@@ -8,7 +8,7 @@ the reported issue. It mirrors ``dast/ai/mutator.py``'s action-loop shape — th
 LLM is the primary stop signal (``action="finish"``); a hard step ceiling only
 guards against a loop that never stops.
 
-Where it differs from the single-shot ``dast/hackerone/validator.py`` path: the
+Where it differs from the single-shot ``dast/triage/validator.py`` path: the
 agent iterates, and it hands control back to a human on three walls — an
 out-of-scope/new host (approval), an auth wall / captcha (browser handoff), and a
 value it cannot derive (free-form question). All of that human plumbing (events,
@@ -61,7 +61,7 @@ WaitForHuman = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
 _SYSTEM_AGENT = """\
 You are an expert application security engineer reproducing an externally-reported
-vulnerability (e.g. a HackerOne submission) against a live target, using a fixed set
+vulnerability (e.g. a external submission) against a live target, using a fixed set
 of tools. You work in a loop: each turn you see the report, the tools available, and
 a transcript of your prior steps and what each tool observed. You decide the single
 next step.
@@ -276,7 +276,7 @@ async def run_triage_agent(
     layer's plumbing. Never raises — a fatal error returns status="error".
     """
     from dast.tools import all_tools, run_tool
-    from dast.hackerone.validator import _looks_like_auth_wall, _sanitise_cookies
+    from dast.triage.validator import _looks_like_auth_wall, _sanitise_cookies
 
     tool_defs = [
         {"name": t.name, "description": t.description} for t in all_tools()

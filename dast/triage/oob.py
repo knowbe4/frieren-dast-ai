@@ -1,5 +1,5 @@
 """
-Out-of-band (OOB) callback client used by the HackerOne SSRF validator.
+Out-of-band (OOB) callback client used by the external SSRF validator.
 
 interactsh is an open-source OOB interaction server by ProjectDiscovery. It
 provides a public HTTP API to register a unique subdomain and poll for

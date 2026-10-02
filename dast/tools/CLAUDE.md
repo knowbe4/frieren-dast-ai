@@ -52,7 +52,7 @@ register(Tool(name="my_tool", description="...", input_schema=_SCHEMA,
   via `payload_safety.classify` and offer the safe variant (see `http_tools.send_request`).
 - **Dual data path:** read `ctx.store` when present (fast, in-process); otherwise fall back to the
   dashboard HTTP API via `ctx.dashboard_base_url`. The MCP process has no in-proc store.
-- **Keep handlers thin.** Wrap an existing scanner/engine in `dast/scanners/`, `dast/hackerone/`,
+- **Keep handlers thin.** Wrap an existing scanner/engine in `dast/scanners/`, `dast/triage/`,
   etc. — never reimplement scanning logic here. The tool layer is an adapter, not a home for
   new detection code.
 - **Descriptions are prompts.** The `description` and each schema field `description` are what an

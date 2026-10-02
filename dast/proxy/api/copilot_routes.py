@@ -229,7 +229,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 )
             session["_pause_result"] = {"decision": decision}
         elif kind == "auth":
-            from dast.hackerone.validator import _sanitise_cookies
+            from dast.triage.validator import _sanitise_cookies
             raw = value.get("cookies") or {}
             if not isinstance(raw, dict):
                 return JSONResponse({"error": "cookies must be an object"}, status_code=400)

@@ -847,6 +847,37 @@ class CopilotService:
         session["status"] = "idle" if status == "complete" else status
         session["updated_at"] = time.time()
 
+        # Clean up resources the copilot acquired during the run.
+        self._cleanup_session(session)
+
+    def _cleanup_session(self, session: dict) -> None:
+        """Release per-session resources: close the agent browser and remove any
+        match/replace rules the copilot added (tagged with [copilot_session])."""
+        # Close the agent browser so it doesn't leak Playwright processes.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            import asyncio
+            try:
+                asyncio.ensure_future(browser.close())
+            except Exception as exc:
+                logger.debug("AgentBrowser cleanup error", error=str(exc))
+        # Remove copilot-scoped match/replace rules so the operator's browsing
+        # is not affected after the copilot finishes.
+        settings = getattr(self._ctx, "settings", None)
+        if settings is not None:
+            try:
+                from dast.tools.match_replace_tools import _COPILOT_TAG
+                all_rules = settings.get_match_replace() or []
+                removed = 0
+                for i in reversed(range(len(all_rules))):
+                    if all_rules[i].get("comment", "").startswith(f"[{_COPILOT_TAG}]"):
+                        settings.remove_match_replace(i)
+                        removed += 1
+                if removed:
+                    logger.info("Cleaned up copilot match/replace rules", removed=removed)
+            except Exception as exc:
+                logger.warning("match/replace cleanup failed", error=str(exc))
+
     async def _guidance_pause(self, sid: str, session: dict, reply, deadline: float) -> dict:
         """Turn a ``need_human`` escalation into an operator prompt on the pause
         channel and block for an answer (answer / pause / abort). Bounded by the

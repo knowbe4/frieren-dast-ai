@@ -987,6 +987,60 @@ async def test_verify_reflection_out_of_scope_blocked():
     assert "out of scope" in result["error"]
 
 
+# ── match_replace tool (copilot-scoped M&R rules) ───────────────────────────────
+
+class _FakeSettings:
+    def __init__(self):
+        self._rules = []
+    def get_match_replace(self):
+        return list(self._rules)
+    def add_match_replace(self, rule):
+        self._rules.append(dict(rule))
+    def remove_match_replace(self, idx):
+        if 0 <= idx < len(self._rules): self._rules.pop(idx)
+
+
+@pytest.mark.asyncio
+async def test_match_replace_add_list_clear_lifecycle():
+    settings = _FakeSettings()
+    ctx = ToolContext(settings=settings)
+
+    # Add a copilot rule
+    r = await run_tool(ctx, "match_replace", {
+        "action": "add", "scope": "request", "type": "body",
+        "match": "BodyHtml=[^&]+", "replace": "BodyHtml=<script>alert(1)</script>",
+        "comment": "inject XSS",
+    })
+    assert r["ok"] is True
+    assert r["index"] == 0
+
+    # List — rule should be tagged
+    r = await run_tool(ctx, "match_replace", {"action": "list"})
+    assert r["count"] == 1
+    assert r["rules"][0]["copilot"] is True
+    assert "copilot_session" in settings._rules[0]["comment"]
+
+    # Clear — should remove copilot rules
+    r = await run_tool(ctx, "match_replace", {"action": "clear"})
+    assert r["ok"] is True and r["removed"] == 1
+    assert settings._rules == []
+
+
+@pytest.mark.asyncio
+async def test_match_replace_does_not_remove_operator_rules():
+    settings = _FakeSettings()
+    settings._rules.append({"comment": "operator's own rule", "enabled": True})
+    ctx = ToolContext(settings=settings)
+
+    await run_tool(ctx, "match_replace", {"action": "add", "match": "x", "replace": "y"})
+    assert len(settings._rules) == 2
+
+    r = await run_tool(ctx, "match_replace", {"action": "clear"})
+    assert r["removed"] == 1
+    assert len(settings._rules) == 1
+    assert settings._rules[0]["comment"] == "operator's own rule"
+
+
 # ── browser_* tools (agent browser-driving) ─────────────────────────────────────
 
 class _FakeBrowser:

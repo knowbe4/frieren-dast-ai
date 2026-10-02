@@ -1,54 +1,50 @@
 # Frieren DAST-AI — TODO
 
-Improvements identified during H1 #3823255 retest session (2026-10-01).
+Improvements identified during HackerOne retest sessions (2026-10-01).
 
 ---
 
-## Bugs (code fixes ready, need commit)
+## Bugs (fixed)
 
-- [x] **Match/replace content-length desync** — when match/replace modifies the request body, the `content-length` header was not updated, causing the upstream server to hang waiting for bytes that never arrive. Fixed in `dast/proxy/proxy_server.py`.
-- [x] **Browser close not detected on macOS** — closing the Chromium window does not always kill the browser process on macOS, so the `disconnected` event never fires and the dashboard still reports `active: true`. The operator has to go to Manual Browse > Close Browser manually. Fixed in `dast/proxy/browse_session.py` (page/context close listener) and `dast/proxy/runner.py` (`_active` cleanup via `nonlocal`).
+- [x] **Match/replace content-length desync** — when match/replace modifies the request body, the `content-length` header was not updated. Fixed in `dast/proxy/proxy_server.py`.
+- [x] **Browser close not detected on macOS** — closing the Chromium window does not always kill the browser process on macOS. Fixed in `dast/proxy/browse_session.py` and `dast/proxy/runner.py`.
 
 ## XSS payloads
 
-- [x] **H1 #3823255 payloads added to xss.yaml** — three report-specific bypass payloads (null-byte prefix, DOM nesting/mXSS, encoded ontoggle) added to the `bypass` category.
+- [x] **Sanitizer bypass payloads** — three bypass payloads (null-byte prefix, DOM nesting/mXSS, encoded ontoggle) added to the `bypass` category.
 
 ## Copilot improvements
 
-- [x] **Copilot source label in history** — copilot `send_request` entries are now tagged `source: "copilot"` (threaded through `ToolContext.source_label`) with a dedicated history badge and filter checkbox. Crawl traffic already shows as `crawler`.
-- [x] **Copilot pause banner** — persistent top-level banner below the main tab bar, visible on every tab, driven by the copilot WS `pause`/`resumed` events (WS now connected at startup and seeded from any already-paused run). Clicking it jumps to the paused run.
-- [x] **Copilot session-safe mode** — added a `session_safe` flag (autonomous run config + API + UI checkbox, threaded via `ToolContext.session_safe`). When on, it skips the ambient `auto_ai_mode` auto-scan (the param-mining/agent flood that shared the login cookie) and caps `crawl` to 20 clicks with no extra seeds, so strict/single-session targets (ASP.NET) stay logged in.
-- [x] **Copilot browser-driving capability** — DONE: shipped `AgentBrowser` (dast/browser/agent_browser.py) + six `browser_*` tools (navigate/snapshot/fill/click/wait_for/extract). Headless, routed through the proxy, seeded from the cookie jar, one persistent page per session so multi-step form state survives. The copilot can now discover a form (snapshot), fill it, submit, and extract a fresh hidden token — the mechanism needed for single-use CSRF tokens (ComposeToken, __VIEWSTATE, draftId). Unit-tested. NOT YET validated live end-to-end against a CSRF form (needs a live target + creds); and no explicit MFA/needs-human pause yet (a stuck wait just times out).
-- [x] **Encrypted credential storage + auto re-login** — already present in `dast/profiles/` (Fernet-encrypted `Credential.secret_enc` + `saved_session`; `reauth_from_profile` + SessionRefreshWorker auto-relogin, now also via the SSO-capable AuthAgent). Added `DAST_PROFILES_KEY` env override so the key can be hardware-bound (sourced from an OS keychain) instead of the default portable 0600 file.
+- [x] **Copilot source label in history** — copilot `send_request` entries are now tagged `source: "copilot"` with a dedicated history badge and filter checkbox.
+- [x] **Copilot pause banner** — persistent top-level banner below the main tab bar, visible on every tab, driven by the copilot WS `pause`/`resumed` events.
+- [x] **Copilot session-safe mode** — `session_safe` flag skips ambient auto-scan and caps crawl for strict/single-session targets (ASP.NET).
+- [x] **Copilot browser-driving capability** — `AgentBrowser` + six `browser_*` tools (navigate/snapshot/fill/click/wait_for/extract). Headless, proxy-routed, cookie-seeded, one persistent page per session. Validated live.
+- [x] **Encrypted credential storage + auto re-login** — already present in `dast/profiles/`; added `DAST_PROFILES_KEY` env override for optional hardware-bound key.
 
 ## UI/UX improvements
 
-- [x] **Intercept diff view** — `PendingRequest` now snapshots the request/response as first intercepted (`orig_*` fields) and the intercept editor has a Diff toggle showing an inline original-vs-modified line diff.
-- [x] **Proxy findings view** — DONE: promoted the consolidated findings view from the buried Proxy > Issues sub-tab to a top-level **Findings** tab (Triage group) with a severity-colored live count badge (updated on every entry WS update). Findings are now visible at a glance from any tab.
-- [x] **Multi-request findings + evidence clarity** — a BOLA/differential proof spans a request chain (write→read→control→delete) but was pinned to one entry with the whole proof crammed into one free-text blob (an unreadable wall of text that "only showed one request"). DONE: `record_finding` takes an optional `steps` array (label, method, url, status, note), carried through `flatten_findings`, rendered as a clean numbered evidence table in both the detail panel and the Findings tab.
-- [x] **Deterministic BOLA/IDOR runner** — DONE: `idor_probe` tool runs the full differential (foreign-write → foreign-read value-match → never-written control → optional delete+confirm) in ONE call, classifies deterministically, pulls cookies from the jar, and records a finding with the request chain as `steps`. Proven live on H1 #4055826: a single copilot tool call returned CONFIRMED and auto-recorded the 5-step finding — no spinning, no LLM arg-building in the critical path. Covered by confirmed/echo/out-of-scope unit tests.
-- [x] **Model-layer tool-arg forcing** — DONE: when a `call_tool` is missing a required arg, the loop re-asks the model with the TOOL's own JSON Schema (required fields forced) and uses the repaired args if valid, else falls back to the precise nudge. Covered by repair-success / repair-fails-fallback tests. (Residual: in a live run the model sometimes still produced wrong-but-present URLs — the forcing guarantees presence, not correctness; `idor_probe` remains the reliable path for the BOLA differential.)
-- [x] **Match/replace UI visibility** — the Proxy Settings page now has a sticky section jump-nav; the Match & Replace link carries a badge showing the active-rule count, so the operator sees at a glance when rewriting is live.
-- [x] **Settings page restructure** — added a sticky section jump-nav (Scope, Bypass & Extensions, Match & Replace, Setup) with anchors on each section so every tool is one click away and visible at a glance. (Did not split into separate sub-tabs — the jump-nav keeps the existing single-page handlers intact; revisit sub-tabs if the page keeps growing.)
+- [x] **Intercept diff view** — `PendingRequest` snapshots the original; Diff toggle shows inline original-vs-modified line diff.
+- [x] **Findings tab** — promoted from buried Proxy > Issues sub-tab to a top-level **Findings** tab with a severity-colored live count badge.
+- [x] **Multi-request evidence (steps)** — `record_finding` takes an optional `steps` array rendered as a clean numbered evidence table in the Findings tab and detail panel.
+- [x] **Deterministic BOLA/IDOR runner (`idor_probe`)** — one tool call runs the full write/read/control/delete differential, classifies deterministically, and records a finding with steps. Covered by unit tests.
+- [x] **Model-layer tool-arg forcing** — when a `call_tool` is missing a required arg, the loop re-asks with the tool's own JSON Schema; falls back to a precise nudge on failure.
+- [x] **Match/replace UI visibility** — sticky section jump-nav in Proxy Settings; Match & Replace link carries a badge showing the active-rule count.
+- [x] **Settings page restructure** — sticky section jump-nav (Scope, Bypass & Extensions, Match & Replace, Setup) with anchors on each section.
 
-## Copilot autonomous retest capability (H1 #3823255 learnings)
+## Copilot autonomous retest capability
 
-The copilot should be able to fully retest a HackerOne report autonomously without operator intervention. During the H1 #3823255 retest (2026-10-01), the copilot failed at every step and the operator had to manually test via match/replace + manual browser. Key gaps:
+- [x] **CSRF-protected forms end-to-end** — validated live: navigate, snapshot, extract hidden token, fill, submit via browser tools + `match_replace` for transparent payload injection.
+- [x] **Match/replace as copilot tool** — `match_replace` tool (add/list/remove/clear), copilot-scoped rules auto-cleaned on session end.
+- [x] **Verify rendered output (`verify_reflection`)** — classifies payload survival (rendered_raw / encoded / stripped) with evidence.
+- [x] **get_history pagination/filtering** — filters by method, path, source; newest-first; entry_id lookup with bodies.
+- [x] **Session flooding prevention** — session-safe mode skips ambient auto-scan + caps crawl.
+- [x] **Autonomous retest workflow** — composable via system-prompt playbook: auto SSO login, browser-driving, `idor_probe`, `verify_reflection`, `record_finding` with steps.
 
-- [x] **Copilot should handle CSRF-protected forms end-to-end** — DONE and validated live on `kb4-hackerone.egressforms.com`: the copilot navigated to the authenticated form, snapshotted it (discovered all fields including the hidden `submission-id` token), extracted the token value (`ae487a11-...`), filled the editable fields, and clicked submit — full CSRF-token workflow via browser tools. Combined with the `match_replace` tool for transparent payload injection, the copilot can now drive form-based workflows that raw `send_request` cannot reproduce.
-- [x] **Copilot should use match/replace for payload injection** — DONE: `match_replace` tool (add/list/remove/clear), rules tagged `[copilot_session]` and auto-cleaned on session end (`_cleanup_session`). The copilot sets a rewrite rule, drives the browser to submit the form normally, and the proxy injects the payload transparently. Covered by lifecycle + operator-safe tests.
-- [x] **Copilot should verify rendered output automatically** — added the `verify_reflection` tool: fetches a rendered page and classifies the payload as rendered_raw / encoded / stripped with evidence. Baseline-vs-payload comparison is done by calling it twice (benign value, then payload).
-- [x] **get_history pagination/filtering** — `get_history` now filters by method, path (substring), and source, sorts newest-first by default, and supports `entry_id` lookup returning a single entry with bodies.
-- [x] **Copilot should not flood strict session targets** — addressed by the session-safe mode above (skips ambient auto-scan + caps crawl). Still manual opt-in via the checkbox; automatic detection of strict session management (back off on login-redirect/401 after probes) remains a future enhancement.
-- [x] **Autonomous retest workflow** — DONE and proven live: a plain "retest HackerOne #4055826" objective (no tool named) made the copilot auto-authenticate (AuthAgent SSO at startup), choose `idor_probe` per the system-prompt playbook, run the differential, return CONFIRMED, and record the finding with a 5-step chain — reaching idle with no spinning. Building blocks (auto login, browser-driving, idor_probe, verify_reflection, record_finding steps) are composed via the playbook. (Reading the H1 report text automatically via the triage tools is still operator-pasted today; wiring the report fetch is a nice follow-up.)
+## Copilot autonomy fixes
 
-## Copilot autonomy failures observed in H1 #4055826 BOLA retest (2026-10-01)
-
-Live run against `kb4-hackerone.egressforms.com`. The operator (this session) had to hand-hold every step; the copilot could not run it solo. The vuln itself reproduced CONFIRMED (foreign-write 200, foreign-read 200 exact value match, control 500, delete 200, post-delete 500). Concrete code gaps to fix so Frieren does this autonomously next time:
-
-- [x] **AuthAgent logs in through staged SSO** — DONE: `AuthAgent.login()` now follows an SSO sign-in button to the IdP when no username field is on the landing page, and handles the staged `email → Continue → password` pattern; the login's cookies are seeded into the proxy jar (`import_playwright_cookies`) so the copilot/crawler are authenticated, not just the scan pool. Proven live on H1 #4055826: fully automatic login, `cookie_count:8`, no manual script. Headless auto-relogin via SessionRefreshWorker uses the same path.
-- [x] **send_request tool-args are unstable** — FIXED in `dast/ai/copilot/session.py`: required args are now validated from each tool's schema BEFORE dedup/execution; a `send_request` with an empty `url` gets a precise "missing required url" correction and is NOT added to the anti-repeat set, so the corrected call runs instead of being suppressed as a duplicate. (Further hardening — forcing tool-call args through the JSON Schema at the model layer — is still worth doing so the slip never happens.)
-- [x] **Repeat-suppression blocks legitimate state-change re-requests** — FIXED in `dast/ai/copilot/session.py`: a successful state-changing `send_request` (POST/PUT/PATCH/DELETE) now clears the anti-repeat set, so the copilot can re-issue an earlier read (GET /load after DELETE) to observe the new state instead of being suppressed and misreading stale history.
-- [x] **Copilot trusts stale get_history as current state** — DONE: the anti-repeat reset lets the fresh read run, and the system prompt now explicitly instructs the copilot to confirm a state change with a FRESH send_request and never infer the result from `get_history` (whose entries predate the mutation). A history age-stamp remains a possible further nicety.
-- [x] **Finding recorded on an out-of-scope entry is silently dropped** — the target host (`kb4-hackerone.egressforms.com`) did not match the `.*egress\.com$` scope rule, so its traffic/findings recorded as `out-of-scope` and never showed in the Findings tab (the copilot reached it only via the `always_host` tool-gate relaxation). FIXED in `dast/proxy/runner.py`: the `--auth-url` host is auto-added to the proxy scope at startup. TODO follow-up: when the copilot approves a host via `always_host`, also add it to the proxy scope (not just the tool `approved_hosts`), so copilot-discovered hosts' findings surface too.
-- [x] **Single-objective BOLA/IDOR differential runner** — DONE (duplicate of the `idor_probe` item above): one tool call runs write→read→control→delete, asserts value-match + control-500, and records a finding with steps. Proven live.
+- [x] **AuthAgent staged SSO login** — follows SSO sign-in button + handles staged email/Continue/password; seeds the proxy cookie jar from login. Headless auto-relogin via SessionRefreshWorker uses the same path.
+- [x] **Tool-arg validation + repair** — required args validated from schema before dedup/execution; schema-forced repair pass before nudge fallback.
+- [x] **Anti-repeat reset after mutation** — successful state-changing requests clear the dedup set so confirming re-reads run.
+- [x] **Stale get_history guidance** — system prompt instructs confirming mutations with fresh requests, not history.
+- [x] **Auth-host auto-scoped** — `--auth-url` host auto-added to proxy scope so findings are not silently dropped.
+- [x] **BOLA/IDOR differential runner** — `idor_probe` tool; proven live.

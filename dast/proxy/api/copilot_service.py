@@ -443,6 +443,17 @@ class CopilotService:
         run_scan) reach the live queues through the extra fields; they are present
         only for the in-process copilot, so the tools degrade gracefully elsewhere."""
         ctx = self._ctx
+        # One AgentBrowser per session, created lazily and reused across turns so
+        # multi-step form state (and a fresh CSRF token) survives between tool calls.
+        browser = session.get("_agent_browser")
+        if browser is None:
+            try:
+                from dast.browser.agent_browser import AgentBrowser
+                browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store)
+                session["_agent_browser"] = browser
+            except Exception as exc:
+                logger.warning("could not create AgentBrowser", error=str(exc))
+                browser = None
         return AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
@@ -452,6 +463,9 @@ class CopilotService:
             scan_queue=getattr(ctx, "scan_queue", None),
             scan_queue_state=getattr(ctx, "scan_queue_state", None),
             crawl_queue=getattr(ctx, "crawl_queue", None),
+            source_label="copilot",
+            session_safe=bool((session.get("autonomous") or {}).get("session_safe", False)),
+            browser=browser,
         )
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,
@@ -526,6 +540,7 @@ class CopilotService:
         profile_slug: Optional[str] = None,
         budget: Optional[dict] = None,
         auto_ai_mode: bool = True,
+        session_safe: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -551,6 +566,7 @@ class CopilotService:
             "config": cfg,
             "hosts": hosts,
             "profile": profile_slug or None,
+            "session_safe": session_safe,
             "stop_event": asyncio.Event(),
             "pause_gate": pause_gate,
             "paused_at": None,
@@ -565,6 +581,14 @@ class CopilotService:
 
         # Ambient auto-scan: with AI mode on, every in-scope entry the copilot
         # crawls/proxies is auto-queued through the scan pipeline as well.
+        # Session-safe mode suppresses this — the param-mining/agent probes it
+        # fans out share the one logged-in cookie and trip concurrent-session
+        # detection on strict targets (ASP.NET single-session), logging the run
+        # (and the operator's browser) out mid-objective.
+        if session_safe and auto_ai_mode:
+            logger.info("session-safe mode: skipping ambient auto-scan (ai_mode)",
+                        session_id=sid)
+            auto_ai_mode = False
         if auto_ai_mode and self._ctx.store is not None:
             try:
                 # Remember the operator's prior AI-mode setting so it is restored
@@ -822,6 +846,37 @@ class CopilotService:
                                    error=str(exc))
         session["status"] = "idle" if status == "complete" else status
         session["updated_at"] = time.time()
+
+        # Clean up resources the copilot acquired during the run.
+        self._cleanup_session(session)
+
+    def _cleanup_session(self, session: dict) -> None:
+        """Release per-session resources: close the agent browser and remove any
+        match/replace rules the copilot added (tagged with [copilot_session])."""
+        # Close the agent browser so it doesn't leak Playwright processes.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            import asyncio
+            try:
+                asyncio.ensure_future(browser.close())
+            except Exception as exc:
+                logger.debug("AgentBrowser cleanup error", error=str(exc))
+        # Remove copilot-scoped match/replace rules so the operator's browsing
+        # is not affected after the copilot finishes.
+        settings = getattr(self._ctx, "settings", None)
+        if settings is not None:
+            try:
+                from dast.tools.match_replace_tools import _COPILOT_TAG
+                all_rules = settings.get_match_replace() or []
+                removed = 0
+                for i in reversed(range(len(all_rules))):
+                    if all_rules[i].get("comment", "").startswith(f"[{_COPILOT_TAG}]"):
+                        settings.remove_match_replace(i)
+                        removed += 1
+                if removed:
+                    logger.info("Cleaned up copilot match/replace rules", removed=removed)
+            except Exception as exc:
+                logger.warning("match/replace cleanup failed", error=str(exc))
 
     async def _guidance_pause(self, sid: str, session: dict, reply, deadline: float) -> dict:
         """Turn a ``need_human`` escalation into an operator prompt on the pause

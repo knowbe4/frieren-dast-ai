@@ -57,6 +57,7 @@
   <div class="tab-group" title="Triage">
     <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span>
     <div class="mtab on"  id="mt-overview" onclick="switchMain('overview')">Dashboard</div>
+    <div class="mtab"     id="mt-findings" onclick="switchMain('findings')">Findings<span id="findings-tab-badge" class="findings-tab-badge" style="display:none">0</span></div>
     <div class="mtab"     id="mt-copilot"  onclick="switchMain('copilot')">Copilot</div>
   </div>
   <div class="tab-group-sep"></div>
@@ -82,6 +83,11 @@
     <div class="mtab"     id="mt-extras"   onclick="switchMain('extras')">Extras</div>
   </div>
 </div>
+
+<!-- Persistent copilot-paused banner. Hidden until the copilot broadcasts a
+     pause event over /ws/copilot; visible on every tab so the operator never
+     misses a run waiting for input. Clicking it jumps to the Copilot tab. -->
+<div id="cp-pause-banner" style="display:none" onclick="cpBannerGoto()" role="button" tabindex="0"></div>
 
 <!-- hidden file inputs for OS file picker -->
 <input type="file" id="session-file-input"  accept=".json" style="display:none" onchange="onSessionFileSelected(event)">
@@ -168,7 +174,6 @@
         Intercept<span id="intercept-badge"></span>
       </div>
       <div class="stab"    id="st-sitemap"   onclick="switchProxySub('sitemap')">Site map</div>
-      <div class="stab"    id="st-issues"    onclick="switchProxySub('issues')">Issues</div>
       <div class="stab"    id="st-psettings" onclick="switchProxySub('psettings')">Settings</div>
       <div class="sp"></div>
       <button id="intercept-toggle-btn" class="intercept-btn" onclick="interceptToggle()"
@@ -197,6 +202,7 @@
           <label title="SPA crawler traffic"><input type="checkbox" id="chk-src-crawler" checked onchange="applyFilter()"> <span class="src-tag src-crawler">crawl</span></label>
           <label title="AI agent probes (LLM-driven)"><input type="checkbox" id="chk-src-agent" checked onchange="applyFilter()"> <span class="src-tag src-agent">agent</span></label>
           <label title="Deterministic scan probes (code-driven)"><input type="checkbox" id="chk-src-scan" checked onchange="applyFilter()"> <span class="src-tag src-scan">scan</span></label>
+          <label title="Autonomous copilot requests"><input type="checkbox" id="chk-src-copilot" checked onchange="applyFilter()"> <span class="src-tag src-copilot">copilot</span></label>
           <input type="checkbox" id="chk-src-oos" style="display:none" onchange="applyFilter()">
           <div class="sep" style="margin:0 2px"></div>
           <label><input type="checkbox" id="chk-conn" checked onchange="applyFilter()"> Hide CONNECT</label>
@@ -307,6 +313,8 @@
           <div class="sp"></div>
           <span id="ie-title" style="font-size:10px;color:var(--txt2);padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:300px"></span>
           <div class="sp"></div>
+          <button id="ie-diff-btn" class="tbtn" style="font-size:10px;padding:2px 8px;margin:3px 4px"
+                  onclick="_interceptToggleDiff()" disabled title="Toggle original-vs-modified diff">Diff</button>
           <button id="ie-drop-btn" class="tbtn" style="font-size:10px;padding:2px 8px;margin:3px 4px;background:#4a100020;color:#ff6b6b;border-color:#7a202060"
                   onclick="interceptDrop()" disabled>Drop</button>
           <button id="ie-fwd-btn" class="tbtn pri" style="font-size:10px;padding:2px 8px;margin:3px 8px 3px 0"
@@ -317,6 +325,9 @@
                  font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;
                  padding:10px 14px;overflow:auto"
           placeholder="Select a request above to edit its headers and body, then click Forward."></textarea>
+        <!-- Original-vs-modified diff view, shown when the Diff toggle is on. -->
+        <div id="intercept-diff" style="display:none;flex:1;overflow:auto;background:var(--bg);
+             font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;padding:10px 0"></div>
       </div>
     </div>
 
@@ -338,8 +349,17 @@
           </select>
         </div>
 
+        <!-- Section jump-nav: every settings section is listed here so nothing is
+             hidden below the fold (Match & Replace used to be easy to miss). -->
+        <div id="settings-nav">
+          <button class="settings-nav-link" onclick="settingsJump('sec-scope')">Scope</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-bypass')">Bypass &amp; Extensions</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-matchreplace')">Match &amp; Replace<span id="mr-active-badge" class="settings-nav-badge" style="display:none">0</span></button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-setup')">Setup</button>
+        </div>
+
         <!-- Include in scope -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div id="sec-scope" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
           <h3 style="margin:0">Include in scope</h3>
           <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('include')">+ Add rule</button>
         </div>
@@ -391,6 +411,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:14px">
 
         <!-- Bypass + Hidden Ext side by side -->
+        <h3 id="sec-bypass" style="scroll-margin-top:8px;margin:0 0 8px">Bypass &amp; Extensions</h3>
         <div style="display:flex;gap:20px">
           <div style="flex:1;min-width:0">
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
@@ -422,7 +443,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin:14px 0">
 
         <!-- Match & Replace -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <div id="sec-matchreplace" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
           <h3 style="margin:0">Match and Replace</h3>
           <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddMrForm()">+ Add rule</button>
         </div>
@@ -489,7 +510,7 @@
         <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
 
         <!-- ── Setup (formerly its own top-level tab) ── -->
-        <h2>Setup</h2>
+        <h2 id="sec-setup" style="scroll-margin-top:8px">Setup</h2>
 
         <h3>1. Configure browser proxy</h3>
         <p style="color:var(--txt2);font-size:11px;margin:0 0 8px">
@@ -635,8 +656,11 @@
     </div>
 
 
-    <!-- Issues: all findings grouped by host -->
-    <div id="proxy-issues" style="display:none;flex:1;overflow:hidden;flex-direction:column;">
+  </div><!-- /panel-proxy -->
+
+  <!-- Findings: consolidated vuln findings — promoted from the Proxy > Issues
+       sub-tab to a top-level tab so findings are visible at a glance. -->
+  <div class="tpanel" id="panel-findings" style="flex-direction:column;overflow:hidden">
       <div style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:var(--bg2);
                   border-bottom:1px solid var(--bdr);flex-shrink:0;">
         <div style="display:flex;gap:4px;">
@@ -669,7 +693,6 @@
         <span id="issues-page-lbl" style="color:var(--txt2)"></span>
         <button class="tbtn" onclick="issuesPage(1)">Next ›</button>
       </div>
-    </div>
   </div>
 
   <!-- ══ IMPORT FINDINGS MODAL ══ -->
@@ -2144,6 +2167,7 @@
               <label>Minutes <input id="cp-auto-mins" type="number" min="1" value="30" style="width:56px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
               <label>Stuck turns <input id="cp-auto-stuck" type="number" min="1" value="3" style="width:48px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
               <label><input id="cp-auto-escalate" type="checkbox"> Ask before out-of-scope</label>
+              <label title="For targets with strict/single-concurrent sessions (e.g. ASP.NET). Skips ambient auto-scan and caps crawl volume so the shared login cookie isn't invalidated."><input id="cp-auto-session-safe" type="checkbox"> Session-safe (strict sessions)</label>
             </div>
           </details>
           <div style="display:flex;gap:8px;align-items:center">

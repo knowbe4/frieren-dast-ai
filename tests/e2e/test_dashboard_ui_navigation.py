@@ -109,9 +109,10 @@ def monkeypatch_module():
 
 
 TOP_LEVEL_TABS = [
-    "overview", "proxy", "browse", "ai", "plugins", "graphql", "repeater", "intruder", "logs", "extras",
+    "overview", "findings", "proxy", "browse", "ai", "plugins", "graphql", "repeater", "intruder", "logs", "extras",
 ]
-PROXY_SUB_TABS = ["history", "intercept", "sitemap", "issues", "psettings"]
+# "issues" was promoted from a Proxy sub-tab to the top-level "findings" tab.
+PROXY_SUB_TABS = ["history", "intercept", "sitemap", "psettings"]
 BROWSE_SUB_TABS = ["manual", "crawl", "discovery"]
 EXTRAS_SUB_TABS = ["h1", "code", "fedramp", "interactions", "decoder", "jwt"]
 GRAPHQL_SUB_TABS = ["explorer", "fuzzer"]

@@ -124,9 +124,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         """Start a fully autonomous orchestrator run.
 
         Body: {objective (required), focus_hosts?: [str], profile_slug?: str,
-        auto_ai_mode?: bool (default true),
+        auto_ai_mode?: bool (default true), session_safe?: bool (default false),
         budget?: {max_tool_calls, max_wall_clock_seconds, max_stuck_turns,
         allow_scope_escalation}}. Missing budget fields fall back to the defaults.
+        session_safe skips the ambient auto-scan and caps crawl volume for targets
+        with strict/single-concurrent session management.
         """
         objective = (body.get("objective") or "").strip()
         if not objective:
@@ -144,10 +146,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "budget must be an object"}, status_code=400)
         profile_slug = (body.get("profile_slug") or "").strip() or None
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
+        session_safe = bool(body.get("session_safe", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
-                budget=budget, auto_ai_mode=auto_ai_mode,
+                budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

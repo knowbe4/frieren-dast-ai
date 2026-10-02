@@ -244,6 +244,23 @@ class ProxyRunner:
         session_mgr = SessionManager()
         await self._pool.start()
 
+        # Pointing --auth-url at a host declares it the target, so make sure that
+        # host is in the proxy scope. Otherwise its traffic records as
+        # "out-of-scope" and its findings are silently dropped from the Findings
+        # tab / report (in_scope_entries filters them out) even though we probed it.
+        if self._auth_url and self._settings is not None:
+            try:
+                from urllib.parse import urlparse as _urlparse_scope
+                auth_host = (_urlparse_scope(self._auth_url).hostname or "").strip()
+                if auth_host and not self._settings.is_in_scope(self._auth_url):
+                    self._settings.add_scope_rule({
+                        "protocol": "any", "host": auth_host,
+                        "port": "", "file": "", "kind": "include",
+                    })
+                    logger.info("Added auth-url host to proxy scope", host=auth_host)
+            except Exception as exc:
+                logger.warning("Could not add auth-url host to scope", error=str(exc))
+
         refresh_worker = None
         if self._auth_url and self._username:
             async with self._pool.acquire() as ctx:
@@ -258,7 +275,16 @@ class ProxyRunner:
                 if ok:
                     state = await ctx.storage_state()
                     await self._pool.apply_auth_state(state)
-                    logger.info("Auth state applied to proxy scan pool")
+                    # Seed the shared cookie jar too, so the copilot's send_request
+                    # and the crawler (which read the store jar, not the scan pool)
+                    # are authenticated — not just the scanner's browser contexts.
+                    try:
+                        seeded = self._store.import_playwright_cookies(state.get("cookies", []))
+                        logger.info("Auth state applied to proxy scan pool and cookie jar",
+                                    jar_cookies=seeded)
+                    except Exception as exc:
+                        logger.warning("Could not seed cookie jar from login", error=str(exc))
+                        logger.info("Auth state applied to proxy scan pool")
                 else:
                     logger.warning("Proxy auth failed — scanning unauthenticated")
 
@@ -479,7 +505,9 @@ class ProxyRunner:
                     await _active.stop()
 
                 def on_stop():
+                    nonlocal _active
                     self._store.active_browse_session_id = None
+                    _active = None
 
                 session = BrowseSession(
                     proxy_port=self._proxy_port,

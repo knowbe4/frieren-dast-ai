@@ -91,6 +91,12 @@ class BrowseSession:
 
         self._browser.on("disconnected", self._handle_close)
 
+        # On macOS, closing the last Chromium window does not always kill the
+        # browser process, so the "disconnected" event never fires. Watch for
+        # page closes and force-close the browser when the last page is gone.
+        self._context.on("close", self._on_context_or_page_close)
+        page.on("close", self._on_context_or_page_close)
+
     # ── Login-flow recording ────────────────────────────────────────────────
     async def _install_recorder(self) -> None:
         """Expose the record binding + inject the DOM listener into every page."""
@@ -149,6 +155,32 @@ class BrowseSession:
             return await self._context.storage_state()
         except Exception:
             return None
+
+    def _on_context_or_page_close(self, *_) -> None:
+        """Fired when a page or context closes. If all pages are gone, force-close
+        the browser so the ``disconnected`` event fires and cleanup runs."""
+        import asyncio
+        if not self._browser or not self.running:
+            return
+        try:
+            contexts = self._browser.contexts
+            all_pages = [p for ctx in contexts for p in ctx.pages]
+            if not all_pages:
+                logger.info("Last browser page closed, shutting down browse session",
+                            session_id=self.session_id)
+                asyncio.ensure_future(self._force_close())
+        except Exception as exc:
+            logger.warning("Failed to handle browser page/context close",
+                           session_id=self.session_id, error=str(exc))
+
+    async def _force_close(self) -> None:
+        """Close the browser process so ``disconnected`` fires."""
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception as exc:
+                logger.warning("Failed to force-close browser",
+                               session_id=self.session_id, error=str(exc))
 
     def _handle_close(self, *_) -> None:
         self.running = False

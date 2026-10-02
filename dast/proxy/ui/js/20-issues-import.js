@@ -251,7 +251,7 @@ function _buildIssueCard(host, f, globalIdx) {
              <div style="font-size:10.5px;color:var(--txt);line-height:1.5">${esc(f.reasoning)}</div>
            </div>`
         : `<div style="margin-top:6px;padding:5px 8px;background:#1a1a2a;border-left:3px solid var(--acc);border-radius:2px">
-             <div style="font-size:9px;font-weight:600;color:var(--acc);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">AI validator reasoning</div>
+             <div style="font-size:9px;font-weight:600;color:var(--acc);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px">${_vbyList.includes('ai') ? 'AI validator reasoning' : 'Reasoning'}</div>
              <div style="font-size:10.5px;color:var(--txt);line-height:1.5">${esc(f.reasoning)}</div>
            </div>`)
     : '';
@@ -301,7 +301,11 @@ function _buildIssueCard(host, f, globalIdx) {
   const hostBadge = `<span style="font-size:9px;color:var(--txt2);margin-left:6px">${esc(host)}</span>`;
   const hasAiValidation = _vbyList.includes('ai');
   const fidx = f._fidx ?? globalIdx;
-  const validateBtn = !hasAiValidation
+  // Only offer AI validation for findings that are NOT already confirmed and have
+  // not been AI-validated. A finding already confirmed (by the copilot, operator,
+  // browser, OOB, etc.) does not need re-validation — showing the button there
+  // was confusing.
+  const validateBtn = (!hasAiValidation && !f.confirmed && !f.dismissed)
     ? `<button class="tbtn" id="vbtn-${uid}" style="font-size:9px;padding:1px 7px;flex-shrink:0;color:var(--acc);border-color:var(--acc)"
         title="Ask the Red-Team Validator (LLM) to confirm or reject this finding"
         onclick="event.stopPropagation();validateFindingWithAI('${entryId}',${fidx},'${uid}')">Validate with AI</button>`
@@ -325,6 +329,7 @@ function _buildIssueCard(host, f, globalIdx) {
       <span class="iissue-arrow" style="margin-left:6px">▶</span>
     </div>
     <div class="iissue-detail" onclick="event.stopPropagation()">
+      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f) : ''}
       <div class="iissue-evidence">${evidence}</div>
       ${paramHtml}${snippetHtml}${reasoningHtml}${cwe}${payload}${httpDetails}
       <span class="iissue-goto" onclick="goToEntry('${entryId}')">Go to request →</span>
@@ -401,6 +406,33 @@ function renderAllIssues() {
   _renderIssuesPage();
 }
 
+// Live count badge on the top-level Findings tab, so open findings are visible
+// at a glance from any tab. Colored by the highest severity present. Counts
+// non-dismissed, in-scope findings straight from the entries state so it stays
+// current on every WS entry update (called from updateStats), not only when the
+// Findings tab is open.
+function updateFindingsBadge() {
+  const badge = document.getElementById('findings-tab-badge');
+  if (!badge || typeof entries === 'undefined') return;
+  const rank = { critical: 0, high: 1, medium: 2, low: 3, info: 4, informational: 4 };
+  let count = 0, top = 99;
+  for (const id in entries) {
+    const e = entries[id];
+    if (!e || e.source === 'out-of-scope') continue;
+    for (const f of (e.findings || [])) {
+      if (f.dismissed) continue;
+      count++;
+      const r = rank[(f.severity || 'info').toLowerCase()] ?? 4;
+      if (r < top) top = r;
+    }
+  }
+  if (!count) { badge.style.display = 'none'; return; }
+  badge.textContent = count > 99 ? '99+' : String(count);
+  badge.style.display = '';
+  badge.style.background = top <= 1 ? 'var(--bad, #e5484d)'
+    : top === 2 ? 'var(--orange, #e5a23b)' : 'var(--txt2, #8b949e)';
+}
+
 function toggleIssue(uid, entryId) {
   const el = document.getElementById('iissue-' + uid);
   if (!el) return;
@@ -408,8 +440,8 @@ function toggleIssue(uid, entryId) {
 }
 
 function goToEntry(id) {
-  switchProxySub('history');
   switchMain('proxy');
+  switchProxySub('history');
   selectRow(id);
   setDTab('findings');
   setTimeout(() => document.getElementById('row-' + id)?.scrollIntoView({ block: 'nearest' }), 50);
@@ -595,7 +627,7 @@ async function _pollImportJob(jobId, statusEl, btn) {
     statusEl.textContent = msg;
     statusEl.style.color = '#4caf50';
 
-    if (document.getElementById('st-issues').classList.contains('on')) renderAllIssues();
+    if (document.getElementById('mt-findings')?.classList.contains('on')) renderAllIssues();
 
     // Parsing is done and the scan is now queued on the server — it runs in the
     // background whether or not this modal stays open. Auto-close and surface the

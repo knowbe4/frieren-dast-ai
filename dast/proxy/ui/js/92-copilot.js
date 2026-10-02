@@ -9,6 +9,16 @@ let _cpActive = null;      // active session_id
 let _cpPollTimer = null;
 let _cpWs = null;
 let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (see cpRender)
+// session_id -> { kind, payload } for every copilot run currently waiting on the
+// operator. Drives the persistent top-level pause banner (visible on every tab).
+const _cpPaused = {};
+
+// Friendly label per pause kind for the banner.
+const _CP_PAUSE_LABEL = {
+  approve: 'approval needed',
+  auth: 'login needed',
+  guidance: 'guidance needed',
+};
 
 const _CP_INPROGRESS = ['running', 'starting', 'paused', 'paused_approve',
   'paused_auth', 'paused_guidance'];
@@ -69,6 +79,7 @@ async function cpStartAutonomous() {
       body: JSON.stringify({
         objective: objective.trim(), focus_hosts,
         profile_slug: profile_slug || undefined, budget,
+        session_safe: !!(document.getElementById('cp-auto-session-safe') || {}).checked,
       }),
     });
     const d = await r.json();
@@ -232,11 +243,63 @@ function cpConnectWs() {
     _cpWs = new WebSocket(`${proto}://${location.host}/ws/copilot`);
     _cpWs.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch (e) { return; }
-      if (m && m.session_id && m.session_id === _cpActive) cpRefresh(m.session_id);
+      if (!m || !m.session_id) return;
+      // Keep the global pause banner in sync regardless of the active tab.
+      if (m.type === 'pause') {
+        _cpPaused[m.session_id] = { kind: m.kind, payload: m.payload };
+        cpRenderPauseBanner();
+      } else if (m.type === 'resumed') {
+        delete _cpPaused[m.session_id];
+        cpRenderPauseBanner();
+      }
+      if (m.session_id === _cpActive) cpRefresh(m.session_id);
     };
     _cpWs.onclose = () => { _cpWs = null; };
     _cpWs.onerror = () => { /* onclose clears it */ };
   } catch (e) { _cpWs = null; }
+}
+
+// Render (or hide) the persistent top-level banner that tells the operator a
+// copilot run is paused waiting for input, no matter which tab they are on.
+function cpRenderPauseBanner() {
+  const el = document.getElementById('cp-pause-banner');
+  if (!el) return;
+  const ids = Object.keys(_cpPaused);
+  if (!ids.length) { el.style.display = 'none'; return; }
+  let text;
+  if (ids.length === 1) {
+    const kind = _cpPaused[ids[0]].kind;
+    text = `Copilot paused — ${_CP_PAUSE_LABEL[kind] || kind || 'needs you'}`;
+  } else {
+    text = `${ids.length} copilot runs paused — need you`;
+  }
+  el.innerHTML = `<span class="cp-banner-dot"></span><span>${esc(text)}</span>`
+    + `<span class="cp-banner-hint">click to open Copilot</span>`;
+  el.style.display = 'flex';
+}
+
+// Jump to the Copilot tab and focus the first paused run.
+function cpBannerGoto() {
+  const ids = Object.keys(_cpPaused);
+  switchMain('copilot');
+  if (ids.length) cpSelectSession(ids[0]);
+}
+
+// Called once at startup (not on Copilot-tab open) so the pause banner works
+// even if the operator never visits the Copilot tab. Connects the WS and seeds
+// the paused set from any run already waiting (e.g. a pause before page load).
+async function cpInitBanner() {
+  cpConnectWs();
+  try {
+    const sessions = await (await fetch('/api/copilot/sessions')).json();
+    (sessions || []).forEach(s => {
+      const st = s.status || '';
+      if (st.indexOf('paused_') === 0) {
+        _cpPaused[s.session_id] = { kind: st.slice('paused_'.length), payload: {} };
+      }
+    });
+    cpRenderPauseBanner();
+  } catch (e) { /* banner is best-effort */ }
 }
 
 async function cpLoadSessions() {

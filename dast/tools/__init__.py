@@ -15,6 +15,7 @@ from dast.tools.base import Tool, all_tools, get_tool, register, run_tool
 from dast.tools.context import ToolContext
 
 # Import side effects register the built-in tools.
+from dast.tools import browser_tools as _browser_tools  # noqa: F401
 from dast.tools import chain_tools as _chain_tools  # noqa: F401
 from dast.tools import copilot_tools as _copilot_tools  # noqa: F401
 from dast.tools import crawl_tools as _crawl_tools  # noqa: F401
@@ -24,12 +25,15 @@ from dast.tools import graphql_sweep_tools as _graphql_sweep_tools  # noqa: F401
 from dast.tools import graphql_tools as _graphql_tools  # noqa: F401
 from dast.tools import history_tools as _history_tools  # noqa: F401
 from dast.tools import http_tools as _http_tools  # noqa: F401
+from dast.tools import match_replace_tools as _match_replace_tools  # noqa: F401
+from dast.tools import idor_tools as _idor_tools  # noqa: F401
 from dast.tools import oob_tools as _oob_tools  # noqa: F401
 from dast.tools import profile_tools as _profile_tools  # noqa: F401
 from dast.tools import recon_tools as _recon_tools  # noqa: F401
 from dast.tools import record_finding_tools as _record_finding_tools  # noqa: F401
 from dast.tools import scan_tools as _scan_tools  # noqa: F401
 from dast.tools import triage_tools as _triage_tools  # noqa: F401
+from dast.tools import verify_tools as _verify_tools  # noqa: F401
 
 __all__ = [
     "Tool",

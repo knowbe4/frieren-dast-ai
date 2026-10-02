@@ -622,6 +622,7 @@ const _SRC_TAG = {
   crawler:        '<span class="src-tag src-crawler"  title="SPA crawler">crawl</span>',
   agent:          '<span class="src-tag src-agent"    title="AI agent probe (LLM-driven)">agent</span>',
   scan:           '<span class="src-tag src-scan"     title="Deterministic scan probe (code-driven)">scan</span>',
+  copilot:        '<span class="src-tag src-copilot"  title="Autonomous copilot request">copilot</span>',
   imported:       '<span class="src-tag src-imported" title="Imported finding replay">import</span>',
   'out-of-scope': '<span class="src-tag src-oos"      title="Outside configured scope">oos</span>',
 };
@@ -713,6 +714,7 @@ function applyFilterRow(tr, e) {
   const showCrawler = document.getElementById('chk-src-crawler').checked;
   const showAgent   = document.getElementById('chk-src-agent').checked;
   const showScan    = document.getElementById('chk-src-scan').checked;
+  const showCopilot = document.getElementById('chk-src-copilot')?.checked ?? true;
   const showOos     = document.getElementById('chk-src-oos').checked;
   const src = e.source || 'proxy';
   const srcOk = (src === 'proxy'          && showProxy)
@@ -720,6 +722,7 @@ function applyFilterRow(tr, e) {
              || (src === 'crawler'        && showCrawler)
              || (src === 'agent'          && showAgent)
              || (src === 'scan'           && showScan)
+             || (src === 'copilot'        && showCopilot)
              || (src === 'imported'       && showProxy)
              || (src === 'out-of-scope'   && showOos);
   const show = srcOk

@@ -180,7 +180,27 @@ Operational notes:
   privilege escalation (IDOR/BOLA/horizontal/vertical): make the same request as
   both users and compare. Report a finding when a low-privilege session accesses
   resources that should require higher privilege. Tell the operator which session
-  you are using for each request so they can follow your reasoning."""
+  you are using for each request so they can follow your reasoning.
+- Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
+  always issue a FRESH send_request to observe the new state. Do NOT infer the
+  result from get_history — its entries predate your mutation and will mislead you.
+- CSRF-protected / token-bearing forms: raw send_request replay fails when a form
+  carries a single-use token (ComposeToken, __VIEWSTATE, draftId). Drive the real
+  browser instead: browser_navigate to the page, browser_snapshot to see the form
+  fields, browser_fill the inputs, browser_extract any fresh hidden token if you
+  need it in a follow-up request, then browser_click the submit button
+  (expect_navigation=true). Use verify_reflection to check whether an injected
+  payload survived in the rendered output.
+- Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
+  write/read/control/delete chain by hand — one call proves the differential and
+  records the finding. Only ever target an object id you created yourself.
+- HackerOne retest objective ("retest H1 #XXXX"): (1) read the report with the
+  triage tools to understand the vuln and endpoints; (2) you are already logged in
+  (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via
+  the smallest reliable primitive (idor_probe for BOLA; browser-driving for a
+  CSRF form; send_request otherwise); (4) check the result (verify_reflection or a
+  fresh read); (5) record_finding with a steps[] chain if confirmed, or report the
+  fix if not reproduced."""
 
 _SYSTEM_COPILOT += UNTRUSTED_CONTENT_DIRECTIVE
 
@@ -340,6 +360,43 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _repair_tool_args(
+    tool_name: str, tool_schema: Dict[str, Any], thought: str,
+    prior_args: Dict[str, Any], missing: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Re-ask the model for a tool call's arguments, FORCING them through the
+    tool's own JSON Schema so required fields (e.g. send_request's url) cannot be
+    omitted. The free-form step schema lets the model emit empty tool_args; this
+    forced second pass closes that gap deterministically. Returns the repaired
+    args, or None on failure."""
+    system = (
+        "You are repairing a malformed tool call. Return ONLY the arguments object "
+        "for the tool, fully populated and matching its schema. Every required field "
+        "MUST be present and non-empty — in particular any URL must be the complete "
+        "absolute https URL. Do not add commentary."
+    )
+    user = (
+        f"Tool: {tool_name}\n"
+        f"What you are trying to do: {thought}\n"
+        f"The arguments you sent were missing required field(s): {', '.join(missing)}.\n"
+        f"Arguments you sent: {_canonical(prior_args)}\n"
+        "Return the complete, corrected arguments now."
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        repaired = await loop.run_in_executor(
+            None,
+            lambda: bedrock_client.invoke_json(
+                system=system, user=user, model_id=bedrock_client.get_fast_model(),
+                max_tokens=1024, temperature=0, schema=tool_schema,
+            ),
+        )
+        return repaired if isinstance(repaired, dict) else None
+    except Exception as exc:
+        logger.warning("Copilot: tool-arg repair failed", tool=tool_name, error=str(exc))
+        return None
+
+
 class CopilotSession:
     """A conversational exploration thread.
 
@@ -398,6 +455,13 @@ class CopilotSession:
             if "copilot" not in (t.tags or [])
         ]
         tool_names = {t["name"] for t in tool_defs}
+        # Required args per tool (from each schema) so a malformed call with a
+        # missing required field (e.g. send_request with no url) is caught with a
+        # precise nudge BEFORE it is deduped/executed, instead of spinning.
+        required_args = {
+            t["name"]: list(t["input_schema"].get("required") or []) for t in tool_defs
+        }
+        schema_by_tool = {t["name"]: t["input_schema"] for t in tool_defs}
         tool_menu = _render_tool_menu(tool_defs)
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
@@ -614,6 +678,43 @@ class CopilotSession:
                             return reply
                         continue
 
+                    # Validate required args from the tool's schema BEFORE deduping
+                    # or executing. A missing required field (e.g. an empty url on
+                    # send_request) is a model arg-building slip, not a server
+                    # result — give a precise correction and do NOT add it to the
+                    # anti-repeat set, so the corrected call (with the field filled)
+                    # is not later suppressed as a duplicate.
+                    def _missing_for(a: Dict[str, Any]) -> List[str]:
+                        return [field for field in required_args.get(tool_name, [])
+                                if not str(a.get(field, "")).strip()]
+
+                    missing_required = _missing_for(tool_args)
+                    if missing_required:
+                        # Force the args through the tool's own schema (required
+                        # fields cannot be empty) before giving up — this beats the
+                        # model intermittently dropping url on an otherwise valid call.
+                        repaired = await _repair_tool_args(
+                            tool_name, schema_by_tool.get(tool_name, {}),
+                            thought, tool_args, missing_required,
+                        )
+                        if repaired is not None and not _missing_for(repaired):
+                            tool_args = repaired
+                            entry["tool_args"] = tool_args
+                            missing_required = []
+                            logger.info("Copilot: repaired malformed tool args",
+                                        session_id=self.session_id, tool=tool_name)
+                    if missing_required:
+                        reply = await _record_tool_failure(
+                            entry,
+                            f"Invalid arguments for {tool_name}: missing required "
+                            f"{', '.join(missing_required)}. This call was NOT sent. "
+                            f"Re-issue it with {missing_required[0]} set to the full "
+                            f"value (for a URL, the complete absolute https URL).",
+                        )
+                        if reply is not None:
+                            return reply
+                        continue
+
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
                         reply = await _record_tool_failure(
@@ -653,6 +754,16 @@ class CopilotSession:
 
                     consecutive_tool_failures = 0
                     await _observe(entry, _summarize_result(result))
+                    # A successful state-changing request invalidates earlier read
+                    # dedup keys: the copilot must be able to re-issue a prior read
+                    # to observe the NEW state (e.g. GET /load after DELETE). Reset
+                    # the anti-repeat set so that confirming re-read is not wrongly
+                    # suppressed as a duplicate (which previously made it misread a
+                    # stale get_history entry as the live post-mutation response).
+                    if tool_name == "send_request" and str(
+                        tool_args.get("method", "")
+                    ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                        self._seen_calls.clear()
                     continue
 
                 # ── no committed action: a planning-only step ─────────────────────

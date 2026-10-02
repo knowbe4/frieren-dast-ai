@@ -304,6 +304,60 @@ async def test_get_history_reads_store():
     assert result["entries"][0]["host"] == "a.acme-corp.com"
 
 
+class _HistEntry:
+    def __init__(self, eid, method, path, source):
+        self._d = {"id": eid, "method": method, "path": path, "host": "h.acme-corp.com",
+                   "url": f"https://h.acme-corp.com{path}", "source": source}
+    def to_dict(self, include_bodies=False):
+        d = dict(self._d)
+        if include_bodies:
+            d["request_body"] = "x=1"
+        return d
+
+
+class _HistStore:
+    def __init__(self):
+        self._entries = [
+            _HistEntry("1", "GET",  "/a", "proxy"),
+            _HistEntry("2", "POST", "/compose/send", "copilot"),
+            _HistEntry("3", "GET",  "/probe", "scan"),
+        ]
+    def all_entries(self):
+        return list(self._entries)
+    def get_entry(self, eid):
+        return next((e for e in self._entries if e._d["id"] == eid), None)
+
+
+@pytest.mark.asyncio
+async def test_get_history_method_path_source_filters():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    result = await run_tool(ctx, "get_history",
+                            {"method": "post", "path": "/compose", "source": "copilot"})
+    assert result["ok"] is True
+    assert result["count"] == 1
+    assert result["entries"][0]["id"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_get_history_newest_first_ordering():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    newest = await run_tool(ctx, "get_history", {"limit": 1})
+    assert newest["entries"][0]["id"] == "3"  # last appended = most recent
+    oldest = await run_tool(ctx, "get_history", {"limit": 1, "newest_first": False})
+    assert oldest["entries"][0]["id"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_get_history_entry_id_lookup():
+    ctx = ToolContext(settings=_Scope(True), store=_HistStore())
+    result = await run_tool(ctx, "get_history", {"entry_id": "2"})
+    assert result["ok"] is True
+    assert result["entry"]["id"] == "2"
+    assert result["entry"]["request_body"] == "x=1"  # full detail with bodies
+    missing = await run_tool(ctx, "get_history", {"entry_id": "999"})
+    assert missing["ok"] is False
+
+
 # ── recon tools delegate to the scanners (mocked) ───────────────────────────────
 
 @pytest.mark.asyncio
@@ -867,6 +921,288 @@ async def test_crawl_enqueues_and_returns_new_endpoints():
     assert "https://api.acme-corp.com/login" in urls
     assert "https://api.acme-corp.com/app.js" not in urls  # static asset filtered
     assert result["discovered_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_crawl_session_safe_caps_click_budget():
+    import asyncio
+
+    from dast.tools import crawl_tools
+
+    store = _CrawlStore([], [])
+    queue: asyncio.Queue = asyncio.Queue()
+    jobs = []
+
+    async def worker():
+        job = await queue.get()
+        jobs.append(job)
+        store.mark_crawled()
+        job["done_event"].set()
+
+    ctx = ToolContext(settings=_Scope(True), store=store, crawl_queue=queue, session_safe=True)
+    worker_task = asyncio.create_task(worker())
+    result = await run_tool(ctx, "crawl", {
+        "url": "https://api.acme-corp.com/", "max_clicks": 300,
+        "extra_seeds": ["https://api.acme-corp.com/other"],
+    })
+    await worker_task
+
+    assert result["ok"] is True
+    assert jobs[0]["max_clicks"] == crawl_tools._SESSION_SAFE_MAX_CLICKS
+    assert jobs[0]["extra_seeds"] is None  # extra seeds dropped in session-safe mode
+
+
+# ── verify_reflection (payload-survival classification) ─────────────────────────
+
+def test_verify_reflection_classify_raw():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div><script>alert(1)</script></div>", "<script>alert(1)</script>")
+    assert r["classification"] == "rendered_raw"
+    assert r["raw_payload_present"] is True
+    assert "<script" in r["dangerous_tokens_raw"]
+    assert r["evidence"]
+
+
+def test_verify_reflection_classify_encoded():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div>&lt;script&gt;alert(1)&lt;/script&gt;</div>", "<script>alert(1)</script>")
+    assert r["classification"] == "encoded"
+    assert r["raw_payload_present"] is False
+    assert r["html_encoded_present"] is True
+
+
+def test_verify_reflection_classify_stripped():
+    from dast.tools.verify_tools import _classify
+    r = _classify("<div>hello world</div>", "<script>alert(1)</script>")
+    assert r["classification"] == "stripped"
+    assert r["dangerous_tokens_raw"] == []
+
+
+@pytest.mark.asyncio
+async def test_verify_reflection_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "verify_reflection",
+                            {"url": "https://evil.example.com/p/1", "payload": "<script>"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+# ── match_replace tool (copilot-scoped M&R rules) ───────────────────────────────
+
+class _FakeSettings:
+    def __init__(self):
+        self._rules = []
+    def get_match_replace(self):
+        return list(self._rules)
+    def add_match_replace(self, rule):
+        self._rules.append(dict(rule))
+    def remove_match_replace(self, idx):
+        if 0 <= idx < len(self._rules): self._rules.pop(idx)
+
+
+@pytest.mark.asyncio
+async def test_match_replace_add_list_clear_lifecycle():
+    settings = _FakeSettings()
+    ctx = ToolContext(settings=settings)
+
+    # Add a copilot rule
+    r = await run_tool(ctx, "match_replace", {
+        "action": "add", "scope": "request", "type": "body",
+        "match": "BodyHtml=[^&]+", "replace": "BodyHtml=<script>alert(1)</script>",
+        "comment": "inject XSS",
+    })
+    assert r["ok"] is True
+    assert r["index"] == 0
+
+    # List — rule should be tagged
+    r = await run_tool(ctx, "match_replace", {"action": "list"})
+    assert r["count"] == 1
+    assert r["rules"][0]["copilot"] is True
+    assert "copilot_session" in settings._rules[0]["comment"]
+
+    # Clear — should remove copilot rules
+    r = await run_tool(ctx, "match_replace", {"action": "clear"})
+    assert r["ok"] is True and r["removed"] == 1
+    assert settings._rules == []
+
+
+@pytest.mark.asyncio
+async def test_match_replace_does_not_remove_operator_rules():
+    settings = _FakeSettings()
+    settings._rules.append({"comment": "operator's own rule", "enabled": True})
+    ctx = ToolContext(settings=settings)
+
+    await run_tool(ctx, "match_replace", {"action": "add", "match": "x", "replace": "y"})
+    assert len(settings._rules) == 2
+
+    r = await run_tool(ctx, "match_replace", {"action": "clear"})
+    assert r["removed"] == 1
+    assert len(settings._rules) == 1
+    assert settings._rules[0]["comment"] == "operator's own rule"
+
+
+# ── browser_* tools (agent browser-driving) ─────────────────────────────────────
+
+class _FakeBrowser:
+    def __init__(self):
+        self.calls = []
+    async def navigate(self, url, timeout_ms=20000):
+        self.calls.append(("navigate", url)); return {"ok": True, "url": url, "status": 200, "title": "T"}
+    async def snapshot(self):
+        self.calls.append(("snapshot",)); return {"ok": True, "url": "u", "title": "T", "forms": [], "buttons": [], "links": []}
+    async def fill(self, selector, value, timeout_ms=10000):
+        self.calls.append(("fill", selector, value)); return {"ok": True, "selector": selector}
+    async def click(self, selector, timeout_ms=10000, expect_nav=False):
+        self.calls.append(("click", selector, expect_nav)); return {"ok": True, "selector": selector, "url": "u"}
+    async def extract(self, selector, attribute="value"):
+        self.calls.append(("extract", selector, attribute)); return {"ok": True, "value": "tok123"}
+
+
+@pytest.mark.asyncio
+async def test_browser_tools_not_available_without_browser():
+    ctx = ToolContext(settings=_Scope(True))  # no browser attached
+    for name, args in [("browser_navigate", {"url": "https://api.acme-corp.com/"}),
+                       ("browser_snapshot", {}), ("browser_fill", {"selector": "#x", "value": "y"})]:
+        r = await run_tool(ctx, name, args)
+        assert r["ok"] is False and "not available" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_browser_navigate_scope_gated_and_drives():
+    b = _FakeBrowser()
+    ctx = ToolContext(settings=_Scope(True), browser=b)
+    oos = await run_tool(ToolContext(settings=_Scope(False), browser=b), "browser_navigate",
+                         {"url": "https://evil.example.com/"})
+    assert oos["ok"] is False and "out of scope" in oos["error"]
+    ok = await run_tool(ctx, "browser_navigate", {"url": "https://api.acme-corp.com/login"})
+    assert ok["ok"] is True and ok["status"] == 200
+    assert ("navigate", "https://api.acme-corp.com/login") in b.calls
+
+
+@pytest.mark.asyncio
+async def test_browser_fill_click_extract_delegate():
+    b = _FakeBrowser()
+    ctx = ToolContext(settings=_Scope(True), browser=b)
+    assert (await run_tool(ctx, "browser_fill", {"selector": "#tbEmail", "value": "a@b.c"}))["ok"]
+    assert (await run_tool(ctx, "browser_click", {"selector": "#btnContinue", "expect_navigation": True}))["ok"]
+    ex = await run_tool(ctx, "browser_extract", {"selector": "#token", "attribute": "value"})
+    assert ex["ok"] and ex["value"] == "tok123"
+    assert ("fill", "#tbEmail", "a@b.c") in b.calls
+    assert ("click", "#btnContinue", True) in b.calls
+    # selector required
+    assert (await run_tool(ctx, "browser_fill", {"value": "x"}))["ok"] is False
+
+
+# ── idor_probe (deterministic BOLA/IDOR differential runner) ────────────────────
+
+class _FakeResp:
+    def __init__(self, status, text=""):
+        self.status_code = status
+        self.text = text
+
+
+class _FakeHttpClient:
+    """Returns queued responses per (METHOD, url); pops in call order so a url read
+    twice (read, then post-delete read) can return different statuses."""
+    def __init__(self, routes):
+        self._routes = {k: list(v) for k, v in routes.items()}
+        self.calls = []
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+    async def request(self, method, url, headers=None, content=None):
+        self.calls.append((method.upper(), url, dict(headers or {})))
+        q = self._routes.get((method.upper(), url))
+        if not q:
+            return _FakeResp(599, "no route")
+        return q.pop(0) if len(q) > 1 else q[0]
+
+
+class _IdorStore:
+    def __init__(self):
+        self.recorded = []
+        self.cookies = [{"name": "SESS", "value": "abc"}]
+    def get_cookies_for_host(self, host):
+        return list(self.cookies)
+    def record_manual_finding(self, finding, url, method="GET"):
+        self.recorded.append((finding, url, method))
+        return "entry-idor-1"
+
+
+def _idor_routes(base, marker, control_present=True, delete_present=True):
+    routes = {
+        ("POST", f"{base}/save/probe"): [_FakeResp(200, "")],
+        ("GET", f"{base}/load/probe"): [_FakeResp(200, f'[{{"v":"{marker}"}}]'),
+                                        _FakeResp(500, "Failed to load form data.")],
+    }
+    if control_present:
+        routes[("GET", f"{base}/load/never")] = [_FakeResp(500, "Failed to load form data.")]
+    if delete_present:
+        routes[("DELETE", f"{base}/delete/probe")] = [_FakeResp(200, "")]
+    return routes
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_confirmed_records_finding(monkeypatch):
+    import httpx
+    base = "https://api.acme-corp.com/t"
+    marker = "frieren-123"
+    client = _FakeHttpClient(_idor_routes(base, marker))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client)
+
+    store = _IdorStore()
+    ctx = ToolContext(settings=_Scope(True), store=store, source_label="copilot")
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": f"{base}/save/probe", "read_url": f"{base}/load/probe",
+        "control_read_url": f"{base}/load/never", "delete_url": f"{base}/delete/probe",
+        "marker": marker, "write_body": f'[{{"v":"{marker}"}}]',
+    })
+
+    assert result["ok"] is True
+    assert result["confirmed"] is True
+    assert len(result["steps"]) == 5
+    assert [s["status"] for s in result["steps"]] == [200, 200, 500, 200, 500]
+    # finding recorded with the step chain
+    assert len(store.recorded) == 1
+    finding = store.recorded[0][0]
+    assert finding["attack_type"] == "broken-access-control"
+    assert len(finding["steps"]) == 5
+    # cookies from the jar were attached to every sub-request
+    assert all("SESS=abc" in c[2].get("cookie", "") for c in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_echo_not_confirmed(monkeypatch):
+    import httpx
+    base = "https://api.acme-corp.com/t"
+    marker = "frieren-123"
+    routes = _idor_routes(base, marker, delete_present=False)
+    # Control ALSO returns the marker => echo/public, must NOT confirm.
+    routes[("GET", f"{base}/load/never")] = [_FakeResp(200, f'[{{"v":"{marker}"}}]')]
+    client = _FakeHttpClient(routes)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client)
+
+    store = _IdorStore()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": f"{base}/save/probe", "read_url": f"{base}/load/probe",
+        "control_read_url": f"{base}/load/never",
+        "marker": marker, "write_body": f'[{{"v":"{marker}"}}]',
+    })
+    assert result["ok"] is True
+    assert result["confirmed"] is False
+    assert "echo" in result["verdict"].lower() or "public" in result["verdict"].lower()
+    assert store.recorded == []  # nothing recorded when not confirmed
+
+
+@pytest.mark.asyncio
+async def test_idor_probe_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    result = await run_tool(ctx, "idor_probe", {
+        "write_url": "https://evil.example.com/save/x", "read_url": "https://evil.example.com/load/x",
+        "marker": "m", "write_body": "m",
+    })
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
 
 
 # ── run_scan (orchestration primitive over the scan pipeline) ───────────────────

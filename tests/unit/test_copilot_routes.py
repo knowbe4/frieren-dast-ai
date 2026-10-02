@@ -94,10 +94,11 @@ class _StubService:
         self.sessions: dict = {}
 
     def run_autonomous(self, objective, focus_hosts=None, profile_slug=None,
-                       budget=None, auto_ai_mode=True) -> str:
+                       budget=None, auto_ai_mode=True, session_safe=False) -> str:
         self.started = {
             "objective": objective, "focus_hosts": focus_hosts,
             "profile_slug": profile_slug, "budget": budget, "auto_ai_mode": auto_ai_mode,
+            "session_safe": session_safe,
         }
         return "sid-auto"
 
@@ -145,6 +146,7 @@ def test_autonomous_start_passes_args(auto_client):
         "focus_hosts": ["api.example.com"],
         "profile_slug": "admin",
         "auto_ai_mode": False,
+        "session_safe": True,
         "budget": {"max_tool_calls": 50},
     })
     assert resp.status_code == 200
@@ -154,6 +156,7 @@ def test_autonomous_start_passes_args(auto_client):
     assert started["focus_hosts"] == ["api.example.com"]
     assert started["profile_slug"] == "admin"
     assert started["auto_ai_mode"] is False
+    assert started["session_safe"] is True
     assert started["budget"] == {"max_tool_calls": 50}
 
 

@@ -153,6 +153,13 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
     body = args.get("body") or ""
 
+    # Tag the proxy-history entry with the caller's source (e.g. "copilot") so the
+    # operator can tell this traffic apart from manual browsing. The proxy reads
+    # x-dast-source to label the entry and strips it before forwarding upstream.
+    source_label = getattr(ctx, "source_label", None)
+    if source_label and "x-dast-source" not in {k.lower() for k in headers}:
+        headers["x-dast-source"] = str(source_label)
+
     # Payload-safety gate: refuse destructive URL/body, surfacing the safe variant.
     for where, text in (("url", url), ("body", body)):
         destructive = _destructive_reason(text)

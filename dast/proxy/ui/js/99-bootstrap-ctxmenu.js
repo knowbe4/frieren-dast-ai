@@ -70,6 +70,10 @@
       if (m && !m.contains(e.target)) hideMenu();
     });
     document.addEventListener('keydown', e => { if (e.key === 'Escape') hideMenu(); });
+
+    // Connect the copilot WS and seed the pause banner at startup so a paused
+    // run is surfaced on every tab, even before the Copilot tab is opened.
+    if (typeof cpInitBanner === 'function') cpInitBanner();
   });
 
   window._ctxSendRepeater = function() {

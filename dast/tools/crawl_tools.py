@@ -33,6 +33,9 @@ logger = get_logger(__name__)
 _CRAWL_TIMEOUT_SECONDS = 240.0
 _DEFAULT_MAX_CLICKS = 80
 _MAX_CLICKS_CEILING = 300
+# Hard cap on crawl interactions when the run is session-safe (strict/single
+# session targets): enough to map the immediate surface without a traffic flood.
+_SESSION_SAFE_MAX_CLICKS = 20
 _MAX_ENDPOINTS_RETURNED = 200
 
 # Static assets are noise for vuln planning — omit them from the returned surface.
@@ -117,6 +120,15 @@ async def _crawl(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 
     extra_seeds = args.get("extra_seeds")
     if not isinstance(extra_seeds, list):
+        extra_seeds = None
+
+    # Session-safe mode: the target has strict/single-concurrent sessions, so a
+    # wide crawl sharing the logged-in cookie would trip concurrent-session
+    # detection. Cap the interaction budget and drop extra seeds to keep volume low.
+    if getattr(ctx, "session_safe", False) and max_clicks > _SESSION_SAFE_MAX_CLICKS:
+        logger.info("crawl tool: session-safe mode, capping click budget",
+                    requested=max_clicks, capped=_SESSION_SAFE_MAX_CLICKS)
+        max_clicks = _SESSION_SAFE_MAX_CLICKS
         extra_seeds = None
 
     before = _in_scope_url_set(store)

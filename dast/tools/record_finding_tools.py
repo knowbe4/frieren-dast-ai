@@ -46,7 +46,28 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Concrete evidence you OBSERVED (status codes, response shape, "
                            "diffs) that proves the issue. Do NOT include raw secrets or "
-                           "token values — redact them (report PRESENT/REDACTED).",
+                           "token values — redact them (report PRESENT/REDACTED). For a "
+                           "multi-request proof keep this a SHORT mechanism summary and put "
+                           "the per-request detail in 'steps'.",
+        },
+        "steps": {
+            "type": "array",
+            "description": "The ordered request chain that proves the finding, when it "
+                           "takes more than one request (e.g. a BOLA differential: "
+                           "foreign-write, foreign-read, control, delete). Rendered as a "
+                           "clean numbered evidence table so the proof is not pinned to a "
+                           "single request. Omit for a single-request finding.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "What this step proves, e.g. 'foreign-read'."},
+                    "method": {"type": "string", "description": "HTTP method."},
+                    "url": {"type": "string", "description": "Full request URL."},
+                    "status": {"type": "integer", "description": "Observed response status code."},
+                    "note": {"type": "string", "description": "Short observed result, e.g. 'returned the value written in step 1'."},
+                },
+                "required": ["method", "url"],
+            },
         },
         "attack_type": {
             "type": "string",
@@ -72,10 +93,24 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
     severity = str(args.get("severity", "")).strip().lower()
     if severity not in _VALID_SEVERITIES:
         severity = "medium"
+    steps_raw = args.get("steps")
+    steps = []
+    if isinstance(steps_raw, list):
+        for step in steps_raw:
+            if not isinstance(step, dict) or not str(step.get("url", "")).strip():
+                continue
+            steps.append({
+                "label": str(step.get("label", "")).strip(),
+                "method": str(step.get("method", "GET")).strip().upper() or "GET",
+                "url": str(step.get("url", "")).strip(),
+                "status": step.get("status"),
+                "note": str(step.get("note", "")).strip(),
+            })
     return {
         "title": str(args.get("title", "")).strip(),
         "severity": severity,
         "evidence": str(args.get("evidence", "")).strip(),
+        "steps": steps,
         "attack_type": str(args.get("attack_type", "")).strip(),
         "cwe": str(args.get("cwe", "")).strip(),
         "parameter": str(args.get("parameter", "")).strip(),

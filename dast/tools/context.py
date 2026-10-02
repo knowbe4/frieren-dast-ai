@@ -43,6 +43,19 @@ class ToolContext:
     scan_queue: Optional[Any] = None
     scan_queue_state: Optional[Any] = None
     crawl_queue: Optional[Any] = None
+    # Proxy-history source tag for request-sending tools (e.g. "copilot"). When
+    # set, send-style tools stamp the x-dast-source header so the operator can
+    # tell copilot-generated traffic apart from manual browsing in the history.
+    source_label: Optional[str] = None
+    # Session-safe mode: the target enforces strict/single-concurrent sessions,
+    # so heavy automated traffic (ambient auto-scan, large crawls) would trip
+    # concurrent-session detection and log the shared cookie out. Tools consult
+    # this to throttle their own volume (e.g. crawl caps its click budget).
+    session_safe: bool = False
+    # Live browser the agent can drive (navigate/fill/click/snapshot) for form
+    # workflows that need fresh CSRF tokens. Present only for the in-process
+    # copilot; None elsewhere, so the browser_* tools degrade gracefully.
+    browser: Optional[Any] = None
 
     def get_settings(self) -> Any:
         """Return the scope settings, building a disk-backed default on first use."""

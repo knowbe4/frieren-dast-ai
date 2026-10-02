@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dast.ai.prompt_safety import wrap_untrusted
-from dast.proxy.api.agent_triage_routes import AgentToolContext
+from dast.tools.context import AgentToolContext
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:

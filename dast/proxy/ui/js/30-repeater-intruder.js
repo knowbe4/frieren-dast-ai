@@ -8,8 +8,8 @@ function switchMain(tab) {
   if (tab === 'extras') {
     // Re-fire the currently active Extras sub-tab's load call (mirrors the old
     // per-top-level-tab dispatch for h1/code/fedramp/interactions).
-    const activeSub = ['h1', 'code', 'fedramp', 'interactions'].find(
-      s => document.getElementById('st-extras-' + s).classList.contains('on')
+    const activeSub = ['code', 'fedramp', 'interactions'].find(
+      s => document.getElementById('st-extras-' + s)?.classList.contains('on')
     );
     if (activeSub) switchExtrasSub(activeSub);
   }

@@ -1,10 +1,11 @@
-// ── Extras sub-tabs (H1 Validator / Code / FedRAMP / Interactions / Decoder / JWT) ──
+// ── Extras sub-tabs (Code / FedRAMP / Interactions / Decoder / JWT) ──
 function switchExtrasSub(sub) {
-  ['h1', 'code', 'fedramp', 'interactions', 'decoder', 'jwt'].forEach(s => {
-    document.getElementById('extras-sub-' + s).style.display = s === sub ? 'flex' : 'none';
-    document.getElementById('st-extras-' + s).classList.toggle('on', s === sub);
+  ['code', 'fedramp', 'interactions', 'decoder', 'jwt'].forEach(s => {
+    const pane = document.getElementById('extras-sub-' + s);
+    const tab  = document.getElementById('st-extras-' + s);
+    if (pane) pane.style.display = s === sub ? 'flex' : 'none';
+    if (tab)  tab.classList.toggle('on', s === sub);
   });
-  if (sub === 'h1')           h1LoadJobs();
   if (sub === 'code')         { codeRenderJobList(); if (_codeCurrentId) codeLoadResults(_codeCurrentId); }
   if (sub === 'fedramp')      fedrampLoad();
   if (sub === 'interactions') { interactionsLoadSessions(); _interactionsBadgeClear(); }

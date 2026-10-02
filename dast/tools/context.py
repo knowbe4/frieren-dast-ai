@@ -87,3 +87,26 @@ class ToolContext:
     @property
     def dashboard_base_url(self) -> str:
         return f"http://127.0.0.1:{self.dashboard_port}"
+
+
+class AgentToolContext(ToolContext):
+    """ToolContext whose scope gate also honors a per-job approved-host set.
+
+    Scope relaxation is confined to this agent run: a host the operator approves
+    at an approve-pause becomes in-scope for the tools without touching the
+    process-wide scan scope or any other job.
+    """
+
+    def __init__(self, *, approved_hosts: Optional[set] = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.approved_hosts: set = approved_hosts if approved_hosts is not None else set()
+
+    def is_in_scope(self, url: str) -> bool:
+        if super().is_in_scope(url):
+            return True
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(url).hostname or "").lower()
+        except Exception:
+            return False
+        return bool(host) and host in self.approved_hosts

@@ -85,6 +85,18 @@ Selection rules:
 
 - SECRETS: always run — passive, reads response only, zero noise.
 
+- RACE CONDITION (race_condition): select for state-changing operations where a
+  single-use resource, balance, quota, or vote could be applied twice by concurrent
+  duplicate requests — redemption, claiming, voting, transferring, checkout. The agent
+  replays the exact original request concurrently, so it is safe on any of those. SKIP
+  for pure reads, searches, uploads, and idempotent updates.
+
+- HOST HEADER (host_header): select when the endpoint generates links or sends email —
+  password reset, email verification, invitations, magic links, or any response with
+  absolute URLs built from the request host. The agent overrides Host /
+  X-Forwarded-Host and proves impact via OOB callback or link reflection. SKIP for
+  static assets and APIs that never build absolute URLs.
+
 Respond ONLY with JSON: {"agents": ["<agent_attack_type>", ...], "reason": "<one concrete sentence explaining what the endpoint does and why these agents follow from that understanding>"}
 
 The reason must describe the endpoint's behaviour, not a URL pattern. Bad: "POST endpoint with id param". Good: "Checkout endpoint that accepts a price field and returns order total — price manipulation and quantity overflow are the primary risks."
@@ -269,6 +281,24 @@ def _is_mfa_endpoint(url: str) -> bool:
     from urllib.parse import urlparse as _up
     path = _up(url).path
     return bool(_MFA_PATH_RE.search(path))
+
+
+# Race-condition candidate filter: parameter names / body text suggesting a
+# limited-resource or single-use operation the RaceConditionAgent can replay
+# concurrently. Must stay in sync with race_condition_agent._RACE_PARAM_RE.
+_RACE_CANDIDATE_RE = _re.compile(
+    r"coupon|voucher|gift|promo|vote|ballot|like|follow|reward|point|credit|"
+    r"balance|withdraw|transfer|claim|redeem|ticket|checkout|quantity|qty|amount",
+    _re.IGNORECASE,
+)
+
+# Host-header candidate filter: endpoints that plausibly generate absolute links
+# or send email — where an injected Host ends up in someone's inbox or a cache.
+_LINK_ENDPOINT_RE = _re.compile(
+    r"reset|recover|password|verify|verification|confirm|activation|invite|"
+    r"magic|register|signup|subscribe|unsubscribe|email|newsletter|share|export|report",
+    _re.IGNORECASE,
+)
 
 
 def _params_are_all_auth_tokens(target: "CheckTarget") -> bool:
@@ -544,6 +574,20 @@ def _select_attack_types_for_params(
     # We add them as candidates here; the planner filters from the baseline response.
     if target.method in ("POST", "PUT", "PATCH", "DELETE"):
         candidate_types.update(["business_logic", "csrf"])
+
+    # Race-condition candidates: state-changing operations on params whose names
+    # (or body) suggest limited-resource / single-use semantics. The agent's own
+    # LLM gate — or its keyword fallback in no-LLM mode — does the finer filtering.
+    if target.method in ("POST", "PUT", "PATCH", "DELETE") and _RACE_CANDIDATE_RE.search(
+        " ".join([p.get("name", "") for p in (target.params or [])]) + " " + (target.body or "")
+    ):
+        candidate_types.add("race_condition")
+
+    # Host-header injection candidates: endpoints that plausibly generate links or
+    # send email (reset/verify/invite/magic-link shapes). Header-based, no param
+    # canary; the agent bails fast on static content and reflects nothing.
+    if _LINK_ENDPOINT_RE.search(target.url):
+        candidate_types.add("host_header")
 
     # GET endpoints are candidates for cache poisoning — an unkeyed request
     # header reflected into a cacheable response. Header-based, no param canary;

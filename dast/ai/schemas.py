@@ -696,3 +696,41 @@ GQL_VALIDATE_SCHEMA: Dict[str, Any] = {
     },
     "required": ["confirmed", "confidence", "reasoning"],
 }
+
+# Race condition agent — dast/agents/race_condition_agent.py
+RACE_CANDIDATE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "worth_racing": {
+            "type": "boolean",
+            "description": (
+                "True only if the endpoint performs an operation where concurrent duplicate "
+                "requests could beat a server-side single-use/balance/limit check — e.g. "
+                "redemption, voting, transfer, checkout, claiming, following. False for pure "
+                "reads, searches, file uploads, or idempotent updates."
+            ),
+        },
+        "single_use": {
+            "type": "boolean",
+            "description": (
+                "True when the response semantics indicate the operation should succeed at most "
+                "once per resource (one coupon, one vote, one claim) — the classic double-spend."
+            ),
+        },
+        "reason": {"type": "string", "description": "One sentence: what the endpoint does and why it is or is not race-worthy."},
+    },
+    "required": ["worth_racing", "single_use", "reason"],
+}
+
+RACE_VERDICT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "confirmed": {
+            "type": "boolean",
+            "description": "True only when the burst responses prove the server applied the same operation more times than its business rules allow.",
+        },
+        "confidence": {"type": "number", "description": "0.0-1.0."},
+        "reasoning": {"type": "string", "description": "One paragraph citing the observed response divergence."},
+    },
+    "required": ["confirmed", "confidence", "reasoning"],
+}

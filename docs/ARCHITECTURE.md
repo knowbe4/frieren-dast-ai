@@ -805,17 +805,26 @@ dast/
 ## Multi-Provider AI Gateway
 
 - All AI calls go through `dast.ai.bedrock_client`. The gateway dispatches to AWS Bedrock
-  (default), the Anthropic Messages API, an OpenAI-compatible endpoint, or the internal Claude
-  apps gateway based on the active provider. Every request is built Anthropic-shaped and read
-  Anthropic-shaped; `dast/ai/providers.py` translates to/from OpenAI so callers and the
-  schema-forced tool-use path are provider-agnostic. Select at runtime via
+  (default), the Anthropic Messages API, an OpenAI-compatible endpoint, GLM (Zhipu AI), or the
+  internal Claude apps gateway based on the active provider. Every request is built
+  Anthropic-shaped and read Anthropic-shaped; `dast/ai/providers.py` translates to/from OpenAI so
+  callers and the schema-forced tool-use path are provider-agnostic. Select at runtime via
   `bedrock_client.set_provider(provider, keys...)` or `POST /api/scan-config` (`ai_provider`,
-  `anthropic_api_key`, `openai_api_key`, `*_base_url`, `gateway_base_url`). Defaults via `.env`
-  (see Environment Variables in CLAUDE.md). For non-Bedrock providers `model_id` is a plain
-  model name (e.g. `claude-opus-4-8`, `gpt-4o`), not an ARN. API keys are never echoed back by
-  `GET /api/scan-config` (only `*_set` booleans). Local models (Qwen via Ollama/vLLM, LM Studio,
-  `llama.cpp`) run through this same `openai` path — point `openai_base_url` at the local server;
-  see [LOCAL_MODELS.md](LOCAL_MODELS.md) for the walkthrough and the forced-tool-call requirement.
+  `anthropic_api_key`, `openai_api_key`, `glm_api_key`, `*_base_url`, `gateway_base_url`).
+  Defaults via `.env` (see Environment Variables in CLAUDE.md). For non-Bedrock providers
+  `model_id` is a plain model name (e.g. `claude-opus-4-8`, `gpt-4o`, `glm-4.6`), not an ARN.
+  API keys are never echoed back by `GET /api/scan-config` (only `*_set` booleans). Local models
+  (Qwen via Ollama/vLLM, LM Studio, `llama.cpp`) run through this same `openai` path — point
+  `openai_base_url` at the local server; see [LOCAL_MODELS.md](LOCAL_MODELS.md) for the
+  walkthrough and the forced-tool-call requirement.
+- GLM provider (`"glm"`): reuses the OpenAI translator with its own credentials
+  (`glm_api_key`, `glm_base_url` — default `https://api.z.ai/api/paas/v4`, mainland China
+  `https://open.bigmodel.cn/api/paas/v4`). `providers.is_managed_openai_cloud()` treats those
+  hosts as managed cloud: a real key is required and structured output uses native function
+  calling (not json_schema constrained decoding). The read timeout stays generous (GLM thinking
+  models can take minutes per call). Newer models need no code change: the model field is free
+  text and `_preferred_default_model` picks the highest plain `glm-x.y` id from the live
+  catalogue, so a future glm-5 becomes the default automatically.
 - Gateway provider (`dast/ai/gateway_auth.py`): the internal Claude apps gateway speaks the
   Anthropic Messages API over an OAuth JWT reused from the Claude Code CLI session (macOS
   Keychain, service `Claude Code-credentials`; or an explicit `GATEWAY_JWT` on Linux/CI). It
@@ -825,7 +834,7 @@ dast/
   (`config.py` ships an empty string); `scripts/check_no_internal_data.py` blocks any
   `*.internal|corp|private.knowbe4.com` host from tracked files.
 - The `/api/ai/status` badge probes the ACTIVE provider (STS for bedrock; API-key presence for
-  anthropic/openai; `gateway_auth.credentials_available()` for gateway). The status is cached
+  anthropic/openai/glm; `gateway_auth.credentials_available()` for gateway). The status is cached
   5 min; `POST /api/scan-config` clears that cache on a provider switch so the badge re-probes.
 
 ## Dashboard / UI Layout

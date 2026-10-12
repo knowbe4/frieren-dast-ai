@@ -55,15 +55,18 @@ def test_engine_config_carries_provider_fields():
         "anthropic_base_url",
         "openai_api_key",
         "openai_base_url",
+        "glm_api_key",
+        "glm_base_url",
         "gateway_base_url",
     ):
         assert key in config, f"engine_config missing {key}"
     # Base URLs default to the public endpoints (not empty).
     assert config["anthropic_base_url"]
     assert config["openai_base_url"]
+    assert config["glm_base_url"]
 
 
-@pytest.mark.parametrize("provider", ["bedrock", "anthropic", "openai", "gateway"])
+@pytest.mark.parametrize("provider", ["bedrock", "anthropic", "openai", "glm", "gateway"])
 def test_startup_set_provider_does_not_raise(provider):
     """Replicates run()'s startup call for each provider — must not raise."""
     settings.ai_provider = provider
@@ -77,6 +80,8 @@ def test_startup_set_provider_does_not_raise(provider):
         anthropic_base_url=runner._engine_config.get("anthropic_base_url", ""),
         openai_api_key=runner._engine_config.get("openai_api_key", ""),
         openai_base_url=runner._engine_config.get("openai_base_url", ""),
+        glm_api_key=runner._engine_config.get("glm_api_key", ""),
+        glm_base_url=runner._engine_config.get("glm_base_url", ""),
         gateway_base_url=runner._engine_config.get("gateway_base_url", ""),
     )
     assert bedrock_client.get_active_provider() == provider

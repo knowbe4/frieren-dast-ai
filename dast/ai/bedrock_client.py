@@ -14,6 +14,7 @@ Credential priority (matches orchestrator-ai):
 
 import contextlib
 import json
+import re
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -43,8 +44,9 @@ _fast_model_id: str = ""        # Haiku: planning, baseline, low-stakes decision
 _validation_model_id: str = ""  # Opus: red-team validation, complex exploitation proof
 
 # Active provider — which backend serves LLM calls. One of "bedrock",
-# "anthropic", "openai", "gateway". Empty string means "use settings.ai_provider".
-# Set at runtime via set_provider() when the user changes it in the dashboard.
+# "anthropic", "openai", "glm", "gateway". Empty string means "use
+# settings.ai_provider". Set at runtime via set_provider() when the user
+# changes it in the dashboard.
 _active_provider: str = ""
 
 # Per-provider credentials/endpoints, set at runtime via set_provider().
@@ -53,6 +55,10 @@ _anthropic_api_key: str = ""
 _anthropic_base_url: str = ""
 _openai_api_key: str = ""
 _openai_base_url: str = ""
+# GLM (Zhipu AI) is OpenAI-compatible: calls are translated by the OpenAI
+# adapter, only the credentials/base URL differ.
+_glm_api_key: str = ""
+_glm_base_url: str = ""
 # The gateway authenticates via an OAuth JWT reused from the Claude Code CLI
 # session (macOS Keychain / GATEWAY_JWT), not an API key. Only its base URL is
 # configurable here; it is internal, so it lives in .env, never in config.py.
@@ -88,6 +94,31 @@ def mark_ai_unavailable() -> None:
     _ai_unavailable = True
 
 
+# A plain GLM chat model id: "glm-<version>" and nothing else. The strict
+# shape excludes the cheaper -air/-flash tiers, the 4.5v vision variant, and
+# non-chat entries (embedding-3, cogview-*), so the flagship is picked.
+_GLM_PLAIN_MODEL = re.compile(r"^glm-(\d+(?:\.\d+)*)$")
+
+
+def _glm_flagship_model(ids: list) -> str:
+    """
+    The highest-versioned plain GLM model id, or "" when the catalogue has none.
+
+    A future "glm-5" sorts above "glm-4.6" with no code change, and the cheap
+    variants (glm-4.5-air) never win over the flagship they derive from.
+    """
+    best_id = ""
+    best_version: tuple = (0,)
+    for model_id in ids:
+        match = _GLM_PLAIN_MODEL.match(model_id.lower())
+        if not match:
+            continue
+        version = tuple(int(part) for part in match.group(1).split("."))
+        if version > best_version:
+            best_id, best_version = model_id, version
+    return best_id
+
+
 def _preferred_default_model(models: list) -> str:
     """Pick a provider-appropriate default model NAME from a catalogue, preferring
     a Sonnet tier (the balanced default) over Haiku/Opus. Bedrock ARNs are skipped
@@ -108,6 +139,9 @@ def _preferred_default_model(models: list) -> str:
     any_sonnet = [i for i in ids if "sonnet" in i.lower()]
     if any_sonnet:
         return any_sonnet[0]
+    glm_flagship = _glm_flagship_model(ids)
+    if glm_flagship:
+        return glm_flagship
     return ids[0]
 
 
@@ -151,14 +185,16 @@ def set_provider(
     anthropic_base_url: str = "",
     openai_api_key: str = "",
     openai_base_url: str = "",
+    glm_api_key: str = "",
+    glm_base_url: str = "",
     gateway_base_url: str = "",
 ) -> None:
     """
     Select the active LLM provider and its credentials/endpoint at runtime.
 
-    provider — "bedrock" (default), "anthropic", "openai", or "gateway". Empty
-    falls back to settings.ai_provider. Only the fields relevant to the chosen
-    provider are used; each empty argument falls back to the corresponding
+    provider — "bedrock" (default), "anthropic", "openai", "glm", or "gateway".
+    Empty falls back to settings.ai_provider. Only the fields relevant to the
+    chosen provider are used; each empty argument falls back to the corresponding
     settings value. The gateway takes no API key (it reuses the Claude Code CLI
     OAuth session); only its base URL is configurable, and it stays in .env.
     Switching provider clears the cached Bedrock client so a later switch back to
@@ -167,11 +203,14 @@ def set_provider(
     """
     global _active_provider, _anthropic_api_key, _anthropic_base_url
     global _openai_api_key, _openai_base_url, _gateway_base_url, _active_model_id
+    global _glm_api_key, _glm_base_url
     _active_provider = (provider or "").strip().lower()
     _anthropic_api_key = anthropic_api_key or ""
     _anthropic_base_url = anthropic_base_url or ""
     _openai_api_key = openai_api_key or ""
     _openai_base_url = openai_base_url or ""
+    _glm_api_key = glm_api_key or ""
+    _glm_base_url = glm_base_url or ""
     _gateway_base_url = gateway_base_url or ""
     _reset_client()
     _default_model_cache.clear()
@@ -215,7 +254,7 @@ def is_local_provider() -> bool:
     from dast.config import settings
     from dast.ai import providers
 
-    return not providers.is_public_openai(_openai_base_url or settings.openai_base_url)
+    return not providers.is_managed_openai_cloud(_openai_base_url or settings.openai_base_url)
 
 
 # Concurrency gate for external provider calls (see _provider_slot).
@@ -269,10 +308,12 @@ def provider_api_key_present() -> bool:
         if _openai_api_key or settings.openai_api_key:
             return True
         # Local / self-hosted OpenAI-compatible servers ignore the key, so a
-        # non-public base_url is reachable without one (see providers.py).
+        # non-cloud base_url is reachable without one (see providers.py).
         from dast.ai import providers
         base_url = _openai_base_url or settings.openai_base_url
-        return not providers.is_public_openai(base_url)
+        return not providers.is_managed_openai_cloud(base_url)
+    if provider == "glm":
+        return bool(_glm_api_key or settings.glm_api_key)
     if provider == "gateway":
         # The gateway has no API key — reachability means a usable CLI OAuth
         # session (Keychain) or an explicit GATEWAY_JWT is available.
@@ -311,6 +352,11 @@ def list_models() -> Dict[str, Any]:
             models = providers.list_openai_models(
                 api_key=_openai_api_key or (settings.openai_api_key or ""),
                 base_url=_openai_base_url or settings.openai_base_url,
+            )
+        elif provider == "glm":
+            models = providers.list_openai_models(
+                api_key=_glm_api_key or (settings.glm_api_key or ""),
+                base_url=_glm_base_url or settings.glm_base_url,
             )
         elif provider == "gateway":
             models = providers.list_gateway_models(
@@ -540,6 +586,15 @@ def _dispatch_external(provider: str, body: Dict[str, Any], model: str) -> Dict[
             model_id=model,
             api_key=_openai_api_key or (settings.openai_api_key or ""),
             base_url=_openai_base_url or settings.openai_base_url,
+        )
+    if provider == "glm":
+        # GLM (Zhipu AI) is OpenAI-compatible: reuse the chat-completions
+        # translator, only the credentials/endpoint differ.
+        return providers.invoke_openai(
+            body=body,
+            model_id=model,
+            api_key=_glm_api_key or (settings.glm_api_key or ""),
+            base_url=_glm_base_url or settings.glm_base_url,
         )
     if provider == "gateway":
         return providers.invoke_gateway(

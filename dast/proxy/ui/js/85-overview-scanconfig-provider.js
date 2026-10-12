@@ -188,6 +188,7 @@ async function loadProviderModels() {
     if (!r.ok) return;
     const data = await r.json();
     const isLocal = (document.getElementById('sc-ai-provider') || {}).value === 'local';
+    const isGlm = (document.getElementById('sc-ai-provider') || {}).value === 'glm';
     let models = Array.isArray(data.models) ? data.models : [];
     if (!isLocal) _localModelsLive = false;
     if (isLocal) {
@@ -195,6 +196,11 @@ async function loadProviderModels() {
       models = models.filter(m => !/embed/i.test(m.id));
       _localModelsLive = data.source === 'live' && models.length > 0;
       updateLocalStatus(data, models);
+    }
+    if (isGlm) {
+      // GLM's catalogue lists non-chat entries (embedding-3, cogview-*,
+      // cogvideo-*) that cannot drive the scanner.
+      models = models.filter(m => !/embedding|cogview|cogvideo/i.test(m.id));
     }
     if (models.length) {
       populateModelPresets(models);
@@ -276,9 +282,14 @@ async function loadScanConfig() {
       s('sc-local-url').value = c.openai_base_url || DEFAULT_LOCAL_URL;
       syncLocalServerPreset(s('sc-local-url').value);
     }
+    if (s('sc-glm-url') && uiProvider === 'glm') {
+      s('sc-glm-url').value = c.glm_base_url || DEFAULT_GLM_URL;
+      syncGlmEndpointPreset(s('sc-glm-url').value);
+    }
     if (s('sc-gateway-url'))    s('sc-gateway-url').value    = c.gateway_base_url ?? '';
     if (s('sc-anthropic-key-set')) s('sc-anthropic-key-set').style.display = c.anthropic_api_key_set ? 'block' : 'none';
     if (s('sc-openai-key-set'))    s('sc-openai-key-set').style.display    = c.openai_api_key_set ? 'block' : 'none';
+    if (s('sc-glm-key-set'))       s('sc-glm-key-set').style.display       = c.glm_api_key_set ? 'block' : 'none';
     if (typeof onProviderChange === 'function') onProviderChange();
     // Replace the static Claude presets with the active provider's real catalogue.
     loadProviderModels();
@@ -384,6 +395,27 @@ async function saveAiModel() {
 // (bedrock_client.is_local_provider). Mirrors providers.is_public_openai.
 const DEFAULT_LOCAL_URL = 'http://localhost:11434/v1';
 
+// ── GLM provider ──────────────────────────────────────────────────────
+// GLM (Zhipu AI) is a first-class backend provider ("glm") reusing the
+// OpenAI translator; only the credentials and endpoint differ. Both official
+// endpoints are OpenAI-compatible — international Z.ai and mainland BigModel.
+const DEFAULT_GLM_URL = 'https://api.z.ai/api/paas/v4';
+
+// Endpoint preset -> URL field (Custom leaves the URL for the user to type).
+function onGlmEndpointChange() {
+  const preset = document.getElementById('sc-glm-endpoint');
+  const url = document.getElementById('sc-glm-url');
+  if (preset && url && preset.value) url.value = preset.value;
+}
+
+// Select the preset matching a saved URL, or Custom.
+function syncGlmEndpointPreset(url) {
+  const preset = document.getElementById('sc-glm-endpoint');
+  if (!preset) return;
+  const match = [...preset.options].find(o => o.value && o.value === url);
+  preset.value = match ? match.value : '';
+}
+
 function isPublicOpenAiUrl(url) {
   if (!url) return true;  // empty means the backend default, api.openai.com
   try {
@@ -421,6 +453,7 @@ const MODEL_HINTS = {
   gateway: 'Model used for the LLM planner, validator, and adaptive mutator. Pick from the gateway catalogue. Takes effect on the next scan.',
   anthropic: 'Model used for the LLM planner, validator, and adaptive mutator. Type the model name (e.g. claude-opus-4-8). Takes effect on the next scan.',
   openai: 'Model used for the LLM planner, validator, and adaptive mutator. Type the model name (e.g. gpt-4o). Takes effect on the next scan.',
+  glm: 'Model used for the LLM planner, validator, and adaptive mutator. Pick a GLM model from the catalogue (e.g. glm-4.6) or type a newer name. Takes effect on the next scan.',
   local: 'A model installed on your local server — the suggestions list what it serves (e.g. qwen2.5-coder:14b). Prefer a 14B+ instruct model with tool support. On 16 GB, use one model for every tier. Takes effect on the next scan.',
 };
 
@@ -433,15 +466,22 @@ function onProviderChange() {
   const provider = g('sc-ai-provider') ? g('sc-ai-provider').value : 'bedrock';
   if (g('provider-anthropic')) g('provider-anthropic').style.display = provider === 'anthropic' ? 'block' : 'none';
   if (g('provider-openai'))    g('provider-openai').style.display    = provider === 'openai'    ? 'block' : 'none';
+  if (g('provider-glm'))       g('provider-glm').style.display       = provider === 'glm'       ? 'block' : 'none';
   if (g('provider-gateway'))   g('provider-gateway').style.display   = provider === 'gateway'   ? 'block' : 'none';
   if (g('provider-local'))     g('provider-local').style.display     = provider === 'local'     ? 'block' : 'none';
   if (provider === 'local' && g('sc-local-url') && !g('sc-local-url').value.trim()) {
     g('sc-local-url').value = DEFAULT_LOCAL_URL;
     syncLocalServerPreset(DEFAULT_LOCAL_URL);
   }
+  if (provider === 'glm' && g('sc-glm-url') && !g('sc-glm-url').value.trim()) {
+    g('sc-glm-url').value = DEFAULT_GLM_URL;
+    syncGlmEndpointPreset(DEFAULT_GLM_URL);
+  }
   if (g('sc-model-hint')) g('sc-model-hint').textContent = MODEL_HINTS[provider] || MODEL_HINTS.bedrock;
   if (g('sc-model-freeform')) {
-    g('sc-model-freeform').placeholder = provider === 'local' ? 'e.g. qwen2.5-coder:14b' : 'e.g. claude-opus-4-8 or gpt-4o';
+    if (provider === 'local') g('sc-model-freeform').placeholder = 'e.g. qwen2.5-coder:14b';
+    else if (provider === 'glm') g('sc-model-freeform').placeholder = 'e.g. glm-4.6';
+    else g('sc-model-freeform').placeholder = 'e.g. claude-opus-4-8 or gpt-4o';
   }
   const usesDropdown = providerUsesModelDropdown(provider);
   if (g('sc-model-id'))       g('sc-model-id').style.display       = usesDropdown ? '' : 'none';
@@ -470,6 +510,7 @@ async function saveProvider() {
     ai_provider: isLocal ? 'openai' : provider,
     anthropic_base_url: g('sc-anthropic-url') ? g('sc-anthropic-url').value.trim() : '',
     openai_base_url:    isLocal ? localUrl : (g('sc-openai-url') ? g('sc-openai-url').value.trim() : ''),
+    glm_base_url:       g('sc-glm-url')       ? g('sc-glm-url').value.trim()      : '',
     gateway_base_url:   g('sc-gateway-url')   ? g('sc-gateway-url').value.trim()   : '',
   };
   // Only send a key when the user typed one — an empty field keeps the existing
@@ -477,7 +518,9 @@ async function saveProvider() {
   const antKey = g('sc-anthropic-key') ? g('sc-anthropic-key').value : '';
   const oaiKey = g('sc-openai-key')    ? g('sc-openai-key').value    : '';
   const localKey = g('sc-local-key')   ? g('sc-local-key').value     : '';
+  const glmKey = g('sc-glm-key')       ? g('sc-glm-key').value       : '';
   if (antKey) body.anthropic_api_key = antKey;
+  if (glmKey) body.glm_api_key = glmKey;
   if (isLocal) {
     // Never forward a stored cloud OpenAI key to a local/self-hosted server: send
     // the local key if one was typed, otherwise clear it (empty string = clear).
@@ -502,6 +545,7 @@ async function saveProvider() {
       if (g('sc-anthropic-key')) g('sc-anthropic-key').value = '';
       if (g('sc-openai-key'))    g('sc-openai-key').value = '';
       if (g('sc-local-key'))     g('sc-local-key').value = '';
+      if (g('sc-glm-key'))       g('sc-glm-key').value = '';
       loadScanConfig();
       // Re-poll the connection badge right away: the backend cleared its AI-status
       // cache on the provider switch, so a fresh poll flips the badge to the new

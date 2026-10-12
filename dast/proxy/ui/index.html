@@ -1141,13 +1141,14 @@
 
       <!-- Provider selection -->
       <h3 style="margin-bottom:4px">Provider</h3>
-      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below; Gateway reuses the Claude Code CLI login (no key); Local model talks to a model server on your machine (no key, no cloud). Takes effect immediately.</p>
+      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic, OpenAI, and GLM use an API key you provide below; Gateway reuses the Claude Code CLI login (no key); Local model talks to a model server on your machine (no key, no cloud). Takes effect immediately.</p>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
         <select id="sc-ai-provider" onchange="onProviderChange()"
                 style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
           <option value="bedrock">AWS Bedrock (SSO / AWS credentials)</option>
           <option value="anthropic">Anthropic API (api.anthropic.com)</option>
           <option value="openai">OpenAI API (api.openai.com or a compatible cloud endpoint)</option>
+          <option value="glm">GLM — Zhipu AI (api.z.ai / bigmodel.cn)</option>
           <option value="gateway">Claude apps gateway (CLI login)</option>
           <option value="local">Local model (Ollama / LM Studio / vLLM)</option>
         </select>
@@ -1183,6 +1184,40 @@
                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
           </div>
         </div>
+      </div>
+      <!-- GLM (Zhipu AI) — OpenAI-compatible cloud API. Saved as the "glm"
+           provider, which routes through the OpenAI translator with GLM's
+           credentials: key required, native function calling for structured
+           output, generous read timeout (thinking models are slow). -->
+      <div id="provider-glm" style="display:none;margin-bottom:12px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">GLM endpoint</p>
+            <select id="sc-glm-endpoint" onchange="onGlmEndpointChange()"
+                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+              <option value="https://api.z.ai/api/paas/v4">Z.ai (international)</option>
+              <option value="https://open.bigmodel.cn/api/paas/v4">Zhipu BigModel (China mainland)</option>
+              <option value="">Custom endpoint</option>
+            </select>
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Base URL (OpenAI-compatible)</p>
+            <input id="sc-glm-url" type="text" placeholder="https://api.z.ai/api/paas/v4"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">GLM API key</p>
+            <input id="sc-glm-key" type="password" placeholder="paste your Zhipu / Z.ai API key" autocomplete="off"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+            <p id="sc-glm-key-set" style="color:var(--green);font-size:10px;margin-top:3px;display:none">A key is configured. Leave blank to keep it.</p>
+          </div>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-top:8px;line-height:1.6">
+          Keep the full path including <code>/api/paas/v4</code> in the base URL. GLM is a cloud
+          provider (concurrent calls allowed); thinking models can take a while per call, so slow
+          answers are normal. Newer models (e.g. glm-5) can be typed into the model field as soon
+          as Zhipu ships them.
+        </p>
       </div>
       <!-- Local model server (OpenAI-compatible API on this machine or the LAN).
            Saved as the "openai" provider with a non-public base URL, which is what

@@ -239,7 +239,7 @@ Sessions panel.
 ## AI provider setup
 
 Frieren DAST-AI needs an LLM backend for the coordinator, agents, and red-team validator.
-Pick one of four providers via `AI_PROVIDER` in `.env` (`bedrock`, `anthropic`, `openai`, `gateway`):
+Pick one of five providers via `AI_PROVIDER` in `.env` (`bedrock`, `anthropic`, `openai`, `glm`, `gateway`):
 
 ### Option 1 — AWS Bedrock (default)
 
@@ -285,7 +285,21 @@ calling, the dummy API key, model-size guidance).
 > or Opus for any run where the findings matter. Details in
 > [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md#reality-check--local-is-for-development-not-real-scans).
 
-### Option 4 — Internal Claude apps gateway (no API key)
+### Option 4 — GLM (Zhipu AI)
+
+```bash
+AI_PROVIDER=glm
+GLM_API_KEY=your-zhipu-or-zai-key
+GLM_BASE_URL=https://api.z.ai/api/paas/v4   # international; China mainland: https://open.bigmodel.cn/api/paas/v4
+AI_MODEL_ID=glm-4.6
+```
+
+GLM's API is OpenAI-compatible; Frieren reuses the OpenAI translator with GLM's credentials,
+native function calling for structured output, and a generous read timeout (thinking models are
+slow — long answers are normal). Newer models work by typing the name (e.g. `glm-5`) as soon as
+Zhipu ships them; the model list in the AI tab fills from the live catalogue.
+
+### Option 5 — Internal Claude apps gateway (no API key)
 
 ```bash
 AI_PROVIDER=gateway        # reuses the Claude Code CLI OAuth session (macOS Keychain)
@@ -309,7 +323,7 @@ All of these can also be switched at runtime from the AI tab in the dashboard (`
 ## Environment variables
 
 ```bash
-# AI provider — one of: bedrock (default), anthropic, openai, gateway
+# AI provider — one of: bedrock (default), anthropic, openai, glm, gateway
 AI_PROVIDER=bedrock
 
 # Required when AI_PROVIDER=bedrock

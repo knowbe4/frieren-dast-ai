@@ -514,6 +514,12 @@ def test_is_local_provider_true_only_for_non_public_openai(monkeypatch):
         bedrock_client.set_provider("openai", openai_api_key="k",
                                     openai_base_url="https://api.openai.com/v1")
         assert bedrock_client.is_local_provider() is False
+        # GLM endpoints are managed cloud, never local — via the glm provider
+        # itself or the openai provider pointed at a GLM host.
+        bedrock_client.set_provider("glm", glm_base_url="https://api.z.ai/api/paas/v4")
+        assert bedrock_client.is_local_provider() is False
+        bedrock_client.set_provider("openai", openai_base_url="https://open.bigmodel.cn/api/paas/v4")
+        assert bedrock_client.is_local_provider() is False
         bedrock_client.set_provider("anthropic", anthropic_api_key="sk-ant-test")
         assert bedrock_client.is_local_provider() is False
     finally:
@@ -562,3 +568,129 @@ def test_local_provider_calls_are_serialized(monkeypatch):
         thread.join()
 
     assert state["peak"] == 1
+
+
+# ── GLM (Zhipu AI) provider ───────────────────────────────────────────────────
+
+_GLM_ZAI_URL = "https://api.z.ai/api/paas/v4"
+_GLM_BIGMODEL_URL = "https://open.bigmodel.cn/api/paas/v4"
+
+
+def test_is_managed_openai_cloud_detects_hosts():
+    assert providers.is_managed_openai_cloud("https://api.openai.com/v1") is True
+    assert providers.is_managed_openai_cloud(_GLM_ZAI_URL) is True
+    assert providers.is_managed_openai_cloud(_GLM_BIGMODEL_URL) is True
+    assert providers.is_managed_openai_cloud("http://localhost:11434/v1") is False
+    assert providers.is_managed_openai_cloud("http://192.168.1.5:8000/v1") is False
+
+
+def test_glm_base_url_requires_key():
+    """GLM is a managed cloud API: an empty key must raise, not send a placeholder."""
+    with pytest.raises(providers.ProviderError, match="GLM"):
+        providers.invoke_openai({"messages": []}, model_id="glm-4.6",
+                                api_key="", base_url=_GLM_ZAI_URL)
+
+
+def test_openai_missing_key_error_keeps_openai_name():
+    """api.openai.com without a key keeps the OpenAI-flavoured error message."""
+    with pytest.raises(providers.ProviderError, match="OpenAI"):
+        providers.invoke_openai({"messages": []}, model_id="gpt-4o",
+                                api_key="", base_url="https://api.openai.com/v1")
+
+
+def test_glm_uses_forced_tool_call(patch_http):
+    """GLM supports native function calling: structured output goes out as a
+    forced tool call, not json_schema constrained decoding."""
+    fake = patch_http(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
+    providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="glm-4.6",
+                            api_key="glm-key", base_url=_GLM_ZAI_URL)
+    sent = fake.calls[0]["json"]
+    assert "response_format" not in sent
+    assert sent["tool_choice"] == {"type": "function", "function": {"name": "emit_result"}}
+    assert fake.calls[0]["headers"]["Authorization"] == "Bearer glm-key"
+
+
+def test_glm_gets_longer_read_timeout(monkeypatch):
+    """GLM thinking models are slow: the generous local read timeout applies
+    even though GLM is a managed cloud endpoint."""
+    seen: Dict[str, Any] = {}
+    fake = _FakeHttpClient(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
+
+    def _client(*args: Any, **kwargs: Any) -> _FakeHttpClient:
+        seen["timeout"] = kwargs.get("timeout")
+        return fake
+
+    monkeypatch.setattr(providers.httpx, "Client", _client)
+    providers.invoke_openai({"messages": []}, model_id="glm-4.6", api_key="k",
+                            base_url=_GLM_ZAI_URL)
+    assert seen["timeout"].read == providers._LOCAL_HTTP_TIMEOUT.read
+
+
+def test_glm_routes_invoke_json_to_openai(monkeypatch):
+    """set_provider('glm') makes invoke_json go through the OpenAI translator
+    with the GLM credentials and endpoint."""
+    captured: Dict[str, Any] = {}
+
+    def _fake_openai(body, model_id, api_key, base_url):
+        captured["model_id"] = model_id
+        captured["api_key"] = api_key
+        captured["base_url"] = base_url
+        return {"content": [{"type": "tool_use", "name": "emit_result", "input": {"routed": True}}]}
+
+    monkeypatch.setattr(providers, "invoke_openai", _fake_openai)
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "glm-4.6")
+
+    try:
+        bedrock_client.set_provider(provider="glm", glm_api_key="sk-glm",
+                                    glm_base_url=_GLM_BIGMODEL_URL)
+        schema = {"type": "object", "properties": {"routed": {"type": "boolean"}}}
+        result = bedrock_client.invoke_json("sys", "user", schema=schema)
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+    assert result == {"routed": True}
+    assert captured["model_id"] == "glm-4.6"
+    assert captured["api_key"] == "sk-glm"
+    assert captured["base_url"] == _GLM_BIGMODEL_URL
+
+
+def test_provider_key_present_for_glm(monkeypatch):
+    from dast.config import settings
+    monkeypatch.setattr(settings, "glm_api_key", None)
+    try:
+        bedrock_client.set_provider(provider="glm")
+        assert bedrock_client.provider_api_key_present() is False
+        bedrock_client.set_provider(provider="glm", glm_api_key="k")
+        assert bedrock_client.provider_api_key_present() is True
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+
+def test_provider_key_present_false_for_openai_at_glm_host_without_key(monkeypatch):
+    """The openai provider pointed at a GLM host is a managed cloud endpoint:
+    without a key it must not report ready the way a local server does."""
+    from dast.config import settings
+    monkeypatch.setattr(settings, "openai_api_key", None)
+    try:
+        bedrock_client.set_provider(provider="openai", openai_api_key="",
+                                    openai_base_url=_GLM_ZAI_URL)
+        assert bedrock_client.provider_api_key_present() is False
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+
+def test_preferred_default_model_picks_glm_flagship():
+    models = [
+        {"id": "embedding-3"},
+        {"id": "glm-4.5-air"},
+        {"id": "glm-4.5-flash"},
+        {"id": "glm-4.5v"},
+        {"id": "glm-4.6"},
+    ]
+    assert bedrock_client._preferred_default_model(models) == "glm-4.6"
+    # A future flagship sorts above the current one with no code change.
+    assert bedrock_client._preferred_default_model(
+        [{"id": "glm-4.6"}, {"id": "glm-5"}]) == "glm-5"
+    # A mixed catalogue still prefers Sonnet when one exists.
+    assert bedrock_client._preferred_default_model(
+        [{"id": "glm-4.6"}, {"id": "claude-sonnet-5"}]) == "claude-sonnet-5"

@@ -101,7 +101,9 @@ def test_location_reflection_flagged_medium():
         findings = _run(agent, _target())
     assert {f.parameter for f in findings} == {"host", "x-forwarded-host"}
     assert all(f.severity == "medium" for f in findings)
-    assert all(f.bypass_validation is True for f in findings)
+    # Reflection is deterministic, but impact context is not — the red-team
+    # validator judges (same precedent as cache-poisoning's reflected path).
+    assert all(f.bypass_validation is False for f in findings)
 
 
 def test_body_link_reflection_flagged():

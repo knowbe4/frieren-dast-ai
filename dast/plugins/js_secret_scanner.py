@@ -45,8 +45,27 @@ _KEYISH_ASSIGNMENT_RE = re.compile(
 )
 
 _MIN_ENTROPY = 4.5
+# Documentation / example keys that legitimately appear in SDK docs and demo
+# bundles. They are published on purpose — flagging them wastes a developer's
+# time. Single/dual-character repeats (Twilio docs "SKaaaa…") covered by the
+# same check.
+_KNOWN_EXAMPLE_SECRETS = frozenset({
+    "AKIAIOSFODNN7EXAMPLE",                      # AWS documentation
+    "ASIAIOSFODNN7EXAMPLE",                      # AWS documentation (temporary)
+    "ghp_16C7e42F292c6912E7710c838347Ae178B4a",  # GitHub documentation
+})
 # Deduped per (host, type, first 8 chars) — the same bundle is re-fetched often.
 _seen_secrets: set[Tuple[str, str, str]] = set()
+
+
+def _is_example_secret(value: str) -> bool:
+    """Documentation/example keys and degenerate repeated-character tokens."""
+    if value in _KNOWN_EXAMPLE_SECRETS:
+        return True
+    stripped = value.rstrip("=")
+    # A 16+ char token over at most 3 distinct characters (SKaaaa…, 0000…) is
+    # never a real key; real ones look random.
+    return len(stripped) >= 16 and len(set(stripped)) <= 3
 
 
 def _shannon_entropy(value: str) -> float:
@@ -86,7 +105,10 @@ class JsSecretScannerPlugin(ProxyPlugin):
 
         for label, severity, pattern in _NAMED_PATTERNS:
             for match in pattern.finditer(body):
-                hits.append((label, severity, match.group(0)))
+                value = match.group(0)
+                if _is_example_secret(value):
+                    continue
+                hits.append((label, severity, value))
 
         for match in _KEYISH_ASSIGNMENT_RE.finditer(body):
             value = match.group(1)

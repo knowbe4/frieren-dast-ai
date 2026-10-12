@@ -31,17 +31,18 @@ class _Store:
         self.findings.append((entry_id, finding, status))
 
 
-def _entry(url: str, method: str = "GET") -> SimpleNamespace:
+def _entry(url: str, method: str = "GET", referer: str = "") -> SimpleNamespace:
+    headers = {"Referer": referer} if referer else {}
     return SimpleNamespace(
         id="e1", method=method, url=url, path=url.split("app.example.com", 1)[-1].split("?")[0],
-        host="app.example.com", source="proxy", request_headers={},
+        host="app.example.com", source="proxy", request_headers=headers,
         content_type="text/html", response_body=None, response_status=200,
     )
 
 
-def _run(url: str, method: str = "GET") -> _Store:
+def _run(url: str, method: str = "GET", referer: str = "") -> _Store:
     store = _Store()
-    asyncio.run(ofa.OauthFlowAnalyzerPlugin().on_entry(_entry(url, method=method), store))
+    asyncio.run(ofa.OauthFlowAnalyzerPlugin().on_entry(_entry(url, method=method, referer=referer), store))
     return store
 
 
@@ -92,12 +93,36 @@ def test_token_request_credentials_in_query_flagged_and_redacted():
     assert "<redacted:" in finding["evidence"]
 
 
-def test_external_redirect_uri_flagged():
+def test_external_redirect_uri_flagged_with_referer_evidence():
+    # Referer shows the initiating app; redirect_uri matches neither it nor the
+    # authorization server — the only shape worth flagging.
     store = _run(
         "https://app.example.com/oauth/authorize?response_type=code&client_id=client-exturi"
-        "&redirect_uri=https://evil.example.com/cb&state=xyz&code_challenge=x"
+        "&redirect_uri=https://evil.example.com/cb&state=xyz&code_challenge=x",
+        referer="https://shop.example.org/checkout",
     )
     assert any("redirect_uri" in t for t in _titles(store))
+
+
+def test_normal_idp_flow_not_flagged():
+    # The healthy OAuth shape: authorization request goes to the IdP, redirect_uri
+    # points back at the referring app. Different hosts BY DESIGN — must stay silent.
+    store = _run(
+        "https://app.example.com/oauth/authorize?response_type=code&client_id=client-idpnormal"
+        "&redirect_uri=https://shop.example.org/cb&state=xyz&code_challenge=x",
+        referer="https://shop.example.org/checkout",
+    )
+    assert store.findings == []
+
+
+def test_redirect_uri_without_referer_stays_silent():
+    # No Referer = no passive evidence of the initiating app; flagging would fire
+    # on every normal IdP-mediated flow (FP).
+    store = _run(
+        "https://app.example.com/oauth/authorize?response_type=code&client_id=client-noref"
+        "&redirect_uri=https://other.example.net/cb&state=xyz&code_challenge=x"
+    )
+    assert not any("redirect_uri" in t for t in _titles(store))
 
 
 def test_healthy_flow_produces_no_findings():

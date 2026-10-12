@@ -108,15 +108,18 @@ async def _llm_gate(target: "CheckTarget", baseline_text: str) -> Optional[dict]
         return None
 
 
-async def _llm_verdict(baseline_text: str, variants: List[str], burst_size: int) -> Optional[dict]:
+async def _llm_verdict(
+    baseline_text: str, variants: List[str], burst_size: int, note: str = ""
+) -> Optional[dict]:
     """Ask the LLM for a final verdict on ambiguous burst outcomes; None on failure."""
     variant_blocks = "\n\n".join(
         f"--- Burst response variant {index + 1} ---\n{wrap_untrusted(v[:500], 'target_response', 500)}"
         for index, v in enumerate(variants[:4])
     )
+    note_section = f"\n{note}\n" if note else ""
     user = (
         f"--- Baseline (single request) ---\n{wrap_untrusted(baseline_text[:500], 'target_response', 500)}\n\n"
-        f"{variant_blocks}\n"
+        f"{variant_blocks}\n{note_section}"
     )
     try:
         loop = asyncio.get_running_loop()
@@ -138,14 +141,29 @@ def _is_success(status: int, text: str) -> bool:
     return 200 <= status < 300 and not _FAILURE_RE.search(text or "")
 
 
+# Volatile content stripped before comparing two success bodies: timestamps,
+# ids, uuids, nonces and base64 blobs make structurally identical responses
+# look distinct, which would auto-"confirm" a race that is not there.
+# ISO timestamps come BEFORE the bare-number alternative, or the date part is
+# consumed piecemeal and fragments of the timestamp survive the substitution.
+_VOLATILE_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"  # uuids
+    r"|\d{4}-\d{2}-\d{2}[T ][0-9:.+Z-]+"                     # ISO timestamps
+    r"|[A-Za-z0-9+/=_-]{24,}"   # base64/jwt-ish blobs
+    r"|\b\d{2,}\b"               # multi-digit numbers (ids, amounts, epochs)
+)
+
+
+def _normalized_body(text: str) -> str:
+    return _VOLATILE_RE.sub("<v>", (text or "").strip())[:600]
+
+
 def _distinct_successes(responses: List["httpx.Response"]) -> List[str]:
-    """Distinct bodies among the successful burst responses."""
+    """Structurally distinct (volatiles stripped) successful burst bodies."""
     seen: set[str] = set()
     for resp in responses:
         if _is_success(resp.status_code, resp.text):
-            body = (resp.text or "").strip()[:600]
-            if body not in seen:
-                seen.add(body)
+            seen.add(_normalized_body(resp.text))
     return list(seen)
 
 
@@ -212,9 +230,12 @@ class RaceConditionAgent(VulnAgent):
         successes = [r for r in responses if _is_success(r.status_code, r.text)]
         distinct_successes = _distinct_successes(responses)
 
-        # Deterministic confirmation: a single-use operation that succeeded more
-        # than once in the burst is a double-spend by construction.
-        if single_use and len(successes) >= 2 and len(distinct_successes) >= 1:
+        # Deterministic confirmation — ONLY when two or more burst responses are
+        # STRUCTURALLY distinct successes (volatiles stripped) for an operation
+        # the gate judged single-use. Identical success bodies are consistent
+        # with an idempotent replay (same result object returned twice), which
+        # is NOT proof of a double-spend — those go to the LLM verdict below.
+        if single_use and len(distinct_successes) >= 2:
             raw_request, raw_response = _fmt_http_pair(baseline)
             probe_request, probe_response = _fmt_http_pair(successes[0])
             return [AgentFinding(
@@ -239,23 +260,37 @@ class RaceConditionAgent(VulnAgent):
                 probe_response=probe_response,
             )]
 
-        # Ambiguous divergence: same request, different business outcomes. Let
-        # the LLM decide; without a verdict we stay silent (FP bar).
+        # Ambiguous outcomes — either divergent responses, or a single-use
+        # operation whose successes were all identical (could be a real
+        # double-spend with identical replies, or an idempotent replay). Both
+        # need an LLM verdict; without one we stay silent (FP bar).
         variants = sorted({(r.status_code, (r.text or "").strip()[:600]) for r in responses})
-        if len(variants) < 2 or not gate:
-            return []
-        verdict = await _llm_verdict(baseline_text, [v[1] for v in variants], _BURST_SIZE)
+        note = ""
+        if len(variants) < 2:
+            if not (gate and single_use and len(successes) >= 2):
+                return []
+            note = (
+                f"All {_BURST_SIZE} burst responses were identical successes "
+                f"({len(successes)} accepted). The gate judged this operation single-use: "
+                f"decide whether identical replies here mean the operation was applied "
+                f"twice (e.g. a boolean/200 with no per-request id) or is an idempotent "
+                f"replay of the same result."
+            )
+        verdict = await _llm_verdict(
+            baseline_text, [v[1] for v in variants], _BURST_SIZE, note=note
+        )
         if not verdict or not verdict.get("confirmed"):
             return []
         raw_request, raw_response = _fmt_http_pair(baseline)
         return [AgentFinding(
-            title="Race Condition — Divergent Outcomes For Identical Concurrent Requests",
+            title="Race Condition — Concurrent Duplicate Requests Beat Single-Use Enforcement",
             severity="medium",
             cwe="CWE-362",
             attack_type="race_condition",
             evidence=(
                 f"{_BURST_SIZE} identical concurrent {target.method} requests to {target.path} "
-                f"returned {len(variants)} distinct business outcomes (statuses: "
+                f"yielded {len(successes)} accepted responses "
+                f"({len(variants)} distinct outcomes, statuses: "
                 f"{', '.join(str(v[0]) for v in variants)}). LLM verdict: "
                 f"{str(verdict.get('reasoning', ''))[:300]}"
             ),

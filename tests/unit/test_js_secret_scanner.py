@@ -45,14 +45,23 @@ def _run(body: bytes) -> _Store:
 
 
 def test_aws_key_flagged_and_redacted():
-    store = _run(b'var k = "AKIAIOSFODNN7EXAMPLE";')
+    store = _run(b'var k = "AKIAJ4RP2VNCEXAMPLE1";')
     assert len(store.findings) == 1
     finding = store.findings[0]
     assert finding["cwe"] == "CWE-798"
     assert finding["severity"] == "high"
     # Redaction: prefix + length only, never the full key.
-    assert "AKIAIOSFODNN7EXAMPLE" not in finding["evidence"]
-    assert "AKIAIOSF" in finding["evidence"]
+    assert "AKIAJ4RP2VNCEXAMPLE1" not in finding["evidence"]
+    assert "AKIAJ4RP" in finding["evidence"]
+
+
+def test_documentation_example_keys_ignored():
+    # Canonical doc/demo keys appear in SDK docs and demo bundles on purpose —
+    # flagging them is a false positive.
+    assert _run(b'var k = "AKIAIOSFODNN7EXAMPLE";').findings == []
+    assert _run(b'var t = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";').findings == []
+    # Degenerate repeated-character token (Twilio docs shape).
+    assert _run(b'var s = "SKaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";').findings == []
 
 
 def test_high_entropy_keyish_assignment_flagged():
@@ -86,17 +95,17 @@ def test_non_js_content_ignored():
 
 
 def test_dedup_per_host():
-    body = b'var k = "AKIAIOSFODNN7EXAMPLE";'
+    body = b'var k = "AKIAJ4RP2VNCEXAMPLE1";'
     assert len(_run(body).findings) == 1
     assert _run(body).findings == []
 
 
 def test_github_and_private_key_patterns():
     store = _run(
-        b'gh = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"; '
+        b'gh = "ghp_9C7e42F292c6912E7710c838347Ae178B4aZx7Qk2Lm5Np8Rt4Wv6Y"; '
         b'key = "-----BEGIN RSA PRIVATE KEY-----";'
     )
     assert len(store.findings) == 1
     assert store.findings[0]["severity"] == "high"
-    assert "ghp_16C7" in store.findings[0]["evidence"]
-    assert "ghp_16C7e42F292c6912E7710c838347Ae178B4a" not in store.findings[0]["evidence"]
+    assert "ghp_9C7e" in store.findings[0]["evidence"]
+    assert "ghp_9C7e42F292c6912E7710c838347Ae178B4aZx7Qk2Lm5Np8Rt4Wv6Y" not in store.findings[0]["evidence"]

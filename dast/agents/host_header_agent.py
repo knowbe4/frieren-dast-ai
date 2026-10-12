@@ -143,7 +143,11 @@ class HostHeaderAgent(VulnAgent):
                     parameter=header_name,
                     url=target.url,
                     request_method=target.method,
-                    bypass_validation=True,  # verbatim reflection in a link context
+                    # The reflection itself is deterministic, but its IMPACT depends on
+                    # context (cacheable response? link actually emailed?) — same precedent
+                    # as cache-poisoning's reflected-but-not-cached finding: the red-team
+                    # validator judges, we do not pre-confirm.
+                    bypass_validation=False,
                     raw_request=raw_request,
                     raw_response=raw_response,
                 ))

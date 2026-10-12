@@ -163,21 +163,39 @@ class OauthFlowAnalyzerPlugin(ProxyPlugin):
                 ),
             )
 
-        # redirect_uri pointing at a host unrelated to the app being proxied.
+        # redirect_uri pointing at a host unrelated to the app that initiated the
+        # flow. In a NORMAL OAuth deployment the authorization request goes to the
+        # IdP host and redirect_uri points back at the app host — different hosts
+        # by design. The only passive evidence of the initiating app is the
+        # Referer header, so without one (or when redirect_uri matches either the
+        # IdP host or the Referer app host / their subdomains) we stay silent.
         redirect_uri = params.get("redirect_uri", "")
         if redirect_uri:
             redirect_host = (urlparse(redirect_uri).hostname or "").lower()
-            if redirect_host and redirect_host != (entry.host or "").lower() and not redirect_host.endswith((entry.host or "###").lower()):
+            referer = {k.lower(): v for k, v in (entry.request_headers or {}).items()}.get("referer", "")
+            referer_host = (urlparse(referer).hostname or "").lower()
+            entry_host = (entry.host or "").lower()
+            related = any(
+                h and (
+                    host == h
+                    or host.endswith("." + h)
+                    or h.endswith("." + host)
+                )
+                for host in (redirect_host,)
+                for h in (entry_host, referer_host)
+            )
+            if redirect_host and referer_host and not related:
                 _fire(
                     "external_redirect_uri",
-                    "OAuth redirect_uri Points To External Host",
+                    "OAuth redirect_uri Points To Unrelated Host",
                     "low",
                     "CWE-601",
                     (
-                        f"redirect_uri host {redirect_host!r} differs from the application host "
-                        f"{entry.host!r} on {entry.path}. Confirm the server validates redirect_uri "
-                        f"against an allowlist — an open redirect_uri leaks authorization codes. "
-                        f"Request: {evidence_qs}"
+                        f"redirect_uri host {redirect_host!r} matches neither the authorization "
+                        f"server ({entry_host!r}) nor the referring application "
+                        f"({referer_host!r}) on {entry.path}. Confirm the server validates "
+                        f"redirect_uri against an allowlist — an open redirect_uri leaks "
+                        f"authorization codes. Request: {evidence_qs}"
                     ),
                 )
 

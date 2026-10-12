@@ -68,8 +68,17 @@ def test_llm_gate_rejects():
 def test_double_spend_confirmed_deterministically():
     agent = rc.RaceConditionAgent()
     gate = AsyncMock(return_value={"worth_racing": True, "single_use": True, "reason": "coupon redemption"})
-    # Baseline + burst of identical successes.
-    with patch.object(rc, "_send", new=AsyncMock(return_value=_resp())), \
+    # Baseline + burst where the successes are STRUCTURALLY distinct after
+    # volatile normalization (different response shapes, not just different ids).
+    responses = [
+        _resp(),  # baseline
+        _resp(body='{"status":"redeemed","coupon_left":"no"}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+        _resp(body='{"status":"redeemed","coupon_left":"no"}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+    ]
+    with patch.object(rc, "_send", new=AsyncMock(side_effect=responses)), \
          patch.object(rc, "_llm_gate", new=gate):
         findings = _run(agent, _target())
     assert len(findings) == 1
@@ -77,6 +86,45 @@ def test_double_spend_confirmed_deterministically():
     assert finding.cwe == "CWE-362"
     assert finding.severity == "high"
     assert finding.bypass_validation is True
+
+
+def test_identical_successes_not_auto_confirmed():
+    """The FP this locks out: an idempotent endpoint replaying the SAME 200 body
+    five times is consistent with a plain idempotent replay — it must NOT be a
+    bypass-validated finding. It goes to the LLM verdict, and stays silent when
+    the verdict is unavailable or negative."""
+    agent = rc.RaceConditionAgent()
+    gate = AsyncMock(return_value={"worth_racing": True, "single_use": True, "reason": "r"})
+    with patch.object(rc, "_send", new=AsyncMock(return_value=_resp())), \
+         patch.object(rc, "_llm_gate", new=gate), \
+         patch.object(rc, "_llm_verdict", new=AsyncMock(return_value=None)):
+        assert _run(agent, _target()) == []
+    verdict = AsyncMock(return_value={"confirmed": True, "confidence": 0.7, "reasoning": "boolean 200, applied twice"})
+    with patch.object(rc, "_send", new=AsyncMock(return_value=_resp())), \
+         patch.object(rc, "_llm_gate", new=gate), \
+         patch.object(rc, "_llm_verdict", new=verdict):
+        findings = _run(agent, _target())
+    assert len(findings) == 1
+    assert findings[0].bypass_validation is False  # LLM-validated, not deterministic
+
+
+def test_volatile_only_distinctness_not_auto_confirmed():
+    """Bodies differing ONLY by uuid/timestamp/id normalize to the same shape —
+    no deterministic confirmation, and without an LLM verdict: silence."""
+    agent = rc.RaceConditionAgent()
+    gate = AsyncMock(return_value={"worth_racing": True, "single_use": True, "reason": "r"})
+    responses = [
+        _resp(),
+        _resp(body='{"tx":"a3f9c2e8-1111-2222-3333-444455556666","ts":"2026-10-12T10:00:01Z"}'),
+        _resp(body='{"tx":"b7e1d4f9-9999-8888-7777-666655554444","ts":"2026-10-12T10:00:02Z"}'),
+        _resp(body='{"tx":"c1b2a3d4-1234-5678-9abc-def012345678","ts":"2026-10-12T10:00:03Z"}'),
+        _resp(body='{"tx":"d4c3b2a1-4321-8765-cba9-fed987654321","ts":"2026-10-12T10:00:04Z"}'),
+        _resp(body='{"tx":"e5d4c3b2-1111-2222-3333-444455556666","ts":"2026-10-12T10:00:05Z"}'),
+    ]
+    with patch.object(rc, "_send", new=AsyncMock(side_effect=responses)), \
+         patch.object(rc, "_llm_gate", new=gate), \
+         patch.object(rc, "_llm_verdict", new=AsyncMock(return_value=None)):
+        assert _run(agent, _target()) == []
 
 
 def test_all_failures_no_finding():
@@ -123,11 +171,30 @@ def test_divergence_rejected_by_llm():
 
 def test_no_llm_keyword_fallback():
     agent = rc.RaceConditionAgent()
-    # LLM unavailable (None) + race-shaped param name -> keyword fallback fires.
-    with patch.object(rc, "_send", new=AsyncMock(return_value=_resp())), \
+    responses = [
+        _resp(),
+        _resp(body='{"status":"redeemed","coupon_left":"no"}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+        _resp(body='{"status":"redeemed","coupon_left":"no"}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+        _resp(body='{"ok":true,"votes_counted":true}'),
+    ]
+    # LLM unavailable (None) + race-shaped param + structurally distinct
+    # successes -> keyword fallback still confirms deterministically.
+    with patch.object(rc, "_send", new=AsyncMock(side_effect=responses)), \
          patch.object(rc, "_llm_gate", new=AsyncMock(return_value=None)):
         findings = _run(agent, _target())
     assert len(findings) == 1
+    assert findings[0].bypass_validation is True
+
+
+def test_no_llm_identical_successes_silent():
+    """No-LLM mode + identical success bodies: no deterministic proof and no
+    verdict possible — silence, never a guess."""
+    agent = rc.RaceConditionAgent()
+    with patch.object(rc, "_send", new=AsyncMock(return_value=_resp())), \
+         patch.object(rc, "_llm_gate", new=AsyncMock(return_value=None)):
+        assert _run(agent, _target()) == []
 
 
 def test_no_llm_and_no_keyword_skipped():

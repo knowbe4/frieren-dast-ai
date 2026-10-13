@@ -152,12 +152,13 @@ class PluginManager:
             return
         import httpx
         timeout = httpx.Timeout(15.0)
-        proxies = {"http://": proxy_url, "https://": proxy_url} if proxy_url else None
+        # httpx >= 0.28 takes a single `proxy` (the old `proxies=` mapping was
+        # removed); routing through Frieren's proxy records the probes in history.
         async with httpx.AsyncClient(
             verify=False,
             timeout=timeout,
             follow_redirects=True,
-            **({"proxies": proxies} if proxies else {}),
+            **({"proxy": proxy_url} if proxy_url else {}),
         ) as client:
             for p in active_plugins:
                 try:

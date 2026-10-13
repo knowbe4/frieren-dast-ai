@@ -131,6 +131,7 @@ proxy traffic on every entry → plugin.
 | Vuln knowledge | `uv run python -c "from dast.vuln_knowledge import known_attack_types; print(known_attack_types())"` |
 | Triage engine | `uv run pytest tests/unit/test_payload_safety.py` |
 | Tool layer / MCP | `uv run pytest tests/unit/test_tools_registry.py`; `uv run dast-ai mcp --help` |
+| Active plugins / OOB | `uv run pytest tests/unit/test_header_oob_scanner.py tests/unit/test_oob_correlator.py tests/unit/test_plugin_dispatch_active.py` |
 
 Run a single test with `uv run pytest tests/unit/test_x.py::test_name`. `tests/evals/` is an
 opt-in LLM decision-quality harness (`make evals`) and is **not** part of the default pytest run.

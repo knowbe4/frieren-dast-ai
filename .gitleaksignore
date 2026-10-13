@@ -1,0 +1,15 @@
+# Fingerprints of known-fake test fixtures from the initial upload commit,
+# surfaced once CI started scanning full history. Each entry pins one exact
+# commit/file/rule/line, so any new secret in these files is still reported.
+# Format: <commit>:<file>:<rule-id>:<line>
+
+# Public jwt.io example tokens
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_coordinator_helpers.py:jwt:149
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_coordinator_helpers.py:jwt:394
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_h1_parser.py:generic-api-key:64
+
+# Placeholder provider keys (abcDEF0123456789...) used by redaction tests
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_deterministic_hardening.py:generic-api-key:79
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_deterministic_hardening.py:gitlab-pat:87
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_deterministic_hardening.py:npm-access-token:95
+4fd3e440ebfd8d7037e123a74725db2325720ea4:tests/unit/test_deterministic_hardening.py:generic-api-key:104

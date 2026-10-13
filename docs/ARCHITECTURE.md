@@ -675,6 +675,43 @@ dast/
   `Coordinator._select_attack_types_for_params()` adds `cache_poisoning` for every GET
   (no-canary; planner decides, agent self-gates on cacheability).
 
+### Race Condition (TOCTOU / double-spend)
+- `dast/agents/race_condition_agent.py::RaceConditionAgent` (`race_condition`). Replays the
+  ORIGINAL captured request concurrently (`_BURST_SIZE`=5 identical copies via
+  `asyncio.gather`) and diffs business outcomes. Pipeline: baseline replay → LLM gate
+  (`RACE_CANDIDATE_SCHEMA`: worth_racing / single_use; keyword fallback when AI is off) →
+  burst → confirm. Single-use op with ≥2 accepted responses = double-spend by construction
+  (`bypass_validation=True`, high, CWE-362). Ambiguous divergence (same request, different
+  outcomes) goes through a final LLM verdict (`RACE_VERDICT_SCHEMA`) — no verdict, no finding.
+  Wiring: `_select_attack_types_for_params()` adds the candidate for state-changing methods
+  with race-shaped params (`_RACE_CANDIDATE_RE`); planner rules select it from the baseline
+  response.
+- SAFETY: detection only — no values are changed, only the exact captured request is re-sent;
+  429s become `rate_limit` observations, never findings.
+
+### Host Header Injection (password-reset poisoning)
+- `dast/agents/host_header_agent.py::HostHeaderAgent` (`host_header`). Overrides `Host` and
+  `X-Forwarded-Host` with a marker host and proves impact two ways: (1) OOB callback via the
+  collaborator (server dereferenced the injected host — the password-reset-poisoning
+  primitive, high, `bypass_validation=True`); (2) reflection into link-generating contexts
+  only (`Location` header, absolute `href/src/action/url` values — a plain error echo is NOT
+  a finding). Without a collaborator only path (2) runs, using the non-routable
+  `hostprobe.invalid` marker. Wiring: `_LINK_ENDPOINT_RE` candidate gate (reset/verify/
+  invite/magic-link shapes); planner rules select it; static content types are skipped.
+
+### New passive plugins (deterministic, no AI)
+- `dast/plugins/oauth_flow_analyzer.py` (`oauth-flow-analyzer`): OAuth/OIDC flow weaknesses
+  from observed traffic — implicit grant, missing `state`, code flow without PKCE, token
+  request credentials in the query string, external `redirect_uri`. Secret values redacted
+  in evidence; one finding per (host, client_id, check).
+- `dast/plugins/websocket_observer.py` (`websocket-observer`): catalogues 101 WebSocket
+  handshakes (informational) and flags handshakes that accepted a cross-origin `Origin`
+  (CSWSH, medium, CWE-346). Observation only — fires solely on genuinely observed traffic.
+- `dast/plugins/js_secret_scanner.py` (`js-secret-scanner`): named provider secrets in JS
+  bundles (AWS `AKIA*`, GitHub `gh?_*`, Stripe `_live_`, Google `AIza*`, Slack, SendGrid,
+  Twilio, private key blocks) plus a conservative high-entropy fallback that only fires near
+  key-like assignments. Evidence carries the first 8 chars + length, never the full secret.
+
 ### Scope Presets (per organization)
 - Drop a `<slug>.json` under `dast/scope_presets/` (gitignored, see `example.json.example`
   for the schema) — auto-discovered at startup and written to `~/.dast-ai/projects/<slug>.json`

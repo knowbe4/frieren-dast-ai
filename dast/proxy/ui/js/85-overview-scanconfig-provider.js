@@ -187,8 +187,17 @@ async function loadProviderModels() {
     const r = await fetch('/api/ai/models');
     if (!r.ok) return;
     const data = await r.json();
-    if (Array.isArray(data.models) && data.models.length) {
-      populateModelPresets(data.models);
+    const isLocal = (document.getElementById('sc-ai-provider') || {}).value === 'local';
+    let models = Array.isArray(data.models) ? data.models : [];
+    if (!isLocal) _localModelsLive = false;
+    if (isLocal) {
+      // Embedding models (nomic-embed-text, ...) cannot drive the scanner.
+      models = models.filter(m => !/embed/i.test(m.id));
+      _localModelsLive = data.source === 'live' && models.length > 0;
+      updateLocalStatus(data, models);
+    }
+    if (models.length) {
+      populateModelPresets(models);
       // Re-apply saved primary + tiered selections now that provider-specific
       // options exist (repopulating the <select> can otherwise drop them).
       const cfg = await fetch('/api/scan-config').then(x => x.json()).catch(() => ({}));
@@ -198,8 +207,38 @@ async function loadProviderModels() {
       if (primary && cfg.model_id && [...primary.options].some(o => o.value === cfg.model_id)) primary.value = cfg.model_id;
       if (fast && cfg.fast_model_id && [...fast.options].some(o => o.value === cfg.fast_model_id)) fast.value = cfg.fast_model_id;
       if (val && cfg.validation_model_id && [...val.options].some(o => o.value === cfg.validation_model_id)) val.value = cfg.validation_model_id;
+      if (isLocal && primary && cfg.model_id && ![...primary.options].some(o => o.value === cfg.model_id)) {
+        // Keep the configured model visible even if the server no longer lists it.
+        const missing = document.createElement('option');
+        missing.value = cfg.model_id;
+        missing.textContent = `${cfg.model_id} (not installed on the server)`;
+        primary.prepend(missing);
+        primary.value = cfg.model_id;
+      }
     }
+    // The installed-model list is known now: switch Local to the dropdown.
+    if (isLocal) onProviderChange();
   } catch (e) { console.error('loadProviderModels:', e); }
+}
+
+// True once the local server answered with at least one chat model; until then
+// (or if it is down) the Local model field stays free-text.
+let _localModelsLive = false;
+
+function updateLocalStatus(data, chatModels) {
+  const el = document.getElementById('sc-local-status');
+  if (!el) return;
+  if (data.source === 'live') {
+    const count = chatModels.length;
+    el.textContent = count
+      ? `● Server reachable · ${count} chat model${count === 1 ? '' : 's'} installed`
+      : '● Server reachable · no chat model installed (pull one, e.g. qwen2.5-coder:14b)';
+    el.style.color = count ? 'var(--green)' : 'var(--orange)';
+  } else {
+    el.textContent = '● Server not reachable — start it, or check the URL and Apply Provider';
+    el.style.color = 'var(--red)';
+    el.title = data.error || '';
+  }
 }
 
 async function loadScanConfig() {
@@ -227,9 +266,16 @@ async function loadScanConfig() {
     if (s('sc-fast-model-id'))       s('sc-fast-model-id').value       = c.fast_model_id       ?? '';
     if (s('sc-validation-model-id')) s('sc-validation-model-id').value = c.validation_model_id ?? '';
     // Provider fields (API keys are never returned — only *_set booleans).
-    if (s('sc-ai-provider'))    s('sc-ai-provider').value    = c.ai_provider ?? 'bedrock';
+    const uiProvider = uiProviderFor(c);
+    if (s('sc-ai-provider'))    s('sc-ai-provider').value    = uiProvider;
     if (s('sc-anthropic-url'))  s('sc-anthropic-url').value  = c.anthropic_base_url ?? '';
-    if (s('sc-openai-url'))     s('sc-openai-url').value     = c.openai_base_url ?? '';
+    // The OpenAI and Local blocks share the backend base URL; show it in the
+    // block that matches what is configured so the other one stays clean.
+    if (s('sc-openai-url'))     s('sc-openai-url').value     = uiProvider === 'openai' ? (c.openai_base_url ?? '') : '';
+    if (s('sc-local-url') && uiProvider === 'local') {
+      s('sc-local-url').value = c.openai_base_url || DEFAULT_LOCAL_URL;
+      syncLocalServerPreset(s('sc-local-url').value);
+    }
     if (s('sc-gateway-url'))    s('sc-gateway-url').value    = c.gateway_base_url ?? '';
     if (s('sc-anthropic-key-set')) s('sc-anthropic-key-set').style.display = c.anthropic_api_key_set ? 'block' : 'none';
     if (s('sc-openai-key-set'))    s('sc-openai-key-set').style.display    = c.openai_api_key_set ? 'block' : 'none';
@@ -297,6 +343,7 @@ async function saveScanConfig() {
 // (possibly self-hosted) endpoints, so they keep a free-text field for a model
 // name the catalogue may not know.
 function providerUsesModelDropdown(provider) {
+  if (provider === 'local') return _localModelsLive;  // installed models, once listed
   return provider === 'bedrock' || provider === 'gateway';
 }
 
@@ -331,6 +378,52 @@ async function saveAiModel() {
   if (r.ok && typeof loadAiStatus === 'function') loadAiStatus();
 }
 
+// ── Local model provider ──────────────────────────────────────────────
+// "Local model" is a UI-level provider: the backend stores it as the "openai"
+// provider with a non-public base URL, which is exactly what it treats as local
+// (bedrock_client.is_local_provider). Mirrors providers.is_public_openai.
+const DEFAULT_LOCAL_URL = 'http://localhost:11434/v1';
+
+function isPublicOpenAiUrl(url) {
+  if (!url) return true;  // empty means the backend default, api.openai.com
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'api.openai.com' || host.endsWith('.openai.com');
+  } catch (e) {
+    return false;
+  }
+}
+
+// Which dropdown entry represents a saved backend config.
+function uiProviderFor(config) {
+  const provider = config.ai_provider || 'bedrock';
+  if (provider === 'openai' && !isPublicOpenAiUrl(config.openai_base_url || '')) return 'local';
+  return provider;
+}
+
+// Server preset -> URL field (Custom leaves the URL for the user to type).
+function onLocalServerChange() {
+  const preset = document.getElementById('sc-local-server');
+  const url = document.getElementById('sc-local-url');
+  if (preset && url && preset.value) url.value = preset.value;
+}
+
+// Select the preset matching a saved URL, or Custom.
+function syncLocalServerPreset(url) {
+  const preset = document.getElementById('sc-local-server');
+  if (!preset) return;
+  const match = [...preset.options].find(o => o.value && o.value === url);
+  preset.value = match ? match.value : '';
+}
+
+const MODEL_HINTS = {
+  bedrock: 'Model used for the LLM planner, validator, and adaptive mutator. Pick from the Bedrock catalogue. Takes effect on the next scan.',
+  gateway: 'Model used for the LLM planner, validator, and adaptive mutator. Pick from the gateway catalogue. Takes effect on the next scan.',
+  anthropic: 'Model used for the LLM planner, validator, and adaptive mutator. Type the model name (e.g. claude-opus-4-8). Takes effect on the next scan.',
+  openai: 'Model used for the LLM planner, validator, and adaptive mutator. Type the model name (e.g. gpt-4o). Takes effect on the next scan.',
+  local: 'A model installed on your local server — the suggestions list what it serves (e.g. qwen2.5-coder:14b). Prefer a 14B+ instruct model with tool support. On 16 GB, use one model for every tier. Takes effect on the next scan.',
+};
+
 // ── AI provider selection ─────────────────────────────────────────────
 // Toggle credential rows + the model input style to match the chosen provider.
 // Bedrock uses the ARN preset dropdown; Anthropic/OpenAI use a free-form model
@@ -341,6 +434,15 @@ function onProviderChange() {
   if (g('provider-anthropic')) g('provider-anthropic').style.display = provider === 'anthropic' ? 'block' : 'none';
   if (g('provider-openai'))    g('provider-openai').style.display    = provider === 'openai'    ? 'block' : 'none';
   if (g('provider-gateway'))   g('provider-gateway').style.display   = provider === 'gateway'   ? 'block' : 'none';
+  if (g('provider-local'))     g('provider-local').style.display     = provider === 'local'     ? 'block' : 'none';
+  if (provider === 'local' && g('sc-local-url') && !g('sc-local-url').value.trim()) {
+    g('sc-local-url').value = DEFAULT_LOCAL_URL;
+    syncLocalServerPreset(DEFAULT_LOCAL_URL);
+  }
+  if (g('sc-model-hint')) g('sc-model-hint').textContent = MODEL_HINTS[provider] || MODEL_HINTS.bedrock;
+  if (g('sc-model-freeform')) {
+    g('sc-model-freeform').placeholder = provider === 'local' ? 'e.g. qwen2.5-coder:14b' : 'e.g. claude-opus-4-8 or gpt-4o';
+  }
   const usesDropdown = providerUsesModelDropdown(provider);
   if (g('sc-model-id'))       g('sc-model-id').style.display       = usesDropdown ? '' : 'none';
   if (g('sc-model-freeform')) g('sc-model-freeform').style.display = usesDropdown ? 'none' : '';
@@ -352,19 +454,37 @@ function onProviderChange() {
 async function saveProvider() {
   const g = id => document.getElementById(id);
   const provider = g('sc-ai-provider').value;
+  const msg = g('ai-provider-msg');
+  const isLocal = provider === 'local';
+  const localUrl = g('sc-local-url') ? (g('sc-local-url').value.trim() || DEFAULT_LOCAL_URL) : DEFAULT_LOCAL_URL;
+  if (isLocal && isPublicOpenAiUrl(localUrl)) {
+    if (msg) {
+      msg.textContent = 'That URL is the public OpenAI API — pick "OpenAI API" instead.';
+      msg.style.color = 'var(--red)';
+      msg.style.display = 'inline';
+    }
+    return;
+  }
   const body = {
-    ai_provider: provider,
+    // Local is the openai provider pointed at a non-public URL (see uiProviderFor).
+    ai_provider: isLocal ? 'openai' : provider,
     anthropic_base_url: g('sc-anthropic-url') ? g('sc-anthropic-url').value.trim() : '',
-    openai_base_url:    g('sc-openai-url')    ? g('sc-openai-url').value.trim()    : '',
+    openai_base_url:    isLocal ? localUrl : (g('sc-openai-url') ? g('sc-openai-url').value.trim() : ''),
     gateway_base_url:   g('sc-gateway-url')   ? g('sc-gateway-url').value.trim()   : '',
   };
   // Only send a key when the user typed one — an empty field keeps the existing
   // key server-side (the field is absent from the body, not blank).
   const antKey = g('sc-anthropic-key') ? g('sc-anthropic-key').value : '';
   const oaiKey = g('sc-openai-key')    ? g('sc-openai-key').value    : '';
+  const localKey = g('sc-local-key')   ? g('sc-local-key').value     : '';
   if (antKey) body.anthropic_api_key = antKey;
-  if (oaiKey) body.openai_api_key = oaiKey;
-  const msg = g('ai-provider-msg');
+  if (isLocal) {
+    // Never forward a stored cloud OpenAI key to a local/self-hosted server: send
+    // the local key if one was typed, otherwise clear it (empty string = clear).
+    body.openai_api_key = localKey;
+  } else if (oaiKey) {
+    body.openai_api_key = oaiKey;
+  }
   try {
     const r = await fetch('/api/scan-config', {
       method: 'POST',
@@ -381,6 +501,7 @@ async function saveProvider() {
       // Clear the password fields and refresh the "configured" hints.
       if (g('sc-anthropic-key')) g('sc-anthropic-key').value = '';
       if (g('sc-openai-key'))    g('sc-openai-key').value = '';
+      if (g('sc-local-key'))     g('sc-local-key').value = '';
       loadScanConfig();
       // Re-poll the connection badge right away: the backend cleared its AI-status
       // cache on the provider switch, so a fresh poll flips the badge to the new

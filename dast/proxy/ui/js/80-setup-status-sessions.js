@@ -133,9 +133,21 @@ async function loadAiStatus() {
           tierSuffix = ` [${parts.join(' · ')}]`;
         }
       } catch(_) {}
-      lbl.textContent = `AI: ${model}${tierSuffix}${s.aws_identity ? ' · ' + s.aws_identity : ''}`;
+      const text = `${model}${tierSuffix}${s.aws_identity ? ' · ' + s.aws_identity : ''}`;
+      lbl.textContent = 'AI: ';
+      if (s.ai_local) {
+        // Make a local model server unmistakable in the top bar (built from DOM
+        // nodes, never innerHTML, so a model name cannot inject markup).
+        const pill = document.createElement('span');
+        pill.textContent = 'LOCAL';
+        pill.style.cssText = 'background:var(--orange);color:#000;font-weight:700;font-size:9px;'
+          + 'letter-spacing:.5px;padding:1px 5px;border-radius:3px;margin-right:5px;vertical-align:1px';
+        lbl.appendChild(pill);
+      }
+      lbl.appendChild(document.createTextNode(text));
       lbl.style.color  = 'var(--txt)';
-      lbl.title = `Model: ${s.ai_model}\nAttack types: ${(s.attack_types||[]).join(', ')}`;
+      lbl.title = `${s.ai_local ? 'Local model server (slower, less accurate than Claude)\n' : ''}`
+        + `Model: ${s.ai_model}\nAttack types: ${(s.attack_types||[]).join(', ')}`;
     } else {
       dot.style.background = 'var(--red)';
       lbl.textContent = 'AI: not connected';

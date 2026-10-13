@@ -117,6 +117,9 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 "ai_enabled": ai_ok,
                 "ai_model": ai_model,
                 "ai_model_label": cfg.ai_model_label,
+                # True when LLM calls go to a local/self-hosted server (Ollama etc.),
+                # so the UI can mark the connection as local.
+                "ai_local": bedrock_client.is_local_provider(),
                 "aws_identity": aws_identity,
                 "ai_error": ai_error,
                 # Actual proxy listen host/port. The runner may bump either port
@@ -326,6 +329,9 @@ async def prefetch_ai_status(ctx: DashboardContext) -> None:
             "ai_enabled": ai_ok,
             "ai_model": ai_model,
             "ai_model_label": cfg.ai_model_label,
+            # True when LLM calls go to a local/self-hosted server (Ollama etc.),
+            # so the UI can mark the connection as local.
+            "ai_local": bedrock_client.is_local_provider(),
             "aws_identity": aws_identity,
             "ai_error": None if ai_ok else f"AI not reachable for provider '{provider}'",
             "proxy_host": ctx.proxy_host,

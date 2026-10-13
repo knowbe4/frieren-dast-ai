@@ -1141,14 +1141,15 @@
 
       <!-- Provider selection -->
       <h3 style="margin-bottom:4px">Provider</h3>
-      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below; Gateway reuses the Claude Code CLI login (no key). Takes effect immediately.</p>
+      <p style="color:var(--txt2);font-size:10px;margin-bottom:8px">Which backend serves all LLM calls (planner, validator, mutator). Bedrock uses the AWS credential chain; Anthropic and OpenAI use an API key you provide below; Gateway reuses the Claude Code CLI login (no key); Local model talks to a model server on your machine (no key, no cloud). Takes effect immediately.</p>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
         <select id="sc-ai-provider" onchange="onProviderChange()"
                 style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
           <option value="bedrock">AWS Bedrock (SSO / AWS credentials)</option>
           <option value="anthropic">Anthropic API (api.anthropic.com)</option>
-          <option value="openai">OpenAI / compatible (api.openai.com)</option>
+          <option value="openai">OpenAI API (api.openai.com or a compatible cloud endpoint)</option>
           <option value="gateway">Claude apps gateway (CLI login)</option>
+          <option value="local">Local model (Ollama / LM Studio / vLLM)</option>
         </select>
       </div>
       <!-- Anthropic credentials -->
@@ -1182,6 +1183,49 @@
                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
           </div>
         </div>
+      </div>
+      <!-- Local model server (OpenAI-compatible API on this machine or the LAN).
+           Saved as the "openai" provider with a non-public base URL, which is what
+           the backend treats as local (constrained decoding, serialized calls,
+           longer budgets). No API key unless the server itself requires one. -->
+      <div id="provider-local" style="display:none;margin-bottom:12px;border:1px solid var(--bdr);border-left:3px solid var(--orange);border-radius:4px;padding:12px 14px;background:var(--bg2)">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+          <span style="background:var(--orange);color:#000;font-weight:700;font-size:10px;letter-spacing:.5px;padding:2px 7px;border-radius:3px">LOCAL</span>
+          <span style="font-size:12px;font-weight:600;color:var(--txt)">Local model — runs on this machine, no cloud</span>
+          <span id="sc-local-status" style="margin-left:auto;font-size:11px;color:var(--txt2)">checking server…</span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Model server</p>
+            <select id="sc-local-server" onchange="onLocalServerChange()"
+                    style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+              <option value="http://localhost:11434/v1">Ollama (localhost:11434)</option>
+              <option value="http://localhost:1234/v1">LM Studio (localhost:1234)</option>
+              <option value="http://localhost:8000/v1">vLLM (localhost:8000)</option>
+              <option value="">Custom URL</option>
+            </select>
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Server URL (OpenAI-compatible)</p>
+            <input id="sc-local-url" type="text" placeholder="http://localhost:11434/v1"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+          <div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">API key (only if your server requires one)</p>
+            <input id="sc-local-key" type="password" placeholder="leave blank for Ollama / LM Studio" autocomplete="off"
+                   style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+        </div>
+        <p style="color:var(--orange);font-size:10px;margin-top:8px;line-height:1.6">
+          Local models are much slower and less accurate than Claude: each scan is dozens of LLM calls,
+          so one endpoint can take minutes, and small models miss real vulnerabilities. Use local for
+          running the pipeline without cloud credentials and for dev/CI smoke tests.
+        </p>
+        <p style="color:var(--txt2);font-size:10px;margin-top:4px;line-height:1.6">
+          Tuned automatically for local servers: schema-constrained output, one LLM call at a time,
+          longer per-endpoint budgets (raise <strong>Scan Budget per Endpoint</strong> below to ~900 s).
+          Setup and model sizing: <code>docs/LOCAL_MODELS.md</code>.
+        </p>
       </div>
       <!-- Gateway settings (no API key — auth is the CLI OAuth session) -->
       <div id="provider-gateway" style="display:none;margin-bottom:12px">

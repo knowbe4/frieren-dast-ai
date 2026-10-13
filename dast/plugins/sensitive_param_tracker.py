@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.utils.logger import get_logger
+from dast.utils.redact import redact_secret
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
@@ -96,16 +97,6 @@ def _classify(name: str, value: str) -> str | None:
     return None
 
 
-def _redact(value: str) -> str:
-    """Show enough of a secret to identify it in the raw request without
-    leaking the whole credential into the findings UI/logs: keep the first
-    and last 4 characters, mask the middle, and note the full length."""
-    value = value.strip()
-    if len(value) <= 12:
-        return f"{value[:2]}***{value[-2:]} ({len(value)} chars)"
-    return f"{value[:4]}...{value[-4:]} ({len(value)} chars)"
-
-
 class SensitiveParamTrackerPlugin(ProxyPlugin):
     name        = "sensitive-param-tracker"
     description = "Flags credentials and auth tokens transmitted in URL query parameters"
@@ -127,7 +118,7 @@ class SensitiveParamTrackerPlugin(ProxyPlugin):
                 # Show the parameter name, its classification, and a redacted
                 # preview of the value so the developer can locate exactly what
                 # was flagged in the raw request without exposing the full secret.
-                hits.append(f"{name}={_redact(value)} [{label}]")
+                hits.append(f"{name}={redact_secret(value)} [{label}]")
                 logger.debug(
                     "sensitive param detected",
                     param=name,

@@ -26,6 +26,14 @@ if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
 
 
+# Entry sources whose requests the scanner synthesized itself (agent attack
+# payloads, param-discovery probes, probe-diff baselines) rather than genuine
+# application or user traffic. Observers that judge "what the app does" must skip
+# them: flagging our own injected requests is a self-inflicted false positive, and
+# re-enqueueing them feeds the scan queue with its own probes.
+SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
+
+
 class ProxyPlugin:
     # --- metadata (override in subclass) ---
     name: str        = "unnamed"

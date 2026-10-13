@@ -137,6 +137,10 @@ class TestCorrelatorPlugin:
         assert finding["attack_type"] == "taint"
         assert finding["parameter"] == "text"
         assert "comment" in finding["evidence"] and "feed" in finding["evidence"]
+        # Cross-endpoint surfacing is a lead (often by design), never a confirmed vuln.
+        assert finding["confirmed"] is False
+        assert finding["needs_review"] is True
+        assert finding["severity"] == "low"
 
     async def test_same_endpoint_reflection_no_finding(self):
         store = _FakeStore(taint_store=TaintStore())

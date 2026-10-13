@@ -668,7 +668,9 @@ async def _active_cors_probe(entry: "ProxyEntry", rule_id: str) -> Tuple[Optiona
         probe_resp_text = "\r\n".join(resp_lines)
 
         return probe_req_text[:6000], probe_resp_text[:6000]
-    except Exception:
+    except Exception as exc:
+        logger.warning("CORS confirmation probe failed; finding kept without probe proof",
+                       rule_id=rule_id, url=entry.url, error=str(exc))
         return None, None
 
 

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import httpx
 
 from dast.payloads.loader import get_payloads
-from dast.proxy.plugin_base import ProxyPlugin
+from dast.proxy.plugin_base import SYNTHETIC_SOURCES, ProxyPlugin
 from dast.proxy.plugin_manager import log_event
 from dast.utils.logger import get_logger
 # JWT/base64url primitives live in dast.utils.jwt. Re-exported under the local
@@ -107,6 +107,9 @@ class JwtTesterPlugin(ProxyPlugin):
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         if entry.response_status is None or entry.method == "CONNECT":
             return
+        # Our own probes may carry forged tokens; attacking them tests nothing real.
+        if getattr(entry, "source", "proxy") in SYNTHETIC_SOURCES:
+            return
 
         found = _find_jwt(entry.request_headers)
         if not found:
@@ -153,7 +156,9 @@ class JwtTesterPlugin(ProxyPlugin):
                     entry.method, entry.url, headers=forward_headers,
                     content=body.encode() if body else None,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning("JWT tester: baseline request failed; skipping JWT tests",
+                               url=entry.url, error=str(exc))
                 return
             baseline_status = baseline.status_code
             baseline_text = baseline.text
@@ -207,7 +212,8 @@ class JwtTesterPlugin(ProxyPlugin):
                         entry.method, entry.url, headers=h,
                         content=body.encode() if body else None,
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.warning("JWT tester: probe request failed", url=entry.url, error=str(exc))
                     return None
 
             def _finding(title, severity, cwe, evidence, payload_str, resp):
@@ -231,7 +237,9 @@ class JwtTesterPlugin(ProxyPlugin):
             for none_hdr_b64 in get_payloads("jwt", "alg_none"):
                 try:
                     none_hdr = json.loads(_b64url_decode(none_hdr_b64))
-                except Exception:
+                except Exception as exc:
+                    logger.warning("JWT tester: invalid alg:none header payload in jwt.yaml",
+                                   payload=none_hdr_b64, error=str(exc))
                     continue
                 resp = await _try(_build_token(none_hdr, orig_payload, secret=None))
                 if _accepted(resp):

@@ -42,9 +42,15 @@ def _reset_flagged_endpoints():
     mod._flagged_endpoints.clear()
 
 
-def _entry(source: str = "proxy", entry_id: str = "e1", path: str = "/vulnerabilities/exec/") -> SimpleNamespace:
-    # A tokenless, cookie-less state-changing request with a 200 response and a
-    # simple content-type — the classic Check-1 trigger.
+def _entry(
+    source: str = "proxy",
+    entry_id: str = "e1",
+    path: str = "/vulnerabilities/exec/",
+    headers: dict | None = None,
+) -> SimpleNamespace:
+    # A tokenless, cookie-authenticated state-changing request with a 200
+    # response and a simple content-type — the classic Check-1 trigger (DVWA
+    # /exec/ authenticates with PHPSESSID).
     return SimpleNamespace(
         id=entry_id,
         host="app.example.com",
@@ -52,7 +58,10 @@ def _entry(source: str = "proxy", entry_id: str = "e1", path: str = "/vulnerabil
         path=path,
         source=source,
         response_status=200,
-        request_headers={"content-type": "application/x-www-form-urlencoded"},
+        request_headers=headers if headers is not None else {
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": "PHPSESSID=abc123; security=low",
+        },
         request_body=b"ip=127.0.0.1&Submit=Submit",
         response_headers={},
         queued_for_scan=False,
@@ -103,3 +112,22 @@ def test_distinct_endpoints_flag_separately():
     asyncio.run(plugin.on_entry(_entry(entry_id="b", path="/users/v1/register"), store))
     assert len(store.findings) == 2
     assert store.enqueued == ["a", "b"]
+
+
+def test_bearer_only_request_is_not_csrf():
+    # A browser does not attach a JS-set Bearer token to a forged cross-site request.
+    store = _run(_entry(headers={"content-type": "application/json",
+                                 "authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"}))
+    assert store.findings == [] and store.enqueued == []
+
+
+def test_request_without_any_credential_is_not_csrf():
+    store = _run(_entry(headers={"content-type": "application/x-www-form-urlencoded"}))
+    assert store.findings == []
+
+
+def test_basic_auth_is_an_ambient_credential():
+    # Browsers re-send cached Basic credentials cross-site, so CSRF applies.
+    store = _run(_entry(headers={"content-type": "application/x-www-form-urlencoded",
+                                 "authorization": "Basic dXNlcjpwYXNz"}))
+    assert len(store.findings) == 1

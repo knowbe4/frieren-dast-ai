@@ -255,6 +255,34 @@ class TechStack:
 
 ---
 
+## Deterministic Active Plugins (no AI)
+
+Active plugins confirm vulnerabilities with deterministic evidence, so they work with AI mode off
+and with any (or no) LLM.
+
+- **Hook** — the scan worker calls `PluginManager.dispatch_active()` for every **in-scope** entry
+  queued for scanning, right after the scope gate and before the injectable-param gate (header
+  checks need no params). Each plugin's `on_active_probe(entry, store, client)` gets an httpx client
+  routed through Frieren's proxy, so probes appear in HTTP history. A failing plugin is logged and
+  never stops the others or the scan.
+- **OOB correlation** — `dast/scanners/oob_correlator.py` (`OobCorrelator`) owns one interactsh
+  session per component. Each injection gets a unique marker label
+  (`<marker>.<correlation-id><nonce>.<oob-domain>`); interactsh reports the full queried subdomain,
+  so every DNS/HTTP callback is attributed to the exact request + location that caused it. It is
+  the session's only poller (interactsh deletes interactions once polled), keeps polling for 10 min
+  after the newest injection, and mirrors callbacks to a display-only session in the Interactions
+  tab (`interactions_routes.register_display_session` / `publish_callbacks`).
+- **Header OOB Scanner** (`dast/plugins/header_oob_scanner.py`) — one probe per method + host +
+  normalised path, a unique OOB hostname in each header of `dast/payloads/oob_headers.yaml` (never
+  `Host`). HTTP callback → "Blind SSRF via <header>" (high, confirmed); DNS-only → "Out-of-band DNS
+  interaction via <header>" (medium, confirmed — the lookup may come from a proxy, WAF or log
+  pipeline); value reflected in the probe response → held for review (a client rendering it could
+  have made the callback). `validated_by: ["oob_callback"]`, confidence 1.0.
+
+New deterministic check that needs blind confirmation: create an `OobCorrelator`, call
+`new_injection()` per value, send the request, call `track()`, and record the finding in the
+`on_hit` callback.
+
 ## Passive Scanner Rule Engine
 
 ```

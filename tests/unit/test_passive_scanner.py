@@ -664,3 +664,81 @@ class TestAiValidateFindingFailsClosed:
         for f in findings:
             assert f.get("validated_by") == ["passive"]
             assert "validated_at" not in f
+
+
+class TestPassiveDedupAndSyntheticTraffic:
+    """Seen on a live SPA scan: one wildcard-CORS host produced 23 identical
+    findings — every crawler revisit and every agent replay of the same endpoint
+    re-reported it. One finding per rule per endpoint; probes are not scanned."""
+
+    _CORS_HEADERS = {"content-type": "application/json", "access-control-allow-origin": "*"}
+
+    @staticmethod
+    def _record(store, url: str, source: str = "proxy"):
+        entry_id = store.new_entry("GET", url, {}, None, source=source)
+        store.complete_entry(entry_id, 200, dict(TestPassiveDedupAndSyntheticTraffic._CORS_HEADERS), b"{}", 5.0)
+        return store.get_entry(entry_id)
+
+    @staticmethod
+    def _cors_findings(entry) -> list:
+        return [f for f in entry.findings if f.get("rule_id") == "cors-wildcard-origin"]
+
+    @pytest.mark.asyncio
+    async def test_same_endpoint_reported_once(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        first = self._record(store, "https://example.com/api/items?page=1")
+        await plugin.on_entry(first, store)
+        revisit = self._record(store, "https://example.com/api/items?page=2")
+        await plugin.on_entry(revisit, store)
+
+        assert len(self._cors_findings(first)) == 1
+        assert self._cors_findings(revisit) == []
+
+    @pytest.mark.asyncio
+    async def test_distinct_endpoints_each_reported(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        items = self._record(store, "https://example.com/api/items")
+        users = self._record(store, "https://example.com/api/users")
+        await plugin.on_entry(items, store)
+        await plugin.on_entry(users, store)
+
+        assert len(self._cors_findings(items)) == 1
+        assert len(self._cors_findings(users)) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["agent", "passive"])
+    async def test_synthetic_probe_traffic_is_not_scanned(self, source):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        probe = self._record(store, "https://example.com/api/items", source=source)
+        await PassiveScannerPlugin().on_entry(probe, store)
+
+        assert probe.findings == []
+        # The real entry for the same endpoint must still be reported afterwards.
+        real = self._record(store, "https://example.com/api/items")
+        await PassiveScannerPlugin().on_entry(real, store)
+        assert len(self._cors_findings(real)) == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_resets_endpoint_dedup(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        await plugin.on_entry(self._record(store, "https://example.com/api/items"), store)
+        store.clear()
+        again = self._record(store, "https://example.com/api/items")
+        await plugin.on_entry(again, store)
+
+        assert len(self._cors_findings(again)) == 1

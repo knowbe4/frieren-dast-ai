@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from dast.proxy.api.context import DashboardContext
+from dast.utils.destructive_paths import destructive_segment
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
 
@@ -272,16 +273,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         probe_method = "GET" if method in _DESTRUCTIVE else method
 
         # ── Safety: block known-destructive path segments ────────────────
-        _DANGEROUS_SEGMENTS = frozenset({
-            "logout", "logoff", "log-out", "log_out", "signout", "sign-out",
-            "sign_out", "end-session", "endsession", "revoke-session",
-            "delete-account", "deleteaccount", "deactivate", "deactivate-account",
-            "close-account", "closeaccount", "cancel-account", "cancelaccount",
-            "unsubscribe", "reset-password", "resetpassword",
-            "change-password", "changepassword", "drop", "truncate",
-        })
-        last_seg = path.rstrip("/").rsplit("/", 1)[-1].lower().split("?")[0]
-        if last_seg in _DANGEROUS_SEGMENTS:
+        if destructive_segment(path):
             return JSONResponse(
                 {"error": f"Path '{path}' is destructive — blocked for safety"},
                 status_code=400,

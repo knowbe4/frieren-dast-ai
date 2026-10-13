@@ -811,6 +811,33 @@ def _require_fields(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[
     missing = [key for key in schema.get("required", []) if key not in structured]
     if missing:
         raise ValueError(f"Structured output missing required field(s): {', '.join(missing)}")
+    return _decode_stringified_containers(structured, schema)
+
+
+_JSON_CONTAINER_TYPES: Dict[str, type] = {"array": list, "object": dict}
+
+
+def _decode_stringified_containers(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode top-level array/object properties the model sent as a JSON string.
+
+    Models sometimes fill a tool-call argument typed ``array`` with the JSON text
+    of the array instead of the array itself. Callers then iterate the string
+    character by character. Only a string that parses to the declared container
+    type is replaced; anything else is left for the caller to reject.
+    """
+    for key, property_schema in (schema.get("properties") or {}).items():
+        value = structured.get(key)
+        expected_type = _JSON_CONTAINER_TYPES.get((property_schema or {}).get("type", ""))
+        if expected_type is None or not isinstance(value, str):
+            continue
+        try:
+            decoded = json.loads(_strip_json_fence(value))
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Structured field is a non-JSON string", field=key, error=str(exc))
+            continue
+        if isinstance(decoded, expected_type):
+            logger.warning("Structured field arrived as a JSON string; decoded", field=key)
+            structured[key] = decoded
     return structured
 
 

@@ -314,3 +314,37 @@ def test_structured_output_missing_required_field_raises(install_fake_client):
     schema = {"type": "object", "properties": {"agents": {}, "reason": {}}, "required": ["agents", "reason"]}
     with pytest.raises(ValueError, match="reason"):
         bedrock_client.invoke_json(system="s", user="u", schema=schema)
+
+
+_PAYLOADS_SCHEMA = {
+    "type": "object",
+    "properties": {"payloads": {"type": "array", "items": {"type": "object"}}},
+    "required": ["payloads"],
+}
+
+
+def test_array_field_sent_as_json_string_is_decoded(install_fake_client):
+    # Seen with the gateway provider: the tool-call argument typed `array` held the
+    # JSON text of the array. Callers iterated it character by character.
+    install_fake_client([_tool_response({"payloads": '[{"value": "a"}, {"value": "b"}]'})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_PAYLOADS_SCHEMA)
+
+    assert result == {"payloads": [{"value": "a"}, {"value": "b"}]}
+
+
+def test_string_that_is_not_the_declared_container_is_left_alone(install_fake_client):
+    install_fake_client([_tool_response({"payloads": '{"value": "a"}'})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_PAYLOADS_SCHEMA)
+
+    assert result == {"payloads": '{"value": "a"}'}
+
+
+def test_string_typed_field_holding_json_is_not_decoded(install_fake_client):
+    schema = {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}
+    install_fake_client([_tool_response({"note": "[1, 2]"})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"note": "[1, 2]"}

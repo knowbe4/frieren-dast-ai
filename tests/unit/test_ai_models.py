@@ -58,6 +58,25 @@ class TestListModels:
         result = bedrock_client.list_models()
         assert result["source"] == "preset"
 
+    def test_glm_without_key_falls_back_to_presets_with_error(self):
+        bedrock_client.set_provider("glm")
+        result = bedrock_client.list_models()
+        assert result["provider"] == "glm"
+        assert result["source"] == "preset"
+        assert result["error"]  # "no API key is configured" is surfaced
+
+    def test_glm_live_catalogue_is_used_when_available(self, monkeypatch):
+        fake_models = [
+            {"id": "glm-4.6", "label": "glm-4.6"},
+            {"id": "glm-4.5-air", "label": "glm-4.5-air"},
+        ]
+        monkeypatch.setattr(providers, "list_openai_models", lambda **_: fake_models)
+        bedrock_client.set_provider("glm", glm_api_key="sk-glm")
+        result = bedrock_client.list_models()
+        assert result["provider"] == "glm"
+        assert result["source"] == "live"
+        assert result["models"] == fake_models
+
     def test_provider_exception_never_propagates(self, monkeypatch):
         def _boom(**_):
             raise providers.ProviderError("network down")

@@ -73,18 +73,43 @@ def is_public_openai(base_url: str) -> bool:
     return host == "api.openai.com" or host.endswith(".openai.com")
 
 
+# Hosts of managed OpenAI-compatible CLOUD APIs beyond OpenAI itself: Zhipu
+# AI's GLM endpoints (international api.z.ai, mainland open.bigmodel.cn).
+_MANAGED_CLOUD_HOSTS = ("z.ai", "bigmodel.cn")
+
+
+def _is_glm_host(base_url: str) -> bool:
+    """Whether ``base_url`` targets one of Zhipu AI's GLM API hosts."""
+    host = (urlparse(base_url or "").hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in _MANAGED_CLOUD_HOSTS)
+
+
+def is_managed_openai_cloud(base_url: str) -> bool:
+    """
+    Whether ``base_url`` targets a managed OpenAI-compatible cloud API.
+
+    True for api.openai.com and the GLM endpoints; any other host is a
+    self-hosted / local server. Decides key enforcement and the
+    structured-output mode. Deliberately NOT the read timeout: GLM's thinking
+    models can take minutes on large scanner prompts, so every non-public-
+    OpenAI host keeps the generous local timeout.
+    """
+    return is_public_openai(base_url) or _is_glm_host(base_url)
+
+
 def _resolve_openai_key(api_key: str, base_url: str) -> str:
     """
     Return the bearer token to use for an OpenAI-compatible request.
 
-    A real key is required only for the public OpenAI API. Local / self-hosted
-    servers ignore the key, so an empty one is accepted and a harmless
-    placeholder is substituted for the Authorization header.
+    A real key is required for managed cloud APIs (public OpenAI, GLM). Local /
+    self-hosted servers ignore the key, so an empty one is accepted and a
+    harmless placeholder is substituted for the Authorization header.
     """
     if api_key:
         return api_key
-    if is_public_openai(base_url):
-        raise ProviderError("OpenAI provider selected but no API key is configured")
+    if is_managed_openai_cloud(base_url):
+        provider_name = "GLM" if _is_glm_host(base_url) else "OpenAI"
+        raise ProviderError(f"{provider_name} provider selected but no API key is configured")
     return _LOCAL_OPENAI_PLACEHOLDER_KEY
 
 
@@ -275,14 +300,15 @@ def _structured_output_mode(base_url: str) -> str:
     """Return "tools" or "json_schema" for a structured-output request.
 
     ``auto`` (the default) uses json_schema constrained decoding for local /
-    self-hosted servers and a forced tool call for the public OpenAI API.
+    self-hosted servers and a forced tool call for managed OpenAI-compatible
+    clouds (public OpenAI API, GLM — both support native function calling).
     """
     from dast.config import settings  # local import: providers stays config-light
 
     mode = str(getattr(settings, "openai_structured_output", "auto") or "auto").lower()
     if mode in ("tools", "json_schema"):
         return mode
-    return "tools" if is_public_openai(base_url) else "json_schema"
+    return "tools" if is_managed_openai_cloud(base_url) else "json_schema"
 
 
 def _json_schema_unsupported(response_text: str) -> bool:
@@ -435,6 +461,9 @@ def invoke_openai(
         "Authorization": f"Bearer {key}",
         "content-type": "application/json",
     }
+    # Keyed on the PUBLIC OpenAI API only, not on is_managed_openai_cloud():
+    # GLM's thinking models can take minutes per call, so they share the
+    # generous local read timeout instead of the 60s cloud one.
     timeout = _HTTP_TIMEOUT if is_public_openai(base_url) else _LOCAL_HTTP_TIMEOUT
     mode = _structured_output_mode(base_url) if _forced_tool(body) is not None else "tools"
 

@@ -133,6 +133,8 @@ class ProxyRunner:
             "anthropic_base_url": _app_settings.anthropic_base_url,
             "openai_api_key": _app_settings.openai_api_key or "",
             "openai_base_url": _app_settings.openai_base_url,
+            "glm_api_key": _app_settings.glm_api_key or "",
+            "glm_base_url": _app_settings.glm_base_url,
             # Gateway base URL is internal — seeded from .env only, never a code default.
             "gateway_base_url": _app_settings.gateway_base_url or "",
         })
@@ -152,6 +154,8 @@ class ProxyRunner:
             anthropic_base_url=self._engine_config.get("anthropic_base_url", ""),
             openai_api_key=self._engine_config.get("openai_api_key", ""),
             openai_base_url=self._engine_config.get("openai_base_url", ""),
+            glm_api_key=self._engine_config.get("glm_api_key", ""),
+            glm_base_url=self._engine_config.get("glm_base_url", ""),
             gateway_base_url=self._engine_config.get("gateway_base_url", ""),
         )
         logger.info(

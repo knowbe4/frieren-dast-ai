@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     #   "anthropic" — Anthropic Messages API directly (uses anthropic_api_key)
     #   "openai"    — OpenAI-compatible chat completions (uses openai_api_key;
     #                 point openai_base_url at any compatible gateway if needed)
+    #   "glm"       — Zhipu AI GLM (OpenAI-compatible; uses glm_api_key)
     #   "gateway"   — internal Claude apps gateway (Anthropic Messages API over an
     #                 OAuth JWT reused from the Claude Code CLI session; no API key)
     # The provider is selected at runtime; model_id is interpreted by whichever
@@ -44,12 +45,19 @@ class Settings(BaseSettings):
     # How structured output is requested from an OpenAI-compatible server:
     #   "auto"        — json_schema constrained decoding for local/self-hosted
     #                   servers (Ollama, LM Studio, vLLM, llama.cpp), a forced tool
-    #                   call for the public OpenAI API
+    #                   call for managed clouds (the public OpenAI API and GLM's
+    #                   z.ai / bigmodel.cn hosts, which support it natively)
     #   "tools"       — always a forced tool call
     #   "json_schema" — always response_format json_schema
     # Local servers often ignore a forced tool_choice (Ollama + Qwen writes the
     # call out as text), while constrained decoding guarantees schema-valid JSON.
     openai_structured_output: str = "auto"
+
+    # GLM (Zhipu AI) — OpenAI-compatible chat completions, reusing the OpenAI
+    # translator. International endpoint by default; mainland China accounts use
+    # https://open.bigmodel.cn/api/paas/v4 instead.
+    glm_api_key: Optional[str] = None
+    glm_base_url: str = "https://api.z.ai/api/paas/v4"
 
     # Max concurrent LLM calls to an external provider. 0 = auto: 1 for a local
     # OpenAI-compatible server (one GPU serves one request at a time, so parallel

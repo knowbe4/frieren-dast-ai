@@ -202,7 +202,7 @@ Secret-scan git hooks run on every commit and push (installed by `make setup`). 
 ## Environment Variables
 
 ```bash
-AI_PROVIDER=bedrock            # one of: bedrock (default), anthropic, openai, gateway
+AI_PROVIDER=bedrock            # one of: bedrock (default), anthropic, openai, glm, gateway
 
 # bedrock
 AWS_ACCESS_KEY_ID=  AWS_SECRET_ACCESS_KEY=  AWS_REGION=us-east-1
@@ -214,13 +214,16 @@ ANTHROPIC_API_KEY=  ANTHROPIC_BASE_URL=   # default https://api.anthropic.com
 # openai (base_url also targets any OpenAI-compatible gateway)
 OPENAI_API_KEY=  OPENAI_BASE_URL=         # default https://api.openai.com/v1
 
+# glm (Zhipu AI — OpenAI-compatible cloud; reuses the OpenAI translator)
+GLM_API_KEY=  GLM_BASE_URL=               # default https://api.z.ai/api/paas/v4 (China: https://open.bigmodel.cn/api/paas/v4)
+
 # gateway (internal Claude apps gateway; no API key — reuses Claude Code CLI OAuth session).
 # GATEWAY_BASE_URL is an INTERNAL hostname: set it in .env only, NEVER in code.
 GATEWAY_BASE_URL=              # internal gateway URL (no default)
 GATEWAY_JWT=                   # Linux/CI only: explicit bearer JWT (no Keychain)
 GATEWAY_KEYCHAIN_SERVICE=      # override CLI Keychain service (default "Claude Code-credentials")
 
-AI_MODEL_ID=                   # bedrock: an ARN; anthropic/openai/gateway: a model name
+AI_MODEL_ID=                   # bedrock: an ARN; anthropic/openai/glm/gateway: a model name
 PROXY_PORT=8080  DASHBOARD_PORT=8088  PARALLEL_WORKERS=4
 ```
 

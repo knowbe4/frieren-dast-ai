@@ -212,7 +212,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         # is set so the UI can show a "configured" state without leaking secrets.
         from dast.config import settings as _settings
         safe = dict(_scan_config)
-        for key in ("anthropic_api_key", "openai_api_key"):
+        for key in ("anthropic_api_key", "openai_api_key", "glm_api_key"):
             if key in safe:
                 safe[f"{key}_set"] = bool(safe[key])
                 del safe[key]
@@ -289,7 +289,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             _bc2.set_tiered_models(fast=fast, validation=validation)
         _provider_keys = (
             "ai_provider", "anthropic_api_key", "anthropic_base_url",
-            "openai_api_key", "openai_base_url", "gateway_base_url",
+            "openai_api_key", "openai_base_url", "glm_api_key", "glm_base_url",
+            "gateway_base_url",
         )
         if any(k in body for k in _provider_keys):
             from dast.ai import bedrock_client as _bc3
@@ -305,6 +306,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 anthropic_base_url=_scan_config.get("anthropic_base_url", ""),
                 openai_api_key=_scan_config.get("openai_api_key", ""),
                 openai_base_url=_scan_config.get("openai_base_url", ""),
+                glm_api_key=_scan_config.get("glm_api_key", ""),
+                glm_base_url=_scan_config.get("glm_base_url", ""),
                 gateway_base_url=_scan_config.get("gateway_base_url", ""),
             )
             # set_provider auto-heals the active model when the previous one was a

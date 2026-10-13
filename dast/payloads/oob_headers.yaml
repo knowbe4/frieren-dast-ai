@@ -1,0 +1,52 @@
+# Request headers the Header OOB Scanner plugin (dast/plugins/header_oob_scanner.py)
+# fills with a unique out-of-band hostname per header.
+#
+# Intent: detect server-side components that resolve or fetch a header value
+# (analytics/log pipelines, proxies that trust X-Forwarded-*, mobile profile
+# fetchers, SSRF in URL-bearing headers). Every value is inert — only a
+# hostname or URL on the interactsh OOB domain, never anything executable.
+#
+# {{OOB_HOST}} is replaced at runtime with "<marker>.<correlation-id>.<oob-domain>",
+# where the marker is unique to this request + header, so a callback names the
+# exact header that triggered it.
+#
+# Headers that change routing (Host) are deliberately excluded: they would
+# change which application answers the probe instead of testing this one.
+
+headers:
+  - name: Referer
+    value: "http://{{OOB_HOST}}/"
+  - name: User-Agent
+    value: "Mozilla/5.0 (compatible; frieren-oob; +http://{{OOB_HOST}}/)"
+  - name: X-Forwarded-For
+    value: "{{OOB_HOST}}"
+  - name: X-Forwarded-Host
+    value: "{{OOB_HOST}}"
+  - name: X-Forwarded-Server
+    value: "{{OOB_HOST}}"
+  - name: X-Host
+    value: "{{OOB_HOST}}"
+  - name: X-Original-Host
+    value: "{{OOB_HOST}}"
+  - name: Forwarded
+    value: "for={{OOB_HOST}};host={{OOB_HOST}}"
+  - name: True-Client-IP
+    value: "{{OOB_HOST}}"
+  - name: X-Client-IP
+    value: "{{OOB_HOST}}"
+  - name: X-Real-IP
+    value: "{{OOB_HOST}}"
+  - name: X-Originating-IP
+    value: "{{OOB_HOST}}"
+  - name: Client-IP
+    value: "{{OOB_HOST}}"
+  - name: CF-Connecting-IP
+    value: "{{OOB_HOST}}"
+  - name: Contact
+    value: "root@{{OOB_HOST}}"
+  - name: From
+    value: "root@{{OOB_HOST}}"
+  - name: X-Wap-Profile
+    value: "http://{{OOB_HOST}}/wap.xml"
+  - name: Origin
+    value: "http://{{OOB_HOST}}"

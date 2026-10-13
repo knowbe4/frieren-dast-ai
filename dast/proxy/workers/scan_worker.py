@@ -9,7 +9,8 @@ import asyncio
 from typing import TYPE_CHECKING
 from datetime import datetime, timezone
 
-from dast.proxy.check_target_adapter import _DANGEROUS_SEGMENTS, _entry_to_check_target
+from dast.proxy.check_target_adapter import _entry_to_check_target
+from dast.utils.destructive_paths import destructive_segment
 from dast.proxy.scan_support import detection_method, normalise_dedup_path, update_import_stubs
 from dast.proxy.suggestions import record_param_hit
 from dast.utils.tasks import spawn_tracked
@@ -189,13 +190,12 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
 
             target = _entry_to_check_target(entry, store=runner._store)
             if not target:
-                from urllib.parse import urlparse as _up2
-                _seg = _up2(entry.url).path.rstrip("/").rsplit("/", 1)[-1].lower()
-                if _seg in _DANGEROUS_SEGMENTS:
+                segment = destructive_segment(entry.url)
+                if segment:
                     log_event("scan-worker", "warn",
                               f"Scan skipped — session-destructive path: {entry.url}",
                               url=entry.url, source="agent")
-                    qs.finish(entry_id, 0, "skipped", f"Destructive path blocked: /{_seg}")
+                    qs.finish(entry_id, 0, "skipped", f"Destructive path blocked: /{segment}")
                 else:
                     qs.finish(entry_id, 0, "skipped", "No injectable parameters found (no query params or JSON body)")
                 runner._store.add_finding(entry_id, {}, "safe")

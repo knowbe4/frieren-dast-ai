@@ -242,6 +242,10 @@ class SessionStore:
         # Passive scanner one_per_host state — keyed by rule_id → set of hosts.
         # Lives on SessionStore so plugin re-instantiation doesn't reset deduplication.
         self.passive_fired_hosts: Dict[str, set] = {}
+        # Passive scanner per-endpoint state — keyed by rule_id → set of
+        # (method, host, path). The same endpoint is re-requested constantly
+        # (crawler revisits, SPA polling); one finding per rule per endpoint.
+        self.passive_fired_endpoints: Dict[str, set] = {}
 
     def _init_passive_analysers(self) -> None:
         """Instantiate the per-store passive analysers fed from complete_entry()."""
@@ -830,6 +834,10 @@ class SessionStore:
             # Parked imported findings wait for a matching history entry; with the
             # history gone they would attach to unrelated future traffic.
             self.pending_import_findings = []
+            # Passive dedup state refers to the cleared entries; without a reset
+            # those findings could never be reported again in this session.
+            self.passive_fired_hosts = {}
+            self.passive_fired_endpoints = {}
         # Give previously-unreachable hosts a fresh chance after a clear —
         # the network may have changed (VPN up, DNS propagated).
         try:

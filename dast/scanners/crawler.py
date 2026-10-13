@@ -16,6 +16,7 @@ from playwright.async_api import BrowserContext, Page, TimeoutError as PwTimeout
 from dast.browser.interceptor import NetworkInterceptor
 from dast.models import Endpoint, EndpointParameter, HttpRequest, Interaction
 from dast.utils.audit_log import AuditLog
+from dast.utils.destructive_paths import destructive_segment
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -24,6 +25,10 @@ _SKIP_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
     ".woff", ".woff2", ".ttf", ".eot",
     ".css", ".map",
+    # Downloads: page.goto() aborts with "Download is starting" on these.
+    ".pdf", ".zip", ".gz", ".tar", ".tgz", ".7z", ".rar",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".mp3", ".mp4", ".avi", ".mov", ".exe", ".dmg", ".msi",
 }
 
 
@@ -228,6 +233,12 @@ class CrawlerWorker:
         if any(url.lower().endswith(ext) for ext in _SKIP_EXTENSIONS):
             return None
         if not self._in_scope(url):
+            return None
+        # Following a logout link ends the server-side session the attack phase
+        # reuses; a checkpoint rollback cannot revive it.
+        segment = destructive_segment(url)
+        if segment:
+            logger.debug("Skipping session-destructive link", url=url, segment=segment)
             return None
         return url
 

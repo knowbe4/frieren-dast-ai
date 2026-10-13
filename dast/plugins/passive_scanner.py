@@ -46,6 +46,12 @@ if TYPE_CHECKING:
 # per-loop gate (not applied in the @lru_cache'd loader, which stays config-agnostic).
 _AGGRESSIVE_RULES_ENABLED = False
 
+# Entry sources that are Frieren's own probes, not observed application traffic:
+# agent/plugin replays and this scanner's CORS proof requests. Their responses
+# repeat the real entry's headers (or reflect injected values), so a passive
+# finding there is a duplicate at best and payload-induced at worst.
+_SYNTHETIC_SOURCES = frozenset({"agent", "passive"})
+
 
 def set_aggressive_rules(enabled: bool) -> None:
     """Enable or disable evaluation of `aggressive: true` passive rules at runtime."""
@@ -758,9 +764,13 @@ class PassiveScannerPlugin(ProxyPlugin):
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         if entry.response_status is None or entry.method == "CONNECT":
             return
+        if getattr(entry, "source", "proxy") in _SYNTHETIC_SOURCES:
+            return
 
         # Use session-level fired_hosts so re-instantiation doesn't reset deduplication
         fired_hosts = store.passive_fired_hosts
+        fired_endpoints = store.passive_fired_endpoints
+        endpoint_key = (entry.method, entry.host, entry.path)
 
         rules = _load_all_rules()
         # (rule_id, finding_tuple)
@@ -781,6 +791,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                 logger.warning("passive rule evaluation failed", rule_id=rule.get("id", ""), error=str(exc))
 
         for rule_id, finding_tuple in all_findings:
+            if endpoint_key in fired_endpoints.get(rule_id, set()):
+                continue
             title, severity, cwe, evidence, line_no, snippet, needs_ai = finding_tuple[:7]
             redacted_snippet = finding_tuple[7] if len(finding_tuple) > 7 else snippet
             rule_confirmed = finding_tuple[8] if len(finding_tuple) > 8 else True
@@ -812,6 +824,9 @@ class PassiveScannerPlugin(ProxyPlugin):
                             raw_body = entry.response_body.decode("utf-8", errors="replace")[:2000]
                         confirmed, _ = await _ai_validate_finding(title, validate_snippet, raw_response_body=raw_body)
                         if confirmed is False:
+                            # A rejection is a decision for this endpoint too —
+                            # do not pay for the same verdict on every revisit.
+                            fired_endpoints.setdefault(rule_id, set()).add(endpoint_key)
                             continue
                         if confirmed is True:
                             validated_by = ["passive", "ai"]
@@ -866,3 +881,4 @@ class PassiveScannerPlugin(ProxyPlugin):
             logger.debug("Passive finding recorded", rule_id=rule_id, title=finding_dict.get("title"),
                          severity=finding_dict.get("severity"), url=entry.url)
             store.add_finding(entry.id, finding_dict, "vulnerable")
+            fired_endpoints.setdefault(rule_id, set()).add(endpoint_key)

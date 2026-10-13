@@ -235,6 +235,7 @@ class TestInsecureForms:
 class _FakeStore:
     def __init__(self):
         self.passive_fired_hosts: Dict = {}
+        self.passive_fired_endpoints: Dict = {}
         self.findings: List[dict] = []
 
     def add_finding(self, entry_id: str, finding: dict, scan_result: str) -> None:

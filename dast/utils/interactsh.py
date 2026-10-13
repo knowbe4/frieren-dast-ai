@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import secrets
 import uuid
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from dast.utils.logger import get_logger
@@ -38,6 +39,40 @@ _ZBASE32 = "0123456789abcdefghijklmnopqrstuv"
 def _xid_token(length: int) -> str:
     """Generate a random string of `length` chars from the zbase32 alphabet."""
     return "".join(secrets.choice(_ZBASE32) for _ in range(length))
+
+
+def _decrypt_entries(private_key: Any, aes_key_b64: str, encrypted_entries: List[str]) -> List[str]:
+    """Decrypt polled interactions: RSA-OAEP(aes_key) then AES-256-CTR per entry."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding as _pad
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    aes_key = private_key.decrypt(
+        base64.b64decode(aes_key_b64),
+        _pad.OAEP(mgf=_pad.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None),
+    )
+    texts: List[str] = []
+    for entry_b64 in encrypted_entries:
+        raw = base64.b64decode(entry_b64)
+        iv, ciphertext = raw[:16], raw[16:]
+        decryptor = Cipher(algorithms.AES(aes_key), modes.CTR(iv)).decryptor()
+        plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+        if plaintext:
+            texts.append(plaintext.decode("utf-8", errors="replace"))
+    return texts
+
+
+def _parse_interaction(text: Any) -> Dict[str, Any]:
+    """Parse one interaction (JSON text, or already a dict); keep unparseable text raw."""
+    if isinstance(text, dict):
+        return text
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.debug("interactsh interaction is not JSON", error=str(exc))
+    return {"protocol": "unknown", "raw-request": str(text)}
 
 
 class InteractshSession:
@@ -156,52 +191,61 @@ class InteractshSession:
         """Fixed OOB callback URL — generated once in register(), never changes."""
         return self._url
 
+    def marker_host(self, marker: str) -> str:
+        """A hostname that routes to this session and carries ``marker`` as its own label.
+
+        interactsh matches the correlation-id label anywhere in the queried name
+        and reports the whole subdomain as the interaction's ``full-id``, so
+        ``<marker>.<correlation-id><nonce>.<domain>`` lets a caller inject many
+        distinct values through one session and attribute every callback to the
+        exact injection that produced it. Returns "" before register().
+        """
+        host = urlparse(self._url).hostname if self._url else ""
+        return f"{marker}.{host}" if host else ""
+
+    async def fetch_interactions(self) -> List[Dict[str, Any]]:
+        """Poll once and return the interactions received since the last poll.
+
+        Each item is interactsh's interaction object: ``protocol`` ("dns",
+        "http", "smtp", ...), ``unique-id``, ``full-id`` (the full subdomain that
+        was queried), ``q-type``, ``raw-request``, ``remote-address`` and
+        ``timestamp``. The server deletes interactions once polled, so only one
+        poller may own a session. Returns [] on any error — polling is periodic
+        and best-effort, so a failed round is retried by the caller's loop.
+        """
+        try:
+            import httpx
+
+            async with httpx.AsyncClient(timeout=10, verify=False, headers=self._headers) as client:
+                response = await client.get(
+                    f"{self._server}/poll",
+                    params={"id": self._correlation_id, "secret": self._secret_key},
+                )
+            if response.status_code != 200:
+                logger.debug("interactsh poll non-200", status=response.status_code)
+                return []
+            data = response.json()
+        except Exception as exc:
+            logger.debug("interactsh poll error", error=str(exc))
+            return []
+
+        interactions = [_parse_interaction(text) for text in (data.get("extra") or [])]
+        encrypted_entries = data.get("data") or []
+        aes_key_b64 = data.get("aes_key", "")
+        if encrypted_entries and aes_key_b64 and self._private_key:
+            try:
+                for text in _decrypt_entries(self._private_key, aes_key_b64, encrypted_entries):
+                    interactions.append(_parse_interaction(text))
+            except Exception as exc:
+                logger.warning("interactsh poll decrypt failed", error=str(exc))
+        return interactions
+
     async def poll(self) -> bool:
         """
         Poll once for interactions. Returns True if any callback was received.
         For long-running polls use poll_for(seconds).
         """
-        try:
-            import httpx
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import padding as _pad
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-
-            async with httpx.AsyncClient(timeout=10, verify=False, headers=self._headers) as client:
-                r = await client.get(
-                    f"{self._server}/poll",
-                    params={"id": self._correlation_id, "secret": self._secret_key},
-                )
-                if r.status_code != 200:
-                    return False
-                data = r.json()
-
-            if data.get("extra"):
-                return True
-
-            encrypted_entries = data.get("data") or []
-            aes_key_b64 = data.get("aes_key", "")
-            if not encrypted_entries or not aes_key_b64 or not self._private_key:
-                return False
-
-            aes_key = self._private_key.decrypt(
-                base64.b64decode(aes_key_b64),
-                _pad.OAEP(
-                    mgf=_pad.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None,
-                ),
-            )
-            for entry_b64 in encrypted_entries:
-                raw = base64.b64decode(entry_b64)
-                iv, ciphertext = raw[:16], raw[16:]
-                cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv))
-                dec = cipher.decryptor()
-                if dec.update(ciphertext) + dec.finalize():
-                    return True
-        except Exception as exc:
-            logger.debug("interactsh poll error", error=str(exc))
-        return False
+        return bool(await self.fetch_interactions())
 
     async def poll_for(self, seconds: int, interval: int = 5) -> bool:
         """

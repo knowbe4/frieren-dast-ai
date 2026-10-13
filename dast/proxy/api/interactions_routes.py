@@ -11,7 +11,6 @@ GET    /api/interactions/{id}      — single session detail
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import time
 import uuid
@@ -411,104 +410,77 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     return router
 
 
+# Raw callbacks are kept for display; long enough that a typical DNS or HTTP
+# interaction stays valid JSON so the tab can format it.
+_MAX_CALLBACK_RAW_CHARS = 2000
+
+
+def _callback_from_interaction(interaction: dict, received_at: float) -> dict:
+    """Shape one interactsh interaction as an Interactions-tab callback."""
+    protocol = str(interaction.get("protocol") or "").lower()
+    if protocol in ("http", "https"):
+        interaction_type = "http"
+    elif protocol == "dns":
+        interaction_type = "dns"
+    else:
+        interaction_type = "unknown"
+    return {
+        "received_at": received_at,
+        "type": interaction_type,
+        "raw": json.dumps(interaction)[:_MAX_CALLBACK_RAW_CHARS],
+    }
+
+
 async def _poll_once(interactsh_session) -> List[dict]:
     """
     Poll interactsh once and return a list of callback dicts with
     type, raw text, and received_at timestamp.
     """
-    try:
-        import httpx
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding as _pad
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    now = time.time()
+    interactions = await interactsh_session.fetch_interactions()
+    return [_callback_from_interaction(interaction, now) for interaction in interactions]
 
-        async with httpx.AsyncClient(
-            timeout=10, verify=False, headers=interactsh_session._headers
-        ) as client:
-            r = await client.get(
-                f"{interactsh_session._server}/poll",
-                params={
-                    "id": interactsh_session._correlation_id,
-                    "secret": interactsh_session._secret_key,
-                },
-            )
-            if r.status_code != 200:
-                return []
-            data = r.json()
 
-        results: List[dict] = []
-        now = time.time()
+def register_display_session(oob_url: str, label: str = "") -> str:
+    """Create an Interactions-tab session that its owner feeds; it is never polled here.
 
-        if data.get("extra"):
-            results.append(
-                {
-                    "received_at": now,
-                    "type": "unknown",
-                    "raw": str(data["extra"])[:500],
-                }
-            )
-            return results
+    For components that poll their own interactsh session and attribute each
+    callback themselves (the header OOB plugin). Polling here as well would race
+    them for the same interactions — the server deletes interactions once polled.
+    No finding is auto-created: the owner records precise findings itself.
+    """
+    session_id = str(uuid.uuid4())[:8]
+    _sessions[session_id] = {
+        "session_id": session_id,
+        "oob_url": oob_url,
+        "label": label,
+        "origin_url": "",
+        "created_at": time.time(),
+        "active": True,
+        "callbacks": [],
+    }
+    _gc_external()
+    return session_id
 
-        encrypted_entries = data.get("data") or []
-        aes_key_b64 = data.get("aes_key", "")
-        if (
-            not encrypted_entries
-            or not aes_key_b64
-            or not interactsh_session._private_key
-        ):
-            return []
 
-        aes_key = interactsh_session._private_key.decrypt(
-            base64.b64decode(aes_key_b64),
-            _pad.OAEP(
-                mgf=_pad.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
-
-        for entry_b64 in encrypted_entries:
-            raw_bytes = base64.b64decode(entry_b64)
-            iv, ciphertext = raw_bytes[:16], raw_bytes[16:]
-            cipher = Cipher(algorithms.AES(aes_key), modes.CTR(iv))
-            dec = cipher.decryptor()
-            plaintext_bytes = dec.update(ciphertext) + dec.finalize()
-            if not plaintext_bytes:
-                continue
-
+async def publish_callbacks(session_id: str, interactions: List[dict]) -> None:
+    """Append interactions to a display session and push them to open dashboards."""
+    session = _sessions.get(session_id)
+    if not session:
+        return
+    now = time.time()
+    for interaction in interactions:
+        callback = _callback_from_interaction(interaction, now)
+        if len(session["callbacks"]) >= _MAX_CALLBACKS_PER_SESSION:
+            session["callbacks"].pop(0)
+        session["callbacks"].append(callback)
+        if _broadcast_fn:
             try:
-                plaintext = plaintext_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                plaintext = repr(plaintext_bytes)
-
-            interaction_type = "unknown"
-            plaintext_lower = plaintext.lower()
-            if '"protocol":"http"' in plaintext_lower or "http request" in plaintext_lower:
-                interaction_type = "http"
-            elif '"protocol":"dns"' in plaintext_lower or "dns" in plaintext_lower[:80]:
-                interaction_type = "dns"
-
-            try:
-                import json as _json
-                parsed = _json.loads(plaintext)
-                proto = (parsed.get("protocol") or "").lower()
-                if proto in ("http", "https"):
-                    interaction_type = "http"
-                elif proto == "dns":
-                    interaction_type = "dns"
+                await _broadcast_fn({
+                    "type": "interaction",
+                    "session_id": session_id,
+                    "oob_url": session["oob_url"],
+                    "callback": callback,
+                })
             except Exception as exc:
-                logger.debug("failed to parse interactsh interaction protocol", error=str(exc))
-
-            results.append(
-                {
-                    "received_at": now,
-                    "type": interaction_type,
-                    "raw": plaintext[:500],
-                }
-            )
-
-        return results
-
-    except Exception as exc:
-        logger.debug("interactions _poll_once error", error=str(exc))
-        return []
+                logger.warning("interactions broadcast failed", session_id=session_id, error=str(exc))

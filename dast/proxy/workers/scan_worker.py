@@ -176,6 +176,17 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                 qs.finish(entry_id, 0, "skipped", "URL is out of scope — configure scope in Proxy → Settings")
                 return
 
+            # Active plugins (deterministic, no AI) run on every in-scope scan,
+            # with AI mode on or off — they confirm with deterministic evidence.
+            # Endpoints without injectable params still qualify (e.g. header
+            # checks), so this runs before the param gate below. Never for an
+            # out-of-scope imported entry.
+            if runner._settings.is_in_scope(entry.url):
+                try:
+                    await runner._plugin_manager.dispatch_active(entry, runner._store, proxy_url)
+                except Exception as exc:
+                    logger.warning("Active plugins failed", url=entry.url, error=str(exc))
+
             target = _entry_to_check_target(entry, store=runner._store)
             if not target:
                 from urllib.parse import urlparse as _up2

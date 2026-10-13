@@ -27,7 +27,7 @@ repos:
     hooks:
       - id: detect-private-key
         # Scanner test fixtures embed fake private keys by design.
-        exclude: '^tests/unit/(test_secrets_agent|test_passive_scanner)\.py$'
+        exclude: '^tests/unit/(test_secrets_agent|test_passive_scanner|test_js_secret_scanner)\.py$'
       - id: check-added-large-files
         args: ["--maxkb=1024"]
       - id: check-merge-conflict

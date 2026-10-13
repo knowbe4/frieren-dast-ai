@@ -88,10 +88,32 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
             )
             return
 
+        # A Content-Length that is not a single integer (duplicated "12, 12", signed,
+        # garbage) is itself a CL.CL / framing-ambiguity signal — record it instead
+        # of letting int() raise and silently dropping the entry.
+        cl_val = str(_header_value(req_headers, "content-length")).strip() if has_cl else ""
+        if has_cl and not cl_val.isdigit():
+            store.add_finding(
+                entry.id,
+                {
+                    "title": "Potential Request Smuggling: Malformed Content-Length",
+                    "severity": "low",
+                    "cwe": "CWE-444",
+                    "attack_type": "request-smuggling",
+                    "evidence": (
+                        f"Content-Length is {cl_val!r}, not a single integer. Front-end and "
+                        f"back-end servers may parse it differently (CL.CL desync)."
+                    ),
+                    "confirmed": False,
+                    "validated_by": ["pattern"],
+                },
+                "safe",
+            )
+            return
+
         # Response desync hint: 400 on a normal-looking request (server rejected framing)
         if entry.response_status == 400 and has_cl and not has_te:
-            cl_val = _header_value(req_headers, "content-length")
-            if entry.request_body and len(entry.request_body) != int(cl_val or 0):
+            if entry.request_body and len(entry.request_body) != int(cl_val):
                 store.add_finding(
                     entry.id,
                     {

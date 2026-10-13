@@ -10,18 +10,21 @@ import re
 from urllib.parse import parse_qs, urlparse
 from typing import TYPE_CHECKING
 
-from dast.proxy.plugin_base import ProxyPlugin
+from dast.proxy.plugin_base import SYNTHETIC_SOURCES, ProxyPlugin
 from dast.utils.logger import get_logger
+from dast.utils.redact import redact_secret
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
 
 logger = get_logger(__name__)
 
+# Password-class parameter names only. Tokens, API keys and secrets are owned by
+# sensitive_param_tracker (long, high-entropy values, redacted); flagging them
+# here too produced a duplicate high finding per request. That tracker skips
+# short human passwords (password=hunter2), which is exactly what this catches.
 _SENSITIVE_PARAM_RE = re.compile(
-    r'^(?:password|passwd|pass|pwd|secret|api[_-]?key|apikey|access[_-]?token|'
-    r'auth[_-]?token|token|private[_-]?key|client[_-]?secret|app[_-]?secret|'
-    r'credentials?|session[_-]?token|bearer)$',
+    r'^(?:password|passwd|pass|pwd|passphrase)$',
     re.IGNORECASE,
 )
 
@@ -35,12 +38,12 @@ _MIN_VALUE_LEN = 6
 # own injected `token=`/`password=` discovery probes is a self-inflicted false
 # positive. The corresponding real request (source "proxy"/"browse"/"crawler"/…)
 # is still analysed, so nothing real is missed.
-_SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
+_SYNTHETIC_SOURCES = SYNTHETIC_SOURCES
 
 
 class CredentialInUrlPlugin(ProxyPlugin):
     name        = "credential-in-url"
-    description = "Flags passwords, tokens, and API keys passed in URL query parameters"
+    description = "Flags passwords passed in URL query parameters (tokens and keys: sensitive-param-tracker)"
     version     = "1.0.0"
     author      = "Frieren DAST-AI"
     enabled     = True
@@ -62,7 +65,7 @@ class CredentialInUrlPlugin(ProxyPlugin):
                 continue
             value = values[0] if values else ""
             if len(value) >= _MIN_VALUE_LEN:
-                hits.append(f"{name}={value}")
+                hits.append(f"{name}={redact_secret(value)}")
 
         if not hits:
             return
@@ -70,7 +73,7 @@ class CredentialInUrlPlugin(ProxyPlugin):
         store.add_finding(
             entry.id,
             {
-                "title": "Sensitive Credential Passed in URL Query String",
+                "title": "Password Passed in URL Query String",
                 "severity": "high",
                 "cwe": "CWE-598",
                 "attack_type": "credential-in-url",

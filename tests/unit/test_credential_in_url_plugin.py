@@ -44,13 +44,22 @@ def _run(entry: SimpleNamespace) -> _Store:
 _PLACEHOLDER = "xxxxxxxxxxxx"
 
 
-def test_flags_real_credential_in_query():
-    store = _run(_entry(f"http://app.example.com/cb?token={_PLACEHOLDER}"))
+def test_flags_password_in_query_with_value_masked():
+    store = _run(_entry(f"http://app.example.com/login?user=a&password={_PLACEHOLDER}"))
     assert len(store.findings) == 1
     _, finding, status = store.findings[0]
     assert finding["attack_type"] == "credential-in-url"
     assert status == "vulnerable"
-    assert f"token={_PLACEHOLDER}" in finding["evidence"]
+    assert "password=xx***xx (12 chars)" in finding["evidence"]
+    # The credential itself never lands in the finding / session file / SARIF.
+    assert _PLACEHOLDER not in finding["evidence"]
+
+
+def test_token_params_are_left_to_sensitive_param_tracker():
+    # Tokens and keys are flagged (redacted) by sensitive_param_tracker; flagging
+    # them here too produced a duplicate high finding on the same request.
+    url = f"http://app.example.com/cb?token={_PLACEHOLDER}&api_key={_PLACEHOLDER}"
+    assert _run(_entry(url)).findings == []
 
 
 def test_ignores_param_mining_probe():
@@ -62,7 +71,7 @@ def test_ignores_param_mining_probe():
 
 @pytest.mark.parametrize("source", sorted(_SYNTHETIC_SOURCES))
 def test_all_synthetic_sources_are_skipped(source):
-    url = f"http://app.example.com/x?access_token={_PLACEHOLDER}"
+    url = f"http://app.example.com/x?password={_PLACEHOLDER}"
     assert _run(_entry(url, source=source)).findings == []
 
 
@@ -72,4 +81,4 @@ def test_non_sensitive_params_are_not_flagged():
 
 def test_short_values_are_not_flagged():
     # Below _MIN_VALUE_LEN — placeholder/empty, not a real secret.
-    assert _run(_entry("http://app.example.com/x?token=abc")).findings == []
+    assert _run(_entry("http://app.example.com/x?password=abc")).findings == []

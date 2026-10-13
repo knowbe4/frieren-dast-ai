@@ -113,7 +113,15 @@ class PluginManager:
         Plugins record findings through ``store.add_finding`` (the single locked
         mutation path). ``entry.findings`` is only ever read here via the store's
         locked snapshot, so a concurrent add/remove cannot tear the read.
+
+        Out-of-scope traffic never reaches a plugin. Scope is a hard boundary and
+        several plugins send requests from on_entry (JWT tester attacks, the
+        passive scanner's CORS proof probe, scan enqueues); findings on
+        out-of-scope entries are hidden anyway, so there is nothing to gain.
         """
+        if getattr(entry, "source", "") == "out-of-scope":
+            logger.debug("Plugins skipped for out-of-scope entry", url=getattr(entry, "url", ""))
+            return
         for p in self._plugins:
             if not p.enabled:
                 continue

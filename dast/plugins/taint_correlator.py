@@ -61,7 +61,7 @@ class TaintCorrelatorPlugin(ProxyPlugin):
                 entry.id,
                 {
                     "title": "Cross-Endpoint Input Reflection (Stored / Second-Order Injection Surface)",
-                    "severity": "medium",
+                    "severity": "low",
                     "cwe": "CWE-79",
                     "attack_type": "taint",
                     "evidence": (
@@ -72,9 +72,13 @@ class TaintCorrelatorPlugin(ProxyPlugin):
                         f"context for stored XSS / second-order injection."
                     ),
                     "parameter": marker.source_param,
-                    "confirmed": True,
+                    # A lead, not a vulnerability: showing persisted input on
+                    # another page is often by design (a profile name on the
+                    # profile page), and an alphanumeric marker cannot show
+                    # whether the sink escapes it. Held for review.
+                    "confirmed": False,
+                    "needs_review": True,
                     "validated_by": ["taint-correlation"],
-                    "needs_ai_validation": True,
                 },
                 "vulnerable",
             )

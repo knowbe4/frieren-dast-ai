@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from dast.proxy.plugin_base import ProxyPlugin
+from dast.proxy.plugin_base import SYNTHETIC_SOURCES, ProxyPlugin
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # scanner's own probe traffic into a self-amplifying scan-queue feedback loop
 # that starves real endpoints. The corresponding real request (source
 # "proxy"/"browse"/"crawler"/…) is still analysed, so nothing real is missed.
-_SYNTHETIC_SOURCES = frozenset({"param-mining", "probe-diff", "agent", "vuln-agent"})
+_SYNTHETIC_SOURCES = SYNTHETIC_SOURCES
 
 # State-changing endpoints (host, method, path) already flagged for missing CSRF
 # protection. The signal is a per-endpoint property, not a per-request one: without
@@ -89,6 +89,26 @@ def _has_csrf_token(entry: "ProxyEntry") -> bool:
     return False
 
 
+# Authorization schemes a browser re-sends on its own once the user has
+# authenticated (cached by the browser / negotiated by the OS). A Bearer token is
+# attached by JavaScript and is NOT sent on a forged cross-site request.
+_AMBIENT_AUTH_SCHEMES = frozenset({"basic", "digest", "ntlm", "negotiate"})
+
+
+def _has_ambient_credential(entry: "ProxyEntry") -> bool:
+    """True if the request carries a credential a cross-site forged request would also carry.
+
+    Only then is CSRF possible: a request authenticated solely by a Bearer token
+    (typical SPA / API) or carrying no credential at all gives a forged request
+    nothing to ride on.
+    """
+    headers = {key.lower(): value for key, value in (entry.request_headers or {}).items()}
+    if str(headers.get("cookie", "")).strip():
+        return True
+    scheme = str(headers.get("authorization", "")).strip().split(" ", 1)[0].lower()
+    return scheme in _AMBIENT_AUTH_SCHEMES
+
+
 def _iter_set_cookies(response_headers: dict):
     """Yield each Set-Cookie string, handling both str and list values."""
     for header, value in (response_headers or {}).items():
@@ -129,7 +149,11 @@ class CsrfObserverPlugin(ProxyPlugin):
             return
 
         # Check 1 — no CSRF token and no SameSite cookie defence
-        if not _has_csrf_token(entry) and not _has_samesite_cookie(entry):
+        if (
+            _has_ambient_credential(entry)
+            and not _has_csrf_token(entry)
+            and not _has_samesite_cookie(entry)
+        ):
             # Flag (and actively re-enqueue) each state-changing endpoint once, not
             # on every genuine request to it.
             endpoint_key = (getattr(entry, "host", "") or "", entry.method, entry.path or "")

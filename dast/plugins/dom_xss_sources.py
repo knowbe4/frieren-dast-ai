@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
-from dast.proxy.plugin_base import ProxyPlugin
+from dast.proxy.plugin_base import SYNTHETIC_SOURCES, ProxyPlugin
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -27,48 +27,31 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Each entry: (pattern, label, severity)
+# Real DOM XSS sources: attacker-influenced values the page reads itself.
+_SOURCE = (
+    r"(?:location\.(?:hash|search|href)|document\.(?:URL|documentURI|baseURI|referrer|cookie)"
+    r"|window\.name|URLSearchParams|\.searchParams)"
+)
+# A source only counts when it feeds the sink in the SAME statement and close
+# by: no ';' in between and at most 120 chars. Minified bundles are one huge
+# line, so an unbounded `.*` matched any sink plus any source anywhere after it.
+_NEAR = r"[^;\n]{0,120}?"
+
+# Each entry: (pattern, label, severity). Every hit is a review hint (low):
+# a source reaching a sink is not proof the value is unsanitised.
 _PATTERNS: list[tuple[re.Pattern, str, str]] = [
-    (
-        re.compile(r'document\.write\s*\(.*(?:location|hash|search|param|input|data)', re.IGNORECASE),
-        "document.write() with user-controlled source",
-        "high",
-    ),
-    (
-        re.compile(r'\.innerHTML\s*[+]?=\s*.*(?:location|hash|search|param|input|data|decode)', re.IGNORECASE),
-        "innerHTML assignment with user-controlled source",
-        "high",
-    ),
-    (
-        re.compile(r'\.outerHTML\s*[+]?=\s*.*(?:location|hash|search|param|input)', re.IGNORECASE),
-        "outerHTML assignment with user-controlled source",
-        "high",
-    ),
-    (
-        re.compile(r'eval\s*\(.*(?:location|hash|search|param|input|decode|atob)', re.IGNORECASE),
-        "eval() with user-controlled source",
-        "high",
-    ),
-    (
-        re.compile(r'location\.hash', re.IGNORECASE),
-        "location.hash used (common DOM XSS source)",
-        "medium",
-    ),
-    (
-        re.compile(r'\$\(.*\)\.html\s*\(.*(?:location|hash|search|param|input)', re.IGNORECASE),
-        "jQuery .html() with user-controlled source",
-        "high",
-    ),
-    (
-        re.compile(r'window\.location\s*=.*(?:param|input|data|decode)', re.IGNORECASE),
-        "window.location assignment with user-controlled source",
-        "medium",
-    ),
-    (
-        re.compile(r'document\.location\s*=.*(?:param|input|data)', re.IGNORECASE),
-        "document.location assignment with user-controlled source",
-        "medium",
-    ),
+    (re.compile(r"document\.write(?:ln)?\s*\(" + _NEAR + _SOURCE),
+     "document.write() fed by a DOM source", "low"),
+    (re.compile(r"\.(?:inner|outer)HTML\s*\+?=" + _NEAR + _SOURCE),
+     "innerHTML/outerHTML assignment fed by a DOM source", "low"),
+    (re.compile(r"\.insertAdjacentHTML\s*\(" + _NEAR + _SOURCE),
+     "insertAdjacentHTML() fed by a DOM source", "low"),
+    (re.compile(r"\beval\s*\(" + _NEAR + _SOURCE),
+     "eval() fed by a DOM source", "low"),
+    (re.compile(r"\.(?:html|append|prepend)\s*\(" + _NEAR + _SOURCE),
+     "jQuery .html()/.append()/.prepend() fed by a DOM source", "low"),
+    (re.compile(r"(?:window\.|document\.)?location(?:\.href)?\s*=(?!=)" + _NEAR + _SOURCE),
+     "location assignment fed by a DOM source", "low"),
 ]
 
 _MAX_BODY = 500_000  # only scan first 500 KB
@@ -82,6 +65,10 @@ class DomXssSourcesPlugin(ProxyPlugin):
     enabled     = True
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
+        # Our own probe responses are not the app's code, and re-enqueueing them
+        # would feed the scan queue with its own probes.
+        if getattr(entry, "source", "proxy") in SYNTHETIC_SOURCES:
+            return
         ct = (entry.content_type or "").lower()
         if "html" not in ct and "javascript" not in ct and not entry.path.endswith((".js", ".html")):
             return
@@ -90,7 +77,8 @@ class DomXssSourcesPlugin(ProxyPlugin):
 
         try:
             body = entry.response_body[:_MAX_BODY].decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as exc:
+            logger.debug("DOM XSS sources: response decode failed", url=entry.url, error=str(exc))
             return
 
         hits: list[tuple[str, str, int]] = []  # (label, severity, line_no)
@@ -110,7 +98,8 @@ class DomXssSourcesPlugin(ProxyPlugin):
             if label not in seen:
                 seen[label] = (severity, line_no)
 
-        top_severity = "high" if any(s == "high" for s, _ in seen.values()) else "medium"
+        # Every pattern is a review hint, so the finding keeps the lowest band.
+        top_severity = "low"
         evidence_lines = [f"Line {ln}: {lbl}" for lbl, (_, ln) in seen.items()]
 
         store.add_finding(
@@ -133,7 +122,9 @@ class DomXssSourcesPlugin(ProxyPlugin):
         # is on; with AI off the passive finding above still surfaces on its own.
         # ai_queued only lets the deliberate re-scan bypass dedup, not the ai_mode
         # gate or scope.
-        if not entry.queued_for_scan and not entry.scan_result:
+        # Only an HTML page can be re-scanned meaningfully: a static .js asset has
+        # no injectable parameters for the XSS agent.
+        if "html" in ct and not entry.queued_for_scan and not entry.scan_result:
             entry.ai_queued = True
             entry.queued_for_scan = True
             entry.import_hints = list(entry.import_hints or []) + [

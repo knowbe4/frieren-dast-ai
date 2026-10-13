@@ -228,6 +228,7 @@ def build_app(
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
     from dast.proxy.api.copilot_routes import make_router as copilot_router
     from dast.proxy.api.copilot_service import CopilotService
+    from dast.proxy.api.origin_guard import OriginGuardMiddleware
 
     ctx = DashboardContext(
         store=store,
@@ -256,6 +257,10 @@ def build_app(
         store.session_intelligence.escalation_sink = ctx.copilot.escalate_block
 
     app = FastAPI(title="Frieren DAST-AI Proxy Dashboard")
+    # Loopback-Host + same-Origin guard: the dashboard has no login, so this is what
+    # stops a website in the operator's browser from driving it (CSRF, cross-site
+    # WebSocket reads of captured traffic, DNS rebinding). See origin_guard.py.
+    app.add_middleware(OriginGuardMiddleware)
 
     @app.on_event("startup")
     async def _startup() -> None:

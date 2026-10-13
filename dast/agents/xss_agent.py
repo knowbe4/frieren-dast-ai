@@ -149,6 +149,9 @@ class XssAgent(VulnAgent):
     )
 
     def __init__(self, proxy_port: int = 8080):
+        # Base __init__ sets up self.observations; without this super() call,
+        # self.observe(...) raises AttributeError and crashes every XSS scan.
+        super().__init__()
         self._proxy_port = proxy_port
 
     async def run(

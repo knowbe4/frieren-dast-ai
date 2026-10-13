@@ -115,13 +115,7 @@ async def _broadcast_status(ctx: DashboardContext) -> None:
         "intercept_response": ctx.intercept_store.intercept_response,
         "queue_size": ctx.intercept_store.queue_size,
     })
-    dead = set()
-    for ws in list(ctx.ws_clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    ctx.ws_clients.difference_update(dead)
+    await ctx.broadcast_message(msg)
 
 
 async def _broadcast_queue(ctx: DashboardContext) -> None:
@@ -132,10 +126,4 @@ async def _broadcast_queue(ctx: DashboardContext) -> None:
         "queue": ctx.intercept_store.get_queue(),
         "queue_size": ctx.intercept_store.queue_size,
     })
-    dead = set()
-    for ws in list(ctx.ws_clients):
-        try:
-            await ws.send_text(msg)
-        except Exception:
-            dead.add(ws)
-    ctx.ws_clients.difference_update(dead)
+    await ctx.broadcast_message(msg)

@@ -113,7 +113,7 @@ class TestFpFilter:
         from dast.ai.fp_filter import check
         finding = _FakeFinding(
             attack_type="open_redirect",
-            evidence="Redirected to https://evil.example.com/steal",
+            evidence="Redirected to https://dast-redirect-canary.invalid/steal",
         )
         reason = check(finding, _FakeTarget())
         assert reason is None

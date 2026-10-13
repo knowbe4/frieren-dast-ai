@@ -160,7 +160,7 @@ class TestReproduceEndpoint:
 
         store = SessionStore()
         app = build_app(store=store, scan_queue=asyncio.Queue())
-        with TestClient(app) as c:
+        with TestClient(app, base_url="http://127.0.0.1") as c:
             c._store = store
             yield c
 

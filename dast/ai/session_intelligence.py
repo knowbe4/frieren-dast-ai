@@ -25,6 +25,7 @@ scan.  No threshold logic lives here — the caller decides when to read.
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -153,6 +154,10 @@ class HostIntel:
     ineffective_paths: Dict[str, Set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
+
+    # The owning SessionIntelligence lock (set by SessionIntelligence.get) —
+    # readers that run outside it (planner/mutator hints) acquire it.
+    _shared_lock: Optional[threading.Lock] = field(default=None, repr=False, compare=False)
 
     # Structural errors per (path, operation) — coordinator skips known-broken paths
     structural_errors: Dict[Tuple[str, str], List[str]] = field(
@@ -405,6 +410,12 @@ class HostIntel:
         Produce a concise natural-language hint for the LLM planner.
         Covers everything accumulated across all three ingestion sources.
         """
+        # Proxy threads mutate these sets/dicts under the SessionIntelligence
+        # lock; read under the same lock or iteration can fail mid-scan.
+        with self._shared_lock or nullcontext():
+            return self._planner_hint_unlocked(path, params)
+
+    def _planner_hint_unlocked(self, path: str, params: List[dict]) -> str:
         lines: List[str] = []
 
         # App-level context from LLM synthesis
@@ -485,6 +496,10 @@ class HostIntel:
         the payoff of Gap 2 — a technique proven on one endpoint is offered to
         the mutator first on the next endpoint of the same host.
         """
+        with self._shared_lock or nullcontext():
+            return self._mutator_hint_unlocked(attack_type)
+
+    def _mutator_hint_unlocked(self, attack_type: str) -> str:
         lines: List[str] = []
         if self.waf_vendor:
             lines.append(f"WAF in use: {self.waf_vendor}")
@@ -524,7 +539,7 @@ class SessionIntelligence:
     def get(self, host: str) -> HostIntel:
         with self._lock:
             if host not in self._hosts:
-                self._hosts[host] = HostIntel(host=host)
+                self._hosts[host] = HostIntel(host=host, _shared_lock=self._lock)
             return self._hosts[host]
 
     def peek(self, host: str) -> Optional[HostIntel]:

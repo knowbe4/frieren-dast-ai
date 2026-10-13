@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, List, Optional
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
@@ -69,6 +70,27 @@ _IP_BYPASS_HEADERS = [
     {"True-Client-IP": "127.0.0.1"},
     {"X-Originating-IP": "127.0.0.1"},
 ]
+
+
+_LOGIN_PAGE_RE = re.compile(
+    r"<input[^>]+type=[\"']?password|\b(sign|log)\s?in\b|\bunauthori[sz]ed\b|\baccess denied\b|\bforbidden\b",
+    re.IGNORECASE,
+)
+_MIN_BYPASS_BODY_CHARS = 100
+
+
+def _is_bypass_response(resp: "httpx.Response", baseline_resp: Optional["httpx.Response"]) -> bool:
+    """True when ``resp`` looks like the protected resource rather than a rejection.
+
+    A 200 alone is not proof: many apps answer a blocked request with a 200 login
+    or "access denied" page. Require a substantive body that differs from the
+    rejected baseline and does not look like a login/denial page.
+    """
+    if resp.status_code != 200 or len(resp.text) <= _MIN_BYPASS_BODY_CHARS:
+        return False
+    if baseline_resp is not None and resp.text == baseline_resp.text:
+        return False
+    return not _LOGIN_PAGE_RE.search(resp.text[:20000])
 
 
 class AuthAgent(VulnAgent):
@@ -153,32 +175,49 @@ class AuthAgent(VulnAgent):
             resp = await _send(client, target.method, target.url, headers_with_override, target.body)
             if not resp:
                 continue
-            # Confirm: status changed from 401/403 to 200, with meaningful body
-            if resp.status_code == 200 and len(resp.text) > 100:
-                header_name = list(extra_headers.keys())[0]
-                log_event("auth_bypass", "finding", f"Auth bypass via {header_name} header — {target.url}", url=target.url, finding=f"Auth Bypass via {header_name}", source="agent")
-                baseline_req, baseline_resp_text = _fmt_http_pair(baseline_resp)
-                probe_req, probe_resp_text = _fmt_http_pair(resp)
-                findings.append(AgentFinding(
-                    title=f"Authentication Bypass via {header_name} Header",
-                    severity="high",
-                    cwe="CWE-284",
-                    attack_type="auth_bypass",
-                    evidence=(
-                        f"Baseline: {baseline_status}. "
-                        f"With {header_name}: {extra_headers[header_name]!r} → {resp.status_code} "
-                        f"({len(resp.text)} chars)"
-                    ),
-                    payload=f"{header_name}: {extra_headers[header_name]}",
-                    parameter=header_name,
-                    url=target.url,
-                    request_method=target.method,
-                    bypass_validation=True,
-                    raw_request=baseline_req,
-                    raw_response=baseline_resp_text,
-                    probe_request=probe_req,
-                    probe_response=probe_resp_text,
-                ))
+            # Candidate: status changed from 401/403 to 200 with a meaningful body
+            # that is not just a login/error page.
+            if not _is_bypass_response(resp, baseline_resp):
+                continue
+            # Confirm: the bypass must be reproducible AND the plain request must
+            # still be rejected — rules out a flaky endpoint or a session change
+            # that would make every header look like a bypass.
+            repeat_resp = await _send(client, target.method, target.url, headers_with_override, target.body)
+            rebaseline_resp = await _send(client, target.method, target.url, target.headers, target.body)
+            if (
+                repeat_resp is None
+                or not _is_bypass_response(repeat_resp, baseline_resp)
+                or rebaseline_resp is None
+                or rebaseline_resp.status_code not in (401, 403)
+            ):
+                logger.debug("Auth agent: bypass candidate not reproducible", url=target.url,
+                             header=list(extra_headers.keys())[0])
+                continue
+            header_name = list(extra_headers.keys())[0]
+            log_event("auth_bypass", "finding", f"Auth bypass via {header_name} header — {target.url}", url=target.url, finding=f"Auth Bypass via {header_name}", source="agent")
+            baseline_req, baseline_resp_text = _fmt_http_pair(baseline_resp)
+            probe_req, probe_resp_text = _fmt_http_pair(resp)
+            findings.append(AgentFinding(
+                title=f"Authentication Bypass via {header_name} Header",
+                severity="high",
+                cwe="CWE-284",
+                attack_type="auth_bypass",
+                evidence=(
+                    f"Baseline: {baseline_status}. "
+                    f"With {header_name}: {extra_headers[header_name]!r} → {resp.status_code} "
+                    f"({len(resp.text)} chars). Reproduced on a second request; the plain "
+                    f"request is still rejected ({rebaseline_resp.status_code})."
+                ),
+                payload=f"{header_name}: {extra_headers[header_name]}",
+                parameter=header_name,
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=baseline_req,
+                raw_response=baseline_resp_text,
+                probe_request=probe_req,
+                probe_response=probe_resp_text,
+            ))
 
         return findings
 

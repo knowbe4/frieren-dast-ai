@@ -132,6 +132,7 @@ def test_top_level_tabs_have_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -151,6 +152,7 @@ def test_proxy_sub_tabs_have_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -169,6 +171,7 @@ def test_browse_sub_tabs_have_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -187,6 +190,7 @@ def test_ai_panel_has_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -203,6 +207,7 @@ def test_extras_sub_tabs_have_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -222,6 +227,7 @@ def test_decoder_transforms_and_layout(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -270,6 +276,7 @@ def test_jwt_decode_and_build(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -310,6 +317,7 @@ def test_interactions_raw_formatter(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page(viewport={"width": 1280, "height": 800})
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -340,6 +348,7 @@ def test_graphql_sub_tabs_have_no_console_errors(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -362,6 +371,7 @@ def test_crawl_host_shortcut_lands_on_browse_crawl_subtab(dashboard_url):
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)
@@ -387,6 +397,7 @@ def test_browse_and_login_button_inside_crawl_switches_to_manual_subtab(dashboar
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page = browser.new_page()
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         with _console_error_guard(page) as errors:
             page.goto(dashboard_url, wait_until="domcontentloaded")
             page.wait_for_timeout(500)

@@ -25,6 +25,28 @@ if TYPE_CHECKING:
     from dast.proxy.api.copilot_service import CopilotService
 
 
+# Background-job registries (Intruder, findings import, GraphQL fuzz) keep full
+# results in memory; cap them so a long session does not grow without bound.
+MAX_RETAINED_JOBS = 50
+
+
+def prune_jobs(jobs: dict, max_jobs: int = MAX_RETAINED_JOBS) -> None:
+    """Drop the oldest jobs (dict insertion order) until at most ``max_jobs`` remain."""
+    while len(jobs) > max_jobs:
+        jobs.pop(next(iter(jobs)))
+
+
+async def send_to_all(clients: Set[WebSocket], message: str) -> None:
+    """Send ``message`` to every client; drop the ones whose connection is gone."""
+    dead = set()
+    for ws in list(clients):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.add(ws)  # closed socket — expected when a tab goes away
+    clients.difference_update(dead)
+
+
 @dataclass
 class DashboardContext:
     store: "SessionStore"
@@ -134,68 +156,31 @@ class DashboardContext:
 
     async def broadcast(self, entry) -> None:
         import json
-        dead = set()
-        msg = json.dumps(entry.to_dict())
-        for ws in list(self.ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.ws_clients.difference_update(dead)
+        await send_to_all(self.ws_clients, json.dumps(entry.to_dict()))
+
+    async def broadcast_message(self, message: str) -> None:
+        """Send a pre-serialised message to every dashboard WebSocket client."""
+        await send_to_all(self.ws_clients, message)
 
     async def broadcast_crawl_log(self, msg: str) -> None:
-        dead = set()
-        for ws in list(self.crawl_log_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.crawl_log_clients.difference_update(dead)
+        await send_to_all(self.crawl_log_clients, msg)
 
     async def broadcast_login(self, payload: dict) -> None:
         """Fan out a login-flow event (recording/replay/needs-human) to /ws/login."""
         import json
-        dead = set()
-        msg = json.dumps(payload)
-        for ws in list(self.login_ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.login_ws_clients.difference_update(dead)
+        await send_to_all(self.login_ws_clients, json.dumps(payload))
 
     async def broadcast_approval(self, payload: dict) -> None:
         """Fan out an MCP request-approval event (needed/resolved) to /ws/mcp-approval."""
         import json
-        dead = set()
-        msg = json.dumps(payload)
-        for ws in list(self.mcp_approval_ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.mcp_approval_ws_clients.difference_update(dead)
+        await send_to_all(self.mcp_approval_ws_clients, json.dumps(payload))
 
     async def broadcast_agent(self, payload: dict) -> None:
         """Fan out an agentic Vuln Validator trace/pause event to /ws/agent-triage."""
         import json
-        dead = set()
-        msg = json.dumps(payload, default=str)
-        for ws in list(self.agent_triage_ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.agent_triage_ws_clients.difference_update(dead)
+        await send_to_all(self.agent_triage_ws_clients, json.dumps(payload, default=str))
 
     async def broadcast_copilot(self, payload: dict) -> None:
         """Fan out an Exploration Copilot trace/pause/reply event to /ws/copilot."""
         import json
-        dead = set()
-        msg = json.dumps(payload, default=str)
-        for ws in list(self.copilot_ws_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.add(ws)
-        self.copilot_ws_clients.difference_update(dead)
+        await send_to_all(self.copilot_ws_clients, json.dumps(payload, default=str))

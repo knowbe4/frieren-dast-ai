@@ -315,7 +315,7 @@ async function cpLoadSessions() {
     el.innerHTML = sessions.map(s => {
       const active = _cpActive === s.session_id ? 'background:var(--sel);' : '';
       const dot = cpStatusColor(s.status);
-      return `<div onclick="cpSelectSession('${esc(s.session_id)}')"
+      return `<div onclick="cpSelectSession(${jsArg(s.session_id)})"
                    style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--bdr);${active}">
         <div style="display:flex;gap:6px;align-items:center">
           <span style="width:7px;height:7px;border-radius:50%;background:${dot};flex-shrink:0"></span>
@@ -416,13 +416,13 @@ function cpRenderAutonomous(session) {
   const controls = running
     ? `<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
          ${paused
-           ? `<button class="tbtn" onclick="cpAutoControl('${sid}','resume')">Resume</button>`
-           : `<button class="tbtn" onclick="cpAutoControl('${sid}','pause')">Pause</button>`}
-         <button class="tbtn del" onclick="cpAutoControl('${sid}','stop')">Stop</button>
-         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
+           ? `<button class="tbtn" onclick="cpAutoControl(${jsArg(sid)},'resume')">Resume</button>`
+           : `<button class="tbtn" onclick="cpAutoControl(${jsArg(sid)},'pause')">Pause</button>`}
+         <button class="tbtn del" onclick="cpAutoControl(${jsArg(sid)},'stop')">Stop</button>
+         <button class="tbtn" onclick="cpRefreshSession(${jsArg(sid)}, this)">Refresh Session</button>
        </div>`
     : `<div style="display:flex;gap:6px;margin-top:6px">
-         <button class="tbtn" onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>
+         <button class="tbtn" onclick="cpRefreshSession(${jsArg(sid)}, this)">Refresh Session</button>
        </div>`;
   el.innerHTML = `
     <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;padding:8px 10px;margin-top:4px">
@@ -477,7 +477,7 @@ function cpBlockedBadge(reason) {
   const sid = _cpActive ? esc(_cpActive) : '';
   const refreshBtn = sid
     ? `<button class="tbtn" style="font-size:9px;padding:2px 8px"
-         onclick="cpRefreshSession('${sid}', this)">Refresh Session</button>`
+         onclick="cpRefreshSession(${jsArg(sid)}, this)">Refresh Session</button>`
     : '';
   return `<div style="align-self:flex-start;display:flex;align-items:center;gap:6px;margin-left:2px">
       <span style="font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--yellow);
@@ -547,9 +547,9 @@ function cpRenderPause(session) {
         <code style="display:block;font-size:10px;background:var(--bg2);padding:6px 8px;border-radius:3px;
               word-break:break-all;margin-bottom:10px">${esc(payload.url || payload.host || '')}</code>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="tbtn del" onclick="cpResume('${sid}','approve',{decision:'deny'})">Deny</button>
-          <button class="tbtn" onclick="cpResume('${sid}','approve',{decision:'allow_once'})">Allow once</button>
-          <button class="tbtn pri" onclick="cpResume('${sid}','approve',{decision:'always_host'})">Always allow host</button>
+          <button class="tbtn del" onclick="cpResume(${jsArg(sid)},'approve',{decision:'deny'})">Deny</button>
+          <button class="tbtn" onclick="cpResume(${jsArg(sid)},'approve',{decision:'allow_once'})">Allow once</button>
+          <button class="tbtn pri" onclick="cpResume(${jsArg(sid)},'approve',{decision:'always_host'})">Always allow host</button>
         </div>
       </div>`;
   }
@@ -561,9 +561,9 @@ function cpRenderPause(session) {
         <textarea id="cp-guidance-answer" rows="2" placeholder="Answer (e.g. a value it needs, or how to proceed)..."
           style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:7px 9px;border-radius:4px;font-size:12px;font-family:inherit;resize:vertical;margin-bottom:8px"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="tbtn pri" onclick="cpAnswerGuidance('${sid}','continue')">Answer &amp; continue</button>
-          <button class="tbtn" onclick="cpAnswerGuidance('${sid}','pause')">Answer &amp; pause</button>
-          <button class="tbtn del" onclick="cpAnswerGuidance('${sid}','abort')">Abort run</button>
+          <button class="tbtn pri" onclick="cpAnswerGuidance(${jsArg(sid)},'continue')">Answer &amp; continue</button>
+          <button class="tbtn" onclick="cpAnswerGuidance(${jsArg(sid)},'pause')">Answer &amp; pause</button>
+          <button class="tbtn del" onclick="cpAnswerGuidance(${jsArg(sid)},'abort')">Abort run</button>
         </div>
       </div>`;
   }
@@ -576,9 +576,9 @@ function cpRenderPause(session) {
           then click "Login done" — the captured session cookies are handed to the copilot to retry.
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="tbtn pri" onclick="cpOpenBrowser('${sid}')">Open Browser</button>
-          <button class="tbtn" id="cp-login-done-btn" onclick="cpLoginDone('${sid}')" disabled>Login done — retry</button>
-          <button class="tbtn del" onclick="cpResume('${sid}','auth',{cookies:{}})">Skip (no session)</button>
+          <button class="tbtn pri" onclick="cpOpenBrowser(${jsArg(sid)})">Open Browser</button>
+          <button class="tbtn" id="cp-login-done-btn" onclick="cpLoginDone(${jsArg(sid)})" disabled>Login done — retry</button>
+          <button class="tbtn del" onclick="cpResume(${jsArg(sid)},'auth',{cookies:{}})">Skip (no session)</button>
           <span id="cp-auth-msg" style="font-size:10px;color:var(--txt2);align-self:center"></span>
         </div>
       </div>`;

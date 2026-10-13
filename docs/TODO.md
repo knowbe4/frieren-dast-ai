@@ -84,6 +84,24 @@
 
 ---
 
+## Review follow-ups (2026-10, PR from `fix/review-bugs`)
+
+- [ ] `coordinator._classify_param`: `"1"`/`"0"` classified as boolean before numeric; name
+      hints match by substring (`q` in `request`, `id` in `valid`)
+- [ ] `cmdi_agent.py`: `bypass` payload group loaded but never sent; time-based finding is
+      critical + `bypass_validation` from one slow response
+- [ ] `xxe_agent.py`: `parameter_entities` payload group loaded but never sent
+- [ ] SSTI tested twice (`ssti_agent.py` and `discovery_agent._check_ssti`); open redirect
+      tested twice and `open_redirect` is never a coordinator candidate
+- [ ] Planner / app-context / mutator prompt cleanups (contradictory instructions,
+      `mine_params` only in the schema, unfenced baseline/param values)
+- [ ] Red-team prompt caching does nothing (system prompt < 1024 tokens)
+- [ ] Split `dast/ai/coordinator.py`
+- [ ] Model tiers: runner passes the active model to every stage; tier defaults in
+      `config.py` are placeholder ARNs
+- [ ] e2e: 5 tests fail on develop because an overlay intercepts clicks on history rows
+      (likely the onboarding overlay from `98-onboarding.js`)
+
 ## Up next
 
 ### False positive reduction

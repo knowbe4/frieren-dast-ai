@@ -5,6 +5,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security (project review)
+- **Dashboard could be driven by any website open in the operator's browser.** No Host or
+  Origin check, `request.json()` accepted cross-site `text/plain` POSTs, and `/ws` streamed
+  every captured request to any origin. `OriginGuardMiddleware` enforces a loopback Host
+  (DNS rebinding) and same-origin for state-changing requests and WebSocket handshakes.
+- **Inline handlers could be broken out of by rendered data** (`onclick="f('${esc(v)}')"`,
+  `onclick="f(${JSON.stringify(v)})"`); agent probe requests carrying XSS payloads injected
+  attributes on "Send to Repeater". All handlers use `jsArg()`; e2e test guards it.
+- App-context / threat-model prompts send only the Authorization scheme, never Basic creds.
+
+### Fixed (project review)
+- SSTI was never detected: 8887*8893 is 79032091, every check expected 79014691.
+- Canary signals ignore echoes of the canary payload and patterns already in the baseline.
+- 401/403 baselines aborted the scan and blacklisted the path, so auth bypass never ran;
+  auth bypass now needs a reproducible, non-login 401/403 -> 200 flip.
+- Scan worker spawned unbounded, unreferenced tasks (`spawn_tracked()`); probe-diff and
+  discovery LLM classification no longer block the event loop.
+- Intercept timeout leak, subdomain cookies sent to the parent domain, unbounded job
+  registries, SPA crawler skipping the rest of a page, `/api/crawl` ignoring scope,
+  lock-free per-host intel reads, WebSocket opening before later UI scripts loaded.
+- Structured LLM output fails loudly on missing required fields / malformed provider JSON.
+- Red-team reports honest confidence (rejections, negative browser runs) and sees the
+  response status line + headers; threat-model and passive validation are deterministic
+  and fenced; threat-model merging lets the newest analysis win.
+
+### Changed (project review)
+- `runner.py` (1497 -> ~430 lines): workers in `proxy/workers/`, recon suggestions in
+  `proxy/suggestions.py`, scan bookkeeping in `proxy/scan_support.py`.
+- Unused dependencies removed: aiohttp, sqlalchemy, aiosqlite, beautifulsoup4, lxml,
+  jinja2, requests. Dead routes `/api/search`, `/api/sessions/save`, `/api/browse/status`.
+
 ### Added
 - **GraphQL tab** — Schema Explorer (endpoint discovery + manual introspection, manual
   endpoint add, "Scan History" to catalogue endpoints missed by live detection),

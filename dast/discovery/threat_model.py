@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, describe_auth_header, wrap_untrusted
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -116,14 +117,6 @@ Your goal is to identify:
 Focus on what you OBSERVE consistently across multiple requests, not speculation.
 Only include facts supported by at least 3 examples in the traffic sample.
 
-Respond ONLY with JSON matching this schema:
-{
-  "trust_boundaries": ["<one sentence each>", ...],
-  "high_risk_surfaces": ["<METHOD /path — reason>", ...],
-  "security_invariants": ["<one sentence fact>", ...],
-  "not_vulnerabilities": ["<one sentence why X cannot be exploited>", ...]
-}
-
 Rules:
 - Maximum 8 items per list
 - Each item must be one sentence, max 120 characters
@@ -179,7 +172,9 @@ class ThreatModelWorker:
         for entry in all_entries:
             if not entry.host or entry.method == "CONNECT":
                 continue
-            if entry.source == "out-of-scope":
+            # Only real observed traffic: the scanner's own probes (and the WAF
+            # blocks they trigger) must not become "invariants" of the app.
+            if entry.source in ("out-of-scope", "imported", "agent", "scan"):
                 continue
             if settings and not settings.is_in_scope(entry.url):
                 continue
@@ -210,7 +205,7 @@ class ThreatModelWorker:
 
             line = f"{e.method} {_sanitize(e.path, 80)} → {e.response_status}"
             if auth_hdr:
-                line += f" | auth={_sanitize(auth_hdr[:30])}"
+                line += f" | auth={describe_auth_header(auth_hdr)}"
             if cookie_hdr:
                 names = [p.split("=")[0].strip() for p in cookie_hdr.split(";") if "=" in p]
                 line += f" | cookies=[{','.join(names[:4])}]"
@@ -226,7 +221,7 @@ class ThreatModelWorker:
             f"Host: {host}\n"
             f"Total requests observed: {len(entries)}\n"
             f"\nTraffic sample ({len(sample)} requests):\n"
-            + "\n".join(traffic_lines)
+            + wrap_untrusted("\n".join(traffic_lines), "traffic_sample")
         )
 
         try:
@@ -235,7 +230,10 @@ class ThreatModelWorker:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=800, schema=THREAT_MODEL_SCHEMA),
+                lambda: bedrock_client.invoke_json(
+                    system=_SYSTEM + UNTRUSTED_CONTENT_DIRECTIVE, user=user, max_tokens=1500,
+                    schema=THREAT_MODEL_SCHEMA, temperature=0,
+                ),
             )
             self._apply_result(host, result)
             logger.info(
@@ -250,11 +248,14 @@ class ThreatModelWorker:
         existing = self._models.get(host) or ThreatModel(host=host)
 
         def _merge(current: List[str], incoming: list, max_items: int) -> List[str]:
-            for item in incoming:
-                item = str(item)[:120]
-                if item and item not in current:
-                    current.append(item)
-            return current[:max_items]
+            # The latest analysis has seen the most traffic — its items come first
+            # and older ones fill the remaining slots (previously the oldest 8
+            # items were kept forever and new findings could never get in).
+            merged: List[str] = []
+            for item in [str(i)[:120] for i in incoming] + current:
+                if item and item not in merged:
+                    merged.append(item)
+            return merged[:max_items]
 
         existing.trust_boundaries = _merge(
             existing.trust_boundaries, result.get("trust_boundaries", []), 8

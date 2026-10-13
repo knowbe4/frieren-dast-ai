@@ -39,6 +39,10 @@ logger = get_logger(__name__)
 _STRUCTURED_TOOL_NAME = "emit_result"
 
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=60.0)
+# Local / self-hosted servers run on consumer hardware: a 14B model can take well
+# over a minute to prefill a large scanner prompt, so 60s read timeouts fired on
+# healthy calls and the retry re-queued the same expensive work.
+_LOCAL_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=60.0, pool=60.0)
 
 # Local / self-hosted OpenAI-compatible servers (Ollama, vLLM, LM Studio,
 # llama.cpp) do not validate the bearer token but some reject a missing
@@ -256,8 +260,70 @@ def invoke_gateway(
 
 # ── OpenAI (and OpenAI-compatible) chat completions ──────────────────────────
 
-def _to_openai_request(body: Dict[str, Any], model_id: str) -> Dict[str, Any]:
-    """Translate the gateway's Anthropic-style body into a chat-completions request."""
+def _forced_tool(body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The tool a body forces via tool_choice (the structured-output tool), if any."""
+    forced = body.get("tool_choice") or {}
+    if forced.get("type") != "tool":
+        return None
+    for tool in body.get("tools") or []:
+        if tool.get("name") == forced.get("name"):
+            return tool
+    return None
+
+
+def _structured_output_mode(base_url: str) -> str:
+    """Return "tools" or "json_schema" for a structured-output request.
+
+    ``auto`` (the default) uses json_schema constrained decoding for local /
+    self-hosted servers and a forced tool call for the public OpenAI API.
+    """
+    from dast.config import settings  # local import: providers stays config-light
+
+    mode = str(getattr(settings, "openai_structured_output", "auto") or "auto").lower()
+    if mode in ("tools", "json_schema"):
+        return mode
+    return "tools" if is_public_openai(base_url) else "json_schema"
+
+
+def _json_schema_unsupported(response_text: str) -> bool:
+    """True when a 400 says the server does not accept response_format json_schema."""
+    text = (response_text or "").lower()
+    return "response_format" in text or "json_schema" in text
+
+
+def _json_content_to_tool_use(envelope: Dict[str, Any]) -> Dict[str, Any]:
+    """Present a json_schema reply as the forced tool_use block callers expect.
+
+    Constrained decoding returns the object as the message text. Re-shaping it
+    into a tool_use block keeps bedrock_client on its normal structured path. A
+    reply that is not a JSON object is left as text so the caller's repair /
+    required-field checks still apply.
+    """
+    content = envelope.get("content") or []
+    if any(block.get("type") == "tool_use" for block in content):
+        return envelope
+    text = next((block.get("text", "") for block in content if block.get("type") == "text"), "")
+    try:
+        parsed = json.loads(text.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("json_schema reply was not valid JSON", error=str(exc), raw=text[:200])
+        return envelope
+    if not isinstance(parsed, dict):
+        return envelope
+    reshaped = dict(envelope)
+    reshaped["content"] = [{"type": "tool_use", "name": _STRUCTURED_TOOL_NAME, "input": parsed}]
+    return reshaped
+
+
+def _to_openai_request(
+    body: Dict[str, Any], model_id: str, structured_mode: str = "tools",
+) -> Dict[str, Any]:
+    """Translate the gateway's Anthropic-style body into a chat-completions request.
+
+    ``structured_mode`` controls how a forced structured-output tool is sent:
+    "tools" (a forced function call) or "json_schema" (response_format
+    constrained decoding — the server's grammar guarantees schema-valid JSON).
+    """
     messages: List[Dict[str, Any]] = []
     system_text = _system_to_text(body.get("system", ""))
     if system_text:
@@ -274,7 +340,14 @@ def _to_openai_request(body: Dict[str, Any], model_id: str) -> Dict[str, Any]:
     if "temperature" in body:
         request["temperature"] = body["temperature"]
 
-    # Schema-forced output → a single required function call.
+    # Schema-forced output → constrained decoding, or a single required function call.
+    forced_tool = _forced_tool(body)
+    if structured_mode == "json_schema" and forced_tool is not None:
+        request["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": forced_tool["name"], "schema": forced_tool["input_schema"]},
+        }
+        return request
     tools = body.get("tools")
     if tools:
         request["tools"] = [
@@ -317,8 +390,11 @@ def _from_openai_response(data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             parsed = json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
         except json.JSONDecodeError:
+            # Do not fabricate an empty object: callers would read it as a valid
+            # "nothing to do" answer (e.g. a planner selecting no agents). Leaving
+            # the block out makes invoke_json fail loudly so the caller degrades.
             logger.warning("OpenAI tool_call arguments were not valid JSON", raw=raw_arguments[:200])
-            parsed = {}
+            continue
         content_blocks.append({
             "type": "tool_use",
             # Report the gateway's synthetic tool name so _extract_tool_input matches,
@@ -354,17 +430,31 @@ def invoke_openai(
     """
     key = _resolve_openai_key(api_key, base_url)
 
-    request = _to_openai_request(body, model_id)
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {
         "Authorization": f"Bearer {key}",
         "content-type": "application/json",
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
-        response = client.post(url, headers=headers, json=request)
+    timeout = _HTTP_TIMEOUT if is_public_openai(base_url) else _LOCAL_HTTP_TIMEOUT
+    mode = _structured_output_mode(base_url) if _forced_tool(body) is not None else "tools"
+
+    def _post(structured_mode: str) -> httpx.Response:
+        request = _to_openai_request(body, model_id, structured_mode)
+        with httpx.Client(timeout=timeout) as client:
+            return client.post(url, headers=headers, json=request)
+
+    response = _post(mode)
+    if mode == "json_schema" and response.status_code == 400 and _json_schema_unsupported(response.text):
+        logger.warning(
+            "Server rejected json_schema response_format; falling back to a forced tool call",
+            status=response.status_code,
+        )
+        mode = "tools"
+        response = _post(mode)
     if response.status_code >= 400:
         raise ProviderError(
             f"OpenAI API {response.status_code}: {response.text[:500]}",
             status_code=response.status_code,
         )
-    return _from_openai_response(response.json())
+    envelope = _from_openai_response(response.json())
+    return _json_content_to_tool_use(envelope) if mode == "json_schema" else envelope

@@ -9,7 +9,7 @@ Strategy:
   4. On detection, use mutator for deeper exploitation (RCE proof)
 
 Detection evidence:
-  - Arithmetic product appears in response (e.g. 79014691 from 8887*8893)
+  - Arithmetic product appears in response (e.g. 79032091 from 8887*8893)
   - Template engine class/method name reflected (introspection)
   - Error message reveals template engine type (Jinja2, Freemarker, etc.)
 """
@@ -60,20 +60,20 @@ _INTROSPECTION_PROBES = [
 # WAF-evasive arithmetic variants
 _EVASIVE_CANARIES = [
     # URL-encoded
-    {"payload": "%7B%7B8887*8893%7D%7D", "expected": "79014691", "engines": ["jinja2", "twig"]},
+    {"payload": "%7B%7B8887*8893%7D%7D", "expected": "79032091", "engines": ["jinja2", "twig"]},
     # With spaces
-    {"payload": "{{ 8887 * 8893 }}", "expected": "79014691", "engines": ["jinja2", "twig"]},
+    {"payload": "{{ 8887 * 8893 }}", "expected": "79032091", "engines": ["jinja2", "twig"]},
     # String concat approach (no math operators)
-    {"payload": "{{'dast'~'ssti'}}", "expected": "dastststi", "engines": ["jinja2", "twig"]},
+    {"payload": "{{'dast'~'ssti'}}", "expected": "dastssti", "engines": ["jinja2", "twig"]},
     # Using filter
-    {"payload": "{{8887|int * 8893}}", "expected": "79014691", "engines": ["jinja2"]},
+    {"payload": "{{8887|int * 8893}}", "expected": "79032091", "engines": ["jinja2"]},
     # Freemarker alt
-    {"payload": "${8887?c?number * 8893}", "expected": "79014691", "engines": ["freemarker"]},
+    {"payload": "${8887?c?number * 8893}", "expected": "79032091", "engines": ["freemarker"]},
 ]
 
-_PRODUCT_RE = re.compile(r"\b79014691\b")
+_PRODUCT_RE = re.compile(r"\b79032091\b")
 _PRODUCT_ALT_RE = re.compile(r"\b84232313\b")
-_CANARY_STR_RE = re.compile(r"dastststi")
+_CANARY_STR_RE = re.compile(r"dastssti")
 
 # Error patterns that reveal template engine
 _ENGINE_ERROR_RE = re.compile(
@@ -138,7 +138,7 @@ class SstiAgent(VulnAgent):
                     engines = p_entry.get("engines", [])
                 else:
                     payload = str(p_entry)
-                    expected = "79014691"
+                    expected = "79032091"
                     engines = []
 
                 if known_engines and engines and not any(e in known_engines for e in engines):

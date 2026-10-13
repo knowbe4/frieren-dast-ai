@@ -8,15 +8,12 @@ dependencies = [
     "playwright>=1.44.0",
     # HTTP
     "httpx>=0.27.0",
-    "aiohttp>=3.9.0",
     # AI (AWS Bedrock)
     "boto3>=1.34.0",
     "botocore>=1.34.0",
     # Data
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
-    "sqlalchemy>=2.0.0",
-    "aiosqlite>=0.20.0",
     # CLI & output
     "click>=8.1.0",
     "rich>=13.7.0",
@@ -24,15 +21,11 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "structlog>=24.1.0",
     "dnspython>=2.6.0",
-    "beautifulsoup4>=4.12.0",
-    "lxml>=5.2.0",
-    "jinja2>=3.1.0",
     "fastapi>=0.111.0",
     "uvicorn>=0.30.0",
     "websockets>=12.0",
     "cryptography>=42.0.0",
     "pyyaml>=6.0.0",
-    "requests>=2.34.2",
     # Tech-stack fingerprinting (passive — uses proxy-captured responses, no extra requests)
     "wappalyzer>=2.0.0",
     "msgpack>=1.1.2",

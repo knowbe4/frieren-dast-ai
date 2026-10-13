@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 from dast.proxy.session_store import SessionStore
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 logger = get_logger(__name__)
 
@@ -75,7 +76,7 @@ class SpaCrawler:
         import inspect
         logger.debug(msg, session_id=self.session_id)
         if inspect.iscoroutinefunction(self._log_cb):
-            asyncio.ensure_future(self._log_cb(msg))
+            spawn_tracked(self._log_cb(msg), name="crawl-log")
         else:
             self._log_cb(msg)
 
@@ -205,6 +206,10 @@ class SpaCrawler:
             clicked_fps: set = set()
             visited_routes: set = {page.url.split("?")[0].split("#")[0]}
             discovered_routes: list = []
+            # Pages left mid-interaction (a click navigated away) are queued once
+            # more so their remaining elements are still clicked; clicked_fps
+            # stops already-clicked elements from being clicked again.
+            pending_revisits: set = set()
 
             # Also collect any real links from DOM (rare in SPAs but helps)
             link_urls: set = set()
@@ -217,22 +222,30 @@ class SpaCrawler:
             # Main exploration loop: interact + navigate discovered routes
             clicks = 0
             stale_rounds = 0
+            revisited: set = set()
             while clicks < max_clicks and not self._stop.is_set():
+                url_before = page.url
                 clicks_before = len(clicked_fps)
 
                 # Interact with current page
-                await self._interact_page(page, _is_allowed_host, max_per_page=20,
-                                          clicked_fps=clicked_fps,
-                                          routes_to_visit=discovered_routes,
-                                          visited_urls=visited_routes)
+                left_page = await self._interact_page(page, _is_allowed_host, max_per_page=20,
+                                                      clicked_fps=clicked_fps,
+                                                      visited_urls=visited_routes)
                 clicks = len(clicked_fps)
+                left_key = url_before.split("?")[0].split("#")[0]
+                if left_page and left_key not in revisited and left_key not in pending_revisits:
+                    pending_revisits.add(left_key)
+                    discovered_routes.append(url_before)
 
                 # If no new clicks happened, try navigating to a discovered route
                 if clicks == clicks_before:
                     if discovered_routes:
                         route = discovered_routes.pop(0)
                         route_key = route.split("?")[0].split("#")[0]
-                        if route_key in visited_routes:
+                        if route_key in pending_revisits:
+                            pending_revisits.discard(route_key)
+                            revisited.add(route_key)
+                        elif route_key in visited_routes:
                             continue
                         visited_routes.add(route_key)
                         # Skip routes on hosts the scanner already found unreachable.
@@ -279,7 +292,6 @@ class SpaCrawler:
                     await asyncio.sleep(1.5)
                     await self._interact_page(page, _is_allowed_host, max_per_page=20,
                                               clicked_fps=clicked_fps,
-                                              routes_to_visit=discovered_routes,
                                               visited_urls=visited_routes)
                 except Exception as e:
                     self._log(f"Seed navigation error: {e}")
@@ -348,9 +360,12 @@ class SpaCrawler:
             logger.warning("crawler: collect_links JS failed", error=str(exc))
 
     async def _interact_page(self, page, is_allowed_host, max_per_page: int,
-                            clicked_fps: set, routes_to_visit: list = None,
-                            visited_urls: set = None) -> None:
-        """Click interactive elements and track URL changes to discover SPA routes."""
+                            clicked_fps: set, visited_urls: set = None) -> bool:
+        """Click interactive elements and track URL changes to discover SPA routes.
+
+        Returns True when a click navigated to a new route before every element
+        on the starting page was tried (the caller re-queues that page).
+        """
         elements = []
         for selector in _CLICKABLE:
             try:
@@ -419,9 +434,9 @@ class SpaCrawler:
                         await page.wait_for_load_state("networkidle", timeout=5000)
                     except Exception:
                         pass  # networkidle timeout expected — WebSocket/long-poll keeps network busy
-                    url_before = url_after
                     # Break out of element loop to re-scan elements on the new page
-                    break
+                    return True
 
             except Exception as exc:
                 logger.debug("crawler: element interaction failed", error=str(exc))
+        return False

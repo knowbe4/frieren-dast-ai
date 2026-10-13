@@ -270,7 +270,7 @@ def parse_report(text: str) -> H1Report:
     try:
         _llm_enrich(report, text)
     except Exception as exc:
-        logger.debug("H1 report LLM parse failed", error=str(exc))
+        logger.warning("H1 report LLM enrichment failed — using regex extraction", error=str(exc))
 
     # URL-decode the payload if it's still encoded
     if report.payload and "%" in report.payload:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
+from dast.proxy.api.http_utils import strip_recomputed_headers
 from dast.proxy.api.context import DashboardContext
 
 
@@ -24,9 +25,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         body    = data.get("body") or None
         follow_redirects = bool(data.get("follow_redirects", False))
 
-        for h in ("host", "content-length", "transfer-encoding", "connection", "accept-encoding"):
-            headers.pop(h, None)
-            headers.pop(h.title(), None)
+        headers = strip_recomputed_headers(headers)
 
         t0 = _time.monotonic()
         try:

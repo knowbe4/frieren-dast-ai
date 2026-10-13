@@ -604,14 +604,30 @@ class TestGraphqlAnalyzer:
         from dast.plugins.graphql_analyzer import _analyze
         req_body = b'{"query": "mutation CreatePost { createPost(title: \\"test\\") { id } }"}'
         resp_body = b'{"data": {"createPost": {"id": 1}}}'
-        # No CSRF header
+        # No CSRF header, cookie-authenticated
         e = self._gql_entry(req_body=req_body, resp_body=resp_body, req_headers={
             "content-type": "application/json",
+            "cookie": "session=abc",
         })
         findings = _analyze(e)
         titles = {f["title"] for f in findings}
         assert any("CSRF" in t or "Mutation" in t for t in titles), \
             f"Expected CSRF/mutation finding, got: {titles}"
+        csrf = next(f for f in findings if "CSRF" in f["title"])
+        # JSON bodies force a CORS preflight cross-site — reported as low, with the caveat.
+        assert csrf["severity"] == "low"
+        assert "preflight" in csrf["evidence"]
+
+    def test_analyze_no_csrf_finding_for_bearer_auth_mutation(self):
+        from dast.plugins.graphql_analyzer import _analyze
+        req_body = b'{"query": "mutation CreatePost { createPost(title: \\"test\\") { id } }"}'
+        resp_body = b'{"data": {"createPost": {"id": 1}}}'
+        e = self._gql_entry(req_body=req_body, resp_body=resp_body, req_headers={
+            "content-type": "application/json",
+            "authorization": "Bearer abc",
+            "cookie": "analytics=1",
+        })
+        assert not [f for f in _analyze(e) if "CSRF" in f["title"]]
 
     def test_analyze_no_findings_on_normal_query(self):
         from dast.plugins.graphql_analyzer import _analyze

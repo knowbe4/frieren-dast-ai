@@ -436,8 +436,6 @@ function _repClearTab(id) {
 }
 
 // Legacy shims so existing callers (itrLoadFromRepeater etc.) still work
-function repSend()  { if (_repActiveId) _repSendTab(_repActiveId); }
-function repClear() { if (_repActiveId) _repClearTab(_repActiveId); }
 
 // ── Send to AI ──────────────────────────────────────────────────────────────
 function openSendToAI() {

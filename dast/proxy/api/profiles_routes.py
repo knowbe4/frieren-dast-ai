@@ -224,11 +224,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         auth_headers: Dict[str, str] = {}
         try:
             from dast.proxy.auth_headers import extract_auth_headers
-            recent = [
-                ctx.store._entries[eid]
-                for eid in reversed(ctx.store._order[-100:])
-                if eid in ctx.store._entries
-            ]
+            recent = ctx.store.entries_newest_first()[:100]
             auth_headers = extract_auth_headers(recent, host=host, exclude_sources=())
         except Exception as exc:
             logger.warning("capture-from-proxy: auth-header extract failed", slug=slug, error=str(exc))
@@ -270,11 +266,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         auth_headers: Dict[str, str] = {}
         try:
             from dast.proxy.auth_headers import extract_auth_headers
-            recent = [
-                ctx.store._entries[eid]
-                for eid in reversed(ctx.store._order[-100:])
-                if eid in ctx.store._entries
-            ]
+            recent = ctx.store.entries_newest_first()[:100]
             auth_headers = extract_auth_headers(recent, host=host, exclude_sources=())
         except Exception as exc:
             logger.warning("quick-capture: auth-header extract failed", host=host, error=str(exc))

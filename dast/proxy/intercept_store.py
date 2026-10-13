@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 logger = get_logger(__name__)
 
@@ -125,7 +126,7 @@ class InterceptStore:
         try:
             loop = asyncio.get_running_loop()
             if loop.is_running():
-                loop.call_soon_threadsafe(lambda: asyncio.ensure_future(self._on_change()))
+                loop.call_soon_threadsafe(lambda: spawn_tracked(self._on_change(), name="intercept-broadcast"))
         except RuntimeError:
             pass
 

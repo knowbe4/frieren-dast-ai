@@ -137,7 +137,7 @@ function _renderIssuesPage() {
     const collapsed = _issueSevCollapsed[sev];
     const color = _SEV_COLOR[sev] || 'var(--txt2)';
     html += `<div style="margin-bottom:6px">
-      <div onclick="toggleIssueGroup('${sev}')"
+      <div onclick="toggleIssueGroup(${jsArg(sev)})"
            style="display:flex;align-items:center;gap:8px;padding:5px 8px;
                   background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
                   cursor:pointer;user-select:none;margin-bottom:4px">
@@ -308,16 +308,16 @@ function _buildIssueCard(host, f, globalIdx) {
   const validateBtn = (!hasAiValidation && !f.confirmed && !f.dismissed)
     ? `<button class="tbtn" id="vbtn-${uid}" style="font-size:9px;padding:1px 7px;flex-shrink:0;color:var(--acc);border-color:var(--acc)"
         title="Ask the Red-Team Validator (LLM) to confirm or reject this finding"
-        onclick="event.stopPropagation();validateFindingWithAI('${entryId}',${fidx},'${uid}')">Validate with AI</button>`
+        onclick="event.stopPropagation();validateFindingWithAI(${jsArg(entryId)},${fidx},${jsArg(uid)})">Validate with AI</button>`
     : '';
   const dismissBtn = f.dismissed
     ? `<button class="tbtn" style="font-size:9px;padding:1px 7px;margin-left:auto;flex-shrink:0;color:#4caf50;border-color:#2a5a2a"
         title="Restore to active findings"
-        onclick="event.stopPropagation();restoreFinding('${entryId}',${fidx})">Restore</button>`
+        onclick="event.stopPropagation();restoreFinding(${jsArg(entryId)},${fidx})">Restore</button>`
     : `<button class="tbtn" style="font-size:9px;padding:1px 7px;margin-left:auto;flex-shrink:0;color:var(--txt2)"
         title="Mark as false positive — moves to False Positives tab"
-        onclick="event.stopPropagation();dismissFinding('${entryId}',${globalIdx})">Dismiss FP</button>`;
-  return `<div class="iissue" id="iissue-${uid}" data-entry-id="${entryId}" onclick="toggleIssue('${uid}','${entryId}')">
+        onclick="event.stopPropagation();dismissFinding(${jsArg(entryId)},${globalIdx})">Dismiss FP</button>`;
+  return `<div class="iissue" id="iissue-${uid}" data-entry-id="${entryId}" onclick="toggleIssue(${jsArg(uid)},${jsArg(entryId)})">
     <div class="iissue-row">
       <span class="iissue-sev s${sc}">${_SEV_LABEL[sev]}</span>
       <div class="iissue-info">
@@ -332,8 +332,8 @@ function _buildIssueCard(host, f, globalIdx) {
       ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f) : ''}
       <div class="iissue-evidence">${evidence}</div>
       ${paramHtml}${snippetHtml}${reasoningHtml}${cwe}${payload}${httpDetails}
-      <span class="iissue-goto" onclick="goToEntry('${entryId}')">Go to request →</span>
-      <span class="iissue-goto" style="margin-left:12px" onclick="repLoadEntry('${entryId}')">Send to Repeater →</span>
+      <span class="iissue-goto" onclick="goToEntry(${jsArg(entryId)})">Go to request →</span>
+      <span class="iissue-goto" style="margin-left:12px" onclick="repLoadEntry(${jsArg(entryId)})">Send to Repeater →</span>
     </div>
   </div>`;
 }

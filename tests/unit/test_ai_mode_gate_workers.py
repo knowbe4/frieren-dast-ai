@@ -125,7 +125,7 @@ class _GqlEntry:
     response_status: int = 200
     request_body: bytes = b'{"query":"mutation { deleteUser(id: 1) { ok } }"}'
     response_body: bytes = b'{"data":{"deleteUser":{"ok":true}}}'
-    request_headers: dict = field(default_factory=lambda: {"content-type": "application/json"})
+    request_headers: dict = field(default_factory=lambda: {"content-type": "application/json", "cookie": "session=abc"})
     response_headers: dict = field(default_factory=dict)
     findings: list = field(default_factory=list)
 

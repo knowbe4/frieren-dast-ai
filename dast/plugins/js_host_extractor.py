@@ -7,6 +7,9 @@ internal services, or staging environments.
 import re
 
 from dast.proxy.plugin_base import ProxyPlugin
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 _URL_RE   = re.compile(r'https?://([a-zA-Z0-9._-]+\.[a-zA-Z]{2,})(?:[:/][^\s"\'`<>]*)?')
 _IP_RE    = re.compile(r'\b(\d{1,3}\.){3}\d{1,3}\b')

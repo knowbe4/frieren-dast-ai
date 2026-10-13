@@ -82,7 +82,7 @@ function _gqlOpRowHtml(kind, field, info, onClick) {
   const color = kind === 'query' ? 'var(--green)' : 'var(--blue)';
   return `<div class="gql-op-item" style="padding:6px 8px;cursor:pointer;border-radius:3px;font-size:11px;line-height:1.5"
     onmouseover="this.style.background='var(--hov)'" onmouseout="this.style.background=''"
-    onclick="${onClick}('${kind}', '${esc(field)}')">
+    onclick="${onClick}(${jsArg(kind)}, ${jsArg(field)})">
     <span style="color:${color};font-weight:600">${esc(field)}</span>
     <span style="color:var(--txt2)">(${esc(args)})</span>
   </div>`;

@@ -138,7 +138,7 @@ async function loadAiPanel() {
                 <span style="background:var(--bg3);border:1px solid var(--bdr);border-radius:3px;
                              padding:2px 8px;color:var(--txt)">
                   ${esc(h)}
-                  <button onclick="splitHost('${esc(h)}')" style="background:none;border:none;
+                  <button onclick="splitHost(${jsArg(h)})" style="background:none;border:none;
                     color:var(--txt3);cursor:pointer;font-size:10px;padding:0 0 0 4px"
                     title="Split out of group">✕</button>
                 </span>`).join('')}

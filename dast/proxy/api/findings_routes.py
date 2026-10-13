@@ -10,8 +10,9 @@ import uuid
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 
-from dast.proxy.api.context import DashboardContext
+from dast.proxy.api.context import DashboardContext, prune_jobs
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 logger = get_logger(__name__)
 
@@ -35,7 +36,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
         job_id = str(uuid.uuid4())
         import_jobs[job_id] = {"status": "parsing", "progress": None, "result": None, "error": None}
-        asyncio.ensure_future(_run_import_job(job_id, content, target_hosts, base_url))
+        prune_jobs(import_jobs)
+        spawn_tracked(_run_import_job(job_id, content, target_hosts, base_url), name=f"import-{job_id}")
         return {"job_id": job_id}
 
     @router.get("/api/findings/import/{job_id}")
@@ -112,18 +114,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
         def _best_auth_headers_for_host(host: str) -> dict:
             best: dict = {}
-            with store._lock:
-                for eid in reversed(store._order):
-                    e = store._entries.get(eid)
-                    if not e or e.host != host:
-                        continue
-                    if e.source in ("imported", "agent"):
-                        continue
-                    for k, v in e.request_headers.items():
-                        if k.lower() in _AUTH_HEADERS:
-                            best[k.lower()] = v
-                    if best:
-                        return best
+            for e in store.entries_newest_first():
+                if e.host != host:
+                    continue
+                if e.source in ("imported", "agent"):
+                    continue
+                for k, v in e.request_headers.items():
+                    if k.lower() in _AUTH_HEADERS:
+                        best[k.lower()] = v
+                if best:
+                    return best
 
             session_cookies = store.get_cookies_for_host(host)
             if session_cookies:
@@ -176,9 +176,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 # updated to confirmed/unconfirmed once the active scan completes.
                 entry.findings.append(stub_finding)
 
-            with store._lock:
-                store._entries[entry_id] = entry
-                store._order.append(entry_id)
+            store.add_synthetic_entry(entry, notify=False)
 
             await ctx.broadcast(entry)
 

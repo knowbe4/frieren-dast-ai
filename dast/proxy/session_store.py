@@ -511,7 +511,7 @@ class SessionStore:
                     "domain": morsel["domain"] or host,
                     "path": morsel["path"] or "/",
                     "secure": bool(morsel["secure"]),
-                    "httpOnly": "httponly" in cookie_str.lower(),
+                    "httpOnly": bool(morsel["httponly"]),
                 }
 
     def get_cookie_hosts(self) -> List[str]:
@@ -557,31 +557,15 @@ class SessionStore:
     def get_cookies_for_host(self, host: str) -> List[dict]:
         """Return Playwright-compatible cookie dicts for the given host."""
         with self._lock:
-            # Collect cookies from the exact host and any parent domain match
+            # Collect cookies from the exact host and its parent domains. A
+            # subdomain's cookies are never sent to its parent (browser semantics).
             result = {}
             for h, jar in self._cookies.items():
-                if h == host or host.endswith("." + h) or h.endswith("." + host):
+                if h == host or host.endswith("." + h):
                     result.update(jar)
             # Also exact host
             result.update(self._cookies.get(host, {}))
             return list(result.values())
-
-    def save_named_session(self, name: str, role: str) -> "NamedSession":
-        """Snapshot current proxy cookies + auth headers as a named session."""
-        from dast.proxy.auth_headers import extract_auth_headers
-
-        cookies = {}
-        with self._lock:
-            for jar in self._cookies.values():
-                cookies.update(jar)
-            recent_entries = [
-                self._entries[eid] for eid in reversed(self._order[-50:])
-                if eid in self._entries
-            ]
-            auth_headers = extract_auth_headers(recent_entries, host=None, exclude_sources=())
-        session = NamedSession(name=name, role=role, cookies=cookies, auth_headers=auth_headers)
-        self.named_sessions[name] = session
-        return session
 
     def save_named_session_from_playwright(
         self,
@@ -807,6 +791,21 @@ class SessionStore:
         with self._lock:
             return [self._entries[eid] for eid in self._order if eid in self._entries]
 
+    def entries_newest_first(self) -> List[ProxyEntry]:
+        """Snapshot of all entries, most recent first."""
+        with self._lock:
+            return [self._entries[eid] for eid in reversed(self._order) if eid in self._entries]
+
+    def add_synthetic_entry(self, entry: ProxyEntry, notify: bool = True) -> None:
+        """Insert an entry that did not come through the proxy (import, discovery,
+        code-analysis hypothesis). Bypasses passive analysis; listeners are
+        notified unless ``notify`` is False (the caller broadcasts itself)."""
+        with self._lock:
+            self._entries[entry.id] = entry
+            self._order.append(entry.id)
+        if notify:
+            self._notify(entry)
+
     def in_scope_entries(self) -> List[ProxyEntry]:
         """All entries except out-of-scope — use for findings, overview, scan targeting."""
         with self._lock:
@@ -823,9 +822,14 @@ class SessionStore:
             ]
 
     def clear(self) -> None:
+        """Clear captured history. Cookies and named sessions are kept on purpose —
+        clearing the history must not log the operator out of the target."""
         with self._lock:
             self._entries.clear()
             self._order.clear()
+            # Parked imported findings wait for a matching history entry; with the
+            # history gone they would attach to unrelated future traffic.
+            self.pending_import_findings = []
         # Give previously-unreachable hosts a fresh chance after a clear —
         # the network may have changed (VPN up, DNS propagated).
         try:

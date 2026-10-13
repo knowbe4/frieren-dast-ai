@@ -543,6 +543,23 @@ class TestAiValidateFindingFailsClosed:
         assert confirmed is True
 
     @pytest.mark.asyncio
+    async def test_llm_call_is_schema_forced_and_fenced(self, monkeypatch):
+        from dast.ai import bedrock_client
+        from dast.plugins.passive_scanner import _ai_validate_finding
+
+        seen = {}
+
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return {"confirmed": False, "reasoning": "no"}
+
+        monkeypatch.setattr(bedrock_client, "invoke_json", _fake)
+        await _ai_validate_finding("Some Finding", "some snippet")
+        assert seen["schema"]["required"] == ["confirmed", "reasoning"]
+        assert seen["temperature"] == 0
+        assert "<matched_context>" in seen["user"]
+
+    @pytest.mark.asyncio
     async def test_llm_success_rejected_returns_false(self, monkeypatch):
         from dast.ai import bedrock_client
         from dast.plugins.passive_scanner import _ai_validate_finding

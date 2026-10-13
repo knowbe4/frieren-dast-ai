@@ -47,7 +47,7 @@ async def test_arithmetic_canary_evaluated_detected():
 
     async def fake_send(client, method, url, headers, body, payload=None):
         if payload == "{{8887*8893}}":
-            return _resp(200, "<p>Result: 79014691</p>")
+            return _resp(200, "<p>Result: 79032091</p>")
         return _resp(200, "<p>Hello alice</p>")
 
     with patch("dast.agents.ssti_agent._send", side_effect=fake_send):

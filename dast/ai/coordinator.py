@@ -360,10 +360,13 @@ _CANARY_PAYLOADS: Dict[str, str] = {
     "xxe":    '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY xxe "dast">]><x>&xxe;</x>',
 }
 
+# Prefix of the _baseline_check() abort reason for a 401/403 auth wall
+_AUTH_WALL_REASON_PREFIX = "[auth-wall]"
+
 # Patterns that indicate signal for each attack type in the canary response
 _SIGNAL_PATTERNS: Dict[str, _re.Pattern] = {
     "sqli": _re.compile(
-        r"sql|syntax error|mysql|ora-|sqlite|pg::|unclosed quotation|"
+        r"sql syntax|syntax error|mysql|ora-\d{5}|sqlite|pg::|unclosed quotation|"
         r"you have an error in your sql|warning: mysql|"
         r"microsoft ole db provider for sql|odbc sql",
         _re.I,
@@ -374,8 +377,44 @@ _SIGNAL_PATTERNS: Dict[str, _re.Pattern] = {
     "cmdi": _re.compile(r"uid=\d+|gid=\d+|root:|command not found", _re.I),
     "xxe":  _re.compile(r"xml.*parsing|entity.*not.*allowed|dtd.*not.*allowed|unexpected.*<!DOCTYPE", _re.I),
     "nosql":_re.compile(r"\$where|operator.*not.*allowed|cast.*failed|bson.*error", _re.I),
-    "ssti": _re.compile(r"\b79014691\b|\b84232313\b", _re.I),
+    "ssti": _re.compile(r"\b79032091\b", _re.I),
 }
+
+
+def _strip_payload_echo(response_text: str, payload: str) -> str:
+    """Remove verbatim / URL-encoded / HTML-escaped echoes of the canary payload.
+
+    Several canaries contain their own signal string (``../etc/passwd`` matches the
+    LFI pattern, ``http://169.254.169.254/`` the SSRF one). A page that merely
+    reflects the input would otherwise count as a signal for every such type.
+    """
+    import html
+    from urllib.parse import quote, quote_plus
+
+    stripped = response_text
+    for variant in {payload, quote(payload, safe=""), quote_plus(payload), html.escape(payload),
+                    html.escape(payload, quote=False)}:
+        if variant:
+            stripped = stripped.replace(variant, "")
+    return stripped
+
+
+def _has_canary_signal(attack_type: str, payload: str, response_text: str, baseline_text: str) -> bool:
+    """True when the canary response shows a signal the unmodified request did not.
+
+    XSS keeps raw reflection as its signal (reflection IS the precondition). Every
+    other type must match its pattern outside the echoed payload AND the pattern
+    must be absent from the baseline — an error string the page always shows is
+    not evidence that our input caused it.
+    """
+    if attack_type == "xss":
+        return payload in response_text
+    pattern = _SIGNAL_PATTERNS.get(attack_type)
+    if pattern is None:
+        return False
+    if not pattern.search(_strip_payload_echo(response_text, payload)):
+        return False
+    return not (baseline_text and pattern.search(baseline_text))
 
 
 async def _run_canary_probe(
@@ -383,10 +422,12 @@ async def _run_canary_probe(
     target: "CheckTarget",
     param: dict,
     attack_type: str,
+    baseline_text: str = "",
 ) -> bool:
     """
     Send a single canary payload for attack_type into param.
-    Returns True if the response contains a signal indicating potential vulnerability.
+    Returns True if the response contains a signal indicating potential vulnerability
+    that is absent from ``baseline_text`` and not just an echo of the payload.
     Time-based types (sqli blind) return False here — the full agent handles timing.
     """
     from dast.scanners.active_checks import _inject_body, _inject_path, _inject_query, _send
@@ -417,22 +458,11 @@ async def _run_canary_probe(
 
         if resp is None:
             return False
-
-        pattern = _signal_PATTERNS_for(attack_type)
-        if pattern and pattern.search(resp.text):
-            return True
-
-        # For XSS: reflection of payload is signal
-        if attack_type == "xss" and payload in resp.text:
-            return True
-
+        return _has_canary_signal(attack_type, payload, resp.text, baseline_text)
+    except Exception as exc:
+        logger.debug("Canary probe failed", attack_type=attack_type,
+                     parameter=param.get("name"), error=str(exc))
         return False
-    except Exception:
-        return False
-
-
-def _signal_PATTERNS_for(attack_type: str) -> Optional[_re.Pattern]:
-    return _SIGNAL_PATTERNS.get(attack_type)
 
 
 # A WAF that blocks an attack type this many times on a host, with no confirmed
@@ -559,9 +589,16 @@ class Coordinator:
     def registered_types(cls) -> List[str]:
         return list(cls._registry.keys())
 
-    # Ceiling used only when budget_seconds is not passed in.
+    # Ceiling used only when budget_seconds is not passed in and the caller gives
+    # no budget_ceiling (the operator's "Scan Budget per Endpoint" setting).
     # The actual per-scan budget is computed adaptively by _adaptive_budget().
     SCAN_BUDGET_SECONDS: float = 300.0
+
+    # A local model (Ollama/LM Studio on one machine) answers each LLM call in
+    # seconds-to-tens-of-seconds and serves calls one at a time, so the adaptive
+    # budgets tuned for cloud latency expire before the agents send their real
+    # payloads (observed: 19 LLM calls across a whole Juice Shop bench run).
+    LOCAL_BUDGET_MULTIPLIER: float = 4.0
 
     @classmethod
     def _adaptive_budget(
@@ -631,6 +668,25 @@ class Coordinator:
         return 150.0
 
     @classmethod
+    def _effective_budget(
+        cls,
+        target: "CheckTarget",
+        host_intel: Optional[object],
+        budget_ceiling: Optional[float] = None,
+    ) -> float:
+        """Adaptive budget, stretched for a local model, capped by the ceiling.
+
+        ``budget_ceiling`` is the operator's "Scan Budget per Endpoint" setting;
+        without it the class-level SCAN_BUDGET_SECONDS applies.
+        """
+        from dast.ai import bedrock_client
+
+        adaptive_budget = cls._adaptive_budget(target, host_intel)
+        if bedrock_client.is_local_provider():
+            adaptive_budget *= cls.LOCAL_BUDGET_MULTIPLIER
+        return min(adaptive_budget, budget_ceiling or cls.SCAN_BUDGET_SECONDS)
+
+    @classmethod
     async def run(
         cls,
         target: "CheckTarget",
@@ -642,6 +698,7 @@ class Coordinator:
         session_intelligence: Optional[object] = None,
         budget_seconds: Optional[float] = None,
         probe_diff: bool = False,
+        budget_ceiling: Optional[float] = None,
     ) -> List[AgentFinding]:
         if not cls._registry:
             return []
@@ -656,10 +713,7 @@ class Coordinator:
                     _host_intel0 = session_intelligence.get(_h0)
                 except Exception as exc:
                     logger.debug("failed to read session intelligence for budget", host=_h0, error=str(exc))
-            effective_budget = min(
-                cls._adaptive_budget(target, _host_intel0),
-                cls.SCAN_BUDGET_SECONDS,
-            )
+            effective_budget = cls._effective_budget(target, _host_intel0, budget_ceiling)
         else:
             effective_budget = budget_seconds
 
@@ -803,8 +857,9 @@ class Coordinator:
                 if param.get("name", "").lower() not in _AUTH_TOKEN_PARAMS
             ]
             if canary_combos:
+                canary_baseline_text = await cls._fetch_canary_baseline(client, target)
                 canary_tasks = [
-                    _run_canary_probe(client, target, param, at)
+                    _run_canary_probe(client, target, param, at, canary_baseline_text)
                     for param, at in canary_combos
                 ]
                 canary_results = await asyncio.gather(*canary_tasks, return_exceptions=True)
@@ -873,11 +928,24 @@ class Coordinator:
             target.method in ("GET", "POST", "PUT", "PATCH", "DELETE")
             and (bool(target.body) or bool(target.params))
         )
+        auth_wall = False
         if _run_baseline:
             from dast.ai.bedrock_client import get_fast_model as _get_fast
             baseline_abort, baseline_response_summary = await cls._baseline_check(
                 target, client, model_id=model_id or _get_fast()
             )
+            if baseline_abort and baseline_abort.startswith(_AUTH_WALL_REASON_PREFIX):
+                # An auth wall is not a structural error (it is session state and
+                # must not blacklist the path), and it is exactly where header-based
+                # auth bypass applies — so run that agent alone instead of aborting.
+                auth_wall = True
+                _log_event(
+                    "coordinator", "info",
+                    f"Baseline hit an auth wall — running auth bypass only: "
+                    f"{baseline_abort[len(_AUTH_WALL_REASON_PREFIX):].strip()}",
+                    url=target.url, source="agent",
+                )
+                baseline_abort = None
             if baseline_abort:
                 # Record structural error in session intelligence so future scans
                 # on the same path don't repeat the same mistake
@@ -916,7 +984,10 @@ class Coordinator:
         # The planner now receives the baseline response so it can reason about
         # what the endpoint actually does, not just its URL structure.
         mine_params = False
-        if use_llm_planner:
+        if auth_wall:
+            selected_types = ["auth_bypass"]
+            plan_reason = "Baseline returned 401/403 — only auth bypass applies"
+        elif use_llm_planner:
             from dast.ai.bedrock_client import get_fast_model
             plan_model = model_id or get_fast_model()
             selected_types, plan_reason, mine_params = await cls._plan(
@@ -1202,6 +1273,17 @@ class Coordinator:
         return confirmed + review
 
     @classmethod
+    async def _fetch_canary_baseline(cls, client: "httpx.AsyncClient", target: "CheckTarget") -> str:
+        """Send the unmodified request once so canary signals can be diffed against it."""
+        from dast.scanners.active_checks import _send
+        try:
+            resp = await _send(client, target.method, target.url, target.headers, target.body)
+        except Exception as exc:
+            logger.debug("Canary baseline request failed", url=target.url, error=str(exc))
+            return ""
+        return resp.text if resp is not None else ""
+
+    @classmethod
     async def _baseline_check(
         cls,
         target: "CheckTarget",
@@ -1284,9 +1366,10 @@ class Coordinator:
             except Exception as exc:
                 logger.debug("failed to parse GraphQL errors in baseline response", error=str(exc))
 
-        # 401/403 on a baseline request — auth wall, abort to avoid 401 flooding.
+        # 401/403 on a baseline request — auth wall. The caller runs only the
+        # auth-bypass agent (injection agents would just flood 401s).
         if resp.status_code in (401, 403):
-            return f"HTTP {resp.status_code} — server rejected baseline request (auth required or forbidden)", response_summary
+            return f"{_AUTH_WALL_REASON_PREFIX} HTTP {resp.status_code} — server rejected baseline request (auth required or forbidden)", response_summary
 
         # ── LLM analysis for ambiguous cases ─────────────────────────────
         should_ask_llm = (
@@ -1378,7 +1461,8 @@ class Coordinator:
             if signature is None or not signature.has_signal:
                 continue
 
-            verdict = classify(signature, model_id=model_id)
+            # classify() makes a blocking LLM call — keep it off the event loop.
+            verdict = await asyncio.to_thread(classify, signature, model_id=model_id)
             pname = param.get("name", "")
             if verdict.has_hypothesis:
                 summary_lines.append(

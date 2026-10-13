@@ -6,7 +6,6 @@ the variable-fuzzing job (run/poll/stop), backing the dashboard's GraphQL tab
 
 from __future__ import annotations
 
-import asyncio
 import uuid
 from typing import TYPE_CHECKING
 
@@ -14,7 +13,9 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from dast.proxy.api.http_utils import strip_recomputed_headers
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 if TYPE_CHECKING:
     from dast.proxy.api.context import DashboardContext
@@ -112,16 +113,14 @@ def make_router(ctx: "DashboardContext") -> APIRouter:
 
         host = urlparse(endpoint).netloc
         best: dict = {}
-        with store._lock:
-            for eid in reversed(store._order):
-                e = store._entries.get(eid)
-                if not e or e.host != host or e.source in ("imported", "agent"):
-                    continue
-                for k, v in e.request_headers.items():
-                    if k.lower() in _AUTH_HEADERS:
-                        best[k.lower()] = v
-                if best:
-                    return best
+        for e in store.entries_newest_first():
+            if e.host != host or e.source in ("imported", "agent"):
+                continue
+            for k, v in e.request_headers.items():
+                if k.lower() in _AUTH_HEADERS:
+                    best[k.lower()] = v
+            if best:
+                return best
 
         session_cookies = store.get_cookies_for_host(host)
         if session_cookies:
@@ -139,17 +138,15 @@ def make_router(ctx: "DashboardContext") -> APIRouter:
         everything and can hand-edit it (e.g. swap in a different session)."""
         from dast.plugins.graphql_introspection import _endpoint_url as _ep_url
 
-        with store._lock:
-            for eid in reversed(store._order):
-                e = store._entries.get(eid)
-                if not e or e.source in ("imported", "agent"):
-                    continue
-                if _ep_url(e) != endpoint:
-                    continue
-                return {
-                    k: v for k, v in e.request_headers.items()
-                    if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
-                }
+        for e in store.entries_newest_first():
+            if e.source in ("imported", "agent"):
+                continue
+            if _ep_url(e) != endpoint:
+                continue
+            return {
+                k: v for k, v in e.request_headers.items()
+                if k.lower() not in ("host", "content-length", "transfer-encoding", "connection")
+            }
         return _best_auth_headers_for_endpoint(endpoint)
 
     def _headers_from_named_session(name: str, endpoint: str) -> dict:
@@ -303,9 +300,7 @@ def make_router(ctx: "DashboardContext") -> APIRouter:
 
         attempts = build_fuzz_matrix(variables, payloads)
 
-        for hop in ("host", "content-length", "transfer-encoding", "connection", "accept-encoding"):
-            headers.pop(hop, None)
-            headers.pop(hop.title(), None)
+        headers = strip_recomputed_headers(headers)
         headers.setdefault("content-type", "application/json")
 
         # Baseline request to compare fuzzed responses against.
@@ -327,12 +322,14 @@ def make_router(ctx: "DashboardContext") -> APIRouter:
             "status": "queued", "progress": {"done": 0, "total": len(attempts)},
             "results": [], "cancel": False,
         }
+        from dast.proxy.api.context import prune_jobs
+        prune_jobs(fuzz_jobs)
 
         from dast.graphql.variable_fuzzer import run_fuzz_job
-        asyncio.ensure_future(run_fuzz_job(
+        spawn_tracked(run_fuzz_job(
             fuzz_jobs[job_id], method, url, headers, request_body,
             attempts, baseline_length, baseline_had_errors,
-        ))
+        ), name=f"graphql-fuzz-{job_id}")
 
         return {"job_id": job_id, "total": len(attempts)}
 

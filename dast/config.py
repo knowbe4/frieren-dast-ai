@@ -41,6 +41,21 @@ class Settings(BaseSettings):
     # OpenAI (or OpenAI-compatible) API
     openai_api_key: Optional[str] = None
     openai_base_url: str = "https://api.openai.com/v1"
+    # How structured output is requested from an OpenAI-compatible server:
+    #   "auto"        — json_schema constrained decoding for local/self-hosted
+    #                   servers (Ollama, LM Studio, vLLM, llama.cpp), a forced tool
+    #                   call for the public OpenAI API
+    #   "tools"       — always a forced tool call
+    #   "json_schema" — always response_format json_schema
+    # Local servers often ignore a forced tool_choice (Ollama + Qwen writes the
+    # call out as text), while constrained decoding guarantees schema-valid JSON.
+    openai_structured_output: str = "auto"
+
+    # Max concurrent LLM calls to an external provider. 0 = auto: 1 for a local
+    # OpenAI-compatible server (one GPU serves one request at a time, so parallel
+    # agent calls only queue server-side and hit the read timeout), unlimited
+    # for cloud providers.
+    ai_max_concurrency: int = 0
 
     # Claude apps gateway — the base URL is an INTERNAL hostname, so it has NO
     # default here (this repo is public). Set GATEWAY_BASE_URL in .env. Auth is
@@ -80,18 +95,27 @@ class Settings(BaseSettings):
     def ai_model_label(self) -> str:
         """Return a short human-readable label for the active model."""
         active = self.ai_model_id
-        if self.anthropic_default_sonnet_model and active == self.anthropic_default_sonnet_model:
-            return "sonnet"
-        if self.anthropic_default_haiku_model and active == self.anthropic_default_haiku_model:
-            return "haiku"
-        if self.anthropic_default_opus_model and active == self.anthropic_default_opus_model:
-            return "opus"
-        # Fall back to parsing the model ID string
+        # A Claude model name carries its tier in the string — trust that first.
         import re
         m = re.search(r'claude-(opus|sonnet|haiku)', active, re.IGNORECASE)
         if m:
             return m.group(1).lower()
-        return active.split("/")[-1].split(".")[-1] or active
+        # Bedrock application-inference-profile ARNs are opaque (the tier is not
+        # in the string), so map them to a tier via the configured slots — but
+        # ONLY for ARNs. A non-Claude model reused as a tier default (e.g. a
+        # local Ollama model set as anthropic_default_sonnet_model) must not be
+        # mislabelled "sonnet": it would claim Claude when the scanner is really
+        # calling a local/gateway/OpenAI model.
+        if active.startswith("arn:aws:"):
+            if self.anthropic_default_sonnet_model and active == self.anthropic_default_sonnet_model:
+                return "sonnet"
+            if self.anthropic_default_haiku_model and active == self.anthropic_default_haiku_model:
+                return "haiku"
+            if self.anthropic_default_opus_model and active == self.anthropic_default_opus_model:
+                return "opus"
+        # Non-Claude / non-ARN (gateway, OpenAI, local Ollama): show the real
+        # model name so the badge never claims a model that is not in use.
+        return active.split("/")[-1] or active
 
     # Scan behaviour
     max_depth: int = 5
@@ -112,25 +136,8 @@ class Settings(BaseSettings):
 
     # Output
     output_dir: Path = Path("./scan-results")
-    report_format: str = "html,json,markdown"
-
-    # Database
-    database_url: str = "sqlite+aiosqlite:///./dast.db"
 
     aws_session_token: Optional[str] = None
-
-    def validate_aws(self) -> bool:
-        if self.aws_profile:
-            return True
-        if self.aws_access_key_id and self.aws_secret_access_key:
-            return True
-        try:
-            import boto3
-            session = boto3.Session(region_name=self.aws_region)
-            creds = session.get_credentials()
-            return creds is not None and creds.get_frozen_credentials() is not None
-        except Exception:
-            return False
 
     def build_boto3_session(self):
         """

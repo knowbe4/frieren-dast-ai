@@ -28,6 +28,13 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         url = body.get("url", "").strip()
         if not url:
             return JSONResponse({"error": "url required"}, status_code=400)
+        # Same gate as /api/discovery: the crawler clicks through the app, so it
+        # must never be started against an out-of-scope host.
+        if settings is not None and not settings.is_in_scope(url):
+            return JSONResponse(
+                {"error": "url is out of scope — add it to the Target scope first"},
+                status_code=400,
+            )
 
         async def log_cb(msg: str) -> None:
             await ctx.broadcast_crawl_log(msg)
@@ -92,22 +99,6 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         # the UI's "log in first" nudge matches what the crawl will actually use.
         cookies = store.get_crawl_cookies()
         return {"cookie_count": len(cookies)}
-
-    @router.post("/api/sessions/save")
-    async def save_named_session(body: dict):
-        """Save current proxy cookie jar as a named session (legacy flow)."""
-        name = (body.get("name") or "").strip()
-        role = (body.get("role") or "user").strip()
-        if not name:
-            return JSONResponse({"error": "name required"}, status_code=400)
-        session = store.save_named_session(name, role)
-        return {
-            "ok": True,
-            "name": session.name,
-            "role": session.role,
-            "cookie_count": len(session.cookies),
-            "auth_header_count": len(session.auth_headers),
-        }
 
     @router.post("/api/sessions/browser")
     async def open_named_browser(body: dict):
@@ -281,13 +272,6 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if browse_queue:
             await browse_queue.put({"action": "stop"})
         return {"ok": True}
-
-    @router.get("/api/browse/status")
-    async def browse_status():
-        return {
-            "active": store.active_browse_session_id is not None,
-            "session_id": store.active_browse_session_id,
-        }
 
     @router.get("/api/plugins")
     async def get_plugins():

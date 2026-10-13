@@ -228,9 +228,9 @@ function _buildHypCard(h, statusOverride) {
     </div>` : '';
 
   const _validateBtn = `<button class="tbtn" style="font-size:9px;padding:2px 8px"
-      onclick="codeSendToH1('${esc(h.endpoint_path)}','${esc(h.vuln_type)}','${esc(h.reasoning)}','${esc(h.suggested_payload)}','${esc(h.method||'GET')}')">${status === 'confirmed' || status === 'safe' ? 'Re-validate' : 'Validate'}</button>`;
+      onclick="codeSendToH1(${jsArg(h.endpoint_path)},${jsArg(h.vuln_type)},${jsArg(h.reasoning)},${jsArg(h.suggested_payload)},${jsArg(h.method||'GET')})">${status === 'confirmed' || status === 'safe' ? 'Re-validate' : 'Validate'}</button>`;
   const _viewBtn = h.scan_entry_id
-    ? `<button class="tbtn" style="font-size:9px;padding:2px 8px" onclick="goToEntry('${esc(h.scan_entry_id)}')">View request →</button>`
+    ? `<button class="tbtn" style="font-size:9px;padding:2px 8px" onclick="goToEntry(${jsArg(h.scan_entry_id)})">View request →</button>`
     : '';
   const actionBtn = (status === 'confirmed' || status === 'safe' || status === 'error')
     ? `<div style="margin-left:auto;display:flex;gap:4px">${_viewBtn}${_validateBtn}</div>`
@@ -377,7 +377,7 @@ async function codeLoadResults(id) {
         <td style="padding:4px 8px;color:var(--txt2);font-size:9px">${esc(params)}</td>
         <td style="padding:4px 8px">
           <button class="tbtn" style="font-size:9px;padding:2px 6px"
-            onclick="codeValidateEndpoint('${esc(ep.method)}','${esc(ep.path)}','${esc(ep.notes)}','${esc(ep.vuln_type||'')}')">Validate</button>
+            onclick="codeValidateEndpoint(${jsArg(ep.method)},${jsArg(ep.path)},${jsArg(ep.notes)},${jsArg(ep.vuln_type||'')})">Validate</button>
         </td>`;
       tbody.appendChild(tr);
     });

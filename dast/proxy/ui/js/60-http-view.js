@@ -69,7 +69,7 @@ function _buildHttpEvidenceDetails(f) {
       <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
         <span style="font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px">${baselineLabel}</span>
         ${hasProbeF ? '' : `<button class="tbtn" style="font-size:9px;padding:1px 6px;margin-left:auto"
-          onclick="repLoadRaw(${JSON.stringify(f.raw_request)})">Send to Repeater</button>`}
+          onclick="repLoadRaw(${jsArg(f.raw_request)})">Send to Repeater</button>`}
       </div>
       <pre style="margin:0;padding:8px;background:#0a0a1a;border:1px solid var(--bdr);border-radius:3px;
                   font-size:10px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;
@@ -85,7 +85,7 @@ function _buildHttpEvidenceDetails(f) {
                       font-size:9px;color:#4caf50;display:flex;align-items:center;gap:8px">
       <span>Exploit Proof — probe with payload injected</span>
       <button class="tbtn" style="font-size:9px;padding:1px 6px;margin-left:auto;color:#4caf50;border-color:#2a5a2a"
-        onclick="repLoadRaw(${JSON.stringify(f.probe_request || f.raw_request)})">Send Probe to Repeater</button>
+        onclick="repLoadRaw(${jsArg(f.probe_request || f.raw_request)})">Send Probe to Repeater</button>
     </div>
     ${(f.extracted_data && Object.keys(f.extracted_data).length) ? `<div style="margin-top:6px">
       <div style="font-size:9px;color:#4caf50;margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">Extracted Data (read-only)</div>
@@ -591,5 +591,14 @@ function fmtResp(d, mode) {
 function esc(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// jsArg — a value as a JS literal that is safe inside a double-quoted inline
+// handler attribute: onclick="fn(${jsArg(v)})". JSON.stringify makes a valid JS
+// string literal; esc() then hides its quotes from the HTML parser, which decodes
+// them back before the handler runs. Never use '${esc(v)}' in a handler — the
+// browser turns &#39; back into ' and the value breaks out of the JS string.
+function jsArg(v) {
+  return esc(JSON.stringify(v == null ? '' : String(v)));
 }
 

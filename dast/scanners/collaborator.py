@@ -86,9 +86,9 @@ class CollaboratorService:
             writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
             await writer.drain()
         except Exception as exc:
-            logger.debug("failed to handle inbound OOB interaction", error=str(exc))
+            logger.debug("Collaborator: callback handling failed", error=str(exc))
         finally:
             try:
                 writer.close()
-            except Exception:
-                pass  # best-effort: socket teardown
+            except Exception as exc:
+                logger.debug("Collaborator: writer close failed", error=str(exc))

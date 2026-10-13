@@ -1,0 +1,58 @@
+# Ground-truth benchmark spec for OWASP Juice Shop.
+#
+# Juice Shop is a modern SPA + JSON REST API, the counterpart to DVWA (classic
+# PHP form app) and VAmPI (minimal REST API). It exercises the scanner against
+# query-string, JSON-body and URL-path parameters on a real-world-shaped API.
+#
+# Every endpoint here is UNAUTHENTICATED, so no login flow is needed (auth:
+# none). Authenticated endpoints (basket IDOR, etc.) need a bearer-token auth
+# flow in vuln_bench.py and are intentionally left out of this lean first spec;
+# add them when that flow exists. See tests/live/README.md ("start lean and
+# expand").
+#
+# Bring the target up first (see tests/live/docker-compose.yml):
+#   docker compose -f tests/live/docker-compose.yml up -d juiceshop
+#
+# Data-only; orchestration lives in tests/live/vuln_bench.py.
+
+target:
+  name: juiceshop
+  base_url: http://127.0.0.1:3000
+  auth:
+    type: none
+
+scope:
+  host: 127.0.0.1
+  port: "3000"
+
+# Juice Shop's SPA bootstrap and REST responses carry informational passive
+# signals (headers, tokens) that are not the subject of this active-detection
+# benchmark.
+ignore_attack_types:
+  - passive
+
+endpoints:
+  # GET /rest/products/search?q=<term>: the q parameter is concatenated into the
+  #   SELECT ... FROM Products WHERE ... LIKE '%<q>%'
+  # statement (the classic Juice Shop UNION-based SQLi), and the search term is
+  # also reflected, so it is both SQL-injectable and a reflected-XSS sink.
+  - path: /rest/products/search
+    method: GET
+    query: { q: "apple" }
+    expect: [sqli, xss]
+
+  # GET /rest/track-order/{id}: the order id is interpolated into a NoSQL
+  #   (orders.find) query, injectable with a Mongo operator payload.
+  - path: /rest/track-order/5267-f73c6d19a1b7e3f0
+    method: GET
+    expect: [nosql]
+
+  # GET /redirect?to=<url>: Juice Shop only 302s when `to` contains a
+  # whitelisted URL (otherwise 406), and the open redirect is the allow-list
+  # bypass (append the whitelisted URL to an attacker host). Seed with a
+  # whitelisted URL so the endpoint is actually exercised; the agent then tries
+  # the bypass payloads.
+  - path: /redirect
+    method: GET
+    query: { to: "https://github.com/juice-shop/juice-shop" }
+    expect: [open_redirect]

@@ -105,3 +105,23 @@ def wrap_untrusted(content: str, tag: str, max_len: int = 0, sanitize: bool = Tr
         text = _sanitize_for_prompt(text, len(text) or 1)
 
     return f"<{tag}>\n{text}\n</{tag}>\n"
+
+
+def describe_auth_header(value: str) -> str:
+    """Return only the scheme of an Authorization header (e.g. "Bearer", "Basic").
+
+    The model needs to know HOW a request authenticates, never the credential:
+    a Basic header prefix is the base64 of the username and password.
+    """
+    parts = (value or "").strip().split(" ", 1)
+    scheme = parts[0]
+    # A bare value with no scheme is the credential itself — never echo it.
+    if len(parts) == 2 and scheme.lower() in _KNOWN_AUTH_SCHEMES:
+        return scheme
+    return "(present)"
+
+
+_KNOWN_AUTH_SCHEMES = frozenset({
+    "basic", "bearer", "digest", "negotiate", "ntlm", "token", "apikey", "hawk",
+    "aws4-hmac-sha256", "dpop", "mac",
+})

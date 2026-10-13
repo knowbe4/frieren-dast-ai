@@ -1,0 +1,36 @@
+# Local vulnerable-target lab for the live vuln-detection benchmark
+# (tests/live/vuln_bench.py). These are deliberately insecure training apps;
+# run them ONLY on a trusted local network, never exposed to the internet.
+#
+#   docker compose -f tests/live/docker-compose.yml up -d juiceshop
+#   docker compose -f tests/live/docker-compose.yml up -d           # all targets
+#   docker compose -f tests/live/docker-compose.yml down
+#
+# Port map (matches the ground_truth/*.yaml specs):
+#   Juice Shop  http://127.0.0.1:3000   ground_truth/juiceshop.yaml
+#   DVWA        http://127.0.0.1:8081    ground_truth/dvwa.yaml   (visit once to build the DB)
+#   VAmPI       http://127.0.0.1:5001    ground_truth/vampi.yaml  (curl .../createdb to seed)
+#
+# All bound to 127.0.0.1 so the targets are never reachable off-host.
+
+services:
+  juiceshop:
+    image: bkimminich/juice-shop:latest
+    container_name: frieren-juiceshop
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: frieren-dvwa
+    ports:
+      - "127.0.0.1:8081:80"
+    restart: unless-stopped
+
+  vampi:
+    image: erev0s/vampi:latest
+    container_name: frieren-vampi
+    ports:
+      - "127.0.0.1:5001:5000"
+    restart: unless-stopped

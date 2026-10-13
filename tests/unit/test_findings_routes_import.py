@@ -32,7 +32,7 @@ def app_and_store():
 
 async def _client(app):
     transport = httpx.ASGITransport(app=app)
-    return httpx.AsyncClient(transport=transport, base_url="http://test")
+    return httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1")
 
 
 class TestImportFindingsJob:

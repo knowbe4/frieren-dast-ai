@@ -215,6 +215,10 @@ class ProxyServer:
             try:
                 await asyncio.wait_for(pending._event.wait(), timeout=300.0)
             except asyncio.TimeoutError:
+                # Remove it from the queue too — otherwise a stale item stays in
+                # the Intercept UI forever after its connection is gone.
+                logger.warning("Intercepted request timed out — dropping", url=url)
+                _ic.drop(pending.id)
                 pending.action = "drop"
 
             if pending.action == "drop":

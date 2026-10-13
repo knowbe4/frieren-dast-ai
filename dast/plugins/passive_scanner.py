@@ -700,6 +700,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
     # credentials). Return None so the caller keeps the finding passive-only and
     # never stamps an "AI validated" badge on an unreviewed finding.
     from dast.ai import bedrock_client
+    from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
     from dast.ai.schemas import PASSIVE_VALIDATE_SCHEMA
     if not bedrock_client.is_ai_available():
         return None, ""
@@ -710,17 +711,21 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
         system_prompt = _AI_VALIDATE_LLM_INJECTION
         # Use the raw response body so the LLM can inspect the full JSON structure
         context = raw_response_body[:2000] if raw_response_body else snippet
-        user = f"Finding: {title}\nFull response body (first 2000 chars):\n{context}"
+        user = f"Finding: {title}\nFull response body (first 2000 chars):\n{wrap_untrusted(context, 'target_response')}"
     else:
         system_prompt = _AI_VALIDATE_SYSTEM
-        user = f"Finding: {title}\nMatched context (secret redacted): {snippet}"
+        user = f"Finding: {title}\nMatched context (secret redacted):\n{wrap_untrusted(snippet, 'matched_context')}"
 
     try:
         import asyncio
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: bedrock_client.invoke_json(system=system_prompt, user=user, schema=PASSIVE_VALIDATE_SCHEMA),
+            lambda: bedrock_client.invoke_json(
+                system=system_prompt + UNTRUSTED_CONTENT_DIRECTIVE, user=user,
+                model_id=bedrock_client.get_fast_model(),
+                schema=PASSIVE_VALIDATE_SCHEMA, temperature=0,
+            ),
         )
         # Only claim AI validation when the model EXPLICITLY confirmed. A response
         # missing the key (degraded/empty output from a misconfigured provider)

@@ -52,19 +52,20 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 except Exception as exc:
                     logger.debug("failed to read payload file for AI stats", file=fname, error=str(exc))
 
-        ai_scanned = len([e for e in store._entries.values() if e.scan_result in ("vulnerable", "safe", "error")])
+        all_entries = store.all_entries()
+        ai_scanned = len([e for e in all_entries if e.scan_result in ("vulnerable", "safe", "error")])
         ai_findings = [
-            f for e in store._entries.values()
+            f for e in all_entries
             for f in e.findings
             if f.get("validated_by") in ("ai", "pattern") and f.get("confirmed")
         ]
         passive_findings = [
-            f for e in store._entries.values()
+            f for e in all_entries
             for f in e.findings
             if f.get("validated_by") in ("passive", "passive+ai")
         ]
         ai_rejected = sum(
-            1 for e in store._entries.values()
+            1 for e in all_entries
             if e.scan_result == "safe" and not any(
                 f.get("validated_by") in ("ai", "pattern") for f in e.findings
             )
@@ -206,10 +207,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     request_body=None,
                     source="imported",
                 )
-                with store._lock:
-                    store._entries[synthetic_id] = best
-                    store._order.append(synthetic_id)
-                store._notify(best)
+                store.add_synthetic_entry(best)
 
             hint = {"parameter": parameter, "payload": "", "attack_type": attack_type}
             existing = list(best.import_hints or [])
@@ -275,10 +273,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 request_body=None,
                 source="imported",
             )
-            with store._lock:
-                store._entries[synthetic_id] = best
-                store._order.append(synthetic_id)
-            store._notify(best)
+            store.add_synthetic_entry(best)
 
         hint = {"parameter": parameter, "payload": "", "attack_type": attack_type}
         existing = list(best.import_hints or [])

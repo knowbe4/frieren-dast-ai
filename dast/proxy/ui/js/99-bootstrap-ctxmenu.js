@@ -162,3 +162,7 @@
   };
 })();
 
+// Open the WebSocket only after every script above has loaded: ws.onopen calls
+// functions defined in later modules (loadMode, interceptLoadStatus, ...), and
+// connecting from an earlier file raced with their parsing.
+connect();

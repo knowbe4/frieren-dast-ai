@@ -14,7 +14,6 @@ Tests performed (payloads from jwt.yaml):
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -25,14 +24,15 @@ from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.proxy.plugin_manager import log_event
 from dast.utils.logger import get_logger
-
-logger = get_logger(__name__)
 # JWT/base64url primitives live in dast.utils.jwt. Re-exported under the local
 # underscore names below for backward compatibility (tests import them here).
 from dast.utils.jwt import b64url_decode, b64url_encode, build_token, decode_jwt
+from dast.utils.tasks import spawn_tracked
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
+
+logger = get_logger(__name__)
 
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.([A-Za-z0-9_-]*)")
 
@@ -120,7 +120,7 @@ class JwtTesterPlugin(ProxyPlugin):
         self._seen.add(key)
 
         # Fire probes in background — don't block passive scanning
-        asyncio.create_task(self._probe(entry, store, found))
+        spawn_tracked(self._probe(entry, store, found), name="jwt-probe")
 
     async def _probe(
         self,

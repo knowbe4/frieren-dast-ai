@@ -202,18 +202,30 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
         has_csrf = bool(
             csrf_headers & {"x-csrf-token", "x-xsrf-token", "x-requested-with"}
         )
-        if is_mutation and not has_csrf and entry.status_code == 200:
-            # Simple requests with content-type: application/json are not CSRF-safe by default
+        lowered_headers = {k.lower(): v for k, v in entry.request_headers.items()}
+        # CSRF needs ambient credentials: a browser attaches cookies cross-site, never
+        # an Authorization header. Bearer-authenticated endpoints are not CSRF-able.
+        uses_cookie_auth = "cookie" in lowered_headers and "authorization" not in lowered_headers
+        has_content_type_json = "application/json" in lowered_headers.get("content-type", "").lower()
+        if is_mutation and not has_csrf and uses_cookie_auth and entry.status_code == 200:
+            # A cross-site page cannot send Content-Type: application/json without a
+            # CORS preflight, so a JSON-only endpoint is exploitable only if it ALSO
+            # accepts text/plain or form bodies — unverified passively, so lower severity.
+            preflight_note = (
+                " The request used Content-Type: application/json, which forces a CORS "
+                "preflight cross-site; exploitable only if the endpoint also accepts "
+                "text/plain or form-encoded bodies (not verified)."
+                if has_content_type_json else ""
+            )
             findings.append({
                 "title": "GraphQL Mutation Without CSRF Token",
-                "severity": "medium",
+                "severity": "low" if has_content_type_json else "medium",
                 "cwe": "CWE-352",
                 "attack_type": "graphql",
                 "evidence": (
-                    "GraphQL mutation submitted without a CSRF token header "
-                    "(no X-CSRF-Token / X-XSRF-Token / X-Requested-With). "
-                    "If the endpoint accepts cookies for auth, cross-origin mutation "
-                    "may be possible from an attacker-controlled page."
+                    f"GraphQL mutation submitted with cookie authentication and without a "
+                    f"CSRF token header (no X-CSRF-Token / X-XSRF-Token / X-Requested-With)."
+                    f"{preflight_note}"
                 ),
                 "confirmed": False,
                 "validated_by": ["passive"],
@@ -256,15 +268,12 @@ async def _llm_validate_finding(
     resp_text: str,
 ) -> dict:
     """Run the finding through an LLM to confirm or reject. Returns updated finding dict."""
-    try:
-        from dast.ai.bedrock_client import invoke_json, get_fast_model
-        from dast.ai.prompt_safety import _sanitize_for_prompt
-        from dast.ai.schemas import GQL_VALIDATE_SCHEMA
-    except ImportError:
-        return finding
+    from dast.ai.bedrock_client import get_fast_model, invoke_json
+    from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
+    from dast.ai.schemas import GQL_VALIDATE_SCHEMA
 
-    safe_req = _sanitize_for_prompt(req_body_text[:1500], 1500) if req_body_text else "(none)"
-    safe_resp = _sanitize_for_prompt(resp_text[:1500], 1500) if resp_text else "(none)"
+    safe_req = wrap_untrusted(req_body_text[:1500], "request_body", max_len=1500) if req_body_text else "(none)"
+    safe_resp = wrap_untrusted(resp_text[:1500], "response_body", max_len=1500) if resp_text else "(none)"
 
     user_msg = (
         f"Finding title: {finding['title']}\n"
@@ -285,7 +294,7 @@ async def _llm_validate_finding(
         result = await loop.run_in_executor(
             None,
             lambda: invoke_json(
-                system=_SYSTEM_GQL_VALIDATE,
+                system=_SYSTEM_GQL_VALIDATE + UNTRUSTED_CONTENT_DIRECTIVE,
                 user=user_msg,
                 model_id=get_fast_model(),
                 temperature=0,

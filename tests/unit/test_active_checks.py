@@ -28,7 +28,7 @@ from dast.scanners.active_checks import (
     zero_delay_variant,
 )
 from dast.scanners.taint import _MARKER_RE, TaintStore
-from dast.proxy.runner import _entry_to_check_target
+from dast.proxy.check_target_adapter import _entry_to_check_target
 
 
 # ── adaptive per-host concurrency limiter (AIMD) ─────────────────────────────

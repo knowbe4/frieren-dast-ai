@@ -19,9 +19,12 @@ import re
 from typing import TYPE_CHECKING
 
 from dast.proxy.plugin_base import ProxyPlugin
+from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
+
+logger = get_logger(__name__)
 
 _STATE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
@@ -75,8 +78,8 @@ def _has_csrf_token(entry: "ProxyEntry") -> bool:
     if entry.request_body:
         try:
             body = entry.request_body.decode("utf-8", errors="replace")
-        except Exception:
-            pass  # best-effort: non-decodable body treated as having no CSRF token
+        except Exception as exc:
+            logger.debug("CSRF observer: request body decode failed", error=str(exc))
     if body:
         # Form-encoded or JSON param check
         for part in re.split(r'[&\n]', body):

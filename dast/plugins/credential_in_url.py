@@ -11,9 +11,12 @@ from urllib.parse import parse_qs, urlparse
 from typing import TYPE_CHECKING
 
 from dast.proxy.plugin_base import ProxyPlugin
+from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
+
+logger = get_logger(__name__)
 
 _SENSITIVE_PARAM_RE = re.compile(
     r'^(?:password|passwd|pass|pwd|secret|api[_-]?key|apikey|access[_-]?token|'

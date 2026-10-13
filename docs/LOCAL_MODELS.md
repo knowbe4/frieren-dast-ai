@@ -11,6 +11,30 @@ model your server can serve.
 
 ---
 
+## Reality check — local is for development, not real scans
+
+Running locally is **slow and far less accurate** than a frontier model (Bedrock / the internal
+gateway / Opus). Set expectations before you invest time:
+
+- **Slow.** A single scan is dozens of LLM calls (planner, canary, per-agent payload decisions,
+  mutator rounds, red-team validation). On consumer hardware each call is seconds, so one endpoint
+  takes **minutes**, and the coordinator will frequently hit its per-endpoint time budget and give
+  up before finishing. A full target sweep that is minutes on Opus can be hours locally.
+- **Low recall.** Frieren's whole value is a high true-positive, low false-positive rate, and that
+  is driven by model reasoning. Small local models miss real vulns and misjudge exploitability.
+  Measured example: **`qwen2.5:7b-instruct` on an M3/16GB scored 0% recall** on the Juice Shop
+  live bench (`tests/live/ground_truth/juiceshop.yaml`) — it found none of the planted SQLi / XSS /
+  NoSQL / open-redirect. A ≥ 14B model does better but still trails a frontier model.
+- **Flaky structured output (mitigated).** Local servers often ignore a forced `tool_choice` and
+  write the call out as text. Frieren now requests `json_schema` constrained decoding from local
+  servers and unwraps calls written as text — see **Built-in local tuning** below.
+
+**Use local for:** running the pipeline end-to-end without cloud credentials, developing/debugging
+agents and plugins, and CI-style smoke tests. **Use a frontier model for:** any run where the
+findings matter. The `.env` keeps both configs side by side so you can switch providers in seconds.
+
+---
+
 ## Before you start — two hard requirements
 
 Frieren is not a chatbot; it drives an agentic scanner. These are the difference between
@@ -139,6 +163,40 @@ curl -s http://127.0.0.1:8088/api/scan-config -H 'Content-Type: application/json
   "fast_model_id": "qwen2.5:7b",
   "validation_model_id": "qwen2.5:32b"
 }'
+```
+
+The tiers can also be set at boot through the tier defaults in `.env` (plain model names):
+
+```bash
+ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen2.5:3b          # fast tier: planner, baseline, classifiers
+ANTHROPIC_DEFAULT_OPUS_MODEL=qwen2.5-coder:14b    # validation tier: red-team verdicts
+AI_MODEL_ID=qwen2.5-coder:14b                     # active model: payload generation / mutation
+```
+
+On a 16 GB Mac a 3B + 14B pair (~11 GB) stays resident in Ollama at once; two mid-size models do
+not and Ollama swaps them on every call.
+
+---
+
+## Built-in local tuning
+
+When `AI_PROVIDER=openai` points at a non-public host, Frieren treats it as a local server and
+adapts automatically:
+
+| Behaviour | Why | Override |
+|-----------|-----|----------|
+| Structured output uses `response_format: json_schema` (constrained decoding) instead of a forced tool call; falls back to the tool call if the server rejects it | Ollama + Qwen ignore a forced `tool_choice` and write the call out as text; the grammar guarantees schema-valid JSON and enum values | `OPENAI_STRUCTURED_OUTPUT=auto\|tools\|json_schema` |
+| At most **1** concurrent LLM call | One GPU serves one request at a time; parallel agent calls only queue server-side and time out | `AI_MAX_CONCURRENCY=<n>` |
+| 180 s read timeout (60 s for cloud) | A 14B model can take over a minute to prefill a large prompt | — |
+| Adaptive per-endpoint budget × 4 | Budgets tuned for cloud latency expire before agents send real payloads | capped by **Scan Budget per Endpoint** |
+
+The **Scan Budget per Endpoint** setting (AI tab, `scan_budget_seconds`) is the hard ceiling for
+every scan. For local runs raise it and keep scanning serial:
+
+```bash
+curl -s http://127.0.0.1:8088/api/scan-config -H 'Content-Type: application/json' \
+  -H 'Origin: http://127.0.0.1:8088' \
+  -d '{"workers": 1, "probe_concurrency": 2, "scan_budget_seconds": 900, "ai_response_cache": true}'
 ```
 
 ---

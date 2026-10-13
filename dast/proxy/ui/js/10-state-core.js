@@ -597,9 +597,9 @@ function renderHostItem(host) {
     </div>
     <div class="host-actions" style="display:none;gap:4px;margin-top:3px">
       <button class="tbtn" style="font-size:10px;padding:1px 6px"
-        onclick="event.stopPropagation();crawlHost('${esc(host)}')">Crawl</button>
+        onclick="event.stopPropagation();crawlHost(${jsArg(host)})">Crawl</button>
       <button class="tbtn" style="font-size:10px;padding:1px 6px"
-        onclick="event.stopPropagation();scanHost('${esc(host)}')">Scan all</button>
+        onclick="event.stopPropagation();scanHost(${jsArg(host)})">Scan all</button>
     </div>`;
   el.onmouseenter = () => el.querySelector('.host-actions').style.display = 'flex';
   el.onmouseleave = () => el.querySelector('.host-actions').style.display = 'none';
@@ -806,9 +806,9 @@ function renderSmHostList() {
       </div>
       <div class="host-actions" style="display:none;gap:4px;margin-top:3px">
         <button class="tbtn" style="font-size:10px;padding:1px 6px"
-          onclick="event.stopPropagation();crawlHost('${esc(host)}')">Crawl</button>
+          onclick="event.stopPropagation();crawlHost(${jsArg(host)})">Crawl</button>
         <button class="tbtn" style="font-size:10px;padding:1px 6px"
-          onclick="event.stopPropagation();scanHost('${esc(host)}')">Scan all</button>
+          onclick="event.stopPropagation();scanHost(${jsArg(host)})">Scan all</button>
       </div>`;
     el.onmouseenter = () => el.querySelector('.host-actions').style.display = 'flex';
     el.onmouseleave = () => el.querySelector('.host-actions').style.display = 'none';

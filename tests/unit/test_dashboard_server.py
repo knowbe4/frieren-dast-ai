@@ -176,7 +176,7 @@ def test_build_app_returns_fastapi_app_and_serves_ui(tmp_path, monkeypatch):
     store = SessionStore()
     app = build_app(store=store, scan_queue=asyncio.Queue())
 
-    with TestClient(app) as client:
+    with TestClient(app, base_url="http://127.0.0.1") as client:
         resp = client.get("/")
         assert resp.status_code == 200
         assert "<!DOCTYPE html>" in resp.text or "<html" in resp.text.lower()

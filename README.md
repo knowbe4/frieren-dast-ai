@@ -239,7 +239,7 @@ Sessions panel.
 ## AI provider setup
 
 Frieren DAST-AI needs an LLM backend for the coordinator, agents, and red-team validator.
-Pick one of three providers via `AI_PROVIDER` in `.env`:
+Pick one of four providers via `AI_PROVIDER` in `.env` (`bedrock`, `anthropic`, `openai`, `gateway`):
 
 ### Option 1 — AWS Bedrock (default)
 
@@ -278,7 +278,24 @@ provider — point `OPENAI_BASE_URL` at the local server. See
 [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) for the full walkthrough and gotchas (forced tool
 calling, the dummy API key, model-size guidance).
 
-All three can also be switched at runtime from the AI tab in the dashboard (`POST /api/scan-config`).
+> **Local models are slow and much less accurate.** Each scan is dozens of LLM calls, so on
+> consumer hardware one endpoint takes minutes and often times out; detection quality drops
+> sharply (a 7B model scored **0% recall** on the Juice Shop bench). Use local only for running
+> the pipeline without cloud credentials and for dev/CI smoke tests — use Bedrock, the gateway,
+> or Opus for any run where the findings matter. Details in
+> [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md#reality-check--local-is-for-development-not-real-scans).
+
+### Option 4 — Internal Claude apps gateway (no API key)
+
+```bash
+AI_PROVIDER=gateway        # reuses the Claude Code CLI OAuth session (macOS Keychain)
+# GATEWAY_BASE_URL=        # internal hostname; empty uses the URL the CLI stored on /login
+AI_MODEL_ID=claude-sonnet-5-5   # gateway takes a plain model name, not an ARN
+```
+
+Log in once through the gateway with `claude` then `/login`; on Linux/CI supply `GATEWAY_JWT`.
+
+All of these can also be switched at runtime from the AI tab in the dashboard (`POST /api/scan-config`).
 
 ### Troubleshooting
 
@@ -292,7 +309,7 @@ All three can also be switched at runtime from the AI tab in the dashboard (`POS
 ## Environment variables
 
 ```bash
-# AI provider — one of: bedrock (default), anthropic, openai
+# AI provider — one of: bedrock (default), anthropic, openai, gateway
 AI_PROVIDER=bedrock
 
 # Required when AI_PROVIDER=bedrock

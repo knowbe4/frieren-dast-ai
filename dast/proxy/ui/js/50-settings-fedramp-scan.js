@@ -69,8 +69,8 @@ function showAddScopeForm(kind) {
              style="width:80px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-size:11px">
       <input id="inp-${kind}-file" placeholder="File (e.g. /api/.*)"
              style="flex:2;min-width:100px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:monospace;font-size:11px">
-      <button class="tbtn pri" style="font-size:10px;padding:3px 10px" onclick="submitAddScopeRule('${kind}')">Add</button>
-      <button class="tbtn" style="font-size:10px;padding:3px 10px" onclick="document.getElementById('${formId}').style.display='none'">Cancel</button>
+      <button class="tbtn pri" style="font-size:10px;padding:3px 10px" onclick="submitAddScopeRule(${jsArg(kind)})">Add</button>
+      <button class="tbtn" style="font-size:10px;padding:3px 10px" onclick="document.getElementById(${jsArg(formId)}).style.display='none'">Cancel</button>
     </div>`;
 }
 
@@ -161,7 +161,7 @@ function renderBypassList(items) {
   el.innerHTML = items.map(d =>
     `<div style="display:flex;align-items:center;padding:2px 8px;border-bottom:1px solid var(--bdr)">
       <span style="flex:1;font-size:11px;color:var(--txt);font-family:monospace">${esc(d)}</span>
-      <button class="tbtn del" style="padding:1px 6px;font-size:10px;flex-shrink:0" onclick="removeBypass('${esc(d)}')">x</button>
+      <button class="tbtn del" style="padding:1px 6px;font-size:10px;flex-shrink:0" onclick="removeBypass(${jsArg(d)})">x</button>
     </div>`).join('');
 }
 function renderExtList(items) {
@@ -177,7 +177,7 @@ function renderExtList(items) {
                 border-radius:3px;padding:1px 4px 1px 7px;font-size:10px;font-family:monospace;color:var(--txt)">
       ${esc(e)}
       <button style="background:none;border:none;color:var(--txt2);cursor:pointer;padding:0 2px;font-size:11px;line-height:1"
-              onclick="removeExt('${esc(e)}')" title="Remove">x</button>
+              onclick="removeExt(${jsArg(e)})" title="Remove">x</button>
     </div>`).join('');
 }
 async function addBypass() {
@@ -252,7 +252,7 @@ async function fedrampLoad() {
       const color = _STATUS_COLOR[item.status] || 'var(--txt2)';
       const covColor = _COV_COLOR[item.coverage] || 'var(--txt2)';
       html += `<div style="border:1px solid var(--bdr);border-radius:4px;padding:8px 12px;margin-bottom:6px;background:var(--bg2)">
-        <div style="display:flex;align-items:center;gap:8px;cursor:pointer" onclick="fedrampToggleDetail('${esc(item.id)}')">
+        <div style="display:flex;align-items:center;gap:8px;cursor:pointer" onclick="fedrampToggleDetail(${jsArg(item.id)})">
           <span style="color:${color};font-size:14px" title="${item.status}">${icon}</span>
           <span style="font-size:var(--fs-sm);font-weight:600;color:var(--txt)">${esc(item.title)}</span>
           <span style="font-size:var(--fs-xs);color:${covColor};padding:1px 6px;border:1px solid ${covColor};border-radius:3px">${item.coverage}</span>
@@ -274,7 +274,7 @@ async function fedrampLoad() {
           </div>` : ''}
           <div style="display:flex;gap:6px;align-items:center;margin-top:6px">
             <select style="font-size:var(--fs-xs);background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:2px 6px;border-radius:3px"
-                    onchange="fedrampSetStatus('${item.id}',this.value)">
+                    onchange="fedrampSetStatus(${jsArg(item.id)},this.value)">
               <option value="pending" ${item.status==='pending'?'selected':''}>Pending</option>
               <option value="passed" ${item.status==='passed'?'selected':''}>Passed</option>
               <option value="failed" ${item.status==='failed'?'selected':''}>Failed</option>

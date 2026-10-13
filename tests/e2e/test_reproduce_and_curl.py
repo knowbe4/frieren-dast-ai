@@ -126,6 +126,9 @@ def test_copy_as_curl_produces_runnable_command_with_secret(dashboard):
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(permissions=["clipboard-read", "clipboard-write"])
         page = context.new_page()
+        # Suppress the first-run onboarding modal, whose overlay would otherwise
+        # intercept the context-menu row clicks below.
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         page.goto(base_url, wait_until="domcontentloaded")
         page.wait_for_timeout(300)
 
@@ -158,6 +161,9 @@ def test_copy_reproduce_link_copies_working_link_to_clipboard(dashboard):
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(permissions=["clipboard-read", "clipboard-write"])
         page = context.new_page()
+        # Suppress the first-run onboarding modal, whose overlay would otherwise
+        # intercept the context-menu row clicks below.
+        page.add_init_script("try{localStorage.setItem('dast-onboarded','1')}catch(e){}")
         page.goto(base_url, wait_until="domcontentloaded")
         page.wait_for_timeout(300)
 

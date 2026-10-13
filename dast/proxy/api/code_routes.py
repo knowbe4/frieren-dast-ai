@@ -12,7 +12,6 @@ DELETE /api/code/{id}           — remove job
 
 from __future__ import annotations
 
-import asyncio
 from typing import List, Optional
 
 from fastapi import APIRouter, Query
@@ -21,6 +20,7 @@ from pydantic import BaseModel
 
 from dast.proxy.api.context import DashboardContext
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 logger = get_logger(__name__)
 
@@ -70,9 +70,10 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 _analyses.pop(k, None)
 
         target_url = (body.target_url or "").strip().rstrip("/")
-        asyncio.create_task(
+        spawn_tracked(
             run_analysis(analysis_id, sources, gitlab_token=body.gitlab_token or "",
-                         target_url=target_url)
+                         target_url=target_url),
+            name=f"code-analysis-{analysis_id}",
         )
 
         from dast.proxy.plugin_manager import log_event
@@ -97,7 +98,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 status_code=400,
             )
 
-        asyncio.create_task(enrich_with_ai(analysis_id))
+        spawn_tracked(enrich_with_ai(analysis_id), name=f"code-enrich-{analysis_id}")
 
         from dast.proxy.plugin_manager import log_event
         log_event(
@@ -492,10 +493,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 request_body=synthetic_body,
                 source="imported",
             )
-            with ctx.store._lock:
-                ctx.store._entries[synthetic_id] = target_entry
-                ctx.store._order.append(synthetic_id)
-            ctx.store._notify(target_entry)
+            ctx.store.add_synthetic_entry(target_entry)
 
         # ── Inject hypothesis context as scan hint ───────────────────────
         attack_type = _vuln_type_to_attack(vuln_type)
@@ -559,10 +557,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     extra_entry.queued_for_scan = True
                     extra_entry.scan_result = None
                     extra_entry.skip_dedup = True  # explicit user action — bypass dedup
-                    with ctx.store._lock:
-                        ctx.store._entries[extra_id] = extra_entry
-                        ctx.store._order.append(extra_id)
-                    ctx.store._notify(extra_entry)
+                    ctx.store.add_synthetic_entry(extra_entry)
                     if ctx.scan_queue_state:
                         ctx.scan_queue_state.enqueue(
                             extra_entry.id, extra_entry.method, extra_entry.url, extra_entry.host

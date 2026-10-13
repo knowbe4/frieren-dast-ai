@@ -10,7 +10,7 @@ Unit tests for two reliability guards:
 from __future__ import annotations
 
 
-from dast.proxy.runner import _normalise_dedup_path
+from dast.proxy.scan_support import normalise_dedup_path as _normalise_dedup_path
 from dast.session.refresh_worker import SessionRefreshWorker, _MAX_REAUTH_FAILURES
 
 

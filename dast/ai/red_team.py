@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Optional, Tuple
 
+from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST, SSTI_ARITHMETIC_PRODUCT
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import RED_TEAM_SCHEMA
 from dast.utils.logger import get_logger
@@ -57,7 +58,11 @@ Rules:
 - confirmed=false for: GraphQL/JSON validation errors, CSP-blocked XSS, access-denied SSRF, schema errors
 - confidence must reflect your actual certainty, not just follow the confirmed field
 - A confirmed=true with confidence < 0.5 means you're guessing — set confirmed=false instead
-- Do NOT confirm based on pattern match alone — require evidence of impact in the response
+- Do NOT confirm because a payload is merely reflected or a keyword appears. DO treat
+  output that only the payload reaching an interpreter could produce (a database syntax
+  error quoting the payload, an evaluated expression, file contents) as evidence
+- Use the response status line and headers: Content-Type decides whether a browser would
+  render HTML at all; a 3xx/4xx/5xx changes what the body proves
 - GraphQL enum/type errors echoing payloads are NEVER vulnerabilities
 - JSON application/json responses can NEVER execute injected JavaScript
 
@@ -97,16 +102,16 @@ def _pattern_confidence(finding: "AgentFinding") -> float:
     # LFI with actual file content
     import re as _re
     if attack in ("lfi", "path_traversal") and snippet and _re.search(
-        r"root:.*:0:0:|\\[fonts\\]|\[boot loader\]", snippet
+        r"root:.*:0:0:|\[fonts\]|\[boot loader\]", snippet
     ):
         return 0.90
 
     # SSTI math expression evaluated
-    if attack == "ssti" and ("49" in snippet or "evaluated" in evidence):
+    if attack == "ssti" and (SSTI_ARITHMETIC_PRODUCT in snippet or "evaluated" in evidence):
         return 0.85
 
     # Open redirect with confirmed redirect to our probe domain
-    if attack == "open_redirect" and "evil.example.com" in evidence:
+    if attack == "open_redirect" and OPEN_REDIRECT_CANARY_HOST in evidence:
         return 0.80
 
     # CRLF with injected header confirmed
@@ -134,6 +139,16 @@ def _pattern_confidence(finding: "AgentFinding") -> float:
         return 0.50
 
     return 0.40
+
+
+_RESPONSE_HEAD_MAX_CHARS = 800
+
+
+def _response_head(finding: "AgentFinding") -> str:
+    """Status line + headers of the exploit-proof response (falls back to the baseline)."""
+    raw = getattr(finding, "probe_response", "") or getattr(finding, "raw_response", "") or ""
+    head = raw.replace("\r\n", "\n").split("\n\n", 1)[0]
+    return head[:_RESPONSE_HEAD_MAX_CHARS]
 
 
 def _browser_confidence(finding: "AgentFinding") -> Optional[float]:
@@ -235,16 +250,21 @@ async def validate(
     # response snippet as untrusted data (wrap_untrusted also applies the denylist
     # sanitizer as a second layer). Finding metadata (title, severity) is
     # scanner-derived and safe to interpolate directly.
-    from dast.ai.prompt_safety import _sanitize_for_prompt
     response_snippet = getattr(finding, "raw_response_snippet", "") or ""
+    response_head = _response_head(finding)
+    response_head_section = (
+        f"Response status line and headers:\n{wrap_untrusted(response_head, 'response_headers')}"
+        if response_head else ""
+    )
     user = (
         f"Finding: {finding.title}\n"
         f"Attack type: {finding.attack_type}\n"
         f"Severity: {finding.severity}\n"
         f"Endpoint: {finding.request_method} {finding.url}\n"
         f"Parameter: {finding.parameter}\n"
-        f"Payload used: {_sanitize_for_prompt(finding.payload, 200)!r}\n"
-        f"Evidence: {_sanitize_for_prompt(finding.evidence, 500)}\n"
+        f"Payload used:\n{wrap_untrusted(finding.payload or '', 'payload', 200) or '(none)\n'}"
+        f"Evidence:\n{wrap_untrusted(finding.evidence or '', 'evidence', 500) or '(none)\n'}"
+        f"{response_head_section}"
         f"Response snippet:\n{wrap_untrusted(response_snippet, 'target_response', 400)}"
         f"{browser_note}"
         f"{examples_section}"
@@ -265,6 +285,7 @@ async def validate(
     if not bedrock_client.is_ai_available():
         finding.ai_validated = False
         finding.needs_review = pattern_conf >= confidence_threshold
+        finding.confidence = pattern_conf
         logger.debug(
             "Red-team: AI unavailable — held for review (not confirmed)",
             attack=finding.attack_type, url=finding.url,
@@ -294,11 +315,17 @@ async def validate(
         reasoning = str(result.get("reasoning", ""))
         exploit_scenario = str(result.get("exploit_scenario", ""))
 
-        # Multi-source confidence aggregation — take the strongest signal
+        # Multi-source confidence aggregation — take the strongest signal, except:
+        # an LLM rejection reports the LLM's own confidence (a strong pattern score
+        # must not make a rejected finding look certain), and a browser run that
+        # proved the payload did NOT execute caps confidence at the LLM's view.
         sources = [pattern_conf, llm_confidence]
         if browser_conf is not None:
             sources.append(browser_conf)
         final_confidence = max(sources)
+        if not llm_confirmed or getattr(finding, "browser_confirmed", None) is False:
+            final_confidence = min(final_confidence, llm_confidence)
+        finding.confidence = final_confidence
 
         # Confirmed only if LLM says yes AND final confidence clears the threshold
         confirmed = llm_confirmed and final_confidence >= confidence_threshold
@@ -329,6 +356,7 @@ async def validate(
         # findings for human review and drop the weak ones.
         finding.ai_validated = False
         finding.needs_review = pattern_conf >= confidence_threshold
+        finding.confidence = pattern_conf
         logger.warning(
             "Red-team LLM call failed — held for review (not AI validated)",
             attack=finding.attack_type, url=finding.url, error=str(e),

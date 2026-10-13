@@ -16,9 +16,12 @@ from typing import TYPE_CHECKING, Optional
 
 from dast.proxy.plugin_base import ProxyPlugin
 from dast.utils.jwt import decode_segment
+from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
+
+logger = get_logger(__name__)
 
 _JWT_RE = re.compile(
     r'eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*'
@@ -49,8 +52,8 @@ def _extract_tokens(entry: "ProxyEntry") -> list[str]:
             body = entry.response_body.decode("utf-8", errors="replace")
             for m in _JWT_RE.finditer(body):
                 tokens.append(m.group(0))
-        except Exception:
-            pass  # best-effort: non-decodable body simply yields no tokens
+        except Exception as exc:
+            logger.debug("JWT analyzer: response body scan failed", error=str(exc))
 
     return list(set(tokens))
 

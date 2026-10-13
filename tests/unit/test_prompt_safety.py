@@ -111,3 +111,10 @@ class TestDirective:
         assert "UNTRUSTED DATA" in UNTRUSTED_CONTENT_DIRECTIVE
         assert "never instructions" in UNTRUSTED_CONTENT_DIRECTIVE.lower()
         assert "any language" in UNTRUSTED_CONTENT_DIRECTIVE.lower()
+
+
+def test_describe_auth_header_never_leaks_credentials():
+    from dast.ai.prompt_safety import describe_auth_header
+    assert describe_auth_header("Basic YWRtaW46aHVudGVyMg==") == "Basic"
+    assert describe_auth_header("Bearer eyJhbGciOi.payload.sig") == "Bearer"
+    assert describe_auth_header("rawtokenvalue123") == "(present)"

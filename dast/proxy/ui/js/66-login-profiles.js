@@ -56,7 +56,7 @@ function loginRenderList() {
       p.session_set ? 'session' : '',
       p.flow_set ? 'flow' : '',
     ].filter(Boolean).join(' · ');
-    return `<div onclick="loginSelectProfile('${p.slug}')" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;margin-bottom:4px;cursor:pointer;${active}">
+    return `<div onclick="loginSelectProfile(${jsArg(p.slug)})" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;margin-bottom:4px;cursor:pointer;${active}">
       <div style="font-weight:600;display:flex;align-items:center">${_esc(p.name)}${_privBadge(p.privilege_level)}</div>
       <div style="color:var(--txt2);font-size:10px">${_esc(p.host_pattern || '(no host pattern)')}</div>
       <div style="color:var(--txt2);font-size:10px">${badges}</div>

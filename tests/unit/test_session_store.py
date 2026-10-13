@@ -242,3 +242,38 @@ class TestAllEntriesClear:
         store.new_entry("GET", "https://example.com/a", {}, None)
         store.clear()
         assert store.all_entries() == []
+
+
+def test_subdomain_cookies_not_sent_to_parent_domain():
+    from dast.proxy.session_store import SessionStore
+    store = SessionStore()
+    store._ingest_cookies("api.example.com", {"set-cookie": "api_session=abc; Path=/"})
+    store._ingest_cookies("example.com", {"set-cookie": "root_session=xyz; Path=/; HttpOnly"})
+    parent_names = {c["name"] for c in store.get_cookies_for_host("example.com")}
+    child_names = {c["name"] for c in store.get_cookies_for_host("api.example.com")}
+    assert parent_names == {"root_session"}
+    assert child_names == {"api_session", "root_session"}
+    root = next(c for c in store.get_cookies_for_host("example.com"))
+    assert root["httpOnly"] is True
+
+
+def test_prune_jobs_keeps_newest():
+    from dast.proxy.api.context import prune_jobs
+    jobs = {f"job{index}": {} for index in range(5)}
+    prune_jobs(jobs, max_jobs=3)
+    assert list(jobs) == ["job2", "job3", "job4"]
+
+
+def test_add_synthetic_entry_and_newest_first():
+    from dast.proxy.session_store import ProxyEntry, SessionStore
+    store = SessionStore()
+    seen = []
+    store.add_listener(lambda entry: seen.append(entry.id))
+    for index in range(3):
+        store.add_synthetic_entry(ProxyEntry(
+            id=f"syn-{index}", method="GET", url=f"https://a.test/{index}",
+            host="a.test", path=f"/{index}", request_headers={}, request_body=None,
+        ), notify=False)
+    assert [e.id for e in store.entries_newest_first()] == ["syn-2", "syn-1", "syn-0"]
+    assert [e.id for e in store.all_entries()] == ["syn-0", "syn-1", "syn-2"]
+    assert seen == []

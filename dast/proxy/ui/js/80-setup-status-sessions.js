@@ -259,14 +259,6 @@ async function onSettingsFileSelected(event) {
 
 // ── sessions ────────────────────────────────────────────────────────────
 
-function showSessionsPanel() {
-  document.getElementById('sessions-overlay').style.display = 'flex';
-  // pre-fill name input from current session name
-  document.getElementById('new-session-name').value =
-    document.getElementById('session-name').value || 'Untitled session';
-  loadSessionsList();
-}
-
 function hideSessionsPanel() {
   document.getElementById('sessions-overlay').style.display = 'none';
 }
@@ -292,10 +284,10 @@ async function loadSessionsList() {
             ${s.description ? ' · ' + esc(s.description) : ''}
           </div>
         </div>
-        <button class="tbtn pri" onclick="loadSession('${esc(s.id)}','${esc(s.name)}')">Open</button>
+        <button class="tbtn pri" onclick="loadSession(${jsArg(s.id)},${jsArg(s.name)})">Open</button>
         <a class="tbtn" href="/api/sessions/${esc(s.id)}/download" download="${esc(s.name)}.json"
            style="text-decoration:none">Export</a>
-        <button class="tbtn del" onclick="deleteSession('${esc(s.id)}')">Delete</button>
+        <button class="tbtn del" onclick="deleteSession(${jsArg(s.id)})">Delete</button>
       </div>`).join('');
   } catch(e) {
     el.innerHTML = '<div class="empty">Failed to load sessions</div>';
@@ -332,10 +324,6 @@ function _setCurrentSession(id, name) {
     localStorage.removeItem('dast-session-name');
     localStorage.removeItem('dast-session-boot');
   }
-}
-
-function _autoSaveAvailable() {
-  return _autoSaveFileHandle !== null || !window.showSaveFilePicker;
 }
 
 function _showAutoSaveLabel(show) {

@@ -156,7 +156,15 @@ Secret-scan git hooks run on every commit and push (installed by `make setup`). 
 
 ## Key Files
 
-- `dast/proxy/runner.py` — starts proxy + dashboard + scan worker
+- `dast/proxy/runner.py` — wires proxy + dashboard + background workers
+- `dast/proxy/workers/` — scan, recon (crawl + content discovery), browse and login workers
+- `dast/proxy/suggestions.py` — recon suggestions from content discovery + param mining
+- `dast/proxy/scan_support.py` — scan dedup path, import-stub updates, detection labels
+- `dast/proxy/api/origin_guard.py` — the dashboard has no login; this middleware (loopback
+  Host + same-Origin for POST/WebSocket) is what blocks CSRF and DNS rebinding. Keep it on.
+- `dast/utils/tasks.py` — `spawn_tracked()`: use instead of bare `asyncio.create_task`
+- `dast/ai/canaries.py` — shared probe markers (SSTI product, open-redirect canary host)
+- UI inline handlers: pass values with `jsArg(v)`, never `'${esc(v)}'` or `JSON.stringify`
 - `dast/proxy/session_store.py` — intercepted entries, cookie jar, service graph
 - `dast/proxy/dashboard_server.py` — FastAPI app assembly + router wiring (routes live in
   `dast/proxy/api/*_routes.py`); UI is external static files in `dast/proxy/ui/`

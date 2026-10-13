@@ -142,7 +142,7 @@ function _interceptRenderQueue() {
   list.innerHTML = _interceptQueue.map(req => {
     const on    = req.id === _interceptSelId ? ' on' : '';
     const phase = req.phase === 'response' ? '<span style="font-size:9px;color:var(--orange);margin-left:3px">[resp]</span>' : '';
-    return `<div class="iq-item${on}" onclick="_interceptSelectReq('${req.id}')">
+    return `<div class="iq-item${on}" onclick="_interceptSelectReq(${jsArg(req.id)})">
       <span class="cm ${esc(req.method)} iq-method">${esc(req.method)}</span>
       <span class="iq-url" title="${esc(req.url)}">${esc(req.host)}${esc(req.path)}</span>${phase}
     </div>`;

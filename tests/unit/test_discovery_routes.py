@@ -39,7 +39,7 @@ def client_and_queue(monkeypatch):
         intercept_store=InterceptStore(),
         discovery_queue=discovery_queue,
     )
-    return TestClient(app), discovery_queue
+    return TestClient(app, base_url="http://127.0.0.1"), discovery_queue
 
 
 def test_out_of_scope_url_rejected_and_not_enqueued(client_and_queue):
@@ -72,3 +72,26 @@ def test_stop_route_enqueues_stop(client_and_queue):
     r = client.post("/api/discovery/stop")
     assert r.status_code == 200
     assert queue.get_nowait() == {"action": "stop"}
+
+
+def test_crawl_out_of_scope_url_rejected(monkeypatch):
+    from dast.proxy import proxy_settings as ps
+    from dast.proxy.api import status_routes as status_mod
+    from dast.proxy.dashboard_server import build_app
+    from dast.proxy.session_store import SessionStore
+
+    async def _noop(ctx):
+        return None
+    monkeypatch.setattr(status_mod, "prefetch_ai_status", _noop)
+
+    settings = ps.ProxySettings()
+    settings._scope_rules = [{"kind": "include", "host": "in.scope", "enabled": True}]
+    crawl_queue: asyncio.Queue = asyncio.Queue()
+    app = build_app(store=SessionStore(), scan_queue=asyncio.Queue(), settings=settings,
+                    crawl_queue=crawl_queue)
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    assert client.post("/api/crawl", json={"url": "https://out.of.scope/"}).status_code == 400
+    assert crawl_queue.empty()
+    assert client.post("/api/crawl", json={"url": "https://in.scope/"}).status_code == 200
+    assert crawl_queue.qsize() == 1

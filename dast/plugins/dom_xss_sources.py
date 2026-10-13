@@ -20,9 +20,12 @@ import re
 from typing import TYPE_CHECKING
 
 from dast.proxy.plugin_base import ProxyPlugin
+from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
+
+logger = get_logger(__name__)
 
 # Each entry: (pattern, label, severity)
 _PATTERNS: list[tuple[re.Pattern, str, str]] = [

@@ -83,3 +83,9 @@ def test_follow_redirects_defaults_to_off(monkeypatch):
     })
     assert r.status_code == 200
     assert r.json()["status"] == 301
+
+
+def test_strip_recomputed_headers_is_case_insensitive():
+    from dast.proxy.api.http_utils import strip_recomputed_headers
+    cleaned = strip_recomputed_headers({"HOST": "a", "Content-Length": "3", "X-Keep": "1", "accept-encoding": "gzip"})
+    assert cleaned == {"X-Keep": "1"}

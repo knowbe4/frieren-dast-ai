@@ -27,7 +27,9 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from dast.ai.prompt_safety import describe_auth_header
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 if TYPE_CHECKING:
     from dast.proxy.session_store import ProxyEntry, SessionStore
@@ -307,7 +309,7 @@ class AppContextWorker:
                 f"{e.method} {_sanitize(e.path, 100)} → {e.response_status}"
                 + (f" | body={req_preview}" if req_preview else "")
                 + (f" | resp={resp_preview}" if resp_preview else "")
-                + (f" | auth={_sanitize(auth_hdr[:60])}" if auth_hdr else "")
+                + (f" | auth={describe_auth_header(auth_hdr)}" if auth_hdr else "")
                 + (f" | cookie_names={_cookie_names(cookie_hdr)}" if cookie_hdr else "")
             )
 
@@ -423,7 +425,7 @@ class AppContextWorker:
                 logger.warning("AppContextWorker: session intelligence write-back failed", host=host, error=str(exc))
 
         # Act on new high/medium priority hypotheses immediately
-        asyncio.ensure_future(self._act_on_hypotheses(host, existing))
+        spawn_tracked(self._act_on_hypotheses(host, existing), name=f"app-context-hypotheses-{host}")
 
 
     async def _act_on_hypotheses(self, host: str, profile: AppProfile) -> None:
@@ -597,18 +599,16 @@ class AppContextWorker:
 
         best = None
         best_ts = 0.0
-        with self._store._lock:
-            for eid in reversed(self._store._order):
-                e = self._store._entries.get(eid)
-                if not e or e.host != host or e.method != method:
-                    continue
-                if e.source in ("agent", "imported"):
-                    continue
-                ep = e.path.split("?")[0]
-                if ep == path or (path_prefix and ep.startswith(path_prefix + "/")):
-                    if e.ts > best_ts:
-                        best = e
-                        best_ts = e.ts
+        for e in self._store.entries_newest_first():
+            if e.host != host or e.method != method:
+                continue
+            if e.source in ("agent", "imported"):
+                continue
+            ep = e.path.split("?")[0]
+            if ep == path or (path_prefix and ep.startswith(path_prefix + "/")):
+                if e.ts > best_ts:
+                    best = e
+                    best_ts = e.ts
         return best
 
 

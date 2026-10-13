@@ -162,6 +162,91 @@ def test_structured_path_reraises_unrelated_400(monkeypatch):
         bedrock_client.invoke_json("sys", "user", schema={"type": "object"})
 
 
+# ── function call written out as text (Ollama / llama.cpp) ───────────────────
+
+_OK_SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
+
+
+def test_text_tool_call_wrapper_is_unwrapped(install_fake_client):
+    # Ollama with Qwen ignores forced tool_choice and puts the call in the text
+    # content. The caller must get the decision, not the {name, arguments} wrapper.
+    install_fake_client([_text_response('{"name": "emit_result", "arguments": {"ok": true}}')])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_OK_SCHEMA)
+
+    assert result == {"ok": True}
+
+
+def test_text_tool_call_with_string_arguments_is_unwrapped(install_fake_client):
+    install_fake_client([_text_response('{"name": "emit_result", "arguments": "{\\"ok\\": false}"}')])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_OK_SCHEMA)
+
+    assert result == {"ok": False}
+
+
+def test_text_tool_call_wrapper_unwrapped_when_schema_has_no_required(install_fake_client):
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    install_fake_client([_text_response('{"name": "emit_result", "parameters": {"ok": true}}')])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"ok": True}
+
+
+def test_text_output_missing_required_field_raises(install_fake_client):
+    # Previously the text path returned whatever JSON it parsed, so a wrong shape
+    # was read by the caller as an empty decision. It must now fail loudly.
+    install_fake_client([_text_response('{"verdict": "VULNERABLE"}')])
+
+    with pytest.raises(ValueError, match="missing required field"):
+        bedrock_client.invoke_json("sys", "user", schema=_OK_SCHEMA)
+
+
+def test_text_call_to_a_different_tool_is_not_unwrapped(install_fake_client):
+    # The model called some other tool directly (seen with the copilot: it emitted
+    # browser_snapshot instead of the step schema). Those are another tool's
+    # arguments — they must not be passed off as this schema's object.
+    install_fake_client([_text_response('{"name": "browser_snapshot", "arguments": {"ok": true}}')])
+
+    with pytest.raises(ValueError, match="missing required field"):
+        bedrock_client.invoke_json("sys", "user", schema=_OK_SCHEMA)
+
+
+def test_schema_declaring_wrapper_keys_is_not_unwrapped(install_fake_client):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}},
+        "required": ["name", "arguments"],
+    }
+    text = '{"name": "tool_x", "arguments": {"a": 1}}'
+    install_fake_client([_text_response(text)])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"name": "tool_x", "arguments": {"a": 1}}
+
+
+def test_text_json_fallback_unwraps_tool_call_after_tool_use_rejected(monkeypatch):
+    # The "does not support tools" 400 path re-asks for plain JSON; a model that
+    # still answers in function-call shape must be unwrapped there too.
+    from dast.ai import providers
+
+    def fake_invoke_raw(*, schema=None, **kwargs):
+        if schema is not None:
+            raise providers.ProviderError(
+                'OpenAI API 400: {"error":{"message":"model does not support tools"}}',
+                status_code=400,
+            )
+        return _text_response('{"name": "emit_result", "arguments": {"ok": true}}')
+
+    monkeypatch.setattr(bedrock_client, "_invoke_raw", fake_invoke_raw)
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_OK_SCHEMA)
+
+    assert result == {"ok": True}
+
+
 # ── repair-retry on malformed JSON (legacy path) ──────────────────────────────
 
 def test_repair_retry_recovers_from_malformed_json(install_fake_client, caplog):
@@ -222,3 +307,10 @@ def test_legacy_system_stays_plain_string(install_fake_client):
 
     assert isinstance(fake.bodies[0]["system"], str)
     assert "tools" not in fake.bodies[0]
+
+
+def test_structured_output_missing_required_field_raises(install_fake_client):
+    install_fake_client([_tool_response({"agents": []})])
+    schema = {"type": "object", "properties": {"agents": {}, "reason": {}}, "required": ["agents", "reason"]}
+    with pytest.raises(ValueError, match="reason"):
+        bedrock_client.invoke_json(system="s", user="u", schema=schema)

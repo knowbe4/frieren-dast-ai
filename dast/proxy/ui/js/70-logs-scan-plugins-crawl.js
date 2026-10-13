@@ -147,10 +147,10 @@ function _scanCard(item, showCancel, showStop) {
     <div style="flex-shrink:0;text-align:right;min-width:60px">
       ${statusBadge}
       <div style="color:var(--txt3);font-size:10px">${esc(elapsed || age)}</div>
-      ${showStop && !isWaiting ? `<button onclick="stopRunningItem('${esc(item.id)}')"
+      ${showStop && !isWaiting ? `<button onclick="stopRunningItem(${jsArg(item.id)})"
         style="margin-top:2px;background:none;border:1px solid var(--red);color:var(--red);
                padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px">Stop</button>` : ''}
-      ${showCancel ? `<button onclick="cancelScanItem('${esc(item.id)}')"
+      ${showCancel ? `<button onclick="cancelScanItem(${jsArg(item.id)})"
         style="margin-top:2px;background:none;border:1px solid var(--bdr);color:var(--txt2);
                padding:1px 6px;border-radius:3px;cursor:pointer;font-size:10px">Cancel</button>` : ''}
     </div>
@@ -310,7 +310,7 @@ async function loadPlugins() {
                     cursor:pointer;white-space:nowrap;flex-shrink:0">
         <input type="checkbox" ${p.enabled ? 'checked' : ''}
                style="accent-color:var(--acc)"
-               onchange="togglePlugin('${esc(p.name)}', this.checked)">
+               onchange="togglePlugin(${jsArg(p.name)}, this.checked)">
         ${p.enabled ? 'Enabled' : 'Disabled'}
       </label>
     </div>`).join('');

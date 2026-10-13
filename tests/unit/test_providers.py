@@ -203,6 +203,112 @@ def test_openai_tool_call_becomes_tool_use_block(patch_http):
     assert sent["tool_choice"] == {"type": "function", "function": {"name": "emit_result"}}
 
 
+class _QueuedHttpClient(_FakeHttpClient):
+    """Like _FakeHttpClient but returns queued responses in order."""
+
+    def __init__(self, responses: list) -> None:
+        super().__init__(responses[0])
+        self._queue = list(responses)
+
+    def post(self, url: str, headers: Dict[str, str], json: Dict[str, Any]) -> _FakeResponse:
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        return self._queue.pop(0)
+
+
+def _structured_body(schema: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "max_tokens": 100,
+        "system": "s",
+        "messages": [{"role": "user", "content": "u"}],
+        "tools": [{"name": "emit_result", "description": "d", "input_schema": schema}],
+        "tool_choice": {"type": "tool", "name": "emit_result"},
+    }
+
+
+_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"vuln": {"type": "string", "enum": ["sqli", "none"]}},
+    "required": ["vuln"],
+}
+
+
+def test_local_server_uses_json_schema_constrained_decoding(patch_http):
+    # Ollama ignores a forced tool_choice for some models; constrained decoding
+    # makes the server's grammar guarantee schema-valid JSON instead.
+    fake = patch_http(_FakeResponse(200, {"choices": [{"message": {"content": '{"vuln": "sqli"}'}}]}))
+
+    result = providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="qwen2.5-coder:14b",
+                                     api_key="", base_url="http://localhost:11434/v1")
+
+    sent = fake.calls[0]["json"]
+    assert sent["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "emit_result", "schema": _VERDICT_SCHEMA},
+    }
+    assert "tools" not in sent and "tool_choice" not in sent
+    # The JSON reply is re-shaped into the tool_use block the gateway expects.
+    assert result["content"] == [{"type": "tool_use", "name": "emit_result", "input": {"vuln": "sqli"}}]
+
+
+def test_public_openai_keeps_forced_tool_call(patch_http):
+    fake = patch_http(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
+    providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="gpt-4o",
+                            api_key="k", base_url="https://api.openai.com/v1")
+    sent = fake.calls[0]["json"]
+    assert "response_format" not in sent
+    assert sent["tool_choice"] == {"type": "function", "function": {"name": "emit_result"}}
+
+
+def test_json_schema_rejected_falls_back_to_forced_tool(monkeypatch):
+    rejected = _FakeResponse(400, {"error": {"message": "response_format json_schema not supported"}})
+    accepted = _FakeResponse(200, {"choices": [{"message": {"content": None, "tool_calls": [
+        {"function": {"name": "emit_result", "arguments": '{"vuln": "none"}'}}]}}]})
+    fake = _QueuedHttpClient([rejected, accepted])
+    monkeypatch.setattr(providers.httpx, "Client", lambda *a, **k: fake)
+
+    result = providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="m",
+                                     api_key="", base_url="http://localhost:8000/v1")
+
+    assert "response_format" in fake.calls[0]["json"]
+    assert "tools" in fake.calls[1]["json"]
+    assert result["content"][0]["input"] == {"vuln": "none"}
+
+
+def test_structured_output_setting_forces_tools_on_local(patch_http, monkeypatch):
+    from dast.config import settings
+    monkeypatch.setattr(settings, "openai_structured_output", "tools")
+    fake = patch_http(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
+    providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="m",
+                            api_key="", base_url="http://localhost:11434/v1")
+    assert "tools" in fake.calls[0]["json"]
+    assert "response_format" not in fake.calls[0]["json"]
+
+
+def test_json_schema_non_json_reply_stays_text(patch_http):
+    # Left as text so bedrock_client's repair + required-field checks still apply.
+    patch_http(_FakeResponse(200, {"choices": [{"message": {"content": "not json"}}]}))
+    result = providers.invoke_openai(_structured_body(_VERDICT_SCHEMA), model_id="m",
+                                     api_key="", base_url="http://localhost:11434/v1")
+    assert result["content"] == [{"type": "text", "text": "not json"}]
+
+
+def test_local_server_gets_longer_read_timeout(monkeypatch):
+    seen: Dict[str, Any] = {}
+    fake = _FakeHttpClient(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
+
+    def _client(*args: Any, **kwargs: Any) -> _FakeHttpClient:
+        seen["timeout"] = kwargs.get("timeout")
+        return fake
+
+    monkeypatch.setattr(providers.httpx, "Client", _client)
+    providers.invoke_openai({"messages": []}, model_id="m", api_key="",
+                            base_url="http://localhost:11434/v1")
+    assert seen["timeout"].read == providers._LOCAL_HTTP_TIMEOUT.read
+    providers.invoke_openai({"messages": []}, model_id="m", api_key="k",
+                            base_url="https://api.openai.com/v1")
+    assert seen["timeout"].read == providers._HTTP_TIMEOUT.read
+
+
 def test_openai_flattens_cached_system_blocks(patch_http):
     fake = patch_http(_FakeResponse(200, {"choices": [{"message": {"content": "x"}}]}))
     body = {
@@ -391,3 +497,68 @@ def test_invoke_external_does_not_retry_on_4xx(monkeypatch):
         bedrock_client.set_provider(provider="bedrock")
 
     assert calls["n"] == 1  # permanent error surfaced immediately, no retry
+def test_openai_malformed_tool_arguments_are_not_turned_into_empty_object():
+    from dast.ai.providers import _from_openai_response
+    envelope = _from_openai_response({"choices": [{"message": {
+        "tool_calls": [{"function": {"name": "emit_result", "arguments": "{not json"}}],
+    }}]})
+    assert not [b for b in envelope["content"] if b["type"] == "tool_use"]
+
+
+# ── local provider detection + concurrency gate ──────────────────────────────
+
+def test_is_local_provider_true_only_for_non_public_openai(monkeypatch):
+    try:
+        bedrock_client.set_provider("openai", openai_base_url="http://localhost:11434/v1")
+        assert bedrock_client.is_local_provider() is True
+        bedrock_client.set_provider("openai", openai_api_key="k",
+                                    openai_base_url="https://api.openai.com/v1")
+        assert bedrock_client.is_local_provider() is False
+        bedrock_client.set_provider("anthropic", anthropic_api_key="sk-ant-test")
+        assert bedrock_client.is_local_provider() is False
+    finally:
+        bedrock_client.set_provider(provider="bedrock")
+
+
+def test_concurrency_limit_auto_is_one_for_local_and_unlimited_for_cloud(monkeypatch):
+    from dast.config import settings
+    monkeypatch.setattr(settings, "ai_max_concurrency", 0)
+    monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: True)
+    assert bedrock_client._effective_concurrency_limit() == 1
+    monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: False)
+    assert bedrock_client._effective_concurrency_limit() == 0
+    monkeypatch.setattr(settings, "ai_max_concurrency", 3)
+    assert bedrock_client._effective_concurrency_limit() == 3
+
+
+def test_local_provider_calls_are_serialized(monkeypatch):
+    # Parallel agents must not stack requests on a one-GPU local server: they
+    # queue past the read timeout there. The gate lets one call through at a time.
+    import threading
+    import time as real_time
+
+    from dast.config import settings
+    monkeypatch.setattr(settings, "ai_max_concurrency", 0)
+    monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: True)
+
+    state = {"active": 0, "peak": 0}
+    guard = threading.Lock()
+
+    def _slow_dispatch(provider, body, model):
+        with guard:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        real_time.sleep(0.05)
+        with guard:
+            state["active"] -= 1
+        return {"content": []}
+
+    monkeypatch.setattr(bedrock_client, "_dispatch_external", _slow_dispatch)
+    threads = [threading.Thread(target=bedrock_client._invoke_external,
+                                args=("openai", {"messages": []}, "m")) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert state["peak"] == 1

@@ -12,6 +12,7 @@ Credential priority (matches orchestrator-ai):
   3. Default boto3 chain (instance profile, env vars, ~/.aws/credentials)
 """
 
+import contextlib
 import json
 import threading
 import time
@@ -199,6 +200,56 @@ def set_provider(
 def get_active_provider() -> str:
     from dast.config import settings
     return (_active_provider or settings.ai_provider or "bedrock").strip().lower()
+
+
+def is_local_provider() -> bool:
+    """True when LLM calls go to a local / self-hosted OpenAI-compatible server.
+
+    That is the ``openai`` provider pointed at anything other than the public
+    OpenAI API (Ollama, LM Studio, vLLM, llama.cpp). Such a server runs on one
+    machine's hardware, so callers adapt: serialize calls and allow longer
+    budgets.
+    """
+    if get_active_provider() != "openai":
+        return False
+    from dast.config import settings
+    from dast.ai import providers
+
+    return not providers.is_public_openai(_openai_base_url or settings.openai_base_url)
+
+
+# Concurrency gate for external provider calls (see _provider_slot).
+_concurrency_lock = threading.Lock()
+_concurrency_semaphore: Optional[threading.BoundedSemaphore] = None
+_concurrency_limit = 0
+
+
+def _effective_concurrency_limit() -> int:
+    """Max concurrent external calls; 0 means unlimited.
+
+    ``ai_max_concurrency`` > 0 wins. Otherwise a local server gets 1 — it serves
+    one request at a time, so parallel agent calls only queue server-side, pile
+    up past the read timeout, and get retried — and cloud providers are unlimited.
+    """
+    from dast.config import settings
+
+    configured = int(getattr(settings, "ai_max_concurrency", 0) or 0)
+    if configured > 0:
+        return configured
+    return 1 if is_local_provider() else 0
+
+
+def _provider_slot():
+    """Context manager that holds one external-call slot (a no-op when unlimited)."""
+    global _concurrency_semaphore, _concurrency_limit
+    limit = _effective_concurrency_limit()
+    if limit <= 0:
+        return contextlib.nullcontext()
+    with _concurrency_lock:
+        if _concurrency_semaphore is None or _concurrency_limit != limit:
+            _concurrency_semaphore = threading.BoundedSemaphore(limit)
+            _concurrency_limit = limit
+        return _concurrency_semaphore
 
 
 def provider_api_key_present() -> bool:
@@ -471,6 +522,36 @@ def _log_cache_usage(result: Dict[str, Any]) -> None:
         logger.debug("Bedrock cache usage", cache_read=read, cache_creation=created)
 
 
+def _dispatch_external(provider: str, body: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Send one request to the named non-Bedrock provider (no retry)."""
+    from dast.config import settings
+    from dast.ai import providers
+
+    if provider == "anthropic":
+        return providers.invoke_anthropic(
+            body=body,
+            model_id=model,
+            api_key=_anthropic_api_key or (settings.anthropic_api_key or ""),
+            base_url=_anthropic_base_url or settings.anthropic_base_url,
+        )
+    if provider == "openai":
+        return providers.invoke_openai(
+            body=body,
+            model_id=model,
+            api_key=_openai_api_key or (settings.openai_api_key or ""),
+            base_url=_openai_base_url or settings.openai_base_url,
+        )
+    if provider == "gateway":
+        return providers.invoke_gateway(
+            body=body,
+            model_id=model,
+            # No API key: the gateway reuses the CLI OAuth session.
+            api_key="",
+            base_url=_gateway_base_url or settings.gateway_base_url,
+        )
+    raise providers.ProviderError(f"Unknown AI provider: {provider}")
+
+
 def _invoke_external(
     provider: str,
     body: Dict[str, Any],
@@ -479,38 +560,16 @@ def _invoke_external(
     """
     Route a request to a non-Bedrock provider (Anthropic direct / OpenAI) and
     return an Anthropic-style envelope. Retries transient HTTP errors with the
-    same backoff schedule as the Bedrock path.
+    same backoff schedule as the Bedrock path. Each attempt holds a concurrency
+    slot (see _provider_slot) that is released during the backoff sleep.
     """
-    from dast.config import settings
     from dast.ai import providers
 
     delay = 2
     for attempt in range(3):
         try:
-            if provider == "anthropic":
-                return providers.invoke_anthropic(
-                    body=body,
-                    model_id=model,
-                    api_key=_anthropic_api_key or (settings.anthropic_api_key or ""),
-                    base_url=_anthropic_base_url or settings.anthropic_base_url,
-                )
-            if provider == "openai":
-                return providers.invoke_openai(
-                    body=body,
-                    model_id=model,
-                    api_key=_openai_api_key or (settings.openai_api_key or ""),
-                    base_url=_openai_base_url or settings.openai_base_url,
-                )
-            if provider == "gateway":
-                return providers.invoke_gateway(
-                    body=body,
-                    model_id=model,
-                    # No API key: the gateway reuses the CLI OAuth session.
-                    api_key="",
-                    base_url=_gateway_base_url or settings.gateway_base_url,
-                )
-            raise providers.ProviderError(f"Unknown AI provider: {provider}")
-
+            with _provider_slot():
+                return _dispatch_external(provider, body, model)
         except providers.ProviderError as exc:
             # Transient errors — a 429 (rate limit) or any 5xx (server-side) — are
             # worth retrying with backoff, matching the Bedrock throttling path.
@@ -643,10 +702,11 @@ def _invoke_json_as_text(
         system=text_system, user=text_user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system,
     )
-    return _parse_json_or_repair(
+    parsed = _parse_json_or_repair(
         raw=raw, system=text_system, user=text_user, model_id=model_id,
         max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
     )
+    return _coerce_structured(parsed, schema) if schema else parsed
 
 
 def _parse_json_or_repair(
@@ -681,6 +741,79 @@ def _parse_json_or_repair(
             max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
         )
         return json.loads(_strip_json_fence(raw2))
+
+
+# Keys OpenAI-style function calls use for the call's arguments.
+_TOOL_CALL_ARGUMENT_KEYS = ("arguments", "parameters")
+
+
+def _require_fields(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Fail when ``structured`` lacks a key the schema marks required.
+
+    Providers do not strictly validate structured output against the schema; a
+    missing required field must fail here, not be read by the caller as a default.
+    """
+    missing = [key for key in schema.get("required", []) if key not in structured]
+    if missing:
+        raise ValueError(f"Structured output missing required field(s): {', '.join(missing)}")
+    return structured
+
+
+def _unwrap_text_tool_call(
+    parsed: Dict[str, Any], schema: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return the arguments of a function call the model wrote out as text.
+
+    Local OpenAI-compatible servers (Ollama with Qwen, llama.cpp) often ignore a
+    forced ``tool_choice`` and put the call in the text content in OpenAI's
+    function-call shape — ``{"name": "...", "arguments": {...}}`` — so the parsed
+    JSON is the wrapper, not the decision. Only unwrap when the object does not
+    already satisfy the schema (a required key is missing, or none of its keys are
+    schema properties) and the schema does not itself declare the wrapper key.
+    """
+    declared = set((schema.get("properties") or {}).keys())
+    required = schema.get("required", [])
+    already_satisfies = all(key in parsed for key in required) and (
+        not declared or bool(declared & set(parsed))
+    )
+    if already_satisfies:
+        return None
+    # A call to some OTHER tool (e.g. the copilot model calling `browser_snapshot`
+    # directly instead of filling the step schema) carries that tool's arguments,
+    # not this schema's object — unwrapping it would hand the caller the wrong data.
+    called_name = parsed.get("name")
+    if called_name not in (None, _STRUCTURED_TOOL_NAME):
+        return None
+    for wrapper_key in _TOOL_CALL_ARGUMENT_KEYS:
+        if wrapper_key in declared or wrapper_key not in parsed:
+            continue
+        inner = parsed[wrapper_key]
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(_strip_json_fence(inner))
+            except (json.JSONDecodeError, ValueError) as exc:
+                logger.warning("Text tool-call arguments were not valid JSON", error=str(exc))
+                continue
+        if isinstance(inner, dict):
+            logger.warning(
+                "Provider returned tool call as text; unwrapped",
+                wrapper_key=wrapper_key, tool=str(parsed.get("name", "")),
+            )
+            return inner
+    return None
+
+
+def _coerce_structured(parsed: Any, schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn JSON parsed from a text reply into the schema's object, or fail loudly.
+
+    Used on every path where structured output arrives as text instead of a
+    tool_use block: unwraps a function call written out as text, then enforces
+    the schema's required keys exactly like the tool_use path does.
+    """
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Structured output is not a JSON object: {type(parsed).__name__}")
+    unwrapped = _unwrap_text_tool_call(parsed, schema)
+    return _require_fields(unwrapped if unwrapped is not None else parsed, schema)
 
 
 def _extract_tool_input(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -792,7 +925,7 @@ def _invoke_json_uncached(
     the legacy text path). Wrapped by invoke_json, which layers optional
     deterministic-response caching on top."""
     # Structured path: the model is forced to call the tool, so we read the
-    # validated object straight from the tool_use block.
+    # structured object straight from the tool_use block (required keys checked below).
     if schema is not None:
         from dast.ai import providers  # local import: avoids a module-level cycle
         try:
@@ -817,16 +950,19 @@ def _invoke_json_uncached(
             raise
         tool_input = _extract_tool_input(result)
         if tool_input is not None:
-            return tool_input
+            return _require_fields(tool_input, schema)
         # Model returned text despite tool_choice. This is common with local
         # OpenAI-compatible servers (Ollama, LM Studio, llama.cpp, vLLM) that
         # don't honor forced function calling. Parse the text as JSON, repairing
-        # once so the caller gets a dict rather than an uncaught JSONDecodeError.
+        # once so the caller gets a dict rather than an uncaught JSONDecodeError,
+        # then coerce it like a tool_use input (unwrap a call written as text,
+        # enforce required keys).
         logger.warning("Structured output requested but no tool_use block returned; parsing text")
-        return _parse_json_or_repair(
+        parsed = _parse_json_or_repair(
             raw=_extract_text_safe(result), system=system, user=user, model_id=model_id,
             max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
         )
+        return _coerce_structured(parsed, schema)
 
     # Legacy path: instruct JSON, parse text, repair once on failure.
     if "json" not in system.lower():

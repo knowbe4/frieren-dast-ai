@@ -75,6 +75,7 @@ class AgentFinding:
     # for SQLi). Keys are free-form; presence means the injection was exploited,
     # not merely detected. Rendered as concrete proof in the dashboard.
     extracted_data: Dict[str, str] = field(default_factory=dict)
+    confidence: Optional[float] = None  # red-team final confidence (None = not validated)
 
 
 class VulnAgent(ABC):

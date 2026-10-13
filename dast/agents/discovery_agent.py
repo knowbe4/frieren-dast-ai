@@ -14,6 +14,7 @@ from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_detection_payloads
 from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_query, _send
+from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST, is_redirect_to_canary
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -36,7 +37,7 @@ def _ssti_hit(payload: str, expected: str, response_text: str) -> bool:
     if payload in response_text:
         return False  # payload echoed back unchanged — not evaluated
     # The expected value must be surrounded by non-digit, non-hex-letter, non-hyphen chars
-    # so "79014691" doesn't fire on "7901469100" or inside a UUID segment.
+    # so "79032091" doesn't fire on "7903209100" or inside a UUID segment.
     return bool(re.search(r'(?<![0-9a-fA-F\-])' + re.escape(expected) + r'(?![0-9a-fA-F\-])', response_text))
 
 
@@ -165,7 +166,7 @@ class DiscoveryAgent(VulnAgent):
                     "SSTI mutator", param=param["name"], action=mutation.action,
                     rationale=mutation.rationale,
                 )
-                payloads_to_try.append({"payload": mutation.payload, "expected": "79014691"})
+                payloads_to_try.append({"payload": mutation.payload, "expected": "79032091"})
 
         return None
 
@@ -174,9 +175,9 @@ class DiscoveryAgent(VulnAgent):
     ) -> List[AgentFinding]:
         findings = []
         redirect_payloads = [
-            "https://evil.example.com",
-            "//evil.example.com",
-            "/\\evil.example.com",
+            f"https://{OPEN_REDIRECT_CANARY_HOST}",
+            f"//{OPEN_REDIRECT_CANARY_HOST}",
+            f"/\\{OPEN_REDIRECT_CANARY_HOST}",
         ]
         for param in target.params:
             if not any(kw in param["name"].lower() for kw in _REDIRECT_URL_KEYWORDS):
@@ -188,7 +189,9 @@ class DiscoveryAgent(VulnAgent):
                 resp = await _send(client, target.method, url, target.headers, target.body)
                 if resp and resp.status_code in (301, 302, 303, 307, 308):
                     loc = resp.headers.get("location", "")
-                    if "evil.example.com" in loc:
+                    # Parse the destination host — a substring match fired on
+                    # same-site redirects like /login?next=https://canary.
+                    if is_redirect_to_canary(loc):
                         raw_request, raw_response = _fmt_http_pair(resp)
                         findings.append(AgentFinding(
                             title="Open Redirect",

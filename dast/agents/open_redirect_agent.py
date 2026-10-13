@@ -15,6 +15,7 @@ import re
 from typing import TYPE_CHECKING, List, Optional
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
+from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST
 from dast.ai.coordinator import Coordinator
 from dast.proxy.plugin_manager import log_event
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
@@ -37,7 +38,7 @@ _REDIRECT_CANARIES = [
     "https://dast-redirect-canary.invalid%2F@legit.example.com",
 ]
 
-_CANARY_HOST = "dast-redirect-canary.invalid"
+_CANARY_HOST = OPEN_REDIRECT_CANARY_HOST
 
 # Param name patterns that commonly carry redirect destinations
 _REDIRECT_PARAM_RE = re.compile(

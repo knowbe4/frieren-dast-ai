@@ -63,7 +63,7 @@ function decoderInit() {
         `<div style="padding:9px 14px 3px;font-size:9px;font-weight:600;color:var(--txt2);` +
              `text-transform:uppercase;letter-spacing:.5px">${g.name}</div>` +
         g.ops.map(op =>
-          `<div class="dec-op" id="dec-op-${op.id}" onclick="decoderPick('${op.id}')">${op.label}</div>`
+          `<div class="dec-op" id="dec-op-${op.id}" onclick="decoderPick(${jsArg(op.id)})">${op.label}</div>`
         ).join('') +
       `</div>`
     ).join('');

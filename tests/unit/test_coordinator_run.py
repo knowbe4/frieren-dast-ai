@@ -571,3 +571,60 @@ class TestAdaptiveBudget:
         params = [{"name": f"p{i}", "location": "query", "value": "1"} for i in range(5)]
         target = _target(method="POST", params=params)
         assert Coordinator._adaptive_budget(target, None) == 150.0
+
+
+class TestEffectiveBudget:
+    def test_cloud_provider_keeps_adaptive_budget(self, monkeypatch):
+        from dast.ai import bedrock_client
+        monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: False)
+        assert Coordinator._effective_budget(_target(), None) == 150.0
+
+    def test_local_provider_stretches_budget_up_to_operator_ceiling(self, monkeypatch):
+        # A local model needs far longer per call; 150s * 4 = 600s, within 900s.
+        from dast.ai import bedrock_client
+        monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: True)
+        assert Coordinator._effective_budget(_target(), None, budget_ceiling=900.0) == 600.0
+
+    def test_local_provider_still_capped_by_default_ceiling(self, monkeypatch):
+        from dast.ai import bedrock_client
+        monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: True)
+        assert Coordinator._effective_budget(_target(), None) == Coordinator.SCAN_BUDGET_SECONDS
+
+    def test_operator_ceiling_caps_the_adaptive_budget(self, monkeypatch):
+        # The "Scan Budget per Endpoint" setting is a hard ceiling for every scan.
+        from dast.ai import bedrock_client
+        monkeypatch.setattr(bedrock_client, "is_local_provider", lambda: False)
+        assert Coordinator._effective_budget(_target(), None, budget_ceiling=60.0) == 60.0
+
+
+# ── budget timeout keeps confirmed findings ───────────────────────────────
+
+@pytest.mark.asyncio
+async def test_budget_timeout_keeps_deterministic_findings_from_finished_agents():
+    fast_finding = _finding(bypass_validation=True, attack_type="_timeout_fast")
+
+    class _FastAgent(VulnAgent):
+        name = "Fast"
+        attack_type = "_timeout_fast"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return [fast_finding]
+
+    class _SlowAgent(VulnAgent):
+        name = "Slow"
+        attack_type = "_timeout_slow"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            await asyncio.sleep(10)
+            return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_FastAgent)
+        Coordinator.register(_SlowAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(
+                return_value=(["_timeout_fast", "_timeout_slow"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            result = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.5)
+
+    assert result == [fast_finding]

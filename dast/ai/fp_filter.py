@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Optional
 
+from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -140,7 +141,7 @@ def _fp_lfi_no_content(finding: "AgentFinding", target: "CheckTarget") -> Option
     if not snippet:
         return None
     # If neither Linux passwd nor Windows ini markers are present, it's not confirmed
-    if not re.search(r"root:.*:0:0:|\\[fonts\\]|\[boot loader\]", snippet):
+    if not re.search(r"root:.*:0:0:|\[fonts\]|\[boot loader\]", snippet):
         return "LFI pattern matched but no file content markers found in response"
     return None
 
@@ -150,8 +151,8 @@ def _fp_open_redirect_same_domain(finding: "AgentFinding", target: "CheckTarget"
     if finding.attack_type != "open_redirect":
         return None
     evidence = (getattr(finding, "evidence", "") or "").lower()
-    # If the redirect location doesn't contain evil.example.com, it's not our probe
-    if "evil.example.com" not in evidence:
+    # If the redirect location doesn't name our canary host, it's not our probe
+    if OPEN_REDIRECT_CANARY_HOST not in evidence:
         return "Redirect target is not the external probe domain — not an open redirect"
     return None
 

@@ -28,10 +28,10 @@ from pathlib import Path
 # AWS documentation placeholder account id — allowed to appear (it is not real).
 PLACEHOLDER_ACCOUNT_ID = "123456789012"
 # Known non-secret example access keys — allowed to appear anywhere:
-#   - AWS-published documentation example key
+#   - AWS-published documentation example keys (long-term and temporary)
 #   - the sample STS key baked into the passive scanner's own detection regex
 EXAMPLE_ACCESS_KEYS = frozenset(
-    {"AKIAIOSFODNN7EXAMPLE", "ASIAZNBXTZ5JFYWWQKW4"}
+    {"AKIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE", "ASIAZNBXTZ5JFYWWQKW4"}
 )
 
 # Files that exist only to hold scanner fixtures / placeholders / generated
@@ -43,6 +43,7 @@ CONTENT_ALLOWLIST: tuple[str, ...] = (
     "tests/unit/test_passive_scanner.py",
     "tests/unit/test_passive_rules_extended.py",
     "tests/unit/test_agent_logic.py",
+    "tests/unit/test_js_secret_scanner.py",
     "dast/vuln_knowledge/sensitive_data.yaml",
     "desktop/package-lock.json",
 )

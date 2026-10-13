@@ -42,6 +42,9 @@ regexes = [
   # AWS-published documentation example credentials (safe, non-secret)
   '''AKIAIOSFODNN7EXAMPLE''',
   '''wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY''',
+  '''ASIAIOSFODNN7EXAMPLE''',
+  # GitHub-published documentation example PAT (safe, non-secret)
+  '''ghp_16C7e42F292c6912E7710c838347Ae178B4a''',
   # Sample STS key inside the passive scanner's own detection regex/comment
   '''ASIAZNBXTZ5JFYWWQKW4''',
   # AWS documentation placeholder account id used in default ARNs
@@ -58,6 +61,7 @@ paths = [
   '''tests/unit/test_passive_scanner\.py''',
   '''tests/unit/test_passive_rules_extended\.py''',
   '''tests/unit/test_agent_logic\.py''',
+  '''tests/unit/test_js_secret_scanner\.py''',
   '''dast/vuln_knowledge/sensitive_data\.yaml''',
   # npm integrity hashes (sha512-...), not secrets
   '''desktop/package-lock\.json''',

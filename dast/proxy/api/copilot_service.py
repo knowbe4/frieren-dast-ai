@@ -975,46 +975,88 @@ class CopilotService:
             return nudge
         return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
 
-    async def _seed_complete_explore(self, sid: str, session: dict) -> None:
-        """Drive the exhaustive SPA explorer over each focus host before the first
-        LLM turn of a complete run, draining the UI-route frontier. Breadth is thus
-        guaranteed (not left to LLM discretion); the LLM turns then focus on depth.
-        Best-effort and stop-aware — a crawl failure never aborts the run."""
+    async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
+        """Drive breadth deterministically in complete mode so it is never left to
+        LLM discretion: per focus host, EXPLORE the SPA to drain the UI frontier,
+        then (active runs only) CONTENT-DISCOVER, SCAN every observed endpoint to
+        exhaustion, and INTROSPECT+SWEEP (or FUZZ captured ops when introspection is
+        disabled) every GraphQL endpoint. The LLM turns that follow focus on depth.
+        Best-effort and stop-aware — any tool failure is logged, never fatal."""
+        from dast.plugins.graphql_analyzer import _is_graphql
         from dast.tools import run_tool
 
         auto = session["autonomous"]
         hosts = auto.get("hosts") or []
         if not hosts:
             return
+        read_only = bool(auto.get("read_only"))
+        submit_forms = bool(auto.get("submit_forms"))
         stop_event: asyncio.Event = auto["stop_event"]
         ctx = self._build_tool_ctx(session)
-        submit_forms = bool(auto.get("submit_forms"))
+
+        async def _call(tool: str, args: dict) -> dict:
+            try:
+                result = await run_tool(ctx, tool, args)
+                return result if isinstance(result, dict) else {}
+            except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                logger.warning("complete-mode sweep tool failed", session_id=sid,
+                               tool=tool, error=str(exc))
+                return {}
+
+        async def _loop_until_zero(tool: str, args: dict, key: str, passes: int = 12) -> None:
+            prev = -1
+            for _ in range(passes):
+                if stop_event.is_set():
+                    return
+                result = await _call(tool, args)
+                remaining = int(result.get(key, 0) or 0)
+                if remaining == 0 or remaining == prev:
+                    return
+                prev = remaining
+
         for host in hosts:
             if stop_event.is_set():
                 return
             seed = f"https://{host}/"
-            # Re-run explore until the frontier stops shrinking (resumable; each call
-            # drains a batch). Capped so a self-regenerating frontier can't loop here
-            # forever — the main loop + operator stop are the outer bounds.
-            prev_remaining = -1
+
+            # 1) Exhaustive SPA exploration — drain the UI-route frontier.
+            prev_frontier = -1
             for _pass in range(10):
                 if stop_event.is_set():
                     return
-                try:
-                    result = await run_tool(ctx, "explore", {"url": seed, "submit_forms": submit_forms})
-                except Exception as exc:  # noqa: BLE001 — never crash the run on explore
-                    logger.warning("complete-mode seed explore failed", session_id=sid,
-                                   host=host, error=str(exc))
-                    break
-                remaining = int(result.get("frontier_remaining", 0)) if isinstance(result, dict) else 0
+                result = await _call("explore", {"url": seed, "submit_forms": submit_forms})
+                remaining = int(result.get("frontier_remaining", 0) or 0)
                 await self._broadcast_autonomous(sid, "explore_progress", {
-                    "host": host,
-                    "routes_visited": result.get("routes_visited") if isinstance(result, dict) else None,
+                    "host": host, "routes_visited": result.get("routes_visited"),
                     "frontier_remaining": remaining,
                 })
-                if remaining == 0 or remaining == prev_remaining:
+                if remaining == 0 or remaining == prev_frontier:
                     break
-                prev_remaining = remaining
+                prev_frontier = remaining
+
+            if read_only:
+                continue  # active tools below are blocked in read-only
+
+            # 2) Content discovery widens the REST surface with unlinked paths.
+            await _call("content_discovery", {"url": seed})
+            # 3) Scan every observed-but-unscanned endpoint to exhaustion.
+            await _loop_until_zero("scan_surface", {}, "remaining")
+            # 4) GraphQL: introspect+sweep, or fuzz captured ops when introspection is off.
+            gql_urls = set()
+            try:
+                for entry in (self._ctx.store.in_scope_entries() if self._ctx.store else []):
+                    if _is_graphql(entry) and (getattr(entry, "host", "") or "").split(":")[0] == host:
+                        gql_urls.add(entry.url)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("complete-mode sweep: graphql enumeration failed", error=str(exc))
+            for gql_url in gql_urls:
+                if stop_event.is_set():
+                    return
+                intro = await _call("graphql_introspect", {"url": gql_url})
+                if intro.get("ok"):
+                    await _loop_until_zero("graphql_sweep", {"url": gql_url}, "operations_remaining")
+                else:
+                    await _loop_until_zero("graphql_fuzz", {"url": gql_url}, "operations_remaining")
 
     async def _drive_autonomous(self, sid: str) -> None:
         """The cross-turn autonomy loop: self-continue turns commanding the arsenal
@@ -1035,7 +1077,7 @@ class CopilotService:
         # path where an early self-declared 'complete' is honored because nothing
         # was mapped yet. Best-effort; never blocks the run on a crawl failure.
         if mode == "complete" and not auto.get("initial_explore_done"):
-            await self._seed_complete_explore(sid, session)
+            await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
@@ -1175,10 +1217,16 @@ class CopilotService:
                         await self._broadcast_autonomous(sid, "coverage_gate", {
                             "rest_untested": len(coverage["rest_untested"]),
                             "gql_untested": len(coverage["gql_untested"]),
+                            "ui_frontier": len(coverage["ui_frontier"]),
                             "rejection": auto["complete_rejections"],
                         })
+                        # Complete mode closes gaps deterministically rather than
+                        # relying on the LLM to do breadth: drain the frontier, scan
+                        # every endpoint, fuzz/sweep GraphQL. Then re-prompt for depth.
+                        if mode == "complete":
+                            await self._deterministic_recon_scan_sweep(sid, session)
                         prompt = _AUTONOMOUS_COVERAGE_GATE.format(
-                            coverage=self._coverage_block(coverage),
+                            coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
                             budget=self._budget_label(auto, cfg, deadline),
                         )
                         continue
@@ -1267,12 +1315,14 @@ class CopilotService:
         ``complete`` is True only when a surface exists AND nothing on it is untested —
         so 'nothing mapped yet' does not read as 'fully covered'. Best-effort: any error
         degrades to an empty (incomplete) coverage rather than crashing the run."""
+        from dast.plugins.graphql_analyzer import _is_graphql
         from dast.proxy.session_store import normalise_endpoint_path
         from dast.proxy.ui_route_graph import normalise_route_key
 
         cov: Dict[str, object] = {
             "rest_total": 0, "rest_tested": 0, "rest_untested": [],
             "gql_total": 0, "gql_tested": 0, "gql_untested": [],
+            "gql_captured_total": 0, "gql_captured_tested": 0, "gql_captured_untested": [],
             "ui_total": 0, "ui_visited": 0, "ui_frontier": [],
             "has_surface": False, "complete": False,
         }
@@ -1296,6 +1346,10 @@ class CopilotService:
             if method in ("CONNECT", "OPTIONS", "HEAD"):
                 continue
             if getattr(entry, "source", "") in ("agent", "scanner", "scan", "out-of-scope"):
+                continue
+            # GraphQL endpoints are covered by the GraphQL dimensions (sweep/fuzz),
+            # not by scan_surface — don't double-count them as untested REST.
+            if _is_graphql(entry):
                 continue
             host = (getattr(entry, "host", "") or "").split(":")[0]
             if focus and host not in focus:
@@ -1327,6 +1381,42 @@ class CopilotService:
                     else:
                         cov["gql_untested"].append(f"{kind} {field_name}")
 
+        # ── Captured-GraphQL surface (schema-free; prod introspection disabled) ──
+        # Distinct GraphQL operations observed in traffic, tested once graphql_fuzz
+        # records "fuzz:<op>". This is the coverage dimension for endpoints where
+        # introspection is off (so gql_total above stays 0).
+        try:
+            from dast.plugins.graphql_analyzer import _is_graphql
+            from dast.tools.graphql_fuzz_tools import _op_key
+            import json as _json
+            captured: Dict[str, set] = {}
+            for entry in entries:
+                if not _is_graphql(entry):
+                    continue
+                host = (getattr(entry, "host", "") or "").split(":")[0]
+                if focus and host not in focus:
+                    continue
+                raw = getattr(entry, "request_body", None)
+                if not raw:
+                    continue
+                parsed = _json.loads(raw[:200000].decode("utf-8", errors="replace"))
+                for item in (parsed if isinstance(parsed, list) else [parsed]):
+                    if not isinstance(item, dict) or not isinstance(item.get("query"), str):
+                        continue
+                    if not (item.get("variables") or {}):
+                        continue
+                    captured.setdefault(entry.url, set()).add(_op_key(item))
+            for endpoint, keys in captured.items():
+                done = tested_ops.get(endpoint) or set()
+                for key in keys:
+                    cov["gql_captured_total"] += 1
+                    if f"fuzz:{key}" in done:
+                        cov["gql_captured_tested"] += 1
+                    else:
+                        cov["gql_captured_untested"].append(key)
+        except Exception as exc:  # noqa: BLE001 — coverage is best-effort
+            logger.debug("coverage: captured-graphql enumeration failed", error=str(exc))
+
         # ── UI-route surface (SPA exploration frontier) ─────────────────────────
         graph = getattr(store, "ui_route_graph", None)
         if graph is not None:
@@ -1343,10 +1433,11 @@ class CopilotService:
             except Exception as exc:  # noqa: BLE001 — coverage is best-effort
                 logger.debug("coverage: ui enumeration failed", error=str(exc))
 
-        cov["has_surface"] = cov["rest_total"] > 0 or cov["gql_total"] > 0 or cov["ui_total"] > 0
+        cov["has_surface"] = (cov["rest_total"] > 0 or cov["gql_total"] > 0
+                              or cov["gql_captured_total"] > 0 or cov["ui_total"] > 0)
         cov["complete"] = bool(
             cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
-            and not cov["ui_frontier"]
+            and not cov["gql_captured_untested"] and not cov["ui_frontier"]
         )
         return cov
 
@@ -1385,6 +1476,14 @@ class CopilotService:
                 f"- {len(gql_untested)} GraphQL operation(s) untested. Run graphql_sweep on the "
                 f"endpoint (covers every query/mutation) until operations_remaining is 0. Examples: "
                 + wrap_untrusted(", ".join(gql_untested[:8]), "untested_gql_operations")
+            )
+        gql_captured_untested = cov.get("gql_captured_untested") or []
+        if gql_captured_untested:
+            lines.append(
+                f"- {len(gql_captured_untested)} captured GraphQL operation(s) not yet fuzzed "
+                f"(introspection disabled). Run graphql_fuzz on the endpoint until "
+                f"operations_remaining is 0. Examples: "
+                + wrap_untrusted(", ".join(gql_captured_untested[:8]), "unfuzzed_gql_operations")
             )
         ui_frontier = cov.get("ui_frontier") or []
         if ui_frontier:

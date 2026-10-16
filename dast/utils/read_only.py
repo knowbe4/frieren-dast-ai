@@ -34,6 +34,7 @@ BLOCKED_TOOLS = frozenset({
     "param_mining",
     "content_discovery",
     "validate_chain",
+    "graphql_fuzz",
 })
 
 _ACTION_LABEL = re.compile(

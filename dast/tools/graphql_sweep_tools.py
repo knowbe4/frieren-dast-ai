@@ -196,7 +196,9 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     schema = store.graphql_schemas.get(url)
     if not schema or not schema.get("introspected"):
         return {"ok": False,
-                "error": "no introspected schema for this endpoint — run graphql_introspect first",
+                "fallback": "graphql_fuzz",
+                "error": "no introspected schema for this endpoint (introspection may be disabled) "
+                         "— use graphql_fuzz to test the operations captured in traffic instead",
                 "url": url}
 
     kinds = _normalise_kinds(args.get("kinds"))

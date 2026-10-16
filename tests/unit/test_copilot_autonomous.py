@@ -498,3 +498,74 @@ async def test_app_context_leads_are_injected_into_start_and_continue_prompts():
     prompts = [c.args[0] for c in session["engine"].send.await_args_list]
     assert "HIGH: BOLA on /users/{id}" in prompts[0]      # start prompt carries leads
     assert "HIGH: BOLA on /users/{id}" in prompts[1]      # continuation carries them too
+
+
+# ── complete-mode: UI-route coverage dimension ───────────────────────────────
+
+from dast.proxy.ui_route_graph import UiRouteGraph, normalise_route_key  # noqa: E402
+
+
+class _UiStore(_FakeStore):
+    """FakeStore that also carries a real UI-route graph (and no GraphQL)."""
+
+    def __init__(self, entries=None, cookies=None):
+        super().__init__(entries, cookies)
+        self.ui_route_graph = UiRouteGraph()
+
+
+def test_surface_coverage_incomplete_while_ui_frontier_nonempty():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["has_surface"] is True          # a discovered route is surface
+    assert cov["ui_total"] == 1 and cov["ui_visited"] == 0
+    assert cov["ui_frontier"]                   # non-empty
+    assert cov["complete"] is False             # frontier not drained
+
+
+def test_surface_coverage_complete_when_frontier_drained():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    store.ui_route_graph.mark_visited(normalise_route_key("https://app.example.com/dashboard"))
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["ui_total"] == 1 and cov["ui_visited"] == 1
+    assert cov["ui_frontier"] == []
+    assert cov["complete"] is True              # no REST/GQL/UI gaps
+
+
+def test_progress_snapshot_advances_on_ui_discovery():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    before = service._progress_snapshot()
+    store.ui_route_graph.add_discovered("https://app.example.com/new-route")
+    after = service._progress_snapshot()
+    assert len(after) == 4
+    assert after != before                      # discovery alone counts as progress
+
+
+@pytest.mark.asyncio
+async def test_complete_mode_defaults_raise_budget_and_record_mode():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    # Avoid the up-front explore + driver doing real work: no hosts, and stop fast.
+    sid = service.run_autonomous("map everything", focus_hosts=[], mode="complete",
+                                 submit_forms=True, read_only=True, auto_ai_mode=False)
+    auto = service._sessions[sid]["autonomous"]
+    assert auto["mode"] == "complete"
+    # submit_forms is forced off under read_only.
+    assert auto["submit_forms"] is False
+    assert auto["config"]["max_tool_calls"] == 2000
+    assert auto["config"]["max_wall_clock_seconds"] == 86400
+    service.stop_autonomous(sid)
+
+
+@pytest.mark.asyncio
+async def test_complete_mode_submit_forms_kept_when_active():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("pentest", focus_hosts=[], mode="complete",
+                                 submit_forms=True, read_only=False, auto_ai_mode=False)
+    assert service._sessions[sid]["autonomous"]["submit_forms"] is True
+    service.stop_autonomous(sid)

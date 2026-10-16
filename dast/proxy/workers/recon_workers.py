@@ -36,19 +36,34 @@ async def run_crawl_worker(runner: "ProxyRunner", crawl_queue: asyncio.Queue) ->
         _active_stop = stop_event
         log_cb = job.get("log_cb") or (lambda m: None)
         target_url = job.get("url", "")
-        log_event("crawler", "info", "Crawl started", url=target_url, source="crawler")
+        exhaustive = job.get("mode") == "exhaustive"
+        log_event("crawler", "info", "Exhaustive explore started" if exhaustive else "Crawl started",
+                  url=target_url, source="crawler")
 
-        crawler = SpaCrawler(runner._store, log_cb, stop_event, proxy_port=runner._proxy_port)
         try:
-            await crawler.run(
-                target_url=target_url,
-                auth_cookies=job.get("cookies"),
-                max_clicks=job.get("max_clicks", 200),
-                headless=job.get("headless", True),
-                extra_seeds=job.get("extra_seeds"),
-                read_only=bool(job.get("read_only", False)),
-            )
-            log_event("crawler", "info", "Crawl finished", url=target_url, source="crawler")
+            if exhaustive:
+                from dast.proxy.spa_explorer import SpaExplorer
+                explorer = SpaExplorer(runner._store, log_cb, stop_event, proxy_port=runner._proxy_port)
+                await explorer.run(
+                    target_url=target_url,
+                    read_only=bool(job.get("read_only", False)),
+                    submit_forms=bool(job.get("submit_forms", False)),
+                    session_safe=bool(job.get("session_safe", False)),
+                    headless=job.get("headless", True),
+                    max_routes=job.get("max_routes"),
+                )
+            else:
+                crawler = SpaCrawler(runner._store, log_cb, stop_event, proxy_port=runner._proxy_port)
+                await crawler.run(
+                    target_url=target_url,
+                    auth_cookies=job.get("cookies"),
+                    max_clicks=job.get("max_clicks", 200),
+                    headless=job.get("headless", True),
+                    extra_seeds=job.get("extra_seeds"),
+                    read_only=bool(job.get("read_only", False)),
+                )
+            log_event("crawler", "info", "Explore finished" if exhaustive else "Crawl finished",
+                      url=target_url, source="crawler")
         except Exception as e:
             log_cb(f"Crawler error: {e}")
             logger.error("Crawl failed", url=target_url, error=str(e))

@@ -562,6 +562,8 @@ class CopilotService:
         auto_ai_mode: bool = True,
         session_safe: bool = False,
         read_only: bool = False,
+        mode: str = "bounded",
+        submit_forms: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -570,16 +572,29 @@ class CopilotService:
         auto-scan of everything crawled, then spawns the cross-turn driver as the
         session task. Returns the session id. Raises ``ValueError`` on a missing
         objective and re-raises ``RuntimeError`` if no event loop is running.
+
+        ``mode="complete"`` runs an exhaustive test: it will not self-terminate
+        while UI routes or surface remain untested — only the operator, the
+        wall-clock, or genuine exhaustion ends it. ``submit_forms`` lets the SPA
+        explorer fill and submit forms (active runs only) to reach wizard steps.
         """
         objective = (objective or "").strip()
         if not objective:
             raise ValueError("objective is required")
         hosts = [h.strip().lower() for h in (focus_hosts or []) if h and h.strip()]
+        mode = mode if mode in ("bounded", "complete") else "bounded"
 
         sid = self.new_session(focus_hosts=hosts)
         session = self._sessions[sid]
         session["origin"] = "autonomous"
         cfg = _normalise_budget(budget)
+        # Complete mode: unless the caller set explicit bounds, run on a long leash
+        # so breadth isn't cut short — the operator stops it. (Clamp ceilings from
+        # _normalise_budget still apply.)
+        if mode == "complete" and not budget:
+            cfg["max_wall_clock_seconds"] = 86400
+            cfg["max_tool_calls"] = 2000
+            cfg["max_stuck_turns"] = 50
         pause_gate = asyncio.Event()
         pause_gate.set()  # set = running; cleared = paused
         session["autonomous"] = {
@@ -589,6 +604,9 @@ class CopilotService:
             "profile": profile_slug or None,
             "session_safe": session_safe,
             "read_only": read_only,
+            "mode": mode,
+            "submit_forms": bool(submit_forms) and not read_only,
+            "initial_explore_done": False,
             "stop_event": asyncio.Event(),
             "pause_gate": pause_gate,
             "paused_at": None,
@@ -832,26 +850,30 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: engine session seed failed", error=str(exc))
 
-    def _progress_snapshot(self) -> Tuple[int, int, int]:
-        """A monotonic (findings, in-scope endpoints, coverage units) tuple used by the
-        stuck detector: no change across ``max_stuck_turns`` turns means no progress.
-        Coverage units count scanned endpoints + swept GraphQL operations so that
-        breadth work (scan_surface / graphql_sweep), which need not add a finding, still
-        registers as progress and never trips the stuck detector."""
+    def _progress_snapshot(self) -> Tuple[int, int, int, int]:
+        """A monotonic (findings, in-scope endpoints, coverage units, ui units) tuple
+        used by the stuck detector: no change across ``max_stuck_turns`` turns means no
+        progress. Coverage units count scanned endpoints + swept GraphQL operations so
+        breadth work (scan_surface / graphql_sweep) registers as progress; ui units count
+        discovered + visited UI routes so SPA exploration (discovering or visiting a
+        route) also counts and never trips the stuck detector."""
         store = self._ctx.store
         if store is None:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         try:
             entries = store.in_scope_entries()
         except Exception:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         findings = sum(len(getattr(entry, "findings", None) or []) for entry in entries)
         scanned = sum(1 for entry in entries if getattr(entry, "scan_result", None))
         swept_ops = sum(
             len(ops or ())
             for ops in (getattr(store, "graphql_tested_ops", None) or {}).values()
         )
-        return (findings, len(entries), scanned + swept_ops)
+        graph = getattr(store, "ui_route_graph", None)
+        ui_stats = graph.stats() if graph is not None else {"visited": 0, "frontier": 0}
+        ui_units = ui_stats["visited"] + ui_stats["frontier"]
+        return (findings, len(entries), scanned + swept_ops, ui_units)
 
     async def _broadcast_autonomous(self, sid: str, event: str,
                                     extra: Optional[dict] = None) -> None:
@@ -953,6 +975,47 @@ class CopilotService:
             return nudge
         return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
 
+    async def _seed_complete_explore(self, sid: str, session: dict) -> None:
+        """Drive the exhaustive SPA explorer over each focus host before the first
+        LLM turn of a complete run, draining the UI-route frontier. Breadth is thus
+        guaranteed (not left to LLM discretion); the LLM turns then focus on depth.
+        Best-effort and stop-aware — a crawl failure never aborts the run."""
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        hosts = auto.get("hosts") or []
+        if not hosts:
+            return
+        stop_event: asyncio.Event = auto["stop_event"]
+        ctx = self._build_tool_ctx(session)
+        submit_forms = bool(auto.get("submit_forms"))
+        for host in hosts:
+            if stop_event.is_set():
+                return
+            seed = f"https://{host}/"
+            # Re-run explore until the frontier stops shrinking (resumable; each call
+            # drains a batch). Capped so a self-regenerating frontier can't loop here
+            # forever — the main loop + operator stop are the outer bounds.
+            prev_remaining = -1
+            for _pass in range(10):
+                if stop_event.is_set():
+                    return
+                try:
+                    result = await run_tool(ctx, "explore", {"url": seed, "submit_forms": submit_forms})
+                except Exception as exc:  # noqa: BLE001 — never crash the run on explore
+                    logger.warning("complete-mode seed explore failed", session_id=sid,
+                                   host=host, error=str(exc))
+                    break
+                remaining = int(result.get("frontier_remaining", 0)) if isinstance(result, dict) else 0
+                await self._broadcast_autonomous(sid, "explore_progress", {
+                    "host": host,
+                    "routes_visited": result.get("routes_visited") if isinstance(result, dict) else None,
+                    "frontier_remaining": remaining,
+                })
+                if remaining == 0 or remaining == prev_remaining:
+                    break
+                prev_remaining = remaining
+
     async def _drive_autonomous(self, sid: str) -> None:
         """The cross-turn autonomy loop: self-continue turns commanding the arsenal
         until a stop condition trips. A plain reply is a checkpoint, not a stop."""
@@ -965,6 +1028,15 @@ class CopilotService:
 
         on_event = self._make_counting_on_event(sid, session, auto)
         wait_for_human = self._make_autonomous_wait(sid, session)
+        mode = auto.get("mode", "bounded")
+
+        # Complete mode: force an exhaustive explore of each focus host up front so
+        # the UI-route frontier is seeded and has_surface is True — this closes the
+        # path where an early self-declared 'complete' is honored because nothing
+        # was mapped yet. Best-effort; never blocks the run on a crawl failure.
+        if mode == "complete" and not auto.get("initial_explore_done"):
+            await self._seed_complete_explore(sid, session)
+            auto["initial_explore_done"] = True
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
@@ -1012,7 +1084,9 @@ class CopilotService:
                     await self._broadcast_autonomous(sid, "finished",
                                                      {"status": "tool_budget"})
                     return
-                if stuck_turns >= cfg["max_stuck_turns"]:
+                # Complete mode never stops on 'stuck' — only the operator, the
+                # wall-clock, or genuine exhaustion ends it. Bounded mode is unchanged.
+                if mode != "complete" and stuck_turns >= cfg["max_stuck_turns"]:
                     self._finish_autonomous(session, "stopped",
                                             f"no progress for {stuck_turns} turns")
                     await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
@@ -1074,14 +1148,23 @@ class CopilotService:
                     # pushes discovery), and a fully-tested surface is genuinely done.
                     # In read-only mode scan_surface/graphql_sweep are disabled, so a
                     # scan-based coverage gap can never be closed — don't bounce 'complete'.
-                    surface_incomplete = (coverage["has_surface"] and not coverage["complete"]
-                                          and not auto.get("read_only"))
+                    # In complete mode, ANY gap (unscanned REST, unswept GraphQL, or an
+                    # unexplored UI route in the frontier) blocks 'complete' — so the run
+                    # keeps exploring/scanning until the whole surface is covered. In
+                    # bounded mode, a gap only counts when a surface was mapped (nothing
+                    # mapped = nothing to force). Read-only can't close scan gaps, so it
+                    # never bounces for them (the explorer still drains the UI frontier).
+                    if mode == "complete":
+                        surface_incomplete = not coverage["complete"] and not auto.get("read_only")
+                    else:
+                        surface_incomplete = (coverage["has_surface"] and not coverage["complete"]
+                                              and not auto.get("read_only"))
                     # Coverage gate: refuse a premature 'complete' while known surface is
-                    # not fully tested and there is budget + rejection headroom to keep
-                    # going. This is what stops the run eyeballing a few operations and
-                    # declaring done — it must sweep every op and scan every endpoint.
-                    if (surface_incomplete and budget_left
-                            and auto["complete_rejections"] < _MAX_COMPLETE_REJECTIONS):
+                    # not fully tested and there is budget headroom. In complete mode the
+                    # rejection cap does not apply — the operator decides when to stop.
+                    rejection_headroom = (mode == "complete"
+                                          or auto["complete_rejections"] < _MAX_COMPLETE_REJECTIONS)
+                    if surface_incomplete and budget_left and rejection_headroom:
                         auto["complete_rejections"] += 1
                         logger.info(
                             "autonomous run: coverage gate rejected premature complete",
@@ -1185,10 +1268,12 @@ class CopilotService:
         so 'nothing mapped yet' does not read as 'fully covered'. Best-effort: any error
         degrades to an empty (incomplete) coverage rather than crashing the run."""
         from dast.proxy.session_store import normalise_endpoint_path
+        from dast.proxy.ui_route_graph import normalise_route_key
 
         cov: Dict[str, object] = {
             "rest_total": 0, "rest_tested": 0, "rest_untested": [],
             "gql_total": 0, "gql_tested": 0, "gql_untested": [],
+            "ui_total": 0, "ui_visited": 0, "ui_frontier": [],
             "has_surface": False, "complete": False,
         }
         store = self._ctx.store
@@ -1242,9 +1327,26 @@ class CopilotService:
                     else:
                         cov["gql_untested"].append(f"{kind} {field_name}")
 
-        cov["has_surface"] = cov["rest_total"] > 0 or cov["gql_total"] > 0
+        # ── UI-route surface (SPA exploration frontier) ─────────────────────────
+        graph = getattr(store, "ui_route_graph", None)
+        if graph is not None:
+            try:
+                for route in graph.visited() + graph.frontier():
+                    host = normalise_route_key(route.url).split("/")[0].split(":")[0]
+                    if focus and host not in focus:
+                        continue
+                    cov["ui_total"] += 1
+                    if route.state == "visited":
+                        cov["ui_visited"] += 1
+                    else:
+                        cov["ui_frontier"].append(route.url)
+            except Exception as exc:  # noqa: BLE001 — coverage is best-effort
+                logger.debug("coverage: ui enumeration failed", error=str(exc))
+
+        cov["has_surface"] = cov["rest_total"] > 0 or cov["gql_total"] > 0 or cov["ui_total"] > 0
         cov["complete"] = bool(
             cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
+            and not cov["ui_frontier"]
         )
         return cov
 
@@ -1283,5 +1385,12 @@ class CopilotService:
                 f"- {len(gql_untested)} GraphQL operation(s) untested. Run graphql_sweep on the "
                 f"endpoint (covers every query/mutation) until operations_remaining is 0. Examples: "
                 + wrap_untrusted(", ".join(gql_untested[:8]), "untested_gql_operations")
+            )
+        ui_frontier = cov.get("ui_frontier") or []
+        if ui_frontier:
+            lines.append(
+                f"- {len(ui_frontier)} UI route(s) discovered but not yet explored. Run `explore` "
+                f"on the app until frontier_remaining is 0 to reach every section. Examples: "
+                + wrap_untrusted(", ".join(ui_frontier[:8]), "unexplored_ui_routes")
             )
         return "\n".join(lines)

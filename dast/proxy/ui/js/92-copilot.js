@@ -81,6 +81,8 @@ async function cpStartAutonomous() {
         profile_slug: profile_slug || undefined, budget,
         session_safe: !!(document.getElementById('cp-auto-session-safe') || {}).checked,
         read_only: !!(document.getElementById('cp-auto-read-only') || {}).checked,
+        mode: (document.getElementById('cp-auto-complete') || {}).checked ? 'complete' : 'bounded',
+        submit_forms: !!(document.getElementById('cp-auto-submit-forms') || {}).checked,
       }),
     });
     const d = await r.json();

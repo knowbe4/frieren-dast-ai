@@ -117,6 +117,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "could not start exploration"}, status_code=503)
         return {"session_id": sid, "status": "running"}
 
+    @router.get("/api/ui-routes")
+    async def ui_routes():
+        """Discovered SPA routes (frontier + visited) from the SpaExplorer, so the
+        operator can watch a complete run map the app."""
+        store = getattr(ctx, "store", None)
+        if store is None or getattr(store, "ui_route_graph", None) is None:
+            return {"stats": {}, "routes": []}
+        graph = store.ui_route_graph
+        return {"stats": graph.stats(), "routes": graph.to_list()}
+
     @router.post("/api/copilot/autonomous")
     async def autonomous(body: dict):
         """Start a fully autonomous orchestrator run.
@@ -148,11 +158,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
         session_safe = bool(body.get("session_safe", False))
         read_only = bool(body.get("read_only", False))
+        mode = (body.get("mode") or "bounded").strip().lower()
+        if mode not in ("bounded", "complete"):
+            return JSONResponse({"error": "mode must be 'bounded' or 'complete'"}, status_code=400)
+        submit_forms = bool(body.get("submit_forms", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
                 budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
-                read_only=read_only,
+                read_only=read_only, mode=mode, submit_forms=submit_forms,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

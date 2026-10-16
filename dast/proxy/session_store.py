@@ -227,6 +227,12 @@ class SessionStore:
         # Read by the autonomous copilot's coverage gate to know which introspected
         # operations still need testing before a run may declare complete.
         self.graphql_tested_ops: Dict[str, set] = {}
+        # Discovered SPA UI routes (frontier + visited), populated by SpaExplorer.
+        # The autonomous "complete" run consults this so it does not finish while
+        # routes remain unexplored. Lazy import avoids a module cycle
+        # (ui_route_graph imports normalise_endpoint_path from here).
+        from dast.proxy.ui_route_graph import UiRouteGraph
+        self.ui_route_graph = UiRouteGraph()
         # background executor for passive analysis (fingerprinting, plugins, discovery)
         # keeps the proxy hot path free — responses are returned before analysis runs
         self._bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="dast-bg")

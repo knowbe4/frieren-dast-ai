@@ -120,3 +120,17 @@ def test_send_request_blocks_write_method_in_read_only():
     result = asyncio.run(http_tools._send_request(ctx, {"url": "https://app.example.com/x", "method": "DELETE"}))
     assert result["ok"] is False
     assert result.get("read_only") is True
+
+
+# ── form-fill canaries (used by the SPA explorer) ────────────────────────────
+
+def test_form_field_value_is_type_aware():
+    from dast.ai import canaries
+    assert "@" in canaries.form_field_value("email")
+    assert canaries.form_field_value("email", "work_email").endswith("@example.com")
+    assert canaries.form_field_value("number") == "1"
+    assert canaries.form_field_value("date") == "2000-01-01"
+    assert canaries.form_field_value("url").startswith("https://")
+    # plain text carries the recognisable marker
+    assert canaries.FORM_CANARY_MARKER in canaries.form_field_value("text")
+    assert canaries.FORM_CANARY_MARKER in canaries.form_field_value("")

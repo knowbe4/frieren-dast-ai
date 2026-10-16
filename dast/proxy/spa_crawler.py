@@ -19,6 +19,7 @@ import uuid
 from typing import Callable, List, Optional
 from urllib.parse import urlparse
 
+from dast.proxy.browser_session import proxied_browser_context
 from dast.proxy.session_store import SessionStore
 from dast.utils import read_only as read_only_policy
 from dast.utils.logger import get_logger
@@ -55,9 +56,6 @@ _DANGEROUS_KEYWORDS = {
     "reset password", "change password",
 }
 
-# Header injected by the crawler browser so the proxy can tag entries correctly
-_CRAWLER_HEADER = "x-dast-crawler"
-
 
 class SpaCrawler:
     def __init__(
@@ -90,7 +88,6 @@ class SpaCrawler:
         extra_seeds: Optional[List[str]] = None,
         read_only: bool = False,
     ) -> None:
-        from playwright.async_api import async_playwright
 
         self._read_only = read_only
         if read_only:
@@ -115,78 +112,18 @@ class SpaCrawler:
                 return True
             return False
 
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=headless,
-                proxy={"server": proxy_url},
-                args=["--ignore-certificate-errors"],
-            )
-            context = await browser.new_context(
-                ignore_https_errors=True,
-                viewport={"width": 1280, "height": 900},
-            )
-
-            # Inject crawler header on ALL requests (including JS fetch/XHR)
-            # set_extra_http_headers only works for navigation, not subrequests
-            _request_count = [0]
-            async def _inject_crawler_header(route):
-                headers = {**route.request.headers, _CRAWLER_HEADER: self.session_id}
-                _request_count[0] += 1
-                if _request_count[0] <= 5 or _request_count[0] % 20 == 0:
-                    logger.debug("crawler request",
-                                 n=_request_count[0],
-                                 method=route.request.method,
-                                 url=route.request.url[:100],
-                                 session_id=self.session_id)
-                await route.continue_(headers=headers)
-            if read_only:
-                blocked = [0]
-
-                def _count_block(method: str, url: str) -> None:
-                    blocked[0] += 1
-                    if blocked[0] <= 5 or blocked[0] % 20 == 0:
-                        self._log(f"Read-only: blocked {method} {url[:100]} ({blocked[0]} blocked so far)")
-
-                await context.route("**/*", read_only_policy.make_route_guard(
-                    "crawler", forward=_inject_crawler_header, on_block=_count_block))
-            else:
-                await context.route("**/*", _inject_crawler_header)
-
-            # Inject session cookies captured by the proxy during the browse/login
-            # flow. Uses get_crawl_cookies() (not get_all_cookies()) so cookies
-            # from NAMED / headless-credentials logins — which are isolated in
-            # named_sessions and invisible to the shared jar — are also injected;
-            # otherwise a logged-in user's crawl runs unauthenticated.
-            all_cookies = self._store.get_crawl_cookies()
-            if all_cookies:
-                try:
-                    await context.add_cookies(all_cookies)
-                    self._log(f"Injected {len(all_cookies)} session cookie(s) from proxy store — crawler will use authenticated session")
-                except Exception as exc:
-                    # add_cookies is atomic — one malformed cookie rejects the whole
-                    # batch. Retry cookie-by-cookie so a single bad entry doesn't
-                    # strand an otherwise-valid session (log-and-continue).
-                    logger.warning("crawler: batch cookie injection failed, retrying individually", error=str(exc))
-                    injected = 0
-                    for cookie in all_cookies:
-                        try:
-                            await context.add_cookies([cookie])
-                            injected += 1
-                        except Exception as inner:
-                            logger.warning("crawler: skipping malformed cookie",
-                                           cookie=cookie.get("name", ""), error=str(inner))
-                    self._log(f"Injected {injected}/{len(all_cookies)} session cookie(s) from proxy store — crawler will use authenticated session")
-            else:
-                self._log("No session cookies in proxy store — if the target requires authentication, use the Browse tab to log in first, then start the crawl")
-
-            page = await context.new_page()
+        cookie_count = len(self._store.get_crawl_cookies() or [])
+        total_browser_requests = 0
+        async with proxied_browser_context(
+            self._store, self._proxy_port, self.session_id,
+            read_only=read_only, headless=headless, log_cb=self._log,
+        ) as (context, page, request_count):
 
             # If the scanner already declared this host unreachable, don't spend a
             # 45s navigation timeout on it — abort the crawl immediately.
             from dast.scanners.active_checks import is_host_dead
             if is_host_dead(parsed.hostname or base_host):
                 self._log(f"Host unreachable ({base_host}) — skipping crawl")
-                await browser.close()
                 self._store.active_crawler_session_id = None
                 return
 
@@ -204,7 +141,7 @@ class SpaCrawler:
                 kw in current_url.lower() for kw in ("login", "signin", "auth", "sso", "account")
             ):
                 self._log(f"WARNING: redirected to login page ({current_url}) — not authenticated")
-                self._log(f"Injected {len(all_cookies)} cookie(s) but the session was not accepted — the cookies may be expired, or the login set an Authorization header rather than a cookie")
+                self._log(f"Injected {cookie_count} cookie(s) but the session was not accepted — the cookies may be expired, or the login set an Authorization header rather than a cookie")
                 self._log("To fix: open the Browse tab, log in to the target again (a fresh login updates the captured session), then start the crawl again")
             else:
                 self._log(f"Page loaded: {current_url}")
@@ -313,7 +250,7 @@ class SpaCrawler:
                 except Exception as e:
                     self._log(f"Seed navigation error: {e}")
 
-            await browser.close()
+            total_browser_requests = request_count[0]
 
         # Clear crawler tag
         self._store.active_crawler_session_id = None
@@ -322,7 +259,6 @@ class SpaCrawler:
         crawl_start_ts = time.time() - 600
         crawler_entries = [e for e in self._store.all_entries() if e.source == "crawler" and e.ts >= crawl_start_ts]
         browse_entries = [e for e in self._store.all_entries() if e.source == "browse" and e.ts >= crawl_start_ts]
-        total_browser_requests = _request_count[0]
 
         self._log(f"Crawl complete — {clicks} clicks, {len(crawler_entries)} crawler entries, "
                   f"{len(browse_entries)} browse entries, {total_browser_requests} total browser requests")

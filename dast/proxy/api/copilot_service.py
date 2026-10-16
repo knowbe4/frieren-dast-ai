@@ -982,7 +982,6 @@ class CopilotService:
         exhaustion, and INTROSPECT+SWEEP (or FUZZ captured ops when introspection is
         disabled) every GraphQL endpoint. The LLM turns that follow focus on depth.
         Best-effort and stop-aware — any tool failure is logged, never fatal."""
-        from dast.plugins.graphql_analyzer import _is_graphql
         from dast.tools import run_tool
 
         auto = session["autonomous"]
@@ -1042,21 +1041,59 @@ class CopilotService:
             # 3) Scan every observed-but-unscanned endpoint to exhaustion.
             await _loop_until_zero("scan_surface", {}, "remaining")
             # 4) GraphQL: introspect+sweep, or fuzz captured ops when introspection is off.
-            gql_urls = set()
+            await self._auto_test_graphql(session, ctx, hosts={host})
+
+    async def _auto_test_graphql(self, session: dict, ctx: Any, hosts: set) -> None:
+        """Automatically test every GraphQL endpoint seen in traffic for the given
+        hosts: introspect, then sweep its schema — or, when introspection is
+        disabled, fuzz the operations captured from traffic. Idempotent (already
+        tested ops are skipped) so it is safe to call every turn. No-op in
+        read-only (the GraphQL query/fuzz traffic is active and network-blocked).
+        This is what makes 'see a GraphQL endpoint -> test it' happen without the
+        operator or the LLM having to ask for it."""
+        from dast.plugins.graphql_analyzer import _is_graphql
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        if auto.get("read_only"):
+            return
+        stop_event: asyncio.Event = auto["stop_event"]
+        store = self._ctx.store
+        if store is None:
+            return
+
+        gql_urls = set()
+        try:
+            for entry in store.in_scope_entries():
+                if _is_graphql(entry) and (getattr(entry, "host", "") or "").split(":")[0] in hosts:
+                    gql_urls.add(entry.url)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("auto-graphql: enumeration failed", error=str(exc))
+            return
+
+        async def _call(tool: str, args: dict) -> dict:
             try:
-                for entry in (self._ctx.store.in_scope_entries() if self._ctx.store else []):
-                    if _is_graphql(entry) and (getattr(entry, "host", "") or "").split(":")[0] == host:
-                        gql_urls.add(entry.url)
+                result = await run_tool(ctx, tool, args)
+                return result if isinstance(result, dict) else {}
             except Exception as exc:  # noqa: BLE001
-                logger.debug("complete-mode sweep: graphql enumeration failed", error=str(exc))
-            for gql_url in gql_urls:
+                logger.warning("auto-graphql tool failed", tool=tool, error=str(exc))
+                return {}
+
+        for gql_url in gql_urls:
+            if stop_event.is_set():
+                return
+            intro = await _call("graphql_introspect", {"url": gql_url})
+            op_tool = "graphql_sweep" if intro.get("ok") else "graphql_fuzz"
+            logger.info("auto-graphql: testing endpoint", url=gql_url, via=op_tool)
+            prev = -1
+            for _ in range(12):
                 if stop_event.is_set():
                     return
-                intro = await _call("graphql_introspect", {"url": gql_url})
-                if intro.get("ok"):
-                    await _loop_until_zero("graphql_sweep", {"url": gql_url}, "operations_remaining")
-                else:
-                    await _loop_until_zero("graphql_fuzz", {"url": gql_url}, "operations_remaining")
+                result = await _call(op_tool, {"url": gql_url})
+                remaining = int(result.get("operations_remaining", 0) or 0)
+                if remaining == 0 or remaining == prev:
+                    break
+                prev = remaining
 
     async def _drive_autonomous(self, sid: str) -> None:
         """The cross-turn autonomy loop: self-continue turns commanding the arsenal
@@ -1170,6 +1207,16 @@ class CopilotService:
                     "blocked_reason": reply.blocked_reason,
                 }
                 blocked_reason = (reply.blocked_reason or "").strip().lower()
+
+                # ── Auto-test any GraphQL endpoint seen so far ───────────────────
+                # The moment the copilot's traffic surfaces a GraphQL endpoint, test
+                # it (introspect -> sweep, or fuzz captured ops) without waiting for
+                # the model to decide to. Idempotent; no-op in read-only. Runs in
+                # bounded AND complete mode so "see GraphQL -> test GraphQL" is
+                # guaranteed, not discretionary.
+                if auto.get("hosts"):
+                    await self._auto_test_graphql(
+                        session, self._build_tool_ctx(session), set(auto["hosts"]))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot()

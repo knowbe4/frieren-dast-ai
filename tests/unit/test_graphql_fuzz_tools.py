@@ -97,3 +97,67 @@ def test_captured_graphql_coverage_dimension():
     assert cov2["gql_captured_tested"] == 1
     assert cov2["gql_captured_untested"] == []
     assert cov2["complete"] is True
+
+
+# ── auto-GraphQL: 'see a GraphQL endpoint -> test it' in the driver ──────────
+
+def test_auto_test_graphql_introspects_then_sweeps(monkeypatch):
+    import dast.tools as _tools
+    url = "https://api.example.com/graphql"
+    store = _Store([_gql_entry(url, "query($id:ID!){u(id:$id){x}}", {"id": "1"}, "GetU")])
+    service = CopilotService(SimpleNamespace(proxy_port=8080, dashboard_port=8088,
+                                             store=store, settings=None, broadcast_copilot=None))
+
+    calls = []
+
+    async def _fake_run_tool(ctx, name, args):
+        calls.append((name, args.get("url")))
+        if name == "graphql_introspect":
+            return {"ok": True}
+        return {"ok": True, "operations_remaining": 0}
+
+    monkeypatch.setattr(_tools, "run_tool", _fake_run_tool)
+    session = {"autonomous": {"read_only": False, "stop_event": asyncio.Event()}}
+    asyncio.run(service._auto_test_graphql(session, ctx=None, hosts={"api.example.com"}))
+
+    assert ("graphql_introspect", url) in calls
+    assert ("graphql_sweep", url) in calls          # introspection ok -> sweep
+    assert ("graphql_fuzz", url) not in calls
+
+
+def test_auto_test_graphql_falls_back_to_fuzz_when_introspection_fails(monkeypatch):
+    import dast.tools as _tools
+    url = "https://api.example.com/graphql"
+    store = _Store([_gql_entry(url, "query($id:ID!){u(id:$id){x}}", {"id": "1"}, "GetU")])
+    service = CopilotService(SimpleNamespace(proxy_port=8080, dashboard_port=8088,
+                                             store=store, settings=None, broadcast_copilot=None))
+    calls = []
+
+    async def _fake_run_tool(ctx, name, args):
+        calls.append(name)
+        if name == "graphql_introspect":
+            return {"ok": False, "fallback": "graphql_fuzz"}
+        return {"ok": True, "operations_remaining": 0}
+
+    monkeypatch.setattr(_tools, "run_tool", _fake_run_tool)
+    session = {"autonomous": {"read_only": False, "stop_event": asyncio.Event()}}
+    asyncio.run(service._auto_test_graphql(session, ctx=None, hosts={"api.example.com"}))
+    assert "graphql_fuzz" in calls and "graphql_sweep" not in calls
+
+
+def test_auto_test_graphql_noop_in_read_only(monkeypatch):
+    import dast.tools as _tools
+    url = "https://api.example.com/graphql"
+    store = _Store([_gql_entry(url, "query($id:ID!){u(id:$id){x}}", {"id": "1"})])
+    service = CopilotService(SimpleNamespace(proxy_port=8080, dashboard_port=8088,
+                                             store=store, settings=None, broadcast_copilot=None))
+    calls = []
+
+    async def _fake_run_tool(ctx, name, args):
+        calls.append(name)
+        return {"ok": True}
+
+    monkeypatch.setattr(_tools, "run_tool", _fake_run_tool)
+    session = {"autonomous": {"read_only": True, "stop_event": asyncio.Event()}}
+    asyncio.run(service._auto_test_graphql(session, ctx=None, hosts={"api.example.com"}))
+    assert calls == []  # active GraphQL traffic is blocked in read-only

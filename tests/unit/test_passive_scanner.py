@@ -103,6 +103,23 @@ class TestSecurityHeaders:
         # X-Frame-Options rule removed (superseded by CSP frame-ancestors)
         assert "Missing X-Frame-Options Header" not in titles
 
+    def test_csp_meta_tag_suppresses_missing_csp(self):
+        # A page serving CSP via <meta http-equiv> must NOT be flagged missing.
+        body = (b'<!doctype html><html><head>'
+                b'<meta http-equiv="Content-Security-Policy" content="default-src \'self\'">'
+                b'</head><body>x</body></html>')
+        e = _entry(url="https://example.com/", response_headers={"content-type": "text/html"},
+                   response_body=body)
+        titles = {f[0] for f in _run_rules_by_source(e, "security_headers")}
+        assert "Missing Content Security Policy (CSP)" not in titles
+
+    def test_missing_csp_still_fires_without_meta_or_header(self):
+        body = b'<!doctype html><html><head><title>no csp here</title></head><body>x</body></html>'
+        e = _entry(url="https://example.com/", response_headers={"content-type": "text/html"},
+                   response_body=body)
+        titles = {f[0] for f in _run_rules_by_source(e, "security_headers")}
+        assert "Missing Content Security Policy (CSP)" in titles
+
     def test_no_findings_when_headers_present(self):
         e = _entry(
             url="https://example.com/",
@@ -386,6 +403,56 @@ class TestSensitiveData:
         e = _entry(response_body=body)
         titles = {f[0] for f in _run_rules_by_source(e, "sensitive_data")}
         assert "AWS Access Key Exposed in Response" in titles
+
+    def test_aws_secret_key_detected(self):
+        body = b'{"aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_key_detected_camel_case(self):
+        body = b'{"SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_rule_ignores_pagination_cursor(self):
+        # Real FP: base64 cursor under a generic "*_key" label.
+        body = (
+            b'{"total":1,"next_page_key":"eyJ2IjpbMTc4NDMwNzkyNjAwMCwiZTQzYzk4ZjMtYzJkNy00'
+            b'Y2VjLWJhYTgtODA1MjRkOTM5ZTA5Il0sInMiOiJyZXBvcnRlZF9hdDpkZXNjLF9pZDpkZXNjIn0=",'
+            b'"previous_page_key":null}'
+        )
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_rule_ignores_longer_value_under_aws_label(self):
+        body = b'{"aws_secret_access_key": "' + b"A" * 39 + b"B" * 20 + b'"}'
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "aws-secret-key")
+
+    def test_openai_key_detected(self):
+        body = b'{"openai_key": "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "openai-api-key")
+
+    def test_openai_rule_ignores_uppercase_sk_inside_jwt_signature(self):
+        # Real FP: base64url JWT signature containing "SK-" mid-token.
+        body = (
+            b'{"token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.kAbCjzoxoHaT1wPhsVt_uP1kTc'
+            b'FJCsMixp1A9SK-gbwrLH534v44gYKfWF1SvcI5dGJ2Xo6euCiuv-uBkR6FEXAu7c0NcYx"}'
+        )
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "openai-api-key")
+
+    def test_openai_rule_ignores_lowercase_sk_mid_token(self):
+        body = b'{"sig":"Mixp1A9sk-gbwrLH534v44gYKfWF1SvcI5dGJ2Xo6euCiuv"}'
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "openai-api-key")
+
+    def test_anthropic_key_not_double_reported_as_openai(self):
+        body = b'{"key": "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "anthropic-api-key")
+        assert not _run_rule_by_id(e, "openai-api-key")
 
     def test_snippet_shows_real_value_redacted_is_separate(self):
         body = b'{"token": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234"}'

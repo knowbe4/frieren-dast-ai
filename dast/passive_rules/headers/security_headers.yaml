@@ -23,14 +23,21 @@ rules:
     severity: medium
     cwe: CWE-693
     description: >
-      The Content-Security-Policy header is absent, leaving the application
-      without a defence-in-depth mechanism against XSS and data injection attacks.
+      No Content-Security-Policy is applied, leaving the application without a
+      defence-in-depth mechanism against XSS and data injection attacks. This
+      fires only when neither the CSP response header nor an HTML
+      <meta http-equiv="Content-Security-Policy"> tag is present.
     match:
       header_absent: content-security-policy
+      # A page may deliver CSP via a <meta http-equiv> tag instead of the header
+      # (valid, though it cannot set frame-ancestors/report-uri). Do not flag it
+      # as "missing" in that case.
+      unless_body_regex: '<meta[^>]+http-equiv[^>]+content-security-policy'
+      body_max_scan_bytes: 65536
     conditions:
       content_type: html
       one_per_host: true
-    evidence_template: "Header 'content-security-policy' not present in response at {path}"
+    evidence_template: "No CSP header and no CSP <meta> tag in response at {path}"
     needs_ai_validation: false
 
   - id: missing-x-content-type-options

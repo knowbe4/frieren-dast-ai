@@ -7,12 +7,14 @@ startup. Adding a new check requires only a new YAML file — no code changes.
 
 Special match types handled by the engine:
   header_absent         — fires if a named response header is missing
+  unless_body_regex     — with header_absent: suppress if body matches (e.g. meta CSP)
   header_present        — fires if a named response header exists
   header_value_regex    — fires if header value matches regex
   header_name_any       — multi-header variant of header_value_regex
   cookie_flag_absent    — fires for each Set-Cookie missing the flag
   cookie_name_regex     — additional filter on cookie name (used with cookie checks)
-  body_regex            — fires if response body matches regex
+  body_regex            — fires if response body matches regex (case-insensitive
+                          unless body_regex_case_sensitive: true)
   path_regex            — fires if request path matches regex
   cors_check            — stateful: compares request Origin vs response ACAO
   also_header_name/val  — secondary header assertion (AND condition)
@@ -180,6 +182,17 @@ def _eval_header_absent(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[F
     hdrs = _hdrs(entry)
     if hdr in hdrs:
         return None
+    # Suppress when the body already provides the control another way — e.g. a
+    # CSP delivered as a <meta http-equiv> tag instead of a header. Without this
+    # the rule flags pages that DO have a (meta) CSP, a false positive.
+    unless_body = match.get("unless_body_regex", "")
+    if unless_body:
+        body = _body(entry, match.get("body_max_scan_bytes", 65536))
+        try:
+            if body and re.search(unless_body, body, re.IGNORECASE | re.DOTALL):
+                return None
+        except re.error:
+            pass
     evidence = _format_evidence(
         rule.get("evidence_template", f"Header '{hdr}' not present in response"),
         header=hdr,
@@ -251,6 +264,15 @@ def _eval_header_value_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optio
     return None
 
 
+def _body_regex_flags(match: Dict[str, Any]) -> int:
+    """Regex flags for body_regex. Secret-token prefixes (sk-, ghp_, AKIA) are
+    case-sensitive by spec, so rules can opt out of IGNORECASE — otherwise an
+    uppercase 'SK-' inside a base64 JWT signature reads as an OpenAI key."""
+    if match.get("body_regex_case_sensitive", False):
+        return re.DOTALL
+    return re.IGNORECASE | re.DOTALL
+
+
 def _eval_body_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Finding]:
     match = rule.get("match", {})
     pattern_str = match.get("body_regex", "")
@@ -261,7 +283,7 @@ def _eval_body_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Find
     if not body:
         return None
     try:
-        m = re.search(pattern_str, body, re.IGNORECASE | re.DOTALL)
+        m = re.search(pattern_str, body, _body_regex_flags(match))
     except re.error:
         return None
     if not m:
@@ -457,7 +479,7 @@ def _eval_clickjacking(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Fi
         max_bytes = match.get("body_max_scan_bytes", 8192)
         body = _body(entry, max_bytes)
         try:
-            if not re.search(body_pattern, body, re.IGNORECASE | re.DOTALL):
+            if not re.search(body_pattern, body, _body_regex_flags(match)):
                 return None
         except re.error:
             return None

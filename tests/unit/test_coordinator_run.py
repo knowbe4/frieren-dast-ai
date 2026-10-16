@@ -129,7 +129,7 @@ async def test_run_preserves_findings_confirmed_before_timeout():
 
     async def _fake_inner(target, client, collaborator, use_llm_planner,
                           model_id, confidence_threshold, session_intelligence,
-                          probe_diff, collected):
+                          probe_diff, collected, replan=False):
         # Simulate: validation finalised one confirmed finding into the shared
         # collector, then the run stalls (e.g. slow write-back) and times out.
         collected.append(kept)
@@ -628,3 +628,63 @@ async def test_budget_timeout_keeps_deterministic_findings_from_finished_agents(
             result = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.5)
 
     assert result == [fast_finding]
+
+
+# ── within-target replan (Phase B feedback loop) ─────────────────────────────
+
+@pytest.mark.asyncio
+async def test_replan_runs_followup_agent_after_confirmed_injection():
+    """A confirmed sqli triggers a follow-up pass that runs the implied adjacent
+    class (ssti) on the same target, even though the planner only selected sqli."""
+    sqli_finding = _finding(title="SQLi", attack_type="sqli", bypass_validation=True)
+    ssti_finding = _finding(title="SSTI", attack_type="ssti", bypass_validation=True)
+    ran = []
+
+    class _SqliAgent(VulnAgent):
+        name = "SQLi"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            ran.append("sqli"); return [sqli_finding]
+
+    class _SstiAgent(VulnAgent):
+        name = "SSTI"; attack_type = "ssti"; description = ""
+        async def run(self, target, client, collaborator=None):
+            ran.append("ssti"); return [ssti_finding]
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_SqliAgent)
+        Coordinator.register(_SstiAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=(["sqli"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            client = MagicMock()
+            result = await Coordinator.run(_target(), client, budget_seconds=5.0, replan=True)
+
+    assert "ssti" in ran, "follow-up agent should run on confirmed injection"
+    assert {f.title for f in result} == {"SQLi", "SSTI"}
+
+
+@pytest.mark.asyncio
+async def test_replan_off_by_default_skips_followup():
+    sqli_finding = _finding(title="SQLi", attack_type="sqli", bypass_validation=True)
+    ran = []
+
+    class _SqliAgent(VulnAgent):
+        name = "SQLi"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            ran.append("sqli"); return [sqli_finding]
+
+    class _SstiAgent(VulnAgent):
+        name = "SSTI"; attack_type = "ssti"; description = ""
+        async def run(self, target, client, collaborator=None):
+            ran.append("ssti"); return []
+
+    _activity_log.clear()
+    with _Registry():
+        Coordinator.register(_SqliAgent)
+        Coordinator.register(_SstiAgent)
+        with patch.object(Coordinator, "_plan", new=AsyncMock(return_value=(["sqli"], "reason", False))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            result = await Coordinator.run(_target(), MagicMock(), budget_seconds=5.0)  # replan defaults False
+
+    assert ran == ["sqli"], "no follow-up pass when replan is off"
+    assert {f.title for f in result} == {"SQLi"}

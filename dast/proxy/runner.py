@@ -119,6 +119,7 @@ class ProxyRunner:
             "llm_planner": True,
             "llm_validator": True,
             "probe_diff": False,
+            "coordinator_replan": False,
             "model_id": ai_model_id or "",
             "confidence_threshold": 0.5,
         }

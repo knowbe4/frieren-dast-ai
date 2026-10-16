@@ -97,3 +97,30 @@ def test_auto_actions_drops_active_in_read_only():
     plan = route(ev)
     assert plan.auto_actions(read_only=False)          # run_scan present when active
     assert plan.auto_actions(read_only=True) == []     # dropped in read-only
+
+
+# ── within-target replan: confirmed injection -> adjacent follow-up classes ──
+
+def test_implied_followups_from_confirmed_injection():
+    from dast.ai.evidence_router import implied_followups
+    # sqli confirmed -> try ssti/cmdi, minus anything already run
+    assert implied_followups({"sqli"}, {"sqli"}) == ["ssti", "cmdi"]
+    assert implied_followups({"sqli"}, {"sqli", "cmdi"}) == ["ssti"]
+
+
+def test_implied_followups_idor_and_lfi():
+    from dast.ai.evidence_router import implied_followups
+    assert implied_followups({"idor"}, {"idor"}) == ["auth_bypass"]
+    assert implied_followups({"lfi"}, {"lfi"}) == ["ssrf"]
+
+
+def test_implied_followups_none_for_noninjection():
+    from dast.ai.evidence_router import implied_followups
+    assert implied_followups({"secrets", "csrf"}, {"secrets", "csrf"}) == []
+    assert implied_followups(set(), set()) == []
+
+
+def test_implied_followups_deduped_across_multiple_confirms():
+    from dast.ai.evidence_router import implied_followups
+    # sqli->[ssti,cmdi], ssti->[cmdi,sqli]; already run {sqli,ssti} -> only cmdi, once
+    assert implied_followups({"sqli", "ssti"}, {"sqli", "ssti"}) == ["cmdi"]

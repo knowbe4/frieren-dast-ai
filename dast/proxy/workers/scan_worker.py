@@ -298,6 +298,7 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                     session_intelligence=runner._store.session_intelligence,
                     budget_seconds=budget_override,
                     probe_diff=bool(runner._engine_config.get("probe_diff", False)),
+                    replan=bool(runner._engine_config.get("coordinator_replan", False)),
                     taint_store=runner._store.taint_store,
                     budget_ceiling=budget_ceiling,
                 )

@@ -35,6 +35,32 @@ _LLM_PATH_RE = re.compile(
 _HIGH, _MED, _LOW = 0.8, 0.5, 0.3
 _PRIORITY_CONFIDENCE = {"high": _HIGH, "medium": _MED, "low": _LOW}
 
+# Within-target replan (coordinator feedback loop): a CONFIRMED injection means the
+# input reaches an interpreter unsanitised, so the adjacent injection classes are
+# worth a follow-up pass on the same endpoint. A confirmed IDOR implies auth-bypass
+# siblings; LFI implies SSRF (both are "fetch a resource the server controls").
+# Deliberately small and injection-centric — not a brainstorm of every attack type.
+_FOLLOWUP_MAP = {
+    "sqli": ["ssti", "cmdi"],
+    "ssti": ["cmdi", "sqli"],
+    "cmdi": ["ssti", "sqli"],
+    "xss": ["ssti"],
+    "idor": ["auth_bypass"],
+    "lfi": ["ssrf"],
+}
+
+
+def implied_followups(confirmed_attack_types, already_run) -> List[str]:
+    """Attack types a confirmed finding implies are worth testing next on the SAME
+    target, minus anything already run this pass. Pure; order-stable; deduped."""
+    done = set(already_run or ())
+    out: List[str] = []
+    for atype in confirmed_attack_types or ():
+        for follow in _FOLLOWUP_MAP.get(atype, ()):
+            if follow not in done and follow not in out:
+                out.append(follow)
+    return out
+
 
 @dataclass
 class RouteRecommendation:

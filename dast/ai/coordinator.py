@@ -1056,6 +1056,16 @@ class Coordinator:
         if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
             selected_types = [*selected_types, "csrf"]
 
+        # Caller-requested attack focus (e.g. run_scan recommended by the evidence
+        # router for an LLM endpoint -> guarantee llm_injection runs). Additive, so
+        # it never REDUCES the planner's selection — it only ensures the requested,
+        # evidence-backed types are included.
+        focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
+                 if t in cls._registry and t not in selected_types]
+        if focus:
+            selected_types = [*selected_types, *focus]
+            logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
+
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented
         # parameters, mine them now. Discovered names become recon suggestions

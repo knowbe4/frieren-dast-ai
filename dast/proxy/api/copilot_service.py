@@ -125,6 +125,7 @@ _AUTONOMOUS_START = (
     "of operations and stop — sweep the entire schema and scan the entire REST surface, then go "
     "deep on the leads they surface.\n\n"
     "{leads}\n\n"
+    "{router}"
     "{coverage}\n\n"
     "Signal control ONLY through blocked_reason on a reply: set it to 'complete' when the "
     "objective is fully covered AND you have actively TESTED the high-value leads (not merely "
@@ -142,6 +143,7 @@ _AUTONOMOUS_CONTINUE = (
     "{read_only}"
     "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
     "{leads}\n\n"
+    "{router}"
     "{coverage}\n\n"
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
@@ -975,6 +977,68 @@ class CopilotService:
             return nudge
         return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
 
+    def _router_block(self, hosts: List[str]) -> str:
+        """Evidence-driven 'recommended next actions / AVOID' block for the turn prompt.
+        Deterministic routing from observed signals (id -> sqli/idor, AI endpoint ->
+        llm_injection, MySQL -> avoid MSSQL, GraphQL -> sweep) that shrinks as things get
+        tested. Best-effort; empty string when there is nothing to recommend yet."""
+        store = self._ctx.store
+        if store is None:
+            return ""
+        try:
+            from dast.ai.evidence_router import RouterEvidence, route
+            parts: List[str] = []
+            for host in (hosts or []):
+                plan = route(RouterEvidence.from_store(store, host.split(":")[0]))
+                block = plan.to_prompt_block()
+                if block:
+                    parts.append(block)
+            return ("\n\n".join(parts) + "\n\n") if parts else ""
+        except Exception as exc:  # noqa: BLE001 — routing is advisory, never crash the run
+            logger.debug("router block unavailable", error=str(exc))
+            return ""
+
+    async def _auto_route(self, session: dict, ctx: Any, hosts: set) -> None:
+        """Auto-run the unambiguous, auto_safe evidence recommendations (e.g. AI
+        endpoint -> run_scan[llm_injection], high-confidence id flow -> run_scan[sqli]/
+        idor_probe), honoring read_only (active tools dropped) and skipping anything
+        already auto-run this session. Mirrors _auto_test_graphql; the LLM still handles
+        the judgment-call recommendations surfaced in the prompt block."""
+        from dast.ai.evidence_router import RouterEvidence, route
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        read_only = bool(auto.get("read_only"))
+        stop_event: asyncio.Event = auto["stop_event"]
+        routed: set = auto.setdefault("routed", set())
+        store = self._ctx.store
+        if store is None:
+            return
+        for host in hosts:
+            if stop_event.is_set():
+                return
+            try:
+                plan = route(RouterEvidence.from_store(store, str(host).split(":")[0]))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-route: planning failed", host=host, error=str(exc))
+                continue
+            for rec in plan.auto_actions(read_only=read_only):
+                if stop_event.is_set():
+                    return
+                key = (rec.target_url, rec.kind, rec.attack_type)
+                if not rec.target_url or key in routed:
+                    continue
+                routed.add(key)
+                args: Dict[str, Any] = {"url": rec.target_url}
+                if rec.kind == "run_scan" and rec.attack_type:
+                    args["attack_types"] = [rec.attack_type]
+                try:
+                    logger.info("auto-route: running", kind=rec.kind, attack=rec.attack_type,
+                                url=rec.target_url, source=rec.source)
+                    await run_tool(ctx, rec.kind, args)
+                except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                    logger.warning("auto-route tool failed", kind=rec.kind, error=str(exc))
+
     async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
         """Drive breadth deterministically in complete mode so it is never left to
         LLM discretion: per focus host, EXPLORE the SPA to drain the UI frontier,
@@ -1042,6 +1106,9 @@ class CopilotService:
             await _loop_until_zero("scan_surface", {}, "remaining")
             # 4) GraphQL: introspect+sweep, or fuzz captured ops when introspection is off.
             await self._auto_test_graphql(session, ctx, hosts={host})
+            # 5) Auto-route the unambiguous evidence recommendations (id -> sqli/idor,
+            #    AI endpoint -> llm_injection, etc.) — breadth not left to the LLM.
+            await self._auto_route(session, ctx, hosts={host})
 
     async def _auto_test_graphql(self, session: dict, ctx: Any, hosts: set) -> None:
         """Automatically test every GraphQL endpoint seen in traffic for the given
@@ -1122,6 +1189,7 @@ class CopilotService:
         prompt = _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(auto["hosts"]),
+            router=self._router_block(auto["hosts"]),
             coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
             read_only=read_only_note,
         )
@@ -1197,6 +1265,7 @@ class CopilotService:
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
                         leads=self._leads_label(auto["hosts"]),
+                        router=self._router_block(auto["hosts"]),
                         coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
                         read_only=read_only_note,
                     )
@@ -1215,8 +1284,11 @@ class CopilotService:
                 # bounded AND complete mode so "see GraphQL -> test GraphQL" is
                 # guaranteed, not discretionary.
                 if auto.get("hosts"):
-                    await self._auto_test_graphql(
-                        session, self._build_tool_ctx(session), set(auto["hosts"]))
+                    turn_ctx = self._build_tool_ctx(session)
+                    await self._auto_test_graphql(session, turn_ctx, set(auto["hosts"]))
+                    # Evidence-driven auto-routing of the unambiguous leads (bounded
+                    # and complete). The prompt block surfaces the rest for the LLM.
+                    await self._auto_route(session, turn_ctx, set(auto["hosts"]))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot()
@@ -1331,6 +1403,7 @@ class CopilotService:
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
                     leads=self._leads_label(auto["hosts"]),
+                    router=self._router_block(auto["hosts"]),
                     coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
                     read_only=read_only_note,
                 )

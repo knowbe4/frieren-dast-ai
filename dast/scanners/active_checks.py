@@ -85,6 +85,7 @@ class CheckTarget:
     host_intel: Optional[object] = None  # HostIntel from SessionIntelligence — read-only for agents
     probe_diff_hint: str = ""    # per-param injection-context hypotheses from the probe-diff pass
     param_mining_hint: str = ""  # hidden parameters discovered by the automatic param-mining pass
+    focus_attack_types: List[str] = None  # caller-requested attack types to guarantee (additive)
 
 
 # ── request/response capture ───────────────────────────────────────────────

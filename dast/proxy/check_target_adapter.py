@@ -437,4 +437,5 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
         code_hint=code_hint,
         import_hints=list(entry.import_hints) if entry.import_hints else None,
         named_sessions=named_sessions if named_sessions else None,
+        focus_attack_types=list(getattr(entry, "focus_attack_types", None) or []) or None,
     )

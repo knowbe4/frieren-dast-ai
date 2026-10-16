@@ -56,6 +56,14 @@ _SCAN_SCHEMA: Dict[str, Any] = {
             "description": "Optional exact history entry id to scan, instead of matching by url. "
                            "Use the id from get_history when you want to scan one specific request.",
         },
+        "attack_types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional attack types to guarantee are tested on this endpoint (e.g. "
+                           "['llm_injection'] for an AI endpoint, ['sqli'] for a numeric id). Additive "
+                           "— the planner still runs its own evidence-based selection; these are added "
+                           "on top, never a restriction. Omit to let the planner decide entirely.",
+        },
     },
     "required": ["url"],
 }
@@ -118,6 +126,13 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "resolved entry is out of scope", "url": entry.url}
 
     agents_ran = entry.source == "imported" or bool(getattr(store, "ai_mode", False))
+
+    # Optional caller-requested attack focus (additive; the coordinator unions
+    # these into the planner's selection). Stashed on the entry so it reaches the
+    # CheckTarget built by the scan worker.
+    focus = args.get("attack_types")
+    if isinstance(focus, list):
+        entry.focus_attack_types = [str(t).strip() for t in focus if str(t).strip()]
 
     # Mark it the way "Send to AI" does: ai_queued bypasses the once-per-endpoint
     # dedup so a deliberate re-scan actually runs.

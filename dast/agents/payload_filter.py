@@ -22,6 +22,7 @@ import re
 from typing import TYPE_CHECKING, List
 
 from dast.payloads.loader import get_payloads
+from dast.agents import db_dialect
 
 if TYPE_CHECKING:
     from dast.scanners.active_checks import CheckTarget
@@ -283,4 +284,17 @@ def get_filtered_payloads(attack_type: str, target: "CheckTarget") -> List[str]:
             if p not in seen:
                 seen.add(p)
                 payloads.append(p)
+
+    # Tech-aware dialect exclusion: when the backend DB is pinned to a single
+    # known engine, drop SQLi payloads carrying another dialect's marker (a
+    # MySQL-only target should never fire WAITFOR DELAY / pg_sleep). Conservative:
+    # ambiguous hints leave the set untouched. See dast/agents/db_dialect.py.
+    if attack_type == "sqli":
+        dc = getattr(target, "discovery_context", None)
+        tech = getattr(dc, "tech_stack", None) if dc else None
+        hints = getattr(tech, "database_hints", None) or []
+        db = db_dialect.definite_db(hints)
+        if db:
+            payloads = db_dialect.strip_foreign_dialect(payloads, db)
+
     return payloads

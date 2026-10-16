@@ -140,6 +140,7 @@ async def _crawl(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "headless": True,
             "max_clicks": max_clicks,
             "extra_seeds": extra_seeds,
+            "read_only": bool(getattr(ctx, "read_only", False)),
             "done_event": done_event,
         })
     except Exception as exc:

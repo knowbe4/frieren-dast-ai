@@ -259,7 +259,7 @@ COPILOT_STEP_SCHEMA: Dict[str, Any] = {
         "action": {
             "type": "string",
             "enum": ["call_tool", "reply"],
-            "description": "call_tool = run a Frieren tool and keep working this turn; reply = send a message to the operator and hand the turn back.",
+            "description": "call_tool = run a Frieren tool and keep working this turn; reply = send a message to the operator and hand the turn back. If omitted it is inferred: tool_name present -> call_tool, else reply.",
         },
         "tool_name": {
             "type": "string",
@@ -279,7 +279,10 @@ COPILOT_STEP_SCHEMA: Dict[str, Any] = {
             "description": "Optional when action=reply: a short machine-readable reason you are handing back blocked, e.g. 'waf_block', 'auth_required', 'need_value', 'need_authorization', 'out_of_scope'. Empty when you are simply reporting progress.",
         },
     },
-    "required": ["thought", "action"],
+    # Only `thought` is required. Some providers (e.g. the gateway) occasionally
+    # omit `action` even under schema forcing; the session recovers it from
+    # tool_name/message rather than discarding the whole step as malformed.
+    "required": ["thought"],
 }
 
 # Probe-diff classifier — dast/ai/probe_classifier.py _SYSTEM / classify()

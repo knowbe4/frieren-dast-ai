@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
+from dast.utils import read_only
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -137,6 +138,9 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     method = str(args.get("method", "GET")).upper()
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
         return {"ok": False, "error": f"unsupported method: {method}"}
+    if getattr(ctx, "read_only", False) and not read_only.is_safe_method(method):
+        return {"ok": False, "read_only": True,
+                "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS are sent"}
 
     # Scope gate BEFORE anything is sent. Out-of-scope is denied by default, but an
     # MCP caller (no in-process store) can ask the dashboard operator for an

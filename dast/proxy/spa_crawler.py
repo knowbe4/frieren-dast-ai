@@ -20,6 +20,7 @@ from typing import Callable, List, Optional
 from urllib.parse import urlparse
 
 from dast.proxy.session_store import SessionStore
+from dast.utils import read_only as read_only_policy
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
 
@@ -87,8 +88,13 @@ class SpaCrawler:
         max_clicks: int = 200,
         headless: bool = True,
         extra_seeds: Optional[List[str]] = None,
+        read_only: bool = False,
     ) -> None:
         from playwright.async_api import async_playwright
+
+        self._read_only = read_only
+        if read_only:
+            self._log("Read-only mode: only GET/HEAD/OPTIONS requests are sent and action buttons are not clicked")
 
         proxy_url = f"http://127.0.0.1:{self._proxy_port}"
         self._log(f"Crawler session {self.session_id} starting → {target_url}")
@@ -133,7 +139,18 @@ class SpaCrawler:
                                  url=route.request.url[:100],
                                  session_id=self.session_id)
                 await route.continue_(headers=headers)
-            await context.route("**/*", _inject_crawler_header)
+            if read_only:
+                blocked = [0]
+
+                def _count_block(method: str, url: str) -> None:
+                    blocked[0] += 1
+                    if blocked[0] <= 5 or blocked[0] % 20 == 0:
+                        self._log(f"Read-only: blocked {method} {url[:100]} ({blocked[0]} blocked so far)")
+
+                await context.route("**/*", read_only_policy.make_route_guard(
+                    "crawler", forward=_inject_crawler_header, on_block=_count_block))
+            else:
+                await context.route("**/*", _inject_crawler_header)
 
             # Inject session cookies captured by the proxy during the browse/login
             # flow. Uses get_crawl_cookies() (not get_all_cookies()) so cookies
@@ -396,6 +413,13 @@ class SpaCrawler:
                 combined = f"{text} {aria} {href}".lower()
                 if any(kw in combined for kw in _DANGEROUS_KEYWORDS):
                     continue
+                # Read-only: stay out of action buttons and form submits. Any
+                # write they trigger is blocked at the network layer anyway;
+                # skipping them avoids confirm dialogs and half-filled forms.
+                if getattr(self, "_read_only", False) and tag != "a":
+                    element_type = (await el.get_attribute("type") or "").lower()
+                    if element_type == "submit" or read_only_policy.is_action_label(f"{text} {aria}"):
+                        continue
                 if href and any(seg in href.lower() for seg in
                                 ("logout", "signout", "sign-out", "log-out",
                                  "end-session", "revoke", "/delete")):

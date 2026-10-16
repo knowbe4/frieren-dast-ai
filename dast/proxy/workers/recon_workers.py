@@ -46,6 +46,7 @@ async def run_crawl_worker(runner: "ProxyRunner", crawl_queue: asyncio.Queue) ->
                 max_clicks=job.get("max_clicks", 200),
                 headless=job.get("headless", True),
                 extra_seeds=job.get("extra_seeds"),
+                read_only=bool(job.get("read_only", False)),
             )
             log_event("crawler", "info", "Crawl finished", url=target_url, source="crawler")
         except Exception as e:

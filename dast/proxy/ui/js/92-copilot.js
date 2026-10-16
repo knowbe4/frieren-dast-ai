@@ -80,6 +80,7 @@ async function cpStartAutonomous() {
         objective: objective.trim(), focus_hosts,
         profile_slug: profile_slug || undefined, budget,
         session_safe: !!(document.getElementById('cp-auto-session-safe') || {}).checked,
+        read_only: !!(document.getElementById('cp-auto-read-only') || {}).checked,
       }),
     });
     const d = await r.json();

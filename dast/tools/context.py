@@ -52,6 +52,9 @@ class ToolContext:
     # concurrent-session detection and log the shared cookie out. Tools consult
     # this to throttle their own volume (e.g. crawl caps its click budget).
     session_safe: bool = False
+    # Read-only mode (production targets): only GET/HEAD/OPTIONS leave the
+    # machine and probe/attack tools are refused. See dast/utils/read_only.py.
+    read_only: bool = False
     # Live browser the agent can drive (navigate/fill/click/snapshot) for form
     # workflows that need fresh CSRF tokens. Present only for the in-process
     # copilot; None elsewhere, so the browser_* tools degrade gracefully.

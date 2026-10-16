@@ -195,7 +195,8 @@
       <!-- col 2: request list -->
       <div id="list-col">
         <div id="filterbar">
-          <input id="filter" placeholder="Filter path..." oninput="applyFilter()">
+          <input id="filter" type="search" placeholder="Search history: URL, headers, bodies..." title="Searches method, URL, status, request/response headers and full bodies of every entry" oninput="onHistorySearchInput()" onkeydown="if(event.key==='Escape'){this.value='';onHistorySearchInput()}">
+          <span id="filter-count" style="font-size:10px;color:var(--txt2);white-space:nowrap"></span>
           <span style="font-size:10px;color:var(--txt2);margin-left:2px">Show:</span>
           <label title="Manual browser traffic"><input type="checkbox" id="chk-src-proxy"   checked onchange="applyFilter()"> <span class="src-tag src-proxy"  >proxy</span></label>
           <label title="Headless browse session"><input type="checkbox" id="chk-src-browse"  checked onchange="applyFilter()"> <span class="src-tag src-browse" >browse</span></label>
@@ -249,34 +250,21 @@
       <div class="panel-resizer" id="proxy-resizer-right" title="Drag to resize"></div>
       <!-- col 3: detail -->
       <div class="detail-col" id="proxy-detail-col">
-        <div class="dtab-bar" id="dtabs">
-          <div class="dtab on" id="dt-rr"      onclick="setDTab('rr')">Request / Response</div>
-          <div class="dtab"    id="dt-findings" onclick="setDTab('findings')">Findings</div>
-          <!-- Send to AI popover — triggered by context menu, anchored to panel -->
-          <div id="send-ai-popover" style="display:none;position:absolute;right:8px;top:36px;z-index:200;
-               background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;padding:12px 14px;
-               width:280px;box-shadow:0 4px 20px rgba(0,0,0,0.5)">
-            <div style="font-size:11px;font-weight:600;color:var(--txt);margin-bottom:8px">Send to AI Scanner</div>
-            <textarea id="send-ai-note" placeholder="Optional note for the AI (e.g. 'test mass assignment on role field')"
-              style="width:100%;box-sizing:border-box;height:64px;resize:vertical;background:var(--bg);border:1px solid var(--bdr);
-                     color:var(--txt);border-radius:3px;font-family:inherit;font-size:11px;padding:5px 7px;margin-bottom:8px"></textarea>
-            <div style="display:flex;gap:6px;justify-content:flex-end">
-              <button class="tbtn" onclick="closeSendToAI()" style="font-size:10px">Cancel</button>
-              <button class="tbtn pri" onclick="confirmSendToAI()" style="font-size:10px">Queue</button>
-            </div>
+        <!-- Send to AI popover — triggered by context menu, anchored to panel -->
+        <div id="send-ai-popover" style="display:none;position:absolute;right:8px;top:36px;z-index:200;
+             background:var(--bg2);border:1px solid var(--bdr);border-radius:6px;padding:12px 14px;
+             width:280px;box-shadow:0 4px 20px rgba(0,0,0,0.5)">
+          <div style="font-size:11px;font-weight:600;color:var(--txt);margin-bottom:8px">Send to AI Scanner</div>
+          <textarea id="send-ai-note" placeholder="Optional note for the AI (e.g. 'test mass assignment on role field')"
+            style="width:100%;box-sizing:border-box;height:64px;resize:vertical;background:var(--bg);border:1px solid var(--bdr);
+                   color:var(--txt);border-radius:3px;font-family:inherit;font-size:11px;padding:5px 7px;margin-bottom:8px"></textarea>
+          <div style="display:flex;gap:6px;justify-content:flex-end">
+            <button class="tbtn" onclick="closeSendToAI()" style="font-size:10px">Cancel</button>
+            <button class="tbtn pri" onclick="confirmSendToAI()" style="font-size:10px">Queue</button>
           </div>
         </div>
         <div class="detail-body" id="dbody">
           <div class="empty" id="empty-msg">Select a request to inspect it</div>
-        </div>
-        <!-- Passive findings bar — shown only when selected entry has passive findings -->
-        <div id="passive-bar" style="display:none;position:absolute;bottom:0;left:0;right:0;
-             background:#1a1500;border-top:1px solid var(--yellow);padding:5px 10px;
-             font-size:10.5px;display:none;align-items:center;gap:8px;cursor:pointer;z-index:10"
-             onclick="setDTab('findings');renderDetail()">
-          <span style="color:var(--yellow)">&#9888;</span>
-          <span id="passive-bar-txt" style="color:var(--yellow)"></span>
-          <span style="color:var(--blue);margin-left:auto;text-decoration:underline;font-size:10px">View findings ▸</span>
         </div>
       </div>
     </div>
@@ -644,10 +632,6 @@
           </table>
         </div>
         <div style="height:40%;min-height:100px;display:flex;flex-direction:column;overflow:hidden;">
-          <div class="dtab-bar">
-            <div class="dtab on" id="sdt-rr"      onclick="setSmDTab('rr')">Request / Response</div>
-            <div class="dtab"    id="sdt-findings" onclick="setSmDTab('findings')">Findings</div>
-          </div>
           <div class="detail-body" id="sm-detail-body">
             <div class="empty">Select a request from the table above</div>
           </div>
@@ -679,6 +663,7 @@
           <option value="low">Low</option>
           <option value="info">Info</option>
         </select>
+        <span id="issues-entry-chip" class="issues-entry-chip" style="display:none"></span>
         <span id="issues-match-count" style="font-size:10px;color:var(--txt2);flex-shrink:0"></span>
         <span style="flex:1"></span>
         <button class="tbtn" onclick="window.open('/api/export/sarif','_blank')" title="Download findings as SARIF 2.1.0 (GitHub/GitLab Security tab)">Download SARIF</button>
@@ -2171,6 +2156,7 @@
               <label>Stuck turns <input id="cp-auto-stuck" type="number" min="1" value="3" style="width:48px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 5px;border-radius:3px"></label>
               <label><input id="cp-auto-escalate" type="checkbox"> Ask before out-of-scope</label>
               <label title="For targets with strict/single-concurrent sessions (e.g. ASP.NET). Skips ambient auto-scan and caps crawl volume so the shared login cookie isn't invalidated."><input id="cp-auto-session-safe" type="checkbox"> Session-safe (strict sessions)</label>
+              <label title="For production targets. Sends only GET/HEAD/OPTIONS, disables probe/attack tools, keeps the crawler off action buttons, and pauses AI auto-scan for the run. Maps and observes without changing anything."><input id="cp-auto-read-only" type="checkbox"> Read-only (production safe)</label>
             </div>
           </details>
           <div style="display:flex;gap:8px;align-items:center">
@@ -2216,6 +2202,7 @@
 <script src="/ui/js/40-graphql.js"></script>
 <script src="/ui/js/50-settings-fedramp-scan.js"></script>
 <script src="/ui/js/60-http-view.js"></script>
+<script src="/ui/js/61-detail-pane.js"></script>
 <script src="/ui/js/65-browse.js"></script>
 <script src="/ui/js/66-login-profiles.js"></script>
 <script src="/ui/js/67-mcp-approval.js"></script>

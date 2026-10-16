@@ -126,7 +126,9 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         budget?: {max_tool_calls, max_wall_clock_seconds, max_stuck_turns,
         allow_scope_escalation}}. Missing budget fields fall back to the defaults.
         session_safe skips the ambient auto-scan and caps crawl volume for targets
-        with strict/single-concurrent session management.
+        with strict/single-concurrent session management. read_only (production
+        targets) sends only GET/HEAD/OPTIONS, refuses probe/attack tools and keeps
+        the crawler off action buttons; it also pauses AI mode for the run.
         """
         objective = (body.get("objective") or "").strip()
         if not objective:
@@ -145,10 +147,12 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         profile_slug = (body.get("profile_slug") or "").strip() or None
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
         session_safe = bool(body.get("session_safe", False))
+        read_only = bool(body.get("read_only", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
                 budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
+                read_only=read_only,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

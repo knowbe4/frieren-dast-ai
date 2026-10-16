@@ -101,6 +101,7 @@ _AUTONOMOUS_START = (
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
     "every action is registered inside the tool (schemas, history, findings) for the human to "
     "review later. Objective: {objective}\n\n"
+    "{read_only}"
     "Work the objective end to end across many turns without waiting for me.\n"
     "USE THE INTERNAL TOOLS — never hand-roll with send_request what a dedicated tool does:\n"
     "- graphql_introspect on any GraphQL endpoint (this registers the schema in Frieren); do "
@@ -138,6 +139,7 @@ _AUTONOMOUS_CONTINUE = (
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
     "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding), and actively "
     "TEST leads (IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
+    "{read_only}"
     "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
     "{leads}\n\n"
     "{coverage}\n\n"
@@ -154,6 +156,20 @@ _AUTONOMOUS_COVERAGE_GATE = (
     "each introspected GraphQL endpoint until operations_remaining=0 (crawl / graphql_introspect "
     "first if the surface is not yet mapped). Then go deep on anything they flag. Budget "
     "remaining: {budget}. Only set 'complete' once every endpoint and operation has been tested."
+)
+
+_READ_ONLY_DIRECTIVE = (
+    "[READ-ONLY MODE] This is a production target. Only safe methods (GET/HEAD/OPTIONS) leave "
+    "the machine; any write a click or form would trigger is dropped at the network layer. "
+    "The probe/attack tools (run_scan, scan_surface, graphql_sweep, idor_probe, param_mining, "
+    "content_discovery, match_replace, validate_chain) are DISABLED and will return an error.\n"
+    "Your job is to MAP and OBSERVE, not to attack: crawl to discover the surface, "
+    "browser_navigate/browser_click to reach routes, graphql_introspect to register schemas, "
+    "send_request (GET/HEAD/OPTIONS only) to read endpoints, get_history to review captured "
+    "traffic, and record_finding for anything you can conclude from observation alone (e.g. a "
+    "missing security header, a secret in a response). Do NOT keep retrying a disabled tool. "
+    "Coverage here means 'surface mapped', not 'surface scanned' — set blocked_reason='complete' "
+    "once you have mapped and observed the surface for the objective."
 )
 
 _AUTONOMOUS_GUIDANCE = (
@@ -449,7 +465,10 @@ class CopilotService:
         if browser is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
-                browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store)
+                browser = AgentBrowser(
+                    proxy_port=ctx.proxy_port, store=ctx.store,
+                    read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
+                )
                 session["_agent_browser"] = browser
             except Exception as exc:
                 logger.warning("could not create AgentBrowser", error=str(exc))
@@ -465,6 +484,7 @@ class CopilotService:
             crawl_queue=getattr(ctx, "crawl_queue", None),
             source_label="copilot",
             session_safe=bool((session.get("autonomous") or {}).get("session_safe", False)),
+            read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
             browser=browser,
         )
 
@@ -541,6 +561,7 @@ class CopilotService:
         budget: Optional[dict] = None,
         auto_ai_mode: bool = True,
         session_safe: bool = False,
+        read_only: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -567,6 +588,7 @@ class CopilotService:
             "hosts": hosts,
             "profile": profile_slug or None,
             "session_safe": session_safe,
+            "read_only": read_only,
             "stop_event": asyncio.Event(),
             "pause_gate": pause_gate,
             "paused_at": None,
@@ -585,6 +607,16 @@ class CopilotService:
         # fans out share the one logged-in cookie and trip concurrent-session
         # detection on strict targets (ASP.NET single-session), logging the run
         # (and the operator's browser) out mid-objective.
+        if read_only:
+            # Read-only: ambient auto-scan fires attack payloads at everything
+            # crawled, so it must be OFF for the run even if the operator had
+            # it on. Same save/restore path as the forced-on case below.
+            auto_ai_mode = False
+            if self._ctx.store is not None and self._ctx.store.ai_mode:
+                session["autonomous"]["_ai_mode_prev"] = True
+                session["autonomous"]["_ai_mode_forced"] = True
+                self._ctx.store.ai_mode = False
+                logger.info("read-only run: AI mode paused for the run", session_id=sid)
         if session_safe and auto_ai_mode:
             logger.info("session-safe mode: skipping ambient auto-scan (ai_mode)",
                         session_id=sid)
@@ -935,10 +967,12 @@ class CopilotService:
         wait_for_human = self._make_autonomous_wait(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
+        read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
         prompt = _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(auto["hosts"]),
             coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+            read_only=read_only_note,
         )
 
         last_progress = self._progress_snapshot()
@@ -1011,6 +1045,7 @@ class CopilotService:
                         budget=self._budget_label(auto, cfg, deadline),
                         leads=self._leads_label(auto["hosts"]),
                         coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                        read_only=read_only_note,
                     )
                     continue
 
@@ -1037,7 +1072,10 @@ class CopilotService:
                     # mapped and part of it is still untested. With nothing discovered
                     # yet there is no coverage to force (the crawl-first prompt already
                     # pushes discovery), and a fully-tested surface is genuinely done.
-                    surface_incomplete = coverage["has_surface"] and not coverage["complete"]
+                    # In read-only mode scan_surface/graphql_sweep are disabled, so a
+                    # scan-based coverage gap can never be closed — don't bounce 'complete'.
+                    surface_incomplete = (coverage["has_surface"] and not coverage["complete"]
+                                          and not auto.get("read_only"))
                     # Coverage gate: refuse a premature 'complete' while known surface is
                     # not fully tested and there is budget + rejection headroom to keep
                     # going. This is what stops the run eyeballing a few operations and
@@ -1116,6 +1154,7 @@ class CopilotService:
                     budget=self._budget_label(auto, cfg, deadline),
                     leads=self._leads_label(auto["hosts"]),
                     coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                    read_only=read_only_note,
                 )
         except asyncio.CancelledError:
             self._finish_autonomous(session, "stopped", "cancelled")

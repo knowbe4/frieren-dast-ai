@@ -5,11 +5,9 @@ const hosts   = {};
 let seq       = 0;
 let selId     = null;
 let selHost   = null;
-let dtab      = 'rr';
 let detail    = null;
 let selSmHost = null;
 let selSmId   = null;
-let smDtab    = 'rr';
 let smDetail  = null;
 let smSortCol = null;   // null = insertion order; else 'method'|'path'|'status'|'ms'
 let smSortDir = 'asc';
@@ -655,6 +653,7 @@ function renderRow(entry, isNew) {
     ? `<span title="${esc(entry.body_preview)}">${esc(entry.body_preview.slice(0,80))}${entry.body_preview.length > 80 ? '…' : ''}</span>`
     : '';
   if (isNew) {
+    _scheduleHistoryResearch();  // pick up header/body matches in new traffic
     tr = document.createElement('tr');
     tr.id = 'row-' + entry.id;
     tr.onclick = () => selectRow(entry.id);
@@ -705,8 +704,64 @@ function applyFilter() {
     if (entries[id]) applyFilterRow(tr, entries[id]);
   });
 }
+// ── global history search ──────────────────────────────────────────────
+// The table only holds a body preview, so the search runs server-side over
+// full headers and bodies and returns matching IDs. Until the reply lands (and
+// for rows that arrive after it) rows fall back to a local URL/preview match.
+let _historySearchIds   = null;  // Set of matching entry IDs, null = no server result
+let _historySearchTimer = null;
+let _historySearchSeq   = 0;
+
+function onHistorySearchInput() {
+  clearTimeout(_historySearchTimer);
+  _historySearchTimer = setTimeout(runHistorySearch, 250);
+  applyFilter();
+}
+
+// Throttled (not debounced): steady scan traffic must not postpone it forever.
+let _historyResearchTimer = null;
+function _scheduleHistoryResearch() {
+  if (_historyResearchTimer || !document.getElementById('filter').value.trim()) return;
+  _historyResearchTimer = setTimeout(() => {
+    _historyResearchTimer = null;
+    runHistorySearch();
+  }, 1500);
+}
+
+async function runHistorySearch() {
+  const query   = document.getElementById('filter').value.trim();
+  const countEl = document.getElementById('filter-count');
+  const requestSeq = ++_historySearchSeq;
+  if (!query) {
+    _historySearchIds = null;
+    if (countEl) countEl.textContent = '';
+    applyFilter();
+    return;
+  }
+  try {
+    const r = await fetch('/api/history/search?q=' + encodeURIComponent(query));
+    const data = await r.json();
+    if (requestSeq !== _historySearchSeq) return;  // a newer search superseded this one
+    _historySearchIds = new Set(data.ids || []);
+    if (countEl) countEl.textContent = `${_historySearchIds.size} match${_historySearchIds.size === 1 ? '' : 'es'}`;
+  } catch (err) {
+    console.warn('history search failed', err);
+    _historySearchIds = null;
+    if (countEl) countEl.textContent = '';
+  }
+  applyFilter();
+}
+
+function _matchesHistorySearch(e, q) {
+  if (!q) return true;
+  if (_historySearchIds && _historySearchIds.has(e.id)) return true;
+  return (e.url || '').toLowerCase().includes(q)
+      || (e.body_preview || '').toLowerCase().includes(q)
+      || (e.probe_payload || '').toLowerCase().includes(q);
+}
+
 function applyFilterRow(tr, e) {
-  const q       = document.getElementById('filter').value.toLowerCase();
+  const q       = document.getElementById('filter').value.trim().toLowerCase();
   const hConn   = document.getElementById('chk-conn').checked;
   const hVuln   = document.getElementById('chk-vuln').checked;
   const showProxy   = document.getElementById('chk-src-proxy').checked;
@@ -726,7 +781,7 @@ function applyFilterRow(tr, e) {
              || (src === 'imported'       && showProxy)
              || (src === 'out-of-scope'   && showOos);
   const show = srcOk
-             && (!q || e.path.toLowerCase().includes(q) || (e.body_preview || '').toLowerCase().includes(q) || (e.probe_payload || '').toLowerCase().includes(q))
+             && _matchesHistorySearch(e, q)
              && (selHost === null || e.host === selHost)
              && !(hConn && e.method === 'CONNECT')
              && !(hVuln && e.scan_result !== 'vulnerable');
@@ -744,40 +799,27 @@ function selectRow(id) {
 
 async function refreshDetail(id) {
   const r = await fetch('/api/entry/' + id);
-  detail = await r.json();
-  _paneViewMode.req  = 'raw';
-  _paneViewMode.resp = 'raw';
-  _paneViewMode.gql  = false;
+  const data = await r.json();
+  // A 404 means the row is stale — e.g. the backend was restarted and this
+  // entry no longer exists. Say so instead of rendering a misleading "pending".
+  if (!r.ok || (data && data.error)) {
+    detail = null;
+    const body = document.getElementById('dbody');
+    if (body) body.innerHTML = '<div class="dp-none" style="padding:16px">'
+      + 'This request is no longer in history (the proxy may have been restarted or history cleared). '
+      + 'Reload the dashboard to resync.</div>';
+    return;
+  }
+  detail = data;
+  _paneViewMode.gql  = false;  // req/resp Pretty|Raw stay sticky across selections
   renderDetail();
 }
 
-function setDTab(t) {
-  dtab = t;
-  document.querySelectorAll('#dtabs .dtab').forEach(d => d.classList.remove('on'));
-  document.getElementById('dt-' + t).classList.add('on');
-  renderDetail();
-}
-
+// Findings live in the Findings view; the detail pane only shows a badge
+// that links there (see 61-detail-pane.js).
 function renderDetail() {
   if (!detail) return;
-  document.getElementById('dbody').innerHTML =
-    dtab === 'rr' ? buildRRHtml(detail) : buildFindingsHtml(detail);
-  // Update passive bar visibility
-  const passiveFindings = (detail.findings || []).filter(f =>
-    f.validated_by === 'passive' || f.validated_by === 'passive+ai'
-  );
-  const bar = document.getElementById('passive-bar');
-  const barTxt = document.getElementById('passive-bar-txt');
-  if (bar) {
-    if (passiveFindings.length > 0 && dtab !== 'findings') {
-      const names = passiveFindings.slice(0, 2).map(f => f.title || f.attack_type).join(', ');
-      const extra = passiveFindings.length > 2 ? ` +${passiveFindings.length - 2} more` : '';
-      barTxt.textContent = `passive: ${names}${extra}`;
-      bar.style.display = 'flex';
-    } else {
-      bar.style.display = 'none';
-    }
-  }
+  document.getElementById('dbody').innerHTML = buildRRHtml(detail);
 }
 
 // ── target site map ────────────────────────────────────────────────────
@@ -925,17 +967,8 @@ async function refreshSmDetail(id) {
   renderSmDetail();
 }
 
-function setSmDTab(t) {
-  smDtab = t;
-  document.querySelectorAll('#sm-detail-body').forEach(() => {});
-  document.getElementById('sdt-rr').classList.toggle('on', t === 'rr');
-  document.getElementById('sdt-findings').classList.toggle('on', t === 'findings');
-  renderSmDetail();
-}
-
 function renderSmDetail() {
   if (!smDetail) return;
-  document.getElementById('sm-detail-body').innerHTML =
-    smDtab === 'rr' ? buildRRHtml(smDetail) : buildFindingsHtml(smDetail);
+  document.getElementById('sm-detail-body').innerHTML = buildRRHtml(smDetail);
 }
 

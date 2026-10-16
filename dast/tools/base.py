@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List
 
 from dast.tools.context import ToolContext
+from dast.utils import read_only
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -61,6 +62,9 @@ async def run_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> Di
     tool = _REGISTRY.get(name)
     if tool is None:
         return {"ok": False, "error": f"unknown tool: {name}"}
+    if getattr(ctx, "read_only", False) and name in read_only.BLOCKED_TOOLS:
+        logger.info("read-only mode: refused tool", tool=name)
+        return read_only.blocked_tool_error(name)
     try:
         result = await tool.handler(ctx, arguments or {})
         if not isinstance(result, dict):

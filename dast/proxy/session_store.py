@@ -202,6 +202,14 @@ class SessionStore:
         self._cookies: Dict[str, Dict[str, dict]] = {}
         # active browse session tag — set while user browses manually
         self.active_browse_session_id: Optional[str] = None
+        # The live BrowseSession object (if a Browse/named login window is open),
+        # so the crawler/explorer can snapshot its real authenticated Playwright
+        # storage_state (httpOnly cookies + localStorage) instead of the lossy
+        # Set-Cookie jar. Set by the browse worker; never serialized.
+        self.active_browse_session: Optional[object] = None
+        # Last captured storage_state blob from a (possibly now-closed) browse
+        # login, so a crawl shortly after login still authenticates.
+        self.auth_storage_state: Optional[dict] = None
         # active crawler session tag — set while SpaCrawler is running
         self.active_crawler_session_id: Optional[str] = None
         # service graph, discovery engine and session intelligence

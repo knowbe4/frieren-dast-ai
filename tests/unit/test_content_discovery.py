@@ -126,3 +126,49 @@ def test_dead_host_short_circuits(monkeypatch):
         hits = _run(cd.run_content_discovery("https://in.scope/", {}, settings))
     # baseline probe may be attempted once; but the candidate loop must break immediately.
     assert hits == []
+
+
+def test_spa_catch_all_shell_filtered_despite_varying_length():
+    """A SPA that serves its HTML shell (200) for every path with a per-route
+    nonce (so lengths differ) must NOT produce hits — exact-length matching used
+    to let these through."""
+    settings = MagicMock()
+    settings.is_in_scope.return_value = True
+    counter = {"n": 0}
+
+    async def fake_send(client, method, url, headers, body, payload=None, source="agent"):
+        # Same shell structure every time, but a unique nonce => different length.
+        counter["n"] += 1
+        shell = f"<html><head><title>App</title></head><body><div id=app>{'x'*counter['n']}</div></body></html>"
+        return _resp(200, shell.encode(), content_type="text/html; charset=utf-8")
+
+    with patch.object(cd, "_send", new=AsyncMock(side_effect=fake_send)), \
+         patch.object(cd, "_client"):
+        hits = _run(cd.run_content_discovery("https://spa.scope/", {}, settings))
+
+    assert hits == [], "SPA catch-all shell must be filtered even when length varies"
+
+
+def test_html_for_api_path_is_filtered_but_json_is_a_hit():
+    """An HTML response to a /graphql or .php path is the SPA shell (not a hit);
+    a JSON response to the same path is a real hit."""
+    settings = MagicMock()
+    settings.is_in_scope.return_value = True
+
+    async def fake_send(client, method, url, headers, body, payload=None, source="agent"):
+        if cd._SOFT404_PROBE_PATH in url:
+            return _resp(200, b"<html><body>shell</body></html>", content_type="text/html")
+        if url.endswith("config.php"):
+            return _resp(200, b"<html><body>shell</body></html>", content_type="text/html")  # SPA shell -> FP
+        if url.rstrip("/").endswith("graphql"):
+            return _resp(200, b'{"data":null,"errors":[{"message":"must provide query"}]}',
+                         content_type="application/json")  # real GraphQL -> hit
+        return _resp(404)
+
+    with patch.object(cd, "_send", new=AsyncMock(side_effect=fake_send)), \
+         patch.object(cd, "_client"):
+        hits = _run(cd.run_content_discovery("https://spa.scope/", {}, settings))
+
+    paths = {h["path"] for h in hits}
+    assert not any("config.php" in p for p in paths), "HTML-for-.php is the SPA shell, not a hit"
+    assert any("graphql" in p for p in paths), "a JSON GraphQL response is a real hit"

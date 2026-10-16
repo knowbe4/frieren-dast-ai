@@ -31,8 +31,18 @@ async def run_browse_worker(runner: "ProxyRunner", browse_queue: asyncio.Queue) 
         # ── legacy stop (unnamed session) ───────────────────────────────
         if action == "stop":
             if _active:
+                # Snapshot the authenticated session before closing so a crawl
+                # started after the login window is gone still authenticates.
+                try:
+                    state = await _active.get_storage_state()
+                    if state and (state.get("cookies") or state.get("origins")):
+                        runner._store.auth_storage_state = state
+                except Exception as exc:
+                    log_event("browser", "warn", f"storage_state capture on stop failed: {exc}",
+                              source="browser")
                 await _active.stop()
                 runner._store.active_browse_session_id = None
+                runner._store.active_browse_session = None
                 _active = None
                 log_event("browser", "info", "Browse session stopped", source="browser")
             continue
@@ -45,6 +55,7 @@ async def run_browse_worker(runner: "ProxyRunner", browse_queue: asyncio.Queue) 
             def on_stop():
                 nonlocal _active
                 runner._store.active_browse_session_id = None
+                runner._store.active_browse_session = None
                 _active = None
 
             session = BrowseSession(
@@ -53,6 +64,7 @@ async def run_browse_worker(runner: "ProxyRunner", browse_queue: asyncio.Queue) 
             )
             await session.start(start_url=job.get("url"), headless=False)
             runner._store.active_browse_session_id = session.session_id
+            runner._store.active_browse_session = session
             _active = session
             log_event("browser", "info", "Browse session started",
                       url=job.get("url", ""), source="browser")
@@ -82,6 +94,7 @@ async def run_browse_worker(runner: "ProxyRunner", browse_queue: asyncio.Queue) 
             try:
                 await ns.start(start_url=job.get("url"), headless=False)
                 _named[name] = ns
+                runner._store.active_browse_session = ns
                 log_event("browser", "info", f'Named browse session "{name}" started',
                           url=job.get("url", ""), source="browser")
                 job.get("result_cb", lambda *_: None)(True, "", ns.session_id)

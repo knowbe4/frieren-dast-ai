@@ -45,6 +45,14 @@ _EXPLORE_SCHEMA: Dict[str, Any] = {
                            "submit them to reach wizard steps and capture update/mutation requests. "
                            "Default false (map and navigate only; no writes).",
         },
+        "vision": {
+            "type": "boolean",
+            "description": "Last-resort visual navigation: when the DOM and accessibility tree expose "
+                           "no clickable nav on a page (web-component/canvas UI), screenshot it and ask "
+                           "a cheap multimodal model where to click. Default false; only enable after a "
+                           "normal explore of an authenticated app returns no routes (it costs a vision "
+                           "LLM call per such page).",
+        },
     },
     "required": ["url"],
 }
@@ -65,10 +73,12 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     read_only = bool(getattr(ctx, "read_only", False))
     # Form submission is active-only; read-only runs always map-only regardless of the flag.
     submit_forms = bool(args.get("submit_forms", False)) and not read_only
+    vision = bool(args.get("vision", False))
 
     before = _in_scope_url_set(store)
     done_event = asyncio.Event()
-    logger.info("explore tool: starting", url=url, submit_forms=submit_forms, read_only=read_only)
+    logger.info("explore tool: starting", url=url, submit_forms=submit_forms,
+                read_only=read_only, vision=vision)
     try:
         await crawl_queue.put({
             "mode": "exhaustive",
@@ -76,6 +86,7 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "headless": True,
             "read_only": read_only,
             "submit_forms": submit_forms,
+            "vision": vision,
             "session_safe": bool(getattr(ctx, "session_safe", False)),
             "done_event": done_event,
         })

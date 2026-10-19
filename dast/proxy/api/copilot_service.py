@@ -1084,18 +1084,29 @@ class CopilotService:
 
             # 1) Exhaustive SPA exploration — drain the UI-route frontier.
             prev_frontier = -1
+            last_visited = 0
             for _pass in range(10):
                 if stop_event.is_set():
                     return
                 result = await _call("explore", {"url": seed, "submit_forms": submit_forms})
                 remaining = int(result.get("frontier_remaining", 0) or 0)
+                last_visited = int(result.get("routes_visited", 0) or 0)
                 await self._broadcast_autonomous(sid, "explore_progress", {
-                    "host": host, "routes_visited": result.get("routes_visited"),
-                    "frontier_remaining": remaining,
+                    "host": host, "routes_visited": last_visited, "frontier_remaining": remaining,
                 })
                 if remaining == 0 or remaining == prev_frontier:
                     break
                 prev_frontier = remaining
+
+            # Coordinator decision (NOT automatic): normal DOM/accessibility
+            # navigation found no routes on an app that is clearly authenticated
+            # and rendering (its own traffic reached the store). The nav is likely
+            # a web-component/canvas UI with no enumerable structure — try VISION
+            # navigation once (cheap multimodal model, bounded in the explorer).
+            if last_visited <= 1 and len(self._store.in_scope_entries()) > 3:
+                logger.info("complete-mode: normal nav found no routes — trying vision", host=host)
+                await self._broadcast_autonomous(sid, "vision_fallback", {"host": host})
+                await _call("explore", {"url": seed, "submit_forms": submit_forms, "vision": True})
 
             if read_only:
                 continue  # active tools below are blocked in read-only

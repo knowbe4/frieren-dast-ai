@@ -88,7 +88,11 @@ async def proxied_browser_context(
             args=["--ignore-certificate-errors"],
         )
         try:
-            context_kwargs = {"ignore_https_errors": True, "viewport": {"width": 1280, "height": 900}}
+            # device_scale_factor=1 so a viewport screenshot's pixels map 1:1 to
+            # page.mouse.click CSS coordinates (needed by the vision navigator).
+            context_kwargs = {"ignore_https_errors": True,
+                              "viewport": {"width": 1280, "height": 900},
+                              "device_scale_factor": 1}
             if storage_state:
                 context_kwargs["storage_state"] = storage_state
             context = await browser.new_context(**context_kwargs)

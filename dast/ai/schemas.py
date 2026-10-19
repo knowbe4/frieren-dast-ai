@@ -737,3 +737,37 @@ RACE_VERDICT_SCHEMA: Dict[str, Any] = {
     },
     "required": ["confirmed", "confidence", "reasoning"],
 }
+
+
+# Vision navigator — dast/proxy/vision_nav.py. The multimodal model is shown a
+# screenshot of a rendered SPA and returns the on-screen navigation controls as
+# center pixel coordinates, so the explorer can click them when the DOM/
+# accessibility tree expose no enumerable nav (web-component / canvas UIs).
+VISION_CLICKABLES_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "elements": {
+            "type": "array",
+            "description": "On-screen navigation controls that lead to a different app section.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Visible text/label of the control."},
+                    "x": {"type": "integer", "description": "Center X in viewport pixels."},
+                    "y": {"type": "integer", "description": "Center Y in viewport pixels."},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["nav", "link", "button", "menu", "tab"],
+                        "description": "What kind of control this is.",
+                    },
+                    "destructive": {
+                        "type": "boolean",
+                        "description": "True if it logs out, deletes, or otherwise destroys state — these are skipped.",
+                    },
+                },
+                "required": ["label", "x", "y"],
+            },
+        },
+    },
+    "required": ["elements"],
+}

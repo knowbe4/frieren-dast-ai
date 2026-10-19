@@ -67,6 +67,9 @@ _MAX_INTERACTIONS_PER_ROUTE = 40
 _SESSION_SAFE_INTERACTIONS = 12
 _MAX_FORMS_PER_ROUTE = 5
 _MAX_WIZARD_STEPS = 6
+# Cap on vision-model navigation calls per run (each is a multimodal LLM call).
+_MAX_VISION_CALLS = 25
+_VIEWPORT = {"width": 1280, "height": 900}
 
 
 class SpaExplorer:
@@ -85,6 +88,8 @@ class SpaExplorer:
         self._read_only = False
         self._submit_forms = False
         self._session_safe = False
+        self._vision = False
+        self._vision_calls = 0
 
     def _log(self, msg: str) -> None:
         logger.debug(msg, session_id=self.session_id)
@@ -105,10 +110,12 @@ class SpaExplorer:
         session_safe: bool = False,
         headless: bool = True,
         max_routes: Optional[int] = None,
+        vision: bool = False,
     ) -> None:
         self._read_only = read_only
         self._submit_forms = submit_forms and not read_only
         self._session_safe = session_safe
+        self._vision = vision
         max_routes = max_routes or (_SESSION_SAFE_MAX_ROUTES if session_safe else _DEFAULT_MAX_ROUTES)
 
         graph = self._store.ui_route_graph
@@ -203,6 +210,13 @@ class SpaExplorer:
         # web-component nav inside shadow DOM that CSS selectors miss.
         cap = _SESSION_SAFE_INTERACTIONS if self._session_safe else _MAX_INTERACTIONS_PER_ROUTE
         interactions += await self._click_ax_nav(page, route, graph, is_allowed_host, set(), cap)
+
+        # Vision fallback: the DOM + accessibility paths found nothing to click on a
+        # page that clearly rendered (web-component/canvas UI). Only when the
+        # coordinator enabled vision for this run, and bounded per run.
+        if (self._vision and interactions == 0
+                and self._vision_calls < _MAX_VISION_CALLS and not self._stop.is_set()):
+            interactions += await self._vision_nav(page, route, graph, is_allowed_host)
 
         forms_submitted = 0
         if self._submit_forms:
@@ -479,6 +493,54 @@ class SpaExplorer:
                         break
             except Exception as exc:
                 logger.debug("explorer: ax nav click failed", role=role, name=name[:40], error=str(exc))
+        return interactions
+
+    async def _vision_nav(self, page, route, graph, is_allowed_host) -> int:
+        """Last-resort navigation when the DOM and accessibility tree expose no
+        clickable nav (web-component/canvas UI): screenshot the page, ask the cheap
+        multimodal model for the on-screen nav controls, and click them by
+        coordinate. Discovered routes feed the frontier like any other click."""
+        from dast.ai import bedrock_client
+        from dast.proxy.vision_nav import vision_clickables
+
+        self._vision_calls += 1
+        try:
+            targets = await vision_clickables(page, bedrock_client.invoke_json, _VIEWPORT)
+        except Exception as exc:  # noqa: BLE001 — vision is best-effort
+            logger.warning("explorer: vision nav failed", error=str(exc))
+            return 0
+
+        interactions = 0
+        for t in targets:
+            if self._stop.is_set():
+                break
+            label = (t.get("label") or "").lower()
+            if any(kw in label for kw in _DANGEROUS_KEYWORDS):
+                continue
+            x, y = t.get("x"), t.get("y")
+            if x is None or y is None:
+                continue
+            try:
+                url_before = page.url
+                await page.mouse.click(int(x), int(y))
+                interactions += 1
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    await asyncio.sleep(0.5)
+                landed = page.url
+                if landed != url_before:
+                    parsed = urlparse(landed)
+                    if parsed.netloc and is_allowed_host(parsed.netloc):
+                        if graph.add_discovered(landed, via="vision", parent=route.route_key, depth=route.depth + 1):
+                            self._log(f"  -> vision nav route: {t.get('label')!r} -> {landed}")
+                    try:
+                        await page.goto(route.url, wait_until="domcontentloaded", timeout=15000)
+                        await self._wait_for_spa_render(page)
+                    except Exception:
+                        break
+            except Exception as exc:
+                logger.debug("explorer: vision click failed", x=x, y=y, error=str(exc))
         return interactions
 
     async def _submit_forms_on_page(self, page, route, graph, is_allowed_host) -> int:

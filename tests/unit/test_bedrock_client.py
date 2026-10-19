@@ -348,3 +348,30 @@ def test_string_typed_field_holding_json_is_not_decoded(install_fake_client):
     result = bedrock_client.invoke_json("sys", "user", schema=schema)
 
     assert result == {"note": "[1, 2]"}
+
+
+# ── multimodal / image input (vision navigator) ──────────────────────────────
+
+def test_invoke_json_sends_image_block(install_fake_client):
+    fake = install_fake_client([_tool_response({"elements": []})])
+    schema = {"type": "object", "properties": {"elements": {"type": "array"}}, "required": ["elements"]}
+    bedrock_client.invoke_json("sys", "find nav", schema=schema, image_b64="QUJD", temperature=0)
+    content = fake.bodies[0]["messages"][0]["content"]
+    assert isinstance(content, list)
+    kinds = {block["type"] for block in content}
+    assert kinds == {"text", "image"}
+    img = next(b for b in content if b["type"] == "image")
+    assert img["source"] == {"type": "base64", "media_type": "image/png", "data": "QUJD"}
+
+
+def test_text_only_call_keeps_string_content(install_fake_client):
+    fake = install_fake_client([_text_response("hi")])
+    bedrock_client.invoke("sys", "hello")
+    assert fake.bodies[0]["messages"][0]["content"] == "hello"  # unchanged shape
+
+
+def test_image_rejected_for_openai_provider(monkeypatch):
+    monkeypatch.setattr(bedrock_client, "get_active_provider", lambda: "openai")
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "gpt-x")
+    with pytest.raises(ValueError, match="image input is not supported"):
+        bedrock_client.invoke("sys", "u", image_b64="QUJD")

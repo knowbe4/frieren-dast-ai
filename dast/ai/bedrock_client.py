@@ -531,18 +531,29 @@ def _build_body(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Construct the Bedrock InvokeModel request body shared by invoke()/invoke_json().
 
     Optional params are only added to the body when set, so callers that pass
-    nothing get byte-for-byte the previous request shape.
+    nothing get byte-for-byte the previous request shape. When ``image_b64`` is
+    given (a base64 PNG), the user turn becomes a content list carrying a text
+    block + an image block (Anthropic multimodal), used by the vision navigator.
     """
+    if image_b64:
+        user_content: Any = [
+            {"type": "text", "text": user},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": image_b64}},
+        ]
+    else:
+        user_content = user
     body: Dict[str, Any] = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "system": _build_system_block(system, cache_system),
-        "messages": [{"role": "user", "content": user}],
+        "messages": [{"role": "user", "content": user_content}],
     }
     if temperature is not None:
         body["temperature"] = temperature
@@ -657,6 +668,7 @@ def _invoke_raw(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Send one request to the active provider and return the parsed response
@@ -666,9 +678,12 @@ def _invoke_raw(
     from botocore.exceptions import ClientError
 
     model = _resolve_model(model_id)
-    body = _build_body(system, user, max_tokens, temperature, cache_system, schema)
-
     provider = get_active_provider()
+    if image_b64 and provider in ("openai", "glm"):
+        raise ValueError(f"image input is not supported for provider '{provider}' "
+                         "(use the bedrock/anthropic/gateway provider for vision)")
+    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
+
     if provider != "bedrock":
         result = _invoke_external(provider, body, model)
         _log_cache_usage(result)
@@ -913,6 +928,7 @@ def invoke(
     max_tokens: int = 2048,
     temperature: Optional[float] = None,
     cache_system: bool = False,
+    image_b64: Optional[str] = None,
 ) -> str:
     """
     Send a system+user message to Claude and return the text response.
@@ -922,10 +938,13 @@ def invoke(
                     (model default). Set 0 for deterministic decisions.
     cache_system  — cache the system prompt with an ephemeral breakpoint; use for
                     large static system prompts re-sent across many calls.
+    image_b64     — optional base64 PNG attached to the user turn (multimodal;
+                    bedrock/anthropic/gateway only).
     """
     result = _invoke_raw(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=None,
+        image_b64=image_b64,
     )
     return _extract_text(result)
 
@@ -951,6 +970,7 @@ def invoke_json(
     temperature: Optional[float] = None,
     cache_system: bool = False,
     schema: Optional[Dict[str, Any]] = None,
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Like invoke() but returns parsed JSON.
@@ -970,8 +990,10 @@ def invoke_json(
     schema, max_tokens) tuple returns a stored decision instead of a fresh LLM
     call. Non-deterministic calls bypass the cache entirely.
     """
+    # Image calls are never cached: the screenshot varies per page and is not part
+    # of the cache key, so caching would collide across different views.
     cache_key: Optional[str] = None
-    if temperature == 0 and response_cache.is_enabled():
+    if image_b64 is None and temperature == 0 and response_cache.is_enabled():
         cache_key = response_cache.make_key(
             provider=get_active_provider(),
             model=_resolve_model(model_id),
@@ -987,6 +1009,7 @@ def invoke_json(
     result = _invoke_json_uncached(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=schema,
+        image_b64=image_b64,
     )
 
     if cache_key is not None and isinstance(result, dict):
@@ -1002,6 +1025,7 @@ def _invoke_json_uncached(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The uncached invoke_json body — one LLM round-trip (plus repair retry on
     the legacy text path). Wrapped by invoke_json, which layers optional
@@ -1014,6 +1038,7 @@ def _invoke_json_uncached(
             result = _invoke_raw(
                 system=system, user=user, model_id=model_id, max_tokens=max_tokens,
                 temperature=temperature, cache_system=cache_system, schema=schema,
+                image_b64=image_b64,
             )
         except providers.ProviderError as exc:
             # The server refused forced tool-use outright (e.g. a tool-less local

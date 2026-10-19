@@ -51,6 +51,7 @@ async def run_crawl_worker(runner: "ProxyRunner", crawl_queue: asyncio.Queue) ->
                     session_safe=bool(job.get("session_safe", False)),
                     headless=job.get("headless", True),
                     max_routes=job.get("max_routes"),
+                    vision=bool(job.get("vision", False)),
                 )
             else:
                 crawler = SpaCrawler(runner._store, log_cb, stop_event, proxy_port=runner._proxy_port)

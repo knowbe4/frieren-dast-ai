@@ -168,7 +168,7 @@ class SpaExplorer:
             return
         entries_before = len(self._store.in_scope_entries())
         try:
-            await page.goto(route.url, wait_until="load", timeout=30000)
+            await page.goto(route.url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             logger.debug("explorer: nav timeout", url=route.url, error=str(exc))
             try:
@@ -176,7 +176,10 @@ class SpaExplorer:
             except Exception:
                 graph.mark_failed(route.route_key)
                 return
-        await asyncio.sleep(1.2)
+        # A micro-frontend SPA renders its nav well after `load`: wait for the
+        # network to go idle, then for actual interactive elements to appear,
+        # before snapshotting. Without this the collector runs on an empty shell.
+        await self._wait_for_spa_render(page)
 
         landed = page.url
         # A redirect to login means the session wasn't accepted — record and move on.
@@ -196,6 +199,10 @@ class SpaExplorer:
             graph.add_discovered(url, via="link", parent=route.route_key, depth=route.depth + 1)
 
         interactions = await self._click_nav_elements(page, route, graph, is_allowed_host)
+        # Also drive nav via the accessibility tree (role+name), which reaches
+        # web-component nav inside shadow DOM that CSS selectors miss.
+        cap = _SESSION_SAFE_INTERACTIONS if self._session_safe else _MAX_INTERACTIONS_PER_ROUTE
+        interactions += await self._click_ax_nav(page, route, graph, is_allowed_host, set(), cap)
 
         forms_submitted = 0
         if self._submit_forms:
@@ -210,6 +217,78 @@ class SpaExplorer:
         )
         self._log(f"Visited {landed} — +{api_entries} API calls, {interactions} interactions, "
                   f"{forms_submitted} forms; frontier now {len(graph.frontier())}")
+
+    async def _wait_for_spa_render(self, page) -> None:
+        """Give a client-rendered SPA time to actually paint its nav before we
+        enumerate: network-idle, then poll until interactive elements exist (links,
+        buttons, role=button/menuitem/tab, routerLink), piercing open shadow DOM."""
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        census_js = """() => {
+          const sels = ["a[href]","button","[role=button]","[role=menuitem]","[role=tab]",
+                        "[routerLink]","[ng-reflect-router-link]","[onclick]"];
+          let n = 0;
+          const scan = (root) => {
+            for (const s of sels) { try { n += root.querySelectorAll(s).length; } catch(e){} }
+            try { root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) scan(el.shadowRoot); }); } catch(e){}
+          };
+          scan(document);
+          return n;
+        }"""
+        deadline = asyncio.get_event_loop().time() + 10
+        count = 0
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                count = await page.evaluate(census_js)
+            except Exception:
+                count = 0
+            if count >= 5:
+                break
+            await asyncio.sleep(0.5)
+        # Per-frame census: a micro-frontend SPA renders nav/content inside iframes
+        # that top-document queries never see. Log counts per frame at info so we
+        # can tell "empty shell" from "content is in a frame we're not crawling".
+        frame_counts = []
+        try:
+            for fr in page.frames:
+                try:
+                    fc = await fr.evaluate(census_js)
+                except Exception:
+                    fc = -1
+                frame_counts.append((fr.url[:60], fc))
+        except Exception as exc:
+            logger.debug("explorer: frame census failed", error=str(exc))
+        # Accessibility-tree census: the AX tree surfaces roles even inside shadow
+        # DOM (incl. closed) that querySelectorAll cannot reach. If the DOM census
+        # is low but the AX tree is rich, the nav lives in web components and we
+        # must drive it via roles, not CSS selectors.
+        ax_roles: dict = {}
+        ax_links: list = []
+        try:
+            snap = await page.accessibility.snapshot(interesting_only=False)
+
+            def _walk(node):
+                if not isinstance(node, dict):
+                    return
+                role = node.get("role", "")
+                ax_roles[role] = ax_roles.get(role, 0) + 1
+                if role in ("link", "button", "menuitem", "tab") and node.get("name"):
+                    if len(ax_links) < 25:
+                        ax_links.append(node.get("name")[:30])
+                for child in node.get("children") or []:
+                    _walk(child)
+            _walk(snap)
+        except Exception as exc:
+            logger.debug("explorer: ax snapshot failed", error=str(exc))
+        top_roles = dict(sorted(ax_roles.items(), key=lambda kv: -kv[1])[:12])
+        logger.info("explorer census", url=page.url[:80], top_interactive=count,
+                    frames=len(frame_counts), frame_counts=frame_counts[:8],
+                    ax_total=sum(ax_roles.values()), ax_roles=top_roles, ax_nav_sample=ax_links,
+                    session_id=self.session_id)
+        self._log(f"SPA render settled: {count} DOM interactive, "
+                  f"{sum(ax_roles.values())} AX nodes, {len(frame_counts)} frame(s)")
 
     async def _scroll(self, page) -> None:
         try:
@@ -268,13 +347,16 @@ class SpaExplorer:
         cap = _SESSION_SAFE_INTERACTIONS if self._session_safe else _MAX_INTERACTIONS_PER_ROUTE
         clicked_fps: set = set()
         interactions = 0
+        # Tag every interactive-looking element (div/span nav with click handlers,
+        # role, tabindex, cursor:pointer) across open shadow DOM, then collect those
+        # handles — SPAs rarely use plain <a>/<button> for nav.
         try:
-            handles = []
-            for selector in _EXPLORE_CLICKABLE:
-                try:
-                    handles.extend(await page.query_selector_all(selector))
-                except Exception:
-                    continue
+            tagged = await page.evaluate(dom_probe.TAG_CLICKABLES_JS)
+            self._log(f"Tagged {tagged} clickable element(s) on {page.url[:70]}")
+        except Exception as exc:
+            logger.debug("explorer: clickable tagging failed", error=str(exc))
+        try:
+            handles = await page.query_selector_all("[data-dast-clickable]")
         except Exception as exc:
             logger.debug("explorer: element query failed", error=str(exc))
             return 0
@@ -335,6 +417,68 @@ class SpaExplorer:
                         break
             except Exception as exc:
                 logger.debug("explorer: element interaction failed", error=str(exc))
+        return interactions
+
+    async def _click_ax_nav(self, page, route, graph, is_allowed_host, clicked_fps, cap) -> int:
+        """Click nav items via the ACCESSIBILITY TREE (role + name). The AX tree
+        surfaces interactive elements the browser computes even inside web-component
+        shadow DOM that CSS querySelectorAll cannot reach — this is how a modern
+        component-based SPA (e.g. a micro-frontend console) exposes its nav.
+        Playwright role locators resolve across shadow DOM."""
+        interactions = 0
+        try:
+            snap = await page.accessibility.snapshot(interesting_only=True)
+        except Exception as exc:
+            logger.debug("explorer: ax snapshot failed", error=str(exc))
+            return 0
+
+        candidates: List[tuple] = []  # (role, name)
+
+        def _walk(node):
+            if not isinstance(node, dict) or len(candidates) >= 200:
+                return
+            role = node.get("role", "")
+            name = (node.get("name") or "").strip()
+            if role in ("link", "button", "menuitem", "tab", "treeitem") and name:
+                candidates.append((role, name))
+            for child in node.get("children") or []:
+                _walk(child)
+        _walk(snap)
+
+        for role, name in candidates:
+            if self._stop.is_set() or interactions >= cap:
+                break
+            fp = f"ax:{role}:{name}"
+            if fp in clicked_fps:
+                continue
+            clicked_fps.add(fp)
+            if any(kw in name.lower() for kw in _DANGEROUS_KEYWORDS):
+                continue
+            try:
+                loc = page.get_by_role(role, name=name, exact=True).first
+                if not await loc.is_visible():
+                    continue
+                url_before = page.url
+                await loc.scroll_into_view_if_needed(timeout=1500)
+                await loc.click(timeout=2500)
+                interactions += 1
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    await asyncio.sleep(0.5)
+                landed = page.url
+                if landed != url_before:
+                    parsed = urlparse(landed)
+                    if parsed.netloc and is_allowed_host(parsed.netloc):
+                        if graph.add_discovered(landed, via="click", parent=route.route_key, depth=route.depth + 1):
+                            self._log(f"  -> AX nav route: {name!r} -> {landed}")
+                    try:
+                        await page.goto(route.url, wait_until="domcontentloaded", timeout=15000)
+                        await self._wait_for_spa_render(page)
+                    except Exception:
+                        break
+            except Exception as exc:
+                logger.debug("explorer: ax nav click failed", role=role, name=name[:40], error=str(exc))
         return interactions
 
     async def _submit_forms_on_page(self, page, route, graph, is_allowed_host) -> int:

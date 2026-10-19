@@ -1100,9 +1100,12 @@ class CopilotService:
             if read_only:
                 continue  # active tools below are blocked in read-only
 
-            # 2) Content discovery widens the REST surface with unlinked paths.
-            await _call("content_discovery", {"url": seed})
-            # 3) Scan every observed-but-unscanned endpoint to exhaustion.
+            # 2) Scan every observed-but-unscanned endpoint to exhaustion.
+            #    Surface comes from REAL navigation (the explore above) + the
+            #    authenticated app's own traffic — NOT wordlist forced-browsing.
+            #    content_discovery remains an explicit tool the operator/LLM can
+            #    invoke, but the complete sweep no longer brute-forces paths from
+            #    files (noisy, false-positive-prone on SPAs).
             await _loop_until_zero("scan_surface", {}, "remaining")
             # 4) GraphQL: introspect+sweep, or fuzz captured ops when introspection is off.
             await self._auto_test_graphql(session, ctx, hosts={host})

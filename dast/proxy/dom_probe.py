@@ -60,6 +60,42 @@ COLLECT_ROUTES_JS = r"""
 }
 """
 
+# Tag every interactive-LOOKING element (piercing open shadow DOM) with a marker
+# attribute so Playwright can query handles to them. SPAs build nav from <div>/
+# <span> with click handlers, role=, tabindex, or cursor:pointer — not just <a>/
+# <button>. Returns the count tagged. This is the "clickable detector": we treat
+# an element as clickable if it has an onclick attr, an interactive ARIA role, a
+# tabindex, or a computed `cursor: pointer`. (Listeners added via addEventListener
+# with no onclick attr are approximated by role/cursor; full detection needs CDP.)
+TAG_CLICKABLES_JS = r"""
+() => {
+  const INTERACTIVE_ROLES = new Set(["button","link","tab","menuitem","option","treeitem","checkbox","radio","switch","menuitemcheckbox","menuitemradio"]);
+  let n = 0;
+  const mark = (el) => { try { el.setAttribute("data-dast-clickable","1"); n++; } catch(e){} };
+  const consider = (el) => {
+    try {
+      if (el.hasAttribute("data-dast-clickable")) return;
+      const tag = el.tagName ? el.tagName.toLowerCase() : "";
+      if (tag === "a" || tag === "button") { mark(el); return; }
+      if (el.hasAttribute("onclick") || el.hasAttribute("routerLink") || el.hasAttribute("ng-reflect-router-link") || el.hasAttribute("data-href")) { mark(el); return; }
+      const role = (el.getAttribute && el.getAttribute("role")) || "";
+      if (INTERACTIVE_ROLES.has(role)) { mark(el); return; }
+      const ti = el.getAttribute && el.getAttribute("tabindex");
+      if (ti !== null && ti !== undefined && ti !== "-1") { mark(el); return; }
+      const cs = window.getComputedStyle(el);
+      if (cs && cs.cursor === "pointer") { mark(el); return; }
+    } catch(e){}
+  };
+  const scan = (root) => {
+    let els; try { els = root.querySelectorAll("*"); } catch(e){ return; }
+    els.forEach(el => { consider(el); if (el.shadowRoot) scan(el.shadowRoot); });
+  };
+  scan(document);
+  return n;
+}
+"""
+
+
 # Enumerate forms (document + open shadow roots) with their fields, so the
 # explorer can decide what to fill. Capped to keep the payload small.
 COLLECT_FORMS_JS = r"""

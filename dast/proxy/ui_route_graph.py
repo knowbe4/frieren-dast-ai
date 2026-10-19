@@ -111,6 +111,16 @@ class UiRouteGraph:
             route.interactive_elements = interactive_elements
             route.forms_submitted = forms_submitted
 
+    def reopen(self, route_key: str) -> bool:
+        """Put a visited/failed route back in the frontier so it is visited again
+        (used to re-run a seed under vision mode). Returns True if a route changed."""
+        with self._lock:
+            route = self._routes.get(route_key)
+            if route is None or route.state == FRONTIER:
+                return False
+            route.state = FRONTIER
+            return True
+
     def mark_failed(self, route_key: str) -> None:
         with self._lock:
             route = self._routes.get(route_key)

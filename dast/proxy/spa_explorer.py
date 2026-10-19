@@ -27,6 +27,7 @@ from dast.ai import canaries
 from dast.proxy import dom_probe
 from dast.proxy.browser_session import proxied_browser_context
 from dast.proxy.session_store import SessionStore
+from dast.proxy.ui_route_graph import normalise_route_key
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
 
@@ -120,6 +121,11 @@ class SpaExplorer:
 
         graph = self._store.ui_route_graph
         graph.add_discovered(target_url, via="seed")
+        # Vision runs inside _visit_route; if a prior (DOM/AX) pass already visited
+        # the seed and left an empty frontier, re-open it so the vision pass has a
+        # route to work on. Without this a vision re-run exits immediately.
+        if self._vision and not graph.frontier():
+            graph.reopen(normalise_route_key(target_url))
 
         parsed = urlparse(target_url)
         base_host = parsed.netloc
@@ -304,6 +310,20 @@ class SpaExplorer:
         self._log(f"SPA render settled: {count} DOM interactive, "
                   f"{sum(ax_roles.values())} AX nodes, {len(frame_counts)} frame(s)")
 
+    async def _settle_after_click(self, page) -> None:
+        """Settle the page after a click that MAY navigate. A navigating click
+        dispatches its navigation on a later task, so calling
+        ``wait_for_load_state('networkidle')`` immediately can resolve against the
+        pre-navigation document — the URL would be read before the navigation commits
+        and the new route would be missed on a fast server. A brief pause lets the
+        navigation get in-flight; networkidle then waits for it to finish. A no-op
+        click just settles quickly."""
+        await asyncio.sleep(0.15)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            await asyncio.sleep(0.3)
+
     async def _scroll(self, page) -> None:
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -412,10 +432,7 @@ class SpaExplorer:
                 await el.scroll_into_view_if_needed(timeout=2000)
                 await el.click(timeout=2500)
                 interactions += 1
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=3000)
-                except Exception:
-                    await asyncio.sleep(0.5)
+                await self._settle_after_click(page)
 
                 landed = page.url
                 if landed != url_before:
@@ -476,10 +493,7 @@ class SpaExplorer:
                 await loc.scroll_into_view_if_needed(timeout=1500)
                 await loc.click(timeout=2500)
                 interactions += 1
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=3000)
-                except Exception:
-                    await asyncio.sleep(0.5)
+                await self._settle_after_click(page)
                 landed = page.url
                 if landed != url_before:
                     parsed = urlparse(landed)
@@ -524,10 +538,7 @@ class SpaExplorer:
                 url_before = page.url
                 await page.mouse.click(int(x), int(y))
                 interactions += 1
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=3000)
-                except Exception:
-                    await asyncio.sleep(0.5)
+                await self._settle_after_click(page)
                 landed = page.url
                 if landed != url_before:
                     parsed = urlparse(landed)

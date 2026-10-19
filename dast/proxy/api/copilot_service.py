@@ -1103,7 +1103,11 @@ class CopilotService:
             # and rendering (its own traffic reached the store). The nav is likely
             # a web-component/canvas UI with no enumerable structure — try VISION
             # navigation once (cheap multimodal model, bounded in the explorer).
-            if last_visited <= 1 and len(self._store.in_scope_entries()) > 3:
+            try:
+                observed = len(self._ctx.store.in_scope_entries()) if self._ctx.store else 0
+            except Exception:  # noqa: BLE001
+                observed = 0
+            if last_visited <= 1 and observed > 3:
                 logger.info("complete-mode: normal nav found no routes — trying vision", host=host)
                 await self._broadcast_autonomous(sid, "vision_fallback", {"host": host})
                 await _call("explore", {"url": seed, "submit_forms": submit_forms, "vision": True})

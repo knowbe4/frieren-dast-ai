@@ -37,6 +37,11 @@ async def _auth_storage_state(store: "SessionStore") -> Optional[dict]:
         try:
             state = await session.get_storage_state()
             if state and (state.get("cookies") or state.get("origins")):
+                # Persist the fresh login so it survives a proxy restart without the
+                # operator having to log in again (updated on every crawl seed).
+                from dast.proxy.auth_state_store import save_auth_state
+                store.auth_storage_state = state
+                save_auth_state(state)
                 return state
         except Exception as exc:  # noqa: BLE001 — fall back to the jar on any error
             logger.warning("browser_session: live storage_state capture failed", error=str(exc))

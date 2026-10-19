@@ -37,6 +37,9 @@ async def run_browse_worker(runner: "ProxyRunner", browse_queue: asyncio.Queue) 
                     state = await _active.get_storage_state()
                     if state and (state.get("cookies") or state.get("origins")):
                         runner._store.auth_storage_state = state
+                        # Persist so the login survives a proxy restart.
+                        from dast.proxy.auth_state_store import save_auth_state
+                        save_auth_state(state)
                 except Exception as exc:
                     log_event("browser", "warn", f"storage_state capture on stop failed: {exc}",
                               source="browser")

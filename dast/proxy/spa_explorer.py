@@ -207,6 +207,7 @@ class SpaExplorer:
         await self._scroll(page)
         await self._reveal_menus(page)
 
+        routes_before = graph.stats()["total"]
         new_routes = await self._collect_routes(page, is_allowed_host)
         for url in new_routes:
             graph.add_discovered(url, via="link", parent=route.route_key, depth=route.depth + 1)
@@ -217,12 +218,24 @@ class SpaExplorer:
         cap = _SESSION_SAFE_INTERACTIONS if self._session_safe else _MAX_INTERACTIONS_PER_ROUTE
         interactions += await self._click_ax_nav(page, route, graph, is_allowed_host, set(), cap)
 
-        # Vision fallback: the DOM + accessibility paths found nothing to click on a
-        # page that clearly rendered (web-component/canvas UI). Only when the
-        # coordinator enabled vision for this run, and bounded per run.
-        if (self._vision and interactions == 0
-                and self._vision_calls < _MAX_VISION_CALLS and not self._stop.is_set()):
+        # Vision fallback: the link collector + DOM + accessibility paths discovered
+        # NO new route on a page that clearly rendered (web-component/canvas UI whose
+        # nav is pixels, not structure). Gate on routes discovered, not click count —
+        # a component SPA often exposes clickable controls that lead nowhere
+        # enumerable, so "interactions > 0 but zero routes" is exactly when vision is
+        # needed. Coordinator-enabled only, and bounded per run.
+        routes_discovered = graph.stats()["total"] - routes_before
+        vision_fires = (self._vision and routes_discovered == 0
+                        and self._vision_calls < _MAX_VISION_CALLS and not self._stop.is_set())
+        if vision_fires:
+            logger.info("explorer: vision fallback engaged", url=page.url[:80],
+                        dom_ax_interactions=interactions, vision_calls=self._vision_calls,
+                        session_id=self.session_id)
             interactions += await self._vision_nav(page, route, graph, is_allowed_host)
+        else:
+            logger.debug("explorer: vision not engaged", vision=self._vision,
+                         routes_discovered=routes_discovered, interactions=interactions,
+                         url=page.url[:80], session_id=self.session_id)
 
         forms_submitted = 0
         if self._submit_forms:

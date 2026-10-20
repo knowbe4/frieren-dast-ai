@@ -524,6 +524,48 @@ def test_surface_coverage_incomplete_while_ui_frontier_nonempty():
     assert cov["complete"] is False             # frontier not drained
 
 
+@pytest.mark.asyncio
+async def test_run_autonomous_defers_identity_then_restores():
+    store = _FakeStore()
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("obj", focus_hosts=["app.example.com"])
+    # Deferral is armed synchronously at run start.
+    assert store.defer_identity_hosts is True
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    # ...and lifted when the run ends, so it never leaks into manual use.
+    assert store.defer_identity_hosts is False
+
+
+def test_surface_coverage_excludes_deferred_identity_hosts():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    store.ui_route_graph.add_discovered("https://login.identity.example.com/signin")
+    service = CopilotService(_FakeCtx(store))
+    hosts = ["app.example.com", "login.identity.example.com"]
+
+    store.defer_identity_hosts = True
+    cov = service._surface_coverage(hosts)
+    assert cov["ui_total"] == 1          # IdP route excluded while deferred
+
+    store.defer_identity_hosts = False
+    cov2 = service._surface_coverage(hosts)
+    assert cov2["ui_total"] == 2         # both counted once deferral is lifted
+
+
+@pytest.mark.asyncio
+async def test_final_identity_phase_lifts_deferral_and_runs_once():
+    store = _FakeStore()
+    service = CopilotService(_FakeCtx(store))
+    store.defer_identity_hosts = True
+    session = {"autonomous": {"hosts": ["app.example.com"], "read_only": True,
+                              "stop_event": asyncio.Event()}}
+    await service._final_identity_phase("sid", session)
+    assert store.defer_identity_hosts is False
+    assert session["autonomous"]["identity_phase_done"] is True
+
+
 def test_surface_coverage_complete_when_frontier_drained():
     store = _UiStore()
     store.ui_route_graph.add_discovered("https://app.example.com/dashboard")

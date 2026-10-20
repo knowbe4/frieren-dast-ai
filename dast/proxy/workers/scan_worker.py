@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from dast.proxy.check_target_adapter import _entry_to_check_target
 from dast.utils.destructive_paths import destructive_segment
 from dast.proxy.scan_support import detection_method, normalise_dedup_path, update_import_stubs
+from dast.proxy.session_store import is_identity_host
 from dast.proxy.suggestions import record_param_hit
 from dast.utils.tasks import spawn_tracked
 
@@ -430,6 +431,11 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
         if entry.queued_for_scan or entry.scan_result:
             return
         if not runner._settings.is_in_scope(entry.url):
+            return
+        # Defer identity-provider hosts during an autonomous run: scanning the IdP's
+        # login/token endpoints invalidates the shared SSO session every other host
+        # depends on, so they are tested only in the run's final phase.
+        if getattr(runner._store, "defer_identity_hosts", False) and is_identity_host(entry.host):
             return
 
         # Normalise path: replace UUIDs, numeric IDs, and hex strings with {id}

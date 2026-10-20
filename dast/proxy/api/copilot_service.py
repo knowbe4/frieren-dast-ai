@@ -89,28 +89,13 @@ _MAX_COMPLETE_REJECTIONS = 8
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
 
-# Host-name tokens that mark an identity provider / SSO / login host. Probing these
-# invalidates the shared SSO session every other host depends on, so they are tested
-# LAST. Matched as substrings against the host name — common IdP naming conventions,
-# not tied to any one deployment.
-_IDENTITY_HOST_TOKENS = (
-    "identity", "login", "sso", "oauth", "openid", "idp",
-    "okta", "auth0", "keycloak", "authentik", "accounts",
-)
-
-
-def _is_identity_host(host: str) -> bool:
-    """True when the host looks like an identity provider / SSO / login host."""
-    lowered = (host or "").lower()
-    return any(token in lowered for token in _IDENTITY_HOST_TOKENS)
-
-
 def _order_hosts(hosts) -> List[str]:
     """Sorted host list with identity-provider hosts pushed to the end.
 
     The autonomous sweep iterates this order, so the IdP (whose probing kills the
     shared SSO session) is only reached after the rest of the surface is covered."""
-    return sorted(hosts, key=lambda host: (_is_identity_host(host), host))
+    from dast.proxy.session_store import is_identity_host
+    return sorted(hosts, key=lambda host: (is_identity_host(host), host))
 
 # blocked_reason values that mean "I cannot proceed without a human" — the driver
 # turns these into an operator escalation (answer / pause / abort) then resumes.
@@ -678,6 +663,12 @@ class CopilotService:
                 logger.warning("autonomous run could not enable AI mode",
                                session_id=sid, error=str(exc))
 
+        # Defer identity-provider hosts for the main run: the ambient auto-scan and
+        # scan_surface skip them so probing the IdP cannot log the run out mid-scan.
+        # The driver lifts this for a final phase that tests the IdP last.
+        if self._ctx.store is not None:
+            self._ctx.store.defer_identity_hosts = True
+
         # Preseed auth so the run carries a logged-in session from the first call
         # and the auth-wall gate stays quiet (no operator to answer it mid-run).
         if profile_slug:
@@ -923,6 +914,9 @@ class CopilotService:
                 except Exception as exc:
                     logger.warning("autonomous run could not restore AI mode",
                                    error=str(exc))
+            # Lift the identity-host deferral so it never leaks into manual use.
+            if self._ctx.store is not None:
+                self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
         session["updated_at"] = time.time()
 
@@ -1053,6 +1047,60 @@ class CopilotService:
             logger.debug("router block unavailable", error=str(exc))
             return ""
 
+    def _without_deferred_identity(self, hosts: set) -> set:
+        """Drop identity-provider hosts while the run defers them, so auto-targeting
+        never probes the IdP until the final phase lifts the deferral."""
+        from dast.proxy.session_store import is_identity_host
+        store = self._ctx.store
+        if store is None or not getattr(store, "defer_identity_hosts", False):
+            return set(hosts)
+        return {h for h in hosts if not is_identity_host(h)}
+
+    async def _final_identity_phase(self, sid: str, session: dict) -> None:
+        """Test identity-provider hosts LAST, once the rest of the surface is covered.
+
+        Lifts the deferral and runs the active arsenal against the IdP hosts: scan
+        every now-unblocked endpoint, then GraphQL and evidence-routed probes. Any
+        session death this causes is harmless — every other host is already done.
+        Runs once per run; no-op in read-only (active tools disabled)."""
+        from dast.proxy.session_store import is_identity_host
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        if auto.get("identity_phase_done"):
+            return
+        auto["identity_phase_done"] = True
+        store = self._ctx.store
+        if store is not None:
+            store.defer_identity_hosts = False  # lift the deferral for the IdP pass
+        identity_hosts = {
+            h for h in self._effective_hosts(auto.get("hosts") or []) if is_identity_host(h)
+        }
+        if not identity_hosts or auto.get("read_only") or store is None:
+            return
+        logger.info("autonomous run: final identity-provider phase (tested last)",
+                    session_id=sid, hosts=sorted(identity_hosts))
+        await self._broadcast_autonomous(sid, "identity_phase", {"hosts": sorted(identity_hosts)})
+        ctx = self._build_tool_ctx(session)
+        stop_event: asyncio.Event = auto["stop_event"]
+        # scan_surface now sees the IdP endpoints (deferral lifted); the rest of the
+        # surface is already scanned, so this effectively covers just the IdP.
+        prev = -1
+        for _ in range(12):
+            if stop_event.is_set():
+                return
+            try:
+                result = await run_tool(ctx, "scan_surface", {})
+            except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                logger.warning("identity phase: scan_surface failed", session_id=sid, error=str(exc))
+                break
+            remaining = int((result or {}).get("remaining", 0) or 0)
+            if remaining == 0 or remaining == prev:
+                break
+            prev = remaining
+        await self._auto_test_graphql(session, ctx, set(identity_hosts))
+        await self._auto_route(session, ctx, set(identity_hosts))
+
     async def _auto_route(self, session: dict, ctx: Any, hosts: set) -> None:
         """Auto-run the unambiguous, auto_safe evidence recommendations (e.g. AI
         endpoint -> run_scan[llm_injection], high-confidence id flow -> run_scan[sqli]/
@@ -1068,6 +1116,9 @@ class CopilotService:
         routed: set = auto.setdefault("routed", set())
         store = self._ctx.store
         if store is None:
+            return
+        hosts = self._without_deferred_identity(hosts)
+        if not hosts:
             return
         for host in hosts:
             if stop_event.is_set():
@@ -1201,6 +1252,9 @@ class CopilotService:
         stop_event: asyncio.Event = auto["stop_event"]
         store = self._ctx.store
         if store is None:
+            return
+        hosts = self._without_deferred_identity(hosts)
+        if not hosts:
             return
 
         gql_urls = set()
@@ -1429,6 +1483,29 @@ class CopilotService:
                         continue
 
                     if not surface_incomplete:
+                        # The non-IdP surface is covered. Before completing, test the
+                        # identity-provider hosts LAST — deferred all run so probing
+                        # them could not log the run out mid-scan. This runs once; the
+                        # next turn re-evaluates coverage with the IdP included.
+                        from dast.proxy.session_store import is_identity_host
+                        store = self._ctx.store
+                        identity_pending = (
+                            not auto.get("identity_phase_done")
+                            and store is not None
+                            and getattr(store, "defer_identity_hosts", False)
+                            and any(is_identity_host(h) for h in effective_hosts)
+                        )
+                        if identity_pending:
+                            await self._final_identity_phase(sid, session)
+                            prompt = _AUTONOMOUS_CONTINUE.format(
+                                progress=self._progress_label(last_progress),
+                                budget=self._budget_label(auto, cfg, deadline),
+                                leads=self._leads_label(effective_hosts),
+                                router=self._router_block(effective_hosts),
+                                coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                                read_only=read_only_note,
+                            )
+                            continue
                         # Fully-covered surface, or nothing mapped to cover — honor it.
                         message = ("objective complete; full surface covered"
                                    if coverage["has_surface"]
@@ -1528,6 +1605,14 @@ class CopilotService:
         if store is None:
             return cov
         focus = {h.split(":")[0] for h in (hosts or []) if h}
+        # While identity hosts are deferred they are intentionally untested, so they
+        # must not count against coverage — otherwise 'complete' could never be reached
+        # and the final IdP phase (which lifts the deferral) would never run.
+        if getattr(store, "defer_identity_hosts", False):
+            from dast.proxy.session_store import is_identity_host
+            non_identity = {h for h in focus if not is_identity_host(h)}
+            if non_identity:
+                focus = non_identity
 
         # ── REST surface ────────────────────────────────────────────────────────
         try:

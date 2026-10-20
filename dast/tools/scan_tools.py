@@ -208,7 +208,10 @@ def _untested_surface_entries(store: Any, ctx: ToolContext, methods: List[str]) 
     so only real observed endpoints are scanned."""
     from dast.proxy.session_store import normalise_endpoint_path
 
+    from dast.proxy.session_store import is_identity_host
+
     wanted = {m.strip().upper() for m in methods if m and m.strip()}
+    defer_identity = getattr(store, "defer_identity_hosts", False)
     seen_endpoints: set = set()
     representatives: List[Any] = []
     try:
@@ -222,6 +225,9 @@ def _untested_surface_entries(store: Any, ctx: ToolContext, methods: List[str]) 
         if wanted and method not in wanted:
             continue
         if getattr(entry, "source", "") in ("agent", "scanner", "scan", "out-of-scope"):
+            continue
+        # Defer IdP hosts during the main autonomous run (tested last, see driver).
+        if defer_identity and is_identity_host(getattr(entry, "host", "")):
             continue
         if getattr(entry, "scan_result", None):
             continue  # already scanned

@@ -182,6 +182,21 @@ _NOISE_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".css", ".map",
 }
 
+# Host-name tokens that mark an identity provider / SSO / login host. Actively
+# scanning these floods the login/token endpoints and invalidates the shared SSO
+# session every other in-scope host depends on, so callers defer them until last.
+# Matched as substrings — common IdP naming conventions, not tied to any one deployment.
+_IDENTITY_HOST_TOKENS = (
+    "identity", "login", "sso", "oauth", "openid", "idp",
+    "okta", "auth0", "keycloak", "authentik", "accounts",
+)
+
+
+def is_identity_host(host: str) -> bool:
+    """True when the host looks like an identity provider / SSO / login host."""
+    lowered = (host or "").split(":")[0].lower()
+    return any(token in lowered for token in _IDENTITY_HOST_TOKENS)
+
 
 class SessionStore:
     """
@@ -248,6 +263,11 @@ class SessionStore:
         self.named_sessions: Dict[str, NamedSession] = {}
         # AI mode: when True, every completed in-scope entry is auto-queued for scan
         self.ai_mode: bool = False
+        # When True, identity-provider hosts (SSO/login) are skipped by the ambient
+        # auto-scan and scan_surface. The autonomous driver sets this for the main run
+        # so probing the IdP cannot invalidate the shared session, then clears it for a
+        # final phase that tests the IdP last. Off outside autonomous runs.
+        self.defer_identity_hosts: bool = False
         # Pending findings: imported findings whose host wasn't in proxy yet.
         # Each item: {"path": str, "method": str, "nf": NormalisedFinding-like dict,
         #             "hints": list, "stub": dict}

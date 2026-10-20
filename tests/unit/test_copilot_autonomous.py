@@ -569,3 +569,46 @@ async def test_complete_mode_submit_forms_kept_when_active():
                                  submit_forms=True, read_only=False, auto_ai_mode=False)
     assert service._sessions[sid]["autonomous"]["submit_forms"] is True
     service.stop_autonomous(sid)
+
+
+# ── effective-host expansion (focus host -> all in-scope hosts in traffic) ──────
+class _HostEntry:
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+
+def test_effective_hosts_expands_to_in_scope_subdomains():
+    # Operator typed only the SPA host; the real API lives on sibling subdomains
+    # whose traffic is already captured in scope. The working set must include them.
+    store = _FakeStore(entries=[
+        _HostEntry("console.example.com"),
+        _HostEntry("api.console.example.com"),
+        _HostEntry("bff.console.example.com:443"),   # port stripped
+        _HostEntry("api.console.example.com"),        # dup collapsed
+    ])
+    service = CopilotService(_FakeCtx(store))
+    assert service._effective_hosts(["console.example.com"]) == [
+        "api.console.example.com", "bff.console.example.com", "console.example.com",
+    ]
+
+
+def test_effective_hosts_includes_focus_even_without_traffic():
+    service = CopilotService(_FakeCtx(_FakeStore(entries=[])))
+    assert service._effective_hosts(["Only.Focus.Com:8443"]) == ["only.focus.com"]
+
+
+def test_effective_hosts_degrades_when_store_missing():
+    ctx = _FakeCtx()
+    ctx.store = None
+    service = CopilotService(ctx)
+    assert service._effective_hosts(["h.example.com"]) == ["h.example.com"]
+
+
+def test_effective_hosts_survives_enumeration_error():
+    class _RaisingStore(_FakeStore):
+        def in_scope_entries(self):
+            raise RuntimeError("boom")
+
+    service = CopilotService(_FakeCtx(_RaisingStore()))
+    # Falls back to the focus hosts rather than crashing the run.
+    assert service._effective_hosts(["h.example.com"]) == ["h.example.com"]

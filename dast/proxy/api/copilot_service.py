@@ -950,6 +950,32 @@ class CopilotService:
         )
         return result if isinstance(result, dict) else {"action": "abort", "answer": ""}
 
+    def _effective_hosts(self, focus_hosts: List[str]) -> List[str]:
+        """Expand the operator's focus hosts to every in-scope host actually observed
+        in captured traffic.
+
+        The focus host the operator typed is only a seed. Modern apps serve their real
+        API from sibling subdomains (BFF/API/reporting hosts) that never appear in the
+        operator's one-line target, so grounding and targeting keyed on the literal
+        focus host leave that surface invisible — the copilot then guesses URLs on the
+        focus host and escalates to a human when the guess fails. Deriving the working
+        host set from traffic instead means leads/router/coverage and auto-targeting
+        cover every in-scope host for every vuln class, with no per-host enumeration by
+        the operator. Scope is already enforced by the proxy: ``in_scope_entries``
+        excludes anything tagged out-of-scope, so this never reaches beyond scope."""
+        hosts = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        store = self._ctx.store
+        if store is None:
+            return sorted(hosts)
+        try:
+            for entry in store.in_scope_entries():
+                host = (getattr(entry, "host", "") or "").split(":")[0].lower()
+                if host:
+                    hosts.add(host)
+        except Exception as exc:  # noqa: BLE001 — best-effort expansion, never crash the run
+            logger.debug("effective host expansion failed", error=str(exc))
+        return sorted(hosts)
+
     def _leads_label(self, hosts: List[str]) -> str:
         """Compact, prioritised app-context leads for the focus hosts, injected into the
         autonomous turn prompt so the copilot chases concrete hypotheses ITSELF instead of
@@ -1041,7 +1067,8 @@ class CopilotService:
 
     async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
         """Drive breadth deterministically in complete mode so it is never left to
-        LLM discretion: per focus host, EXPLORE the SPA to drain the UI frontier,
+        LLM discretion: per in-scope host (focus hosts expanded with every in-scope
+        host seen in traffic), EXPLORE the SPA to drain the UI frontier,
         then (active runs only) CONTENT-DISCOVER, SCAN every observed endpoint to
         exhaustion, and INTROSPECT+SWEEP (or FUZZ captured ops when introspection is
         disabled) every GraphQL endpoint. The LLM turns that follow focus on depth.
@@ -1049,7 +1076,7 @@ class CopilotService:
         from dast.tools import run_tool
 
         auto = session["autonomous"]
-        hosts = auto.get("hosts") or []
+        hosts = self._effective_hosts(auto.get("hosts") or [])
         if not hosts:
             return
         read_only = bool(auto.get("read_only"))
@@ -1204,11 +1231,12 @@ class CopilotService:
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        start_hosts = self._effective_hosts(auto["hosts"])
         prompt = _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
-            leads=self._leads_label(auto["hosts"]),
-            router=self._router_block(auto["hosts"]),
-            coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+            leads=self._leads_label(start_hosts),
+            router=self._router_block(start_hosts),
+            coverage=self._coverage_block(self._surface_coverage(start_hosts)),
             read_only=read_only_note,
         )
 
@@ -1261,6 +1289,9 @@ class CopilotService:
                 auto["turns"] += 1
                 session["status"] = "running"
                 session["updated_at"] = time.time()
+                # Recomputed each turn: traffic grows as the run crawls, so sibling
+                # in-scope hosts surface over time and must enter grounding/targeting.
+                effective_hosts = self._effective_hosts(auto["hosts"])
                 tool_ctx = self._build_tool_ctx(session)
                 try:
                     reply = await session["engine"].send(
@@ -1282,9 +1313,9 @@ class CopilotService:
                     prompt = _AUTONOMOUS_CONTINUE.format(
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
-                        leads=self._leads_label(auto["hosts"]),
-                        router=self._router_block(auto["hosts"]),
-                        coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                        leads=self._leads_label(effective_hosts),
+                        router=self._router_block(effective_hosts),
+                        coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
                         read_only=read_only_note,
                     )
                     continue
@@ -1301,12 +1332,12 @@ class CopilotService:
                 # the model to decide to. Idempotent; no-op in read-only. Runs in
                 # bounded AND complete mode so "see GraphQL -> test GraphQL" is
                 # guaranteed, not discretionary.
-                if auto.get("hosts"):
+                if effective_hosts:
                     turn_ctx = self._build_tool_ctx(session)
-                    await self._auto_test_graphql(session, turn_ctx, set(auto["hosts"]))
+                    await self._auto_test_graphql(session, turn_ctx, set(effective_hosts))
                     # Evidence-driven auto-routing of the unambiguous leads (bounded
                     # and complete). The prompt block surfaces the rest for the LLM.
-                    await self._auto_route(session, turn_ctx, set(auto["hosts"]))
+                    await self._auto_route(session, turn_ctx, set(effective_hosts))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot()
@@ -1318,7 +1349,7 @@ class CopilotService:
 
                 # ── Interpret the reply's control signal ─────────────────────────
                 if blocked_reason == "complete":
-                    coverage = self._surface_coverage(auto["hosts"])
+                    coverage = self._surface_coverage(effective_hosts)
                     budget_left = (time.time() < deadline
                                    and auto["tool_calls"] < cfg["max_tool_calls"])
                     # A 'complete' is only premature when a surface has actually been
@@ -1363,7 +1394,7 @@ class CopilotService:
                         if mode == "complete":
                             await self._deterministic_recon_scan_sweep(sid, session)
                         prompt = _AUTONOMOUS_COVERAGE_GATE.format(
-                            coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                            coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
                             budget=self._budget_label(auto, cfg, deadline),
                         )
                         continue
@@ -1420,9 +1451,9 @@ class CopilotService:
                 prompt = _AUTONOMOUS_CONTINUE.format(
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
-                    leads=self._leads_label(auto["hosts"]),
-                    router=self._router_block(auto["hosts"]),
-                    coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                    leads=self._leads_label(effective_hosts),
+                    router=self._router_block(effective_hosts),
+                    coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
                     read_only=read_only_note,
                 )
         except asyncio.CancelledError:

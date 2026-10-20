@@ -257,6 +257,20 @@ def test_subdomain_cookies_not_sent_to_parent_domain():
     assert root["httpOnly"] is True
 
 
+def test_transient_oidc_cookies_pruned_from_request_cookies():
+    from dast.proxy.session_store import SessionStore
+    store = SessionStore()
+    store._ingest_cookies("example.com", {"set-cookie": ".AspNetCore.Cookies=auth; Path=/"})
+    store._ingest_cookies("example.com", {"set-cookie": ".KB4.Session.AccessToken=jwt; Path=/"})
+    store._ingest_cookies("example.com", {"set-cookie": ".AspNetCore.OpenIdConnect.Nonce.A=n1; Path=/"})
+    store._ingest_cookies("example.com", {"set-cookie": ".AspNetCore.Correlation.B=c1; Path=/"})
+    names = {c["name"] for c in store.get_cookies_for_host("example.com")}
+    # Real session cookies kept; single-use OIDC handshake cookies dropped.
+    assert ".AspNetCore.Cookies" in names
+    assert ".KB4.Session.AccessToken" in names
+    assert not any("nonce" in n.lower() or ".correlation." in n.lower() for n in names)
+
+
 def test_prune_jobs_keeps_newest():
     from dast.proxy.api.context import prune_jobs
     jobs = {f"job{index}": {} for index in range(5)}

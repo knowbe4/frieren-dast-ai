@@ -198,6 +198,21 @@ def is_identity_host(host: str) -> bool:
     return any(token in lowered for token in _IDENTITY_HOST_TOKENS)
 
 
+# Single-use OIDC/OAuth login-flow cookies left behind by the SSO handshake
+# (.AspNetCore.OpenIdConnect.Nonce.*, .AspNetCore.Correlation.*, OAuth state/nonce).
+# They are useless after login but accumulate by the dozen and bloat every later
+# request's Cookie header — enough that strict servers reject the request with
+# HTTP 400 before the app even runs. Dropped when building a request's cookies; the
+# real session/auth cookie is matched by none of these markers and is kept.
+_TRANSIENT_COOKIE_MARKERS = ("openidconnect.nonce", ".correlation.", "oauth.nonce", "oauth.state")
+
+
+def _is_transient_login_cookie(name: str) -> bool:
+    """True for a single-use OIDC/OAuth handshake cookie safe to drop post-login."""
+    lowered = (name or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_COOKIE_MARKERS)
+
+
 class SessionStore:
     """
     Stores all intercepted proxy entries.
@@ -603,7 +618,10 @@ class SessionStore:
                     result.update(jar)
             # Also exact host
             result.update(self._cookies.get(host, {}))
-            return list(result.values())
+            # Drop single-use OIDC/OAuth handshake cookies: they are dead weight after
+            # login and their bulk can push the Cookie header past a server's limit.
+            return [c for c in result.values()
+                    if not _is_transient_login_cookie(c.get("name", ""))]
 
     def save_named_session_from_playwright(
         self,

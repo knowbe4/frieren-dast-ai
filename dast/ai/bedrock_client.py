@@ -149,7 +149,9 @@ def _resolve_default_model(provider: str) -> str:
     """Resolve (and cache) the default model NAME for a non-Bedrock provider from
     its live catalogue, preferring Sonnet. Cached per provider so the catalogue is
     fetched at most once per provider between switches. Never raises — a catalogue
-    failure caches "" so callers can fall back to their own error handling."""
+    failure caches "" so callers can fall back to their own error handling.
+    Also caches the raw catalogue list (key ``_cat_{provider}``) so
+    ``_resolve_tier_default`` can pick tier-specific models without re-fetching."""
     if provider == "bedrock":
         return ""
     if provider in _default_model_cache:
@@ -157,7 +159,9 @@ def _resolve_default_model(provider: str) -> str:
     chosen = ""
     try:
         catalogue = list_models()
-        chosen = _preferred_default_model(catalogue.get("models", []))
+        models = catalogue.get("models", [])
+        _default_model_cache[f"_cat_{provider}"] = models
+        chosen = _preferred_default_model(models)
     except Exception as exc:  # never let model listing crash an LLM call
         logger.warning("Default-model resolution failed", provider=provider, error=str(exc))
     if chosen:
@@ -397,6 +401,36 @@ def _is_bedrock_arn(model_id: str) -> bool:
     return bool(model_id) and model_id.startswith("arn:aws:")
 
 
+_TIER_KEYWORD = {"fast": "haiku", "validation": "opus"}
+
+
+def _resolve_tier_default(tier_name: str, provider: str) -> str:
+    """Pick a tier-appropriate model NAME from the provider's catalogue.
+
+    Uses the same cache as ``_resolve_default_model`` so the catalogue is fetched
+    at most once per provider. For the *fast* tier prefer Haiku, for *validation*
+    prefer Opus; if neither is found, returns "" (caller falls back to the active
+    model, same as before).
+    """
+    keyword = _TIER_KEYWORD.get(tier_name, "")
+    if not keyword:
+        return ""
+    cat_key = f"_cat_{provider}"
+    if cat_key not in _default_model_cache:
+        _resolve_default_model(provider)
+    catalogue_models: list = _default_model_cache.get(cat_key, [])
+    ids = [
+        str(m.get("id"))
+        for m in catalogue_models
+        if m.get("id") and not _is_bedrock_arn(str(m.get("id")))
+    ]
+    plain = [i for i in ids if keyword in i.lower() and "[" not in i]
+    if plain:
+        return plain[0]
+    any_match = [i for i in ids if keyword in i.lower()]
+    return any_match[0] if any_match else ""
+
+
 def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     """Return ``tier_model_id`` only if it is valid for the active provider.
 
@@ -406,17 +440,23 @@ def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     openai), a Bedrock ARN is not a model that provider accepts — the gateway
     rejects it with ``HTTP 400: ... not in your role's availableModels
     allowlist``, which silently degrades every planner/canary/baseline/red-team
-    call that uses a tier helper. That produces flaky detection (a vuln is found
-    only when the code path happens to use the active model). Guard against it:
-    when a tier holds a Bedrock ARN but the provider is non-Bedrock, ignore it and
-    fall back to the active model (a provider-appropriate name).
+    call that uses a tier helper. Guard against it: resolve a tier-appropriate
+    model NAME from the provider's catalogue (haiku for fast, opus for validation)
+    so the tier distinction is preserved across providers.
     """
     if not tier_model_id:
         return ""
     provider = get_active_provider()
     if provider != "bedrock" and _is_bedrock_arn(tier_model_id):
+        resolved = _resolve_tier_default(tier_name, provider)
+        if resolved:
+            logger.debug(
+                "Resolved tier model for non-Bedrock provider",
+                tier=tier_name, provider=provider, model=resolved,
+            )
+            return resolved
         logger.warning(
-            "Ignoring Bedrock ARN configured for tier under non-Bedrock provider",
+            "No tier-appropriate model found in catalogue; falling back to active model",
             tier=tier_name, provider=provider,
         )
         return ""

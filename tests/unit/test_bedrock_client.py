@@ -375,3 +375,58 @@ def test_image_rejected_for_openai_provider(monkeypatch):
     monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "gpt-x")
     with pytest.raises(ValueError, match="image input is not supported"):
         bedrock_client.invoke("sys", "u", image_b64="QUJD")
+
+
+# -- Tier model resolution under non-Bedrock providers --
+
+
+@pytest.fixture
+def _gateway_provider(monkeypatch):
+    """Switch to gateway and set ARN-based tier defaults (the startup path)."""
+    monkeypatch.setattr(bedrock_client, "_active_provider", "gateway")
+    monkeypatch.setattr(bedrock_client, "_fast_model_id",
+                        "arn:aws:bedrock:us-east-1:123:application-inference-profile/haiku")
+    monkeypatch.setattr(bedrock_client, "_validation_model_id",
+                        "arn:aws:bedrock:us-east-1:123:application-inference-profile/opus")
+    monkeypatch.setattr(bedrock_client, "_default_model_cache", {})
+    yield
+
+
+def _fake_catalogue_with_tiers():
+    return {"provider": "gateway", "source": "live", "error": "",
+            "models": [
+                {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet"},
+                {"id": "claude-haiku-4-5-20250514", "label": "Claude Haiku"},
+                {"id": "claude-opus-4-20250514", "label": "Claude Opus"},
+            ]}
+
+
+def test_fast_tier_resolves_haiku_under_gateway(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models", _fake_catalogue_with_tiers)
+    model = bedrock_client.get_fast_model()
+    assert "haiku" in model.lower()
+
+
+def test_validation_tier_resolves_opus_under_gateway(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models", _fake_catalogue_with_tiers)
+    model = bedrock_client.get_validation_model()
+    assert "opus" in model.lower()
+
+
+def test_tier_falls_back_to_active_when_catalogue_empty(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models",
+                        lambda: {"provider": "gateway", "models": [], "source": "preset", "error": ""})
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "claude-sonnet-fallback")
+    model = bedrock_client.get_fast_model()
+    assert model == "claude-sonnet-fallback"
+
+
+def test_tier_resolution_reuses_cached_catalogue(_gateway_provider, monkeypatch):
+    call_count = [0]
+    def _counting_list():
+        call_count[0] += 1
+        return _fake_catalogue_with_tiers()
+    monkeypatch.setattr(bedrock_client, "list_models", _counting_list)
+    bedrock_client.get_fast_model()
+    bedrock_client.get_validation_model()
+    assert call_count[0] == 1

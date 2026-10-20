@@ -612,3 +612,20 @@ def test_effective_hosts_survives_enumeration_error():
     service = CopilotService(_FakeCtx(_RaisingStore()))
     # Falls back to the focus hosts rather than crashing the run.
     assert service._effective_hosts(["h.example.com"]) == ["h.example.com"]
+
+
+def test_effective_hosts_puts_identity_providers_last():
+    # Probing the IdP kills the shared SSO session, so identity/login hosts must be
+    # ordered after the rest of the surface — the sweep then tests them last.
+    store = _FakeStore(entries=[
+        _HostEntry("identity.example.com"),
+        _HostEntry("login.sso.example.com"),
+        _HostEntry("api.example.com"),
+        _HostEntry("app.example.com"),
+    ])
+    service = CopilotService(_FakeCtx(store))
+    ordered = service._effective_hosts(["app.example.com"])
+    assert ordered == [
+        "api.example.com", "app.example.com",       # non-IdP first, alphabetical
+        "identity.example.com", "login.sso.example.com",  # IdP hosts last
+    ]

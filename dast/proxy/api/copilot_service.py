@@ -89,6 +89,29 @@ _MAX_COMPLETE_REJECTIONS = 8
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
 
+# Host-name tokens that mark an identity provider / SSO / login host. Probing these
+# invalidates the shared SSO session every other host depends on, so they are tested
+# LAST. Matched as substrings against the host name — common IdP naming conventions,
+# not tied to any one deployment.
+_IDENTITY_HOST_TOKENS = (
+    "identity", "login", "sso", "oauth", "openid", "idp",
+    "okta", "auth0", "keycloak", "authentik", "accounts",
+)
+
+
+def _is_identity_host(host: str) -> bool:
+    """True when the host looks like an identity provider / SSO / login host."""
+    lowered = (host or "").lower()
+    return any(token in lowered for token in _IDENTITY_HOST_TOKENS)
+
+
+def _order_hosts(hosts) -> List[str]:
+    """Sorted host list with identity-provider hosts pushed to the end.
+
+    The autonomous sweep iterates this order, so the IdP (whose probing kills the
+    shared SSO session) is only reached after the rest of the surface is covered."""
+    return sorted(hosts, key=lambda host: (_is_identity_host(host), host))
+
 # blocked_reason values that mean "I cannot proceed without a human" — the driver
 # turns these into an operator escalation (answer / pause / abort) then resumes.
 _ESCALATE_REASONS = frozenset({
@@ -962,11 +985,17 @@ class CopilotService:
         host set from traffic instead means leads/router/coverage and auto-targeting
         cover every in-scope host for every vuln class, with no per-host enumeration by
         the operator. Scope is already enforced by the proxy: ``in_scope_entries``
-        excludes anything tagged out-of-scope, so this never reaches beyond scope."""
+        excludes anything tagged out-of-scope, so this never reaches beyond scope.
+
+        Ordering: identity-provider hosts (SSO/login/OAuth) are sorted LAST. Probing
+        them floods the login/token endpoints and invalidates the very SSO session
+        every other host depends on, so they must be tested only after the rest of
+        the surface is covered — a dead session at the end costs nothing, a dead
+        session at the start wastes the whole run."""
         hosts = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
         store = self._ctx.store
         if store is None:
-            return sorted(hosts)
+            return _order_hosts(hosts)
         try:
             for entry in store.in_scope_entries():
                 host = (getattr(entry, "host", "") or "").split(":")[0].lower()
@@ -974,7 +1003,7 @@ class CopilotService:
                     hosts.add(host)
         except Exception as exc:  # noqa: BLE001 — best-effort expansion, never crash the run
             logger.debug("effective host expansion failed", error=str(exc))
-        return sorted(hosts)
+        return _order_hosts(hosts)
 
     def _leads_label(self, hosts: List[str]) -> str:
         """Compact, prioritised app-context leads for the focus hosts, injected into the

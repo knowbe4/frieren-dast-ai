@@ -357,25 +357,36 @@ class AppContextWorker:
         existing.app_type = result.get("app_type") or existing.app_type
         existing.auth_model = result.get("auth_model") or existing.auth_model
 
-        for rt in result.get("resource_types", []):
-            rt = str(rt)[:60]
+        for rt in result.get("resource_types") or []:
+            if not isinstance(rt, str):
+                continue
+            rt = rt[:60]
             if rt not in existing.resource_types:
                 existing.resource_types.append(rt)
         existing.resource_types = existing.resource_types[:20]
 
-        for pl in result.get("privilege_levels", []):
-            pl = str(pl)[:60]
+        for pl in result.get("privilege_levels") or []:
+            if not isinstance(pl, str):
+                continue
+            pl = pl[:60]
             if pl not in existing.privilege_levels:
                 existing.privilege_levels.append(pl)
         existing.privilege_levels = existing.privilege_levels[:10]
 
-        for flow in result.get("interesting_flows", []):
-            flow = str(flow)[:120]
+        for flow in result.get("interesting_flows") or []:
+            if not isinstance(flow, str):
+                continue
+            flow = flow[:120]
             if flow not in existing.interesting_flows:
                 existing.interesting_flows.append(flow)
         existing.interesting_flows = existing.interesting_flows[:10]
 
-        for h in result.get("vuln_hypotheses", [])[:10]:
+        raw_hypotheses = result.get("vuln_hypotheses") or []
+        if not isinstance(raw_hypotheses, list):
+            raw_hypotheses = []
+        for h in raw_hypotheses[:10]:
+            if not isinstance(h, dict):
+                continue
             hyp = VulnHypothesis(
                 attack_type=str(h.get("attack_type", ""))[:40],
                 endpoint=str(h.get("endpoint", ""))[:100],

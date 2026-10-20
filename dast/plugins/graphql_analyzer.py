@@ -45,12 +45,26 @@ _INTERNAL_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A `/graphql` path *segment*: /graphql, /graphql/, /graphql/<suffix>, /api/graphql.
+# Deliberately a segment match, not a bare substring, so /graphql-docs and the like
+# do not false-positive.
+_GRAPHQL_PATH_RE = re.compile(r"/graphql(?:/|$)", re.IGNORECASE)
+
+
+def graphql_path_matches(path: str) -> bool:
+    """True when a URL path targets a GraphQL endpoint by path convention.
+
+    Shared by the analyzer and the introspection plugin so both agree on what counts
+    as a GraphQL endpoint by path — otherwise one matched `/graphql/<suffix>` (e.g.
+    `/graphql/dashboards`) while the other, keyed on an exact trailing `/graphql`,
+    missed it and never registered the endpoint for introspection."""
+    return bool(_GRAPHQL_PATH_RE.search(path or ""))
+
 
 def _is_graphql(entry: "ProxyEntry") -> bool:
     if entry.method != "POST":
         return False
-    path = (entry.path or "").lower()
-    if "/graphql" in path:
+    if graphql_path_matches(entry.path or ""):
         return True
     if entry.request_body:
         try:

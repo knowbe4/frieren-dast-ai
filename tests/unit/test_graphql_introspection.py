@@ -233,6 +233,17 @@ class TestIsGraphqlEndpoint:
         entry = self._FakeEntry("POST", "/api/users", b'{"name": "bob"}')
         assert _is_graphql_endpoint(entry) is False
 
+    def test_graphql_subpath_detected(self):
+        # Previously missed: a `/graphql/<suffix>` endpoint (the old check required
+        # an exact trailing /graphql) — now aligned with the analyzer's segment match.
+        entry = self._FakeEntry("POST", "/graphql/dashboards", None)
+        assert _is_graphql_endpoint(entry) is True
+
+    def test_graphql_substring_not_detected(self):
+        # A mere substring like /graphql-docs must not false-positive.
+        entry = self._FakeEntry("POST", "/graphql-docs", None)
+        assert _is_graphql_endpoint(entry) is False
+
 
 class TestCatalogueEndpoint:
     def _store(self):

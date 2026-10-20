@@ -310,7 +310,7 @@ async def test_escalation_pauses_then_resumes_on_guidance():
                                  budget={"max_stuck_turns": 10})
     session = service.get(sid)
     session["engine"].send = AsyncMock(side_effect=[
-        _Reply("I need the admin token", "need_human"),
+        _Reply("I need the admin token", "auth_required"),
         _Reply("done", "complete"),
     ])
     # Wait until the driver parks on a guidance escalation.
@@ -330,7 +330,7 @@ async def test_escalation_abort_stops_the_run():
     sid = service.run_autonomous("obj", focus_hosts=["h"],
                                  budget={"max_stuck_turns": 10})
     session = service.get(sid)
-    send = AsyncMock(side_effect=[_Reply("blocked", "need_human"),
+    send = AsyncMock(side_effect=[_Reply("blocked", "auth_required"),
                                   _Reply("should not reach", "complete")])
     session["engine"].send = send
     assert await _wait_for(
@@ -340,6 +340,46 @@ async def test_escalation_abort_stops_the_run():
     assert session["autonomous"]["status"] == "stopped"
     assert "aborted" in session["autonomous"]["detail"]
     assert send.await_count == 1                         # never ran the second turn
+
+
+@pytest.mark.asyncio
+async def test_soft_escalation_auto_nudges_instead_of_pausing():
+    # A soft escalation (need_human/need_value) in an autonomous run is the copilot
+    # asking permission for a step it can take — the driver auto-nudges it to proceed
+    # rather than pausing the operator. Here it "asks" once, is nudged, then completes
+    # on the next turn WITHOUT ever parking on a guidance pause.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"], budget={"max_stuck_turns": 10})
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[
+        _Reply("can I scan the API next?", "need_human"),
+        _Reply("done", "complete"),
+    ])
+    await session["_task"]
+    assert session["autonomous"]["status"] == "complete"
+    assert session.get("pause") is None                 # never paused the operator
+    assert session["autonomous"]["auto_guidance_nudges"] >= 1
+    # The nudge prompt pushed it to proceed autonomously.
+    second_prompt = session["engine"].send.await_args_list[1].args[0]
+    assert "not a genuine blocker" in second_prompt.lower() or "proceed" in second_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_soft_escalation_pauses_after_nudge_budget_exhausted():
+    # If the copilot keeps softly escalating without progress, the nudges run out and
+    # it finally surfaces to the operator — a genuinely stuck loop is not hidden forever.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"], budget={"max_stuck_turns": 50})
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(
+        side_effect=[_Reply("still unsure", "need_value")] * 10
+    )
+    assert await _wait_for(
+        lambda: (session.get("pause") or {}).get("kind") == "guidance")
+    # It took the full nudge budget before pausing.
+    assert session["autonomous"]["auto_guidance_nudges"] == 3
+    service.stop_autonomous(sid)
+    await asyncio.gather(session["_task"], return_exceptions=True)
 
 
 @pytest.mark.asyncio

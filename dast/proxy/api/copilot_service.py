@@ -104,6 +104,15 @@ _ESCALATE_REASONS = frozenset({
     "out_of_scope", "auth_required", "waf_block",
 })
 
+# "Soft" escalations: the copilot is unsure or asking permission for a next step it
+# could just take. In an autonomous run these are not real blockers — the driver
+# auto-nudges it to proceed instead of pausing the operator. The "hard" reasons
+# (auth_required/out_of_scope/need_authorization/waf_block) genuinely need operator
+# action and still pause immediately.
+_SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
+# Soft escalations auto-nudged before a real human pause, per no-progress streak.
+_MAX_AUTO_GUIDANCE_NUDGES = 3
+
 _AUTONOMOUS_START = (
     "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
@@ -156,6 +165,18 @@ _AUTONOMOUS_CONTINUE = (
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
     "blocked (say what a vulnerable vs. normal response would look like)."
+)
+
+_AUTONOMOUS_SELF_PROCEED = (
+    "You set blocked_reason='{reason}', but this is NOT a genuine blocker — you do not need my "
+    "permission to run safe, in-scope next steps you have already planned. Proceed autonomously "
+    "right now: execute your plan with the internal tools (run_scan, scan_surface, idor_probe, "
+    "param_mining, validate_chain, record_finding). Reserve a blocked_reason for a TRUE blocker "
+    "only I can resolve: a credential/value I hold, or an out-of-scope authorization decision — "
+    "never to confirm a step you can already take. Progress: {progress}. Budget: {budget}.\n\n"
+    "{leads}\n\n"
+    "{router}"
+    "{coverage}"
 )
 
 _AUTONOMOUS_COVERAGE_GATE = (
@@ -1426,6 +1447,9 @@ class CopilotService:
                 progress = self._progress_snapshot()
                 if progress != last_progress:
                     stuck_turns = 0
+                    # Real work happened — refresh the soft-escalation nudge budget so a
+                    # later genuine question isn't starved by earlier permission-asks.
+                    auto["auto_guidance_nudges"] = 0
                     last_progress = progress
                 else:
                     stuck_turns += 1
@@ -1538,6 +1562,29 @@ class CopilotService:
                     return
 
                 if blocked_reason in _ESCALATE_REASONS:
+                    # Soft escalation (the copilot is unsure or asking permission for a
+                    # step it could just take): auto-nudge it to proceed instead of
+                    # pausing the operator. Bounded per no-progress streak so a genuinely
+                    # stuck loop still surfaces to the human after a few nudges.
+                    nudges = auto.get("auto_guidance_nudges", 0)
+                    if (blocked_reason in _SOFT_ESCALATE_REASONS
+                            and nudges < _MAX_AUTO_GUIDANCE_NUDGES):
+                        auto["auto_guidance_nudges"] = nudges + 1
+                        logger.info("autonomous run: auto-nudging past soft escalation",
+                                    session_id=sid, blocked_reason=blocked_reason,
+                                    nudge=nudges + 1)
+                        await self._broadcast_autonomous(sid, "auto_nudge", {
+                            "blocked_reason": blocked_reason, "nudge": nudges + 1,
+                        })
+                        prompt = _AUTONOMOUS_SELF_PROCEED.format(
+                            reason=blocked_reason,
+                            progress=self._progress_label(last_progress),
+                            budget=self._budget_label(auto, cfg, deadline),
+                            leads=self._leads_label(effective_hosts),
+                            router=self._router_block(effective_hosts),
+                            coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                        )
+                        continue
                     guidance = await self._guidance_pause(sid, session, reply, deadline)
                     if stop_event.is_set() or guidance.get("action") == "abort":
                         self._finish_autonomous(session, "stopped", "aborted at escalation")

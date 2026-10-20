@@ -33,12 +33,43 @@ def _is_populated(state: Optional[dict]) -> bool:
     return bool(state and (state.get("cookies") or state.get("origins")))
 
 
+def _sanitise_state(state: Optional[dict]) -> Optional[dict]:
+    """Drop cookies Playwright would reject when seeding a context.
+
+    ``Browser.new_context(storage_state=...)`` requires every cookie to carry a
+    ``url`` OR a ``domain``/``path`` pair; a single malformed cookie makes the whole
+    call raise, which (seeded into a browse/crawler context) can abort the run. A
+    partial logout or a hand-edited blob can leave such a cookie behind, so filter
+    them out and keep the valid ones rather than failing closed on the whole state."""
+    if not isinstance(state, dict):
+        return state
+
+    def _valid(cookie: object) -> bool:
+        if not isinstance(cookie, dict) or not cookie.get("name"):
+            return False
+        if cookie.get("url"):
+            return True
+        return bool(cookie.get("domain") and cookie.get("path"))
+
+    cookies = state.get("cookies")
+    if not isinstance(cookies, list):
+        return state
+    valid_cookies = [c for c in cookies if _valid(c)]
+    dropped = len(cookies) - len(valid_cookies)
+    if dropped:
+        logger.warning("auth state: dropped malformed cookies", dropped=dropped)
+    cleaned = dict(state)
+    cleaned["cookies"] = valid_cookies
+    return cleaned
+
+
 def save_auth_state(state: Optional[dict]) -> None:
     """Persist a captured storage_state to disk (owner-read/write only). An empty
     or None state is ignored so a transient blank capture never wipes a good one;
     use ``clear_auth_state`` to explicitly drop it."""
     if not _is_populated(state):
         return
+    state = _sanitise_state(state)
     try:
         _AUTH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _AUTH_STATE_PATH.write_text(json.dumps(state))
@@ -58,7 +89,7 @@ def load_auth_state() -> Optional[dict]:
     try:
         if not _AUTH_STATE_PATH.exists():
             return None
-        state = json.loads(_AUTH_STATE_PATH.read_text())
+        state = _sanitise_state(json.loads(_AUTH_STATE_PATH.read_text()))
         if _is_populated(state):
             return state
     except Exception as exc:  # noqa: BLE001 — a corrupt blob must not block startup

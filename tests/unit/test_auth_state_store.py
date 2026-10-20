@@ -62,3 +62,34 @@ def test_clear_removes_the_file(_tmp_state_path):
     auth_state_store.clear_auth_state()
     assert not _tmp_state_path.exists()
     auth_state_store.clear_auth_state()  # idempotent — no error when already gone
+
+
+def test_malformed_cookies_are_dropped_on_load(_tmp_state_path):
+    # A cookie lacking both a url and a domain/path pair makes Playwright's
+    # new_context(storage_state=...) raise; load must filter it, not fail closed.
+    import json
+    _tmp_state_path.write_text(json.dumps({
+        "cookies": [
+            {"name": "ok", "value": "1", "domain": "example.com", "path": "/"},
+            {"name": "ok_url", "value": "2", "url": "https://example.com"},
+            {"name": "bad_no_loc", "value": "3"},
+            {"name": "bad_domain_only", "value": "4", "domain": "example.com"},
+        ],
+        "origins": [{"origin": "https://example.com"}],
+    }))
+    loaded = auth_state_store.load_auth_state()
+    assert [c["name"] for c in loaded["cookies"]] == ["ok", "ok_url"]
+    assert len(loaded["origins"]) == 1
+
+
+def test_malformed_cookies_are_dropped_on_save(_tmp_state_path):
+    import json
+    auth_state_store.save_auth_state({
+        "cookies": [
+            {"name": "ok", "value": "1", "domain": "example.com", "path": "/"},
+            {"name": "bad", "value": "2"},
+        ],
+        "origins": [],
+    })
+    stored = json.loads(_tmp_state_path.read_text())
+    assert [c["name"] for c in stored["cookies"]] == ["ok"]

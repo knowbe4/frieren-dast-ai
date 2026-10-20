@@ -74,7 +74,16 @@ class BrowseSession:
             context_kwargs["storage_state"] = persisted
             logger.info("browse: seeded from persisted auth",
                         cookies=len(persisted.get("cookies") or []))
-        self._context = await self._browser.new_context(**context_kwargs)
+        try:
+            self._context = await self._browser.new_context(**context_kwargs)
+        except Exception as exc:
+            # A malformed persisted cookie can make new_context raise; never let
+            # that take down the browse session — fall back to an unseeded context
+            # (operator just logs in again) instead of crashing the proxy task.
+            logger.warning("browse: seeding auth failed, starting unauthenticated",
+                           error=str(exc))
+            context_kwargs.pop("storage_state", None)
+            self._context = await self._browser.new_context(**context_kwargs)
 
         # Install the DOM recorder BEFORE the first page so every navigation is
         # instrumented. Secrets are classified in-page and never sent back.

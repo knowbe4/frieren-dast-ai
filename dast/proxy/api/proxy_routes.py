@@ -190,7 +190,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     continue
                 if f.get("dismissed"):
                     continue
-                key = (f.get("title", ""), e.host, e.path, f.get("parameter", ""), f.get("attack_type", ""))
+                key = (f.get("title", ""), e.host, f.get("attack_type", ""))
                 if key in _seen:
                     continue
                 _seen.add(key)

@@ -483,6 +483,25 @@ function goToEntry(id) {
   setTimeout(() => document.getElementById('row-' + id)?.scrollIntoView({ block: 'nearest' }), 50);
 }
 
+function goToFinding(entryId, title) {
+  _issuesFilterEntryId = null;
+  switchMain('findings');
+  switchIssuesTab('all');
+  setTimeout(() => {
+    const cards = document.querySelectorAll('.iissue[data-entry-id="' + entryId + '"]');
+    let target = cards[0];
+    if (title && cards.length > 1) {
+      for (const c of cards) {
+        if (c.querySelector('.iissue-title')?.textContent?.includes(title)) { target = c; break; }
+      }
+    }
+    if (target) {
+      if (!target.classList.contains('open')) target.classList.add('open');
+      target.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, 100);
+}
+
 // ── import findings modal ──────────────────────────────────────────────
 async function openImportFindingsModal() {
   document.getElementById('import-findings-modal').style.display = 'flex';

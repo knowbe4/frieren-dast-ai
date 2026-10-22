@@ -112,6 +112,21 @@ async def _verify_reflection(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     if source_label and "x-dast-source" not in {k.lower() for k in headers}:
         headers["x-dast-source"] = str(source_label)
 
+    if ctx.store is not None and "cookie" not in {k.lower() for k in headers}:
+        from urllib.parse import urlparse as _urlparse_vfy
+        _host = _urlparse_vfy(url).hostname or ""
+        try:
+            jar_cookies = ctx.store.get_cookies_for_host(_host) or []
+            if jar_cookies:
+                cookie_header = "; ".join(
+                    f"{c['name']}={c.get('value', '')}"
+                    for c in jar_cookies if c.get("name")
+                )
+                if cookie_header:
+                    headers["Cookie"] = cookie_header
+        except Exception:
+            pass
+
     try:
         import httpx
 

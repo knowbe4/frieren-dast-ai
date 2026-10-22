@@ -865,6 +865,7 @@ class CopilotSession:
 
         if cookies and "cookie" not in present:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+            headers["x-dast-cookies-injected"] = "1"
 
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":

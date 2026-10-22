@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 from typing import TYPE_CHECKING, Optional, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -103,6 +104,7 @@ class JwtTesterPlugin(ProxyPlugin):
 
     def __init__(self) -> None:
         self._seen: set = set()   # (host, path) pairs already tested
+        self._findings_emitted: set = set()  # (host, title) — host-level dedup
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         if entry.response_status is None or entry.method == "CONNECT":
@@ -205,32 +207,81 @@ class JwtTesterPlugin(ProxyPlugin):
                     return False
                 return True
 
-            async def _try(new_token: str) -> Optional[httpx.Response]:
+            async def _try(new_token: str) -> Tuple[Optional[httpx.Response], dict]:
                 h = _swap_token(forward_headers, header_name, location, new_token)
                 try:
-                    return await client.request(
+                    resp = await client.request(
                         entry.method, entry.url, headers=h,
                         content=body.encode() if body else None,
                     )
+                    return resp, h
                 except Exception as exc:
                     logger.warning("JWT tester: probe request failed", url=entry.url, error=str(exc))
-                    return None
+                    return None, h
 
-            def _finding(title, severity, cwe, evidence, payload_str, resp):
+            def _format_probe_request(headers: dict) -> str:
+                parsed = urlparse(entry.url)
+                path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
+                lines = [f"{entry.method} {path} HTTP/1.1", f"Host: {entry.host}"]
+                for k, v in headers.items():
+                    if k.lower() != "host":
+                        lines.append(f"{k}: {v}")
+                lines.append("")
+                if body:
+                    lines.append(body)
+                return "\r\n".join(lines)
+
+            def _format_probe_response(resp) -> str:
+                if not resp:
+                    return ""
+                lines = [f"HTTP/1.1 {resp.status_code}"]
+                for k, v in resp.headers.items():
+                    lines.append(f"{k}: {v}")
+                lines.append("")
+                lines.append(resp.text[:4000])
+                return "\r\n".join(lines)
+
+            def _finding(title, severity, cwe, evidence, payload_str, resp,
+                         probe_headers=None, forged_token=None, forged_header=None):
+                finding_key = (entry.host, title)
+                if finding_key in self._findings_emitted:
+                    return
+                self._findings_emitted.add(finding_key)
                 resp_snippet = resp.text[:500] if resp else ""
-                store.add_finding(entry.id, {
+                # Spell out the attack so the evidence is self-explanatory: show the
+                # decoded forged header next to the original one, and name the exact
+                # request location (header or cookie parameter) that carried the token.
+                location_label = ("Authorization header" if location == "header"
+                                  else f"cookie parameter '{header_name}'")
+                full_evidence = evidence
+                if forged_header is not None:
+                    full_evidence += (
+                        f"\n\nForged JWT header (decoded): {json.dumps(forged_header)}"
+                        f"\nOriginal JWT header (decoded): {json.dumps(orig_header)}"
+                        f"\nInjected via: {location_label}"
+                    )
+                finding_dict = {
                     "title": title,
                     "severity": severity,
                     "cwe": cwe,
                     "attack_type": "jwt",
-                    "evidence": evidence,
+                    "evidence": full_evidence,
                     "payload": payload_str[:200],
                     "parameter": header_name,
                     "confirmed": True,
                     "validated_by": ["passive", "pattern"],
                     "bypass_validation": False,
                     "snippet": resp_snippet,
-                }, "vulnerable")
+                }
+                if forged_token:
+                    # Surfaced so the UI highlights the exact forged token inside the
+                    # probe request (the raw base64 is otherwise invisible evidence).
+                    finding_dict["forged_token"] = forged_token
+                if probe_headers:
+                    finding_dict["probe_request"] = _format_probe_request(probe_headers)[:6000]
+                if resp:
+                    finding_dict["probe_response"] = _format_probe_response(resp)[:6000]
+                store.add_finding(entry.id, finding_dict, "vulnerable")
                 log_event("JWT Tester", "finding", title, url=entry.url, finding=title, source="plugin")
 
             # ── 1. alg:none ────────────────────────────────────────────
@@ -241,7 +292,8 @@ class JwtTesterPlugin(ProxyPlugin):
                     logger.warning("JWT tester: invalid alg:none header payload in jwt.yaml",
                                    payload=none_hdr_b64, error=str(exc))
                     continue
-                resp = await _try(_build_token(none_hdr, orig_payload, secret=None))
+                forged = _build_token(none_hdr, orig_payload, secret=None)
+                resp, probe_h = await _try(forged)
                 if _accepted(resp):
                     _finding(
                         "JWT Algorithm Confusion — alg:none Accepted",
@@ -250,14 +302,16 @@ class JwtTesterPlugin(ProxyPlugin):
                         f"Original alg: {orig_alg!r}. "
                         f"Response: {resp.status_code} ({len(resp.text)} chars)",
                         f"alg:{none_hdr.get('alg')} + empty signature",
-                        resp,
+                        resp, probe_headers=probe_h,
+                        forged_token=forged, forged_header=none_hdr,
                     )
                     return  # no need to continue after critical
 
             # ── 2. Weak HMAC secrets ────────────────────────────────────
             if orig_alg.startswith("HS"):
                 for secret in get_payloads("jwt", "weak_secrets"):
-                    resp = await _try(_build_token(orig_header, orig_payload, secret=secret))
+                    forged = _build_token(orig_header, orig_payload, secret=secret)
+                    resp, probe_h = await _try(forged)
                     if _accepted(resp):
                         _finding(
                             "JWT Signed with Weak Secret",
@@ -265,7 +319,8 @@ class JwtTesterPlugin(ProxyPlugin):
                             f"Server accepted token re-signed with weak secret {secret!r}. "
                             f"alg={orig_alg}.",
                             f"secret={secret!r}",
-                            resp,
+                            resp, probe_headers=probe_h,
+                            forged_token=forged, forged_header=orig_header,
                         )
                         return
 
@@ -276,7 +331,8 @@ class JwtTesterPlugin(ProxyPlugin):
                     hdr = dict(orig_header)
                     if secret is None:
                         hdr["alg"] = "none"
-                    resp = await _try(_build_token(hdr, escalated, secret=secret))
+                    forged = _build_token(hdr, escalated, secret=secret)
+                    resp, probe_h = await _try(forged)
                     if _accepted(resp) and len(resp.text) != baseline_len:
                         changed = {k: escalated[k] for k in escalated if escalated.get(k) != orig_payload.get(k)}
                         _finding(
@@ -285,7 +341,8 @@ class JwtTesterPlugin(ProxyPlugin):
                             f"Server accepted modified claims {changed!r}. "
                             f"Response length changed: {baseline_len} → {len(resp.text)} chars.",
                             f"modified claims: {changed}",
-                            resp,
+                            resp, probe_headers=probe_h,
+                            forged_token=forged, forged_header=hdr,
                         )
                         return
 
@@ -294,13 +351,15 @@ class JwtTesterPlugin(ProxyPlugin):
                 for kid_val in get_payloads("jwt", "kid_injection"):
                     hdr = dict(orig_header)
                     hdr["kid"] = kid_val
-                    resp = await _try(_build_token(hdr, orig_payload, secret=""))
+                    forged = _build_token(hdr, orig_payload, secret="")
+                    resp, probe_h = await _try(forged)
                     if _accepted(resp):
                         _finding(
                             "JWT kid Parameter Injection",
                             "high", "CWE-22",
                             f"Server accepted token with kid={kid_val!r}.",
                             f"kid={kid_val!r}",
-                            resp,
+                            resp, probe_headers=probe_h,
+                            forged_token=forged, forged_header=hdr,
                         )
                         return

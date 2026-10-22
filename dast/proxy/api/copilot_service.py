@@ -81,6 +81,11 @@ _AUTONOMOUS_DEFAULTS: Dict[str, object] = {
 # How many engine-level errors in a row abort the driver (guards a wedged model).
 _MAX_DRIVER_ERRORS = 3
 
+# Proactive session keepalive: between turns the browser navigates to a known
+# authenticated URL so the SSO session cookie is refreshed server-side before it
+# expires. 20 minutes is well within typical 1h SSO windows.
+_SESSION_KEEPALIVE_INTERVAL = 1200.0
+
 # How many times the coverage gate may bounce a premature 'complete' before letting the
 # run end anyway (with an honest "coverage incomplete" report). Guards against a loop
 # where the copilot cannot make coverage progress; the stuck detector is the other bound.
@@ -372,6 +377,44 @@ class CopilotService:
         logger.info("copilot session refreshed from proxy jar",
                     sid=sid, hosts=hosts_updated, cookies=len(merged_cookies))
         return {"ok": True, "hosts_updated": hosts_updated, "cookies_refreshed": len(merged_cookies)}
+
+    async def _session_keepalive(self, sid: str, session: dict) -> bool:
+        """Navigate the browser to a known host to keep the SSO session alive.
+
+        The browser request goes through the proxy, so the proxy jar captures any
+        refreshed Set-Cookie headers. Then ``refresh_session`` propagates the fresh
+        cookies into the copilot engine. Returns True if cookies were refreshed."""
+        auto = session.get("autonomous")
+        if not auto:
+            return False
+        hosts = auto.get("hosts") or []
+        if not hosts:
+            return False
+        browser = session.get("_agent_browser")
+        if browser is None:
+            return False
+
+        target_url = f"https://{hosts[0]}/"
+        try:
+            result = await browser.navigate(target_url, timeout_ms=15000)
+            status = result.get("status")
+            final_url = result.get("url", "")
+            logger.info("session keepalive: browser visit complete",
+                        sid=sid, target=target_url, status=status, final_url=final_url)
+        except Exception as exc:
+            logger.warning("session keepalive: browser navigation failed",
+                           sid=sid, target=target_url, error=str(exc))
+            return False
+
+        refreshed = self.refresh_session(sid)
+        cookies = refreshed.get("cookies_refreshed", 0)
+        if cookies:
+            logger.info("session keepalive: cookies propagated to engine",
+                        sid=sid, cookies=cookies)
+            await self._broadcast_autonomous(sid, "session_keepalive", {
+                "cookies_refreshed": cookies,
+            })
+        return cookies > 0
 
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
@@ -1332,6 +1375,7 @@ class CopilotService:
         if mode == "complete" and not auto.get("initial_explore_done"):
             await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
+            await self._session_keepalive(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
@@ -1346,6 +1390,7 @@ class CopilotService:
 
         last_progress = self._progress_snapshot()
         stuck_turns = 0
+        last_keepalive = time.time()
         auto["status"] = "running"
         await self._broadcast_autonomous(sid, "started", {
             "objective": auto["objective"], "hosts": auto["hosts"], "config": cfg,
@@ -1388,6 +1433,12 @@ class CopilotService:
                                             f"no progress for {stuck_turns} turns")
                     await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
                     return
+
+                # ── Session keepalive ────────────────────────────────────────────
+                now_ka = time.time()
+                if now_ka - last_keepalive >= _SESSION_KEEPALIVE_INTERVAL:
+                    await self._session_keepalive(sid, session)
+                    last_keepalive = time.time()
 
                 # ── Run one turn ─────────────────────────────────────────────────
                 auto["turns"] += 1

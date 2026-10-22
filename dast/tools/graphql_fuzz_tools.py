@@ -129,9 +129,28 @@ async def _graphql_fuzz(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
 
     total_attempts = 0
     hits: List[dict] = []
-    async with httpx.AsyncClient(follow_redirects=False, timeout=httpx.Timeout(20.0), verify=False) as client:
+
+    source_label = getattr(ctx, "source_label", None) or "agent"
+
+    async with httpx.AsyncClient(
+        proxy=ctx.proxy_url, follow_redirects=False,
+        timeout=httpx.Timeout(20.0), verify=False,
+    ) as client:
         for op_key, body, headers in batch:
             headers.setdefault("content-type", "application/json")
+            headers["x-dast-source"] = str(source_label)
+            if ctx.store is not None and "cookie" not in {k.lower() for k in headers}:
+                from urllib.parse import urlparse as _urlparse_fuzz
+                _host = _urlparse_fuzz(url).hostname or ""
+                try:
+                    jar_cookies = ctx.store.get_cookies_for_host(_host) or []
+                    if jar_cookies:
+                        headers["cookie"] = "; ".join(
+                            f"{c['name']}={c.get('value', '')}"
+                            for c in jar_cookies if c.get("name")
+                        )
+                except Exception:
+                    pass
             body_template = json.dumps(body)
             try:
                 variables = extract_variables(body_template)

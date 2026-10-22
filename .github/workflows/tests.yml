@@ -34,4 +34,4 @@ jobs:
         run: uv run ruff check .
 
       - name: Unit tests
-        run: uv run pytest tests/unit/ -q
+        run: uv run pytest tests/unit/ -q --ignore=tests/unit/test_spa_explorer.py

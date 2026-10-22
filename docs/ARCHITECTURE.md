@@ -323,7 +323,7 @@ match:
   header_absent: strict-transport-security
   # Also available:
   # header_present / header_value_regex / header_name_any
-  # body_regex / body_max_scan_bytes
+  # body_regex / body_max_scan_bytes / body_regex_case_sensitive (default false)
   # cookie_flag_absent / cookie_name_regex
   # path_regex
   # cors_check + cors_mode

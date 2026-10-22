@@ -11,6 +11,7 @@ let _issuesFP = [];       // dismissed / AI-rejected false positives
 let _issuesActiveTab = 'all';  // 'all' | 'fp'
 let _issuesFilterText = '';    // free-text filter over title/host/path/parameter
 let _issuesFilterSev = '';     // '' = all, else a severity name
+let _issuesFilterEntryId = null;  // set by the detail-pane findings badge
 
 // Read the filter controls and re-render. Wired to the Issues filter input/select.
 function filterIssues() {
@@ -25,8 +26,14 @@ function filterIssues() {
 function _applyIssuesFilter(list) {
   const text = _issuesFilterText;
   const sev = _issuesFilterSev;
-  if (!text && !sev) return list;
+  const entryId = _issuesFilterEntryId;
+  if (!text && !sev && !entryId) return list;
+  // _buildIssuesList dedups by title|path|parameter, so a finding of this
+  // entry may be listed under a sibling entry with the same host + path.
+  const entry = entryId ? entries[entryId] : null;
   return list.filter(({ host, f }) => {
+    if (entryId && f._entryId !== entryId
+        && !(entry && host === entry.host && f._path === entry.path)) return false;
     if (sev && (f.severity || 'info').toLowerCase() !== sev) return false;
     if (!text) return true;
     const hay = [f.title, host, f._path, f.parameter].filter(Boolean).join(' ').toLowerCase();
@@ -102,16 +109,17 @@ function _renderIssuesPage() {
   const fullList = _issuesActiveTab === 'fp' ? _issuesFP : _issuesAll;
   const list = _applyIssuesFilter(fullList);
   const total = list.length;
+  _renderIssuesEntryChip();
 
   // Match counter reflects how many pass the current filter, out of the total.
   const matchLbl = document.getElementById('issues-match-count');
   if (matchLbl) {
-    const filtering = _issuesFilterText || _issuesFilterSev;
+    const filtering = _issuesFilterText || _issuesFilterSev || _issuesFilterEntryId;
     matchLbl.textContent = filtering ? `${total} of ${fullList.length}` : '';
   }
 
   if (!total) {
-    const filtering = _issuesFilterText || _issuesFilterSev;
+    const filtering = _issuesFilterText || _issuesFilterSev || _issuesFilterEntryId;
     wrap.innerHTML = filtering
       ? '<div class="empty">No findings match the current filter.</div>'
       : (_issuesActiveTab === 'fp'
@@ -439,12 +447,59 @@ function toggleIssue(uid, entryId) {
   el.classList.toggle('open');
 }
 
+// Detail-pane findings badge: open the Findings view scoped to one request.
+// Lands on the False Positives tab when the entry only has dismissed findings.
+function showEntryFindings(entryId) {
+  const entry = entries[entryId];
+  const active = (entry?.findings || []).some(f => f.title && !f.dismissed);
+  _issuesFilterEntryId = entryId;
+  switchMain('findings');
+  switchIssuesTab(active ? 'all' : 'fp');
+}
+
+function clearIssuesEntryFilter() {
+  _issuesFilterEntryId = null;
+  _renderIssuesPage();
+}
+
+function _renderIssuesEntryChip() {
+  const chip = document.getElementById('issues-entry-chip');
+  if (!chip) return;
+  const entry = _issuesFilterEntryId ? entries[_issuesFilterEntryId] : null;
+  if (!entry) {
+    chip.style.display = 'none';
+    chip.innerHTML = '';
+    return;
+  }
+  chip.style.display = '';
+  chip.innerHTML = `<span title="${esc(entry.url || '')}">Request: ${esc(entry.method || '')} ${esc(entry.path || '')}</span>
+    <button onclick="clearIssuesEntryFilter()" title="Show findings for all requests" aria-label="Clear request filter">&times;</button>`;
+}
+
 function goToEntry(id) {
   switchMain('proxy');
   switchProxySub('history');
   selectRow(id);
-  setDTab('findings');
   setTimeout(() => document.getElementById('row-' + id)?.scrollIntoView({ block: 'nearest' }), 50);
+}
+
+function goToFinding(entryId, title) {
+  _issuesFilterEntryId = null;
+  switchMain('findings');
+  switchIssuesTab('all');
+  setTimeout(() => {
+    const cards = document.querySelectorAll('.iissue[data-entry-id="' + entryId + '"]');
+    let target = cards[0];
+    if (title && cards.length > 1) {
+      for (const c of cards) {
+        if (c.querySelector('.iissue-title')?.textContent?.includes(title)) { target = c; break; }
+      }
+    }
+    if (target) {
+      if (!target.classList.contains('open')) target.classList.add('open');
+      target.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }, 100);
 }
 
 // ── import findings modal ──────────────────────────────────────────────

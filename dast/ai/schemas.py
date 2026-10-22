@@ -259,7 +259,7 @@ COPILOT_STEP_SCHEMA: Dict[str, Any] = {
         "action": {
             "type": "string",
             "enum": ["call_tool", "reply"],
-            "description": "call_tool = run a Frieren tool and keep working this turn; reply = send a message to the operator and hand the turn back.",
+            "description": "call_tool = run a Frieren tool and keep working this turn; reply = send a message to the operator and hand the turn back. If omitted it is inferred: tool_name present -> call_tool, else reply.",
         },
         "tool_name": {
             "type": "string",
@@ -279,7 +279,10 @@ COPILOT_STEP_SCHEMA: Dict[str, Any] = {
             "description": "Optional when action=reply: a short machine-readable reason you are handing back blocked, e.g. 'waf_block', 'auth_required', 'need_value', 'need_authorization', 'out_of_scope'. Empty when you are simply reporting progress.",
         },
     },
-    "required": ["thought", "action"],
+    # Only `thought` is required. Some providers (e.g. the gateway) occasionally
+    # omit `action` even under schema forcing; the session recovers it from
+    # tool_name/message rather than discarding the whole step as malformed.
+    "required": ["thought"],
 }
 
 # Probe-diff classifier — dast/ai/probe_classifier.py _SYSTEM / classify()
@@ -733,4 +736,38 @@ RACE_VERDICT_SCHEMA: Dict[str, Any] = {
         "reasoning": {"type": "string", "description": "One paragraph citing the observed response divergence."},
     },
     "required": ["confirmed", "confidence", "reasoning"],
+}
+
+
+# Vision navigator — dast/proxy/vision_nav.py. The multimodal model is shown a
+# screenshot of a rendered SPA and returns the on-screen navigation controls as
+# center pixel coordinates, so the explorer can click them when the DOM/
+# accessibility tree expose no enumerable nav (web-component / canvas UIs).
+VISION_CLICKABLES_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "elements": {
+            "type": "array",
+            "description": "On-screen navigation controls that lead to a different app section.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Visible text/label of the control."},
+                    "x": {"type": "integer", "description": "Center X in viewport pixels."},
+                    "y": {"type": "integer", "description": "Center Y in viewport pixels."},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["nav", "link", "button", "menu", "tab"],
+                        "description": "What kind of control this is.",
+                    },
+                    "destructive": {
+                        "type": "boolean",
+                        "description": "True if it logs out, deletes, or otherwise destroys state — these are skipped.",
+                    },
+                },
+                "required": ["label", "x", "y"],
+            },
+        },
+    },
+    "required": ["elements"],
 }

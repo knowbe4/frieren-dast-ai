@@ -80,6 +80,9 @@ async function cpStartAutonomous() {
         objective: objective.trim(), focus_hosts,
         profile_slug: profile_slug || undefined, budget,
         session_safe: !!(document.getElementById('cp-auto-session-safe') || {}).checked,
+        read_only: !!(document.getElementById('cp-auto-read-only') || {}).checked,
+        mode: (document.getElementById('cp-auto-complete') || {}).checked ? 'complete' : 'bounded',
+        submit_forms: !!(document.getElementById('cp-auto-submit-forms') || {}).checked,
       }),
     });
     const d = await r.json();
@@ -434,8 +437,29 @@ function cpRenderAutonomous(session) {
       <div style="font-size:10px;color:var(--txt2);margin-top:4px">
         ${auto.turns || 0} turns · ${auto.tool_calls || 0}/${(auto.config || {}).max_tool_calls || '?'} tool calls · ${auto.seconds_remaining || 0}s left
       </div>
+      <div id="cp-ui-routes" style="font-size:10px;color:var(--txt2);margin-top:4px"></div>
       ${controls}
     </div>`;
+  // SPA exploration map (complete-mode frontier). Fire-and-forget refresh.
+  cpRefreshUiRoutes();
+}
+
+// Populate the SPA-map readout: how many UI routes have been explored vs. still
+// queued in the frontier. Shows the operator a complete run mapping the app.
+async function cpRefreshUiRoutes() {
+  const el = document.getElementById('cp-ui-routes');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/ui-routes');
+    const data = await r.json();
+    const s = data.stats || {};
+    if (!s.total) { el.innerHTML = ''; return; }
+    const forms = s.forms_submitted ? ` · ${s.forms_submitted} forms submitted` : '';
+    el.innerHTML = `SPA map: <b>${s.visited || 0}</b> explored · `
+      + `<b>${s.frontier || 0}</b> queued${s.failed ? ` · ${s.failed} failed` : ''}${forms}`;
+  } catch (_) {
+    el.innerHTML = '';
+  }
 }
 
 function cpBubble(m) {

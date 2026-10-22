@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Kill all dast-ai proxy and dashboard processes on Linux, macOS, or Windows."""
 import os
+import re
 import subprocess
 import sys
+from typing import List
 
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8080"))
 DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8088"))
@@ -26,15 +28,38 @@ def kill_by_pattern(pattern: str) -> None:
         _run("pkill", "-f", pattern)
 
 
-def kill_by_port_macos(port: int) -> None:
-    result = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True, text=True)
-    for pid in result.stdout.strip().splitlines():
-        if pid.strip():
-            _run("kill", "-9", pid.strip())
+def listening_pids(port: int) -> List[str]:
+    """PIDs LISTENING on the port — never its clients.
+
+    A bare `lsof -ti :PORT` (or `fuser -k PORT/tcp`) also returns every process
+    with a client connection to the port. With the dashboard open in Chrome
+    that is Chrome's network service; SIGKILLing it wipes in-memory session
+    cookies and logs the user out of SSO (Okta) on every restart.
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError:
+        return _listening_pids_ss(port)
+    own_pid = str(os.getpid())
+    return [pid.strip() for pid in result.stdout.splitlines() if pid.strip() and pid.strip() != own_pid]
 
 
-def kill_by_port_linux(port: int) -> None:
-    _run("fuser", "-k", f"{port}/tcp")
+def _listening_pids_ss(port: int) -> List[str]:
+    """Linux fallback when lsof is missing: parse `ss -ltnpH`."""
+    try:
+        result = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True)
+    except FileNotFoundError:
+        print(f"  neither lsof nor ss found; not killing by port {port}")
+        return []
+    return sorted(set(re.findall(r"pid=(\d+)", result.stdout)))
+
+
+def kill_by_port_posix(port: int) -> None:
+    for pid in listening_pids(port):
+        _run("kill", "-9", pid)
 
 
 def kill_by_port_windows(port: int) -> None:
@@ -53,12 +78,10 @@ def main() -> None:
         kill_by_pattern(pattern)
 
     for port in (PROXY_PORT, DASHBOARD_PORT):
-        if sys.platform == "darwin":
-            kill_by_port_macos(port)
-        elif sys.platform == "win32":
+        if sys.platform == "win32":
             kill_by_port_windows(port)
         else:
-            kill_by_port_linux(port)
+            kill_by_port_posix(port)
 
     print("Done.")
 

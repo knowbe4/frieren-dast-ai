@@ -63,11 +63,27 @@ class BrowseSession:
                 "--start-maximized",
             ],
         )
-        self._context = await self._browser.new_context(
-            ignore_https_errors=True,
-            viewport={"width": 1440, "height": 900},
-            no_viewport=not headless,
-        )
+        context_kwargs: dict = {
+            "ignore_https_errors": True,
+            "viewport": {"width": 1440, "height": 900},
+            "no_viewport": not headless,
+        }
+        from dast.proxy.auth_state_store import load_auth_state
+        persisted = load_auth_state()
+        if persisted and (persisted.get("cookies") or persisted.get("origins")):
+            context_kwargs["storage_state"] = persisted
+            logger.info("browse: seeded from persisted auth",
+                        cookies=len(persisted.get("cookies") or []))
+        try:
+            self._context = await self._browser.new_context(**context_kwargs)
+        except Exception as exc:
+            # A malformed persisted cookie can make new_context raise; never let
+            # that take down the browse session — fall back to an unseeded context
+            # (operator just logs in again) instead of crashing the proxy task.
+            logger.warning("browse: seeding auth failed, starting unauthenticated",
+                           error=str(exc))
+            context_kwargs.pop("storage_state", None)
+            self._context = await self._browser.new_context(**context_kwargs)
 
         # Install the DOM recorder BEFORE the first page so every navigation is
         # instrumented. Secrets are classified in-page and never sent back.

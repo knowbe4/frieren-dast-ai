@@ -81,6 +81,11 @@ _AUTONOMOUS_DEFAULTS: Dict[str, object] = {
 # How many engine-level errors in a row abort the driver (guards a wedged model).
 _MAX_DRIVER_ERRORS = 3
 
+# Proactive session keepalive: between turns the browser navigates to a known
+# authenticated URL so the SSO session cookie is refreshed server-side before it
+# expires. 20 minutes is well within typical 1h SSO windows.
+_SESSION_KEEPALIVE_INTERVAL = 1200.0
+
 # How many times the coverage gate may bounce a premature 'complete' before letting the
 # run end anyway (with an honest "coverage incomplete" report). Guards against a loop
 # where the copilot cannot make coverage progress; the stuck detector is the other bound.
@@ -89,6 +94,14 @@ _MAX_COMPLETE_REJECTIONS = 8
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
 
+def _order_hosts(hosts) -> List[str]:
+    """Sorted host list with identity-provider hosts pushed to the end.
+
+    The autonomous sweep iterates this order, so the IdP (whose probing kills the
+    shared SSO session) is only reached after the rest of the surface is covered."""
+    from dast.proxy.session_store import is_identity_host
+    return sorted(hosts, key=lambda host: (is_identity_host(host), host))
+
 # blocked_reason values that mean "I cannot proceed without a human" — the driver
 # turns these into an operator escalation (answer / pause / abort) then resumes.
 _ESCALATE_REASONS = frozenset({
@@ -96,11 +109,21 @@ _ESCALATE_REASONS = frozenset({
     "out_of_scope", "auth_required", "waf_block",
 })
 
+# "Soft" escalations: the copilot is unsure or asking permission for a next step it
+# could just take. In an autonomous run these are not real blockers — the driver
+# auto-nudges it to proceed instead of pausing the operator. The "hard" reasons
+# (auth_required/out_of_scope/need_authorization/waf_block) genuinely need operator
+# action and still pause immediately.
+_SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
+# Soft escalations auto-nudged before a real human pause, per no-progress streak.
+_MAX_AUTO_GUIDANCE_NUDGES = 3
+
 _AUTONOMOUS_START = (
     "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
     "every action is registered inside the tool (schemas, history, findings) for the human to "
     "review later. Objective: {objective}\n\n"
+    "{read_only}"
     "Work the objective end to end across many turns without waiting for me.\n"
     "USE THE INTERNAL TOOLS — never hand-roll with send_request what a dedicated tool does:\n"
     "- graphql_introspect on any GraphQL endpoint (this registers the schema in Frieren); do "
@@ -124,6 +147,7 @@ _AUTONOMOUS_START = (
     "of operations and stop — sweep the entire schema and scan the entire REST surface, then go "
     "deep on the leads they surface.\n\n"
     "{leads}\n\n"
+    "{router}"
     "{coverage}\n\n"
     "Signal control ONLY through blocked_reason on a reply: set it to 'complete' when the "
     "objective is fully covered AND you have actively TESTED the high-value leads (not merely "
@@ -138,12 +162,26 @@ _AUTONOMOUS_CONTINUE = (
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
     "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding), and actively "
     "TEST leads (IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
+    "{read_only}"
     "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
     "{leads}\n\n"
+    "{router}"
     "{coverage}\n\n"
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
     "blocked (say what a vulnerable vs. normal response would look like)."
+)
+
+_AUTONOMOUS_SELF_PROCEED = (
+    "You set blocked_reason='{reason}', but this is NOT a genuine blocker — you do not need my "
+    "permission to run safe, in-scope next steps you have already planned. Proceed autonomously "
+    "right now: execute your plan with the internal tools (run_scan, scan_surface, idor_probe, "
+    "param_mining, validate_chain, record_finding). Reserve a blocked_reason for a TRUE blocker "
+    "only I can resolve: a credential/value I hold, or an out-of-scope authorization decision — "
+    "never to confirm a step you can already take. Progress: {progress}. Budget: {budget}.\n\n"
+    "{leads}\n\n"
+    "{router}"
+    "{coverage}"
 )
 
 _AUTONOMOUS_COVERAGE_GATE = (
@@ -154,6 +192,20 @@ _AUTONOMOUS_COVERAGE_GATE = (
     "each introspected GraphQL endpoint until operations_remaining=0 (crawl / graphql_introspect "
     "first if the surface is not yet mapped). Then go deep on anything they flag. Budget "
     "remaining: {budget}. Only set 'complete' once every endpoint and operation has been tested."
+)
+
+_READ_ONLY_DIRECTIVE = (
+    "[READ-ONLY MODE] This is a production target. Only safe methods (GET/HEAD/OPTIONS) leave "
+    "the machine; any write a click or form would trigger is dropped at the network layer. "
+    "The probe/attack tools (run_scan, scan_surface, graphql_sweep, idor_probe, param_mining, "
+    "content_discovery, match_replace, validate_chain) are DISABLED and will return an error.\n"
+    "Your job is to MAP and OBSERVE, not to attack: crawl to discover the surface, "
+    "browser_navigate/browser_click to reach routes, graphql_introspect to register schemas, "
+    "send_request (GET/HEAD/OPTIONS only) to read endpoints, get_history to review captured "
+    "traffic, and record_finding for anything you can conclude from observation alone (e.g. a "
+    "missing security header, a secret in a response). Do NOT keep retrying a disabled tool. "
+    "Coverage here means 'surface mapped', not 'surface scanned' — set blocked_reason='complete' "
+    "once you have mapped and observed the surface for the objective."
 )
 
 _AUTONOMOUS_GUIDANCE = (
@@ -326,6 +378,44 @@ class CopilotService:
                     sid=sid, hosts=hosts_updated, cookies=len(merged_cookies))
         return {"ok": True, "hosts_updated": hosts_updated, "cookies_refreshed": len(merged_cookies)}
 
+    async def _session_keepalive(self, sid: str, session: dict) -> bool:
+        """Navigate the browser to a known host to keep the SSO session alive.
+
+        The browser request goes through the proxy, so the proxy jar captures any
+        refreshed Set-Cookie headers. Then ``refresh_session`` propagates the fresh
+        cookies into the copilot engine. Returns True if cookies were refreshed."""
+        auto = session.get("autonomous")
+        if not auto:
+            return False
+        hosts = auto.get("hosts") or []
+        if not hosts:
+            return False
+        browser = session.get("_agent_browser")
+        if browser is None:
+            return False
+
+        target_url = f"https://{hosts[0]}/"
+        try:
+            result = await browser.navigate(target_url, timeout_ms=15000)
+            status = result.get("status")
+            final_url = result.get("url", "")
+            logger.info("session keepalive: browser visit complete",
+                        sid=sid, target=target_url, status=status, final_url=final_url)
+        except Exception as exc:
+            logger.warning("session keepalive: browser navigation failed",
+                           sid=sid, target=target_url, error=str(exc))
+            return False
+
+        refreshed = self.refresh_session(sid)
+        cookies = refreshed.get("cookies_refreshed", 0)
+        if cookies:
+            logger.info("session keepalive: cookies propagated to engine",
+                        sid=sid, cookies=cookies)
+            await self._broadcast_autonomous(sid, "session_keepalive", {
+                "cookies_refreshed": cookies,
+            })
+        return cookies > 0
+
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
@@ -449,7 +539,10 @@ class CopilotService:
         if browser is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
-                browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store)
+                browser = AgentBrowser(
+                    proxy_port=ctx.proxy_port, store=ctx.store,
+                    read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
+                )
                 session["_agent_browser"] = browser
             except Exception as exc:
                 logger.warning("could not create AgentBrowser", error=str(exc))
@@ -465,6 +558,7 @@ class CopilotService:
             crawl_queue=getattr(ctx, "crawl_queue", None),
             source_label="copilot",
             session_safe=bool((session.get("autonomous") or {}).get("session_safe", False)),
+            read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
             browser=browser,
         )
 
@@ -541,6 +635,9 @@ class CopilotService:
         budget: Optional[dict] = None,
         auto_ai_mode: bool = True,
         session_safe: bool = False,
+        read_only: bool = False,
+        mode: str = "bounded",
+        submit_forms: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -549,16 +646,29 @@ class CopilotService:
         auto-scan of everything crawled, then spawns the cross-turn driver as the
         session task. Returns the session id. Raises ``ValueError`` on a missing
         objective and re-raises ``RuntimeError`` if no event loop is running.
+
+        ``mode="complete"`` runs an exhaustive test: it will not self-terminate
+        while UI routes or surface remain untested — only the operator, the
+        wall-clock, or genuine exhaustion ends it. ``submit_forms`` lets the SPA
+        explorer fill and submit forms (active runs only) to reach wizard steps.
         """
         objective = (objective or "").strip()
         if not objective:
             raise ValueError("objective is required")
         hosts = [h.strip().lower() for h in (focus_hosts or []) if h and h.strip()]
+        mode = mode if mode in ("bounded", "complete") else "bounded"
 
         sid = self.new_session(focus_hosts=hosts)
         session = self._sessions[sid]
         session["origin"] = "autonomous"
         cfg = _normalise_budget(budget)
+        # Complete mode: unless the caller set explicit bounds, run on a long leash
+        # so breadth isn't cut short — the operator stops it. (Clamp ceilings from
+        # _normalise_budget still apply.)
+        if mode == "complete" and not budget:
+            cfg["max_wall_clock_seconds"] = 86400
+            cfg["max_tool_calls"] = 2000
+            cfg["max_stuck_turns"] = 50
         pause_gate = asyncio.Event()
         pause_gate.set()  # set = running; cleared = paused
         session["autonomous"] = {
@@ -567,6 +677,10 @@ class CopilotService:
             "hosts": hosts,
             "profile": profile_slug or None,
             "session_safe": session_safe,
+            "read_only": read_only,
+            "mode": mode,
+            "submit_forms": bool(submit_forms) and not read_only,
+            "initial_explore_done": False,
             "stop_event": asyncio.Event(),
             "pause_gate": pause_gate,
             "paused_at": None,
@@ -585,6 +699,16 @@ class CopilotService:
         # fans out share the one logged-in cookie and trip concurrent-session
         # detection on strict targets (ASP.NET single-session), logging the run
         # (and the operator's browser) out mid-objective.
+        if read_only:
+            # Read-only: ambient auto-scan fires attack payloads at everything
+            # crawled, so it must be OFF for the run even if the operator had
+            # it on. Same save/restore path as the forced-on case below.
+            auto_ai_mode = False
+            if self._ctx.store is not None and self._ctx.store.ai_mode:
+                session["autonomous"]["_ai_mode_prev"] = True
+                session["autonomous"]["_ai_mode_forced"] = True
+                self._ctx.store.ai_mode = False
+                logger.info("read-only run: AI mode paused for the run", session_id=sid)
         if session_safe and auto_ai_mode:
             logger.info("session-safe mode: skipping ambient auto-scan (ai_mode)",
                         session_id=sid)
@@ -602,6 +726,12 @@ class CopilotService:
             except Exception as exc:
                 logger.warning("autonomous run could not enable AI mode",
                                session_id=sid, error=str(exc))
+
+        # Defer identity-provider hosts for the main run: the ambient auto-scan and
+        # scan_surface skip them so probing the IdP cannot log the run out mid-scan.
+        # The driver lifts this for a final phase that tests the IdP last.
+        if self._ctx.store is not None:
+            self._ctx.store.defer_identity_hosts = True
 
         # Preseed auth so the run carries a logged-in session from the first call
         # and the auth-wall gate stays quiet (no operator to answer it mid-run).
@@ -800,26 +930,30 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: engine session seed failed", error=str(exc))
 
-    def _progress_snapshot(self) -> Tuple[int, int, int]:
-        """A monotonic (findings, in-scope endpoints, coverage units) tuple used by the
-        stuck detector: no change across ``max_stuck_turns`` turns means no progress.
-        Coverage units count scanned endpoints + swept GraphQL operations so that
-        breadth work (scan_surface / graphql_sweep), which need not add a finding, still
-        registers as progress and never trips the stuck detector."""
+    def _progress_snapshot(self) -> Tuple[int, int, int, int]:
+        """A monotonic (findings, in-scope endpoints, coverage units, ui units) tuple
+        used by the stuck detector: no change across ``max_stuck_turns`` turns means no
+        progress. Coverage units count scanned endpoints + swept GraphQL operations so
+        breadth work (scan_surface / graphql_sweep) registers as progress; ui units count
+        discovered + visited UI routes so SPA exploration (discovering or visiting a
+        route) also counts and never trips the stuck detector."""
         store = self._ctx.store
         if store is None:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         try:
             entries = store.in_scope_entries()
         except Exception:
-            return (0, 0, 0)
+            return (0, 0, 0, 0)
         findings = sum(len(getattr(entry, "findings", None) or []) for entry in entries)
         scanned = sum(1 for entry in entries if getattr(entry, "scan_result", None))
         swept_ops = sum(
             len(ops or ())
             for ops in (getattr(store, "graphql_tested_ops", None) or {}).values()
         )
-        return (findings, len(entries), scanned + swept_ops)
+        graph = getattr(store, "ui_route_graph", None)
+        ui_stats = graph.stats() if graph is not None else {"visited": 0, "frontier": 0}
+        ui_units = ui_stats["visited"] + ui_stats["frontier"]
+        return (findings, len(entries), scanned + swept_ops, ui_units)
 
     async def _broadcast_autonomous(self, sid: str, event: str,
                                     extra: Optional[dict] = None) -> None:
@@ -844,6 +978,9 @@ class CopilotService:
                 except Exception as exc:
                     logger.warning("autonomous run could not restore AI mode",
                                    error=str(exc))
+            # Lift the identity-host deferral so it never leaks into manual use.
+            if self._ctx.store is not None:
+                self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
         session["updated_at"] = time.time()
 
@@ -894,6 +1031,38 @@ class CopilotService:
         )
         return result if isinstance(result, dict) else {"action": "abort", "answer": ""}
 
+    def _effective_hosts(self, focus_hosts: List[str]) -> List[str]:
+        """Expand the operator's focus hosts to every in-scope host actually observed
+        in captured traffic.
+
+        The focus host the operator typed is only a seed. Modern apps serve their real
+        API from sibling subdomains (BFF/API/reporting hosts) that never appear in the
+        operator's one-line target, so grounding and targeting keyed on the literal
+        focus host leave that surface invisible — the copilot then guesses URLs on the
+        focus host and escalates to a human when the guess fails. Deriving the working
+        host set from traffic instead means leads/router/coverage and auto-targeting
+        cover every in-scope host for every vuln class, with no per-host enumeration by
+        the operator. Scope is already enforced by the proxy: ``in_scope_entries``
+        excludes anything tagged out-of-scope, so this never reaches beyond scope.
+
+        Ordering: identity-provider hosts (SSO/login/OAuth) are sorted LAST. Probing
+        them floods the login/token endpoints and invalidates the very SSO session
+        every other host depends on, so they must be tested only after the rest of
+        the surface is covered — a dead session at the end costs nothing, a dead
+        session at the start wastes the whole run."""
+        hosts = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        store = self._ctx.store
+        if store is None:
+            return _order_hosts(hosts)
+        try:
+            for entry in store.in_scope_entries():
+                host = (getattr(entry, "host", "") or "").split(":")[0].lower()
+                if host:
+                    hosts.add(host)
+        except Exception as exc:  # noqa: BLE001 — best-effort expansion, never crash the run
+            logger.debug("effective host expansion failed", error=str(exc))
+        return _order_hosts(hosts)
+
     def _leads_label(self, hosts: List[str]) -> str:
         """Compact, prioritised app-context leads for the focus hosts, injected into the
         autonomous turn prompt so the copilot chases concrete hypotheses ITSELF instead of
@@ -921,6 +1090,270 @@ class CopilotService:
             return nudge
         return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
 
+    def _router_block(self, hosts: List[str]) -> str:
+        """Evidence-driven 'recommended next actions / AVOID' block for the turn prompt.
+        Deterministic routing from observed signals (id -> sqli/idor, AI endpoint ->
+        llm_injection, MySQL -> avoid MSSQL, GraphQL -> sweep) that shrinks as things get
+        tested. Best-effort; empty string when there is nothing to recommend yet."""
+        store = self._ctx.store
+        if store is None:
+            return ""
+        try:
+            from dast.ai.evidence_router import RouterEvidence, route
+            parts: List[str] = []
+            for host in (hosts or []):
+                plan = route(RouterEvidence.from_store(store, host.split(":")[0]))
+                block = plan.to_prompt_block()
+                if block:
+                    parts.append(block)
+            return ("\n\n".join(parts) + "\n\n") if parts else ""
+        except Exception as exc:  # noqa: BLE001 — routing is advisory, never crash the run
+            logger.debug("router block unavailable", error=str(exc))
+            return ""
+
+    def _without_deferred_identity(self, hosts: set) -> set:
+        """Drop identity-provider hosts while the run defers them, so auto-targeting
+        never probes the IdP until the final phase lifts the deferral."""
+        from dast.proxy.session_store import is_identity_host
+        store = self._ctx.store
+        if store is None or not getattr(store, "defer_identity_hosts", False):
+            return set(hosts)
+        return {h for h in hosts if not is_identity_host(h)}
+
+    async def _final_identity_phase(self, sid: str, session: dict) -> None:
+        """Test identity-provider hosts LAST, once the rest of the surface is covered.
+
+        Lifts the deferral and runs the active arsenal against the IdP hosts: scan
+        every now-unblocked endpoint, then GraphQL and evidence-routed probes. Any
+        session death this causes is harmless — every other host is already done.
+        Runs once per run; no-op in read-only (active tools disabled)."""
+        from dast.proxy.session_store import is_identity_host
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        if auto.get("identity_phase_done"):
+            return
+        auto["identity_phase_done"] = True
+        store = self._ctx.store
+        if store is not None:
+            store.defer_identity_hosts = False  # lift the deferral for the IdP pass
+        identity_hosts = {
+            h for h in self._effective_hosts(auto.get("hosts") or []) if is_identity_host(h)
+        }
+        if not identity_hosts or auto.get("read_only") or store is None:
+            return
+        logger.info("autonomous run: final identity-provider phase (tested last)",
+                    session_id=sid, hosts=sorted(identity_hosts))
+        await self._broadcast_autonomous(sid, "identity_phase", {"hosts": sorted(identity_hosts)})
+        ctx = self._build_tool_ctx(session)
+        stop_event: asyncio.Event = auto["stop_event"]
+        # scan_surface now sees the IdP endpoints (deferral lifted); the rest of the
+        # surface is already scanned, so this effectively covers just the IdP.
+        prev = -1
+        for _ in range(12):
+            if stop_event.is_set():
+                return
+            try:
+                result = await run_tool(ctx, "scan_surface", {})
+            except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                logger.warning("identity phase: scan_surface failed", session_id=sid, error=str(exc))
+                break
+            remaining = int((result or {}).get("remaining", 0) or 0)
+            if remaining == 0 or remaining == prev:
+                break
+            prev = remaining
+        await self._auto_test_graphql(session, ctx, set(identity_hosts))
+        await self._auto_route(session, ctx, set(identity_hosts))
+
+    async def _auto_route(self, session: dict, ctx: Any, hosts: set) -> None:
+        """Auto-run the unambiguous, auto_safe evidence recommendations (e.g. AI
+        endpoint -> run_scan[llm_injection], high-confidence id flow -> run_scan[sqli]/
+        idor_probe), honoring read_only (active tools dropped) and skipping anything
+        already auto-run this session. Mirrors _auto_test_graphql; the LLM still handles
+        the judgment-call recommendations surfaced in the prompt block."""
+        from dast.ai.evidence_router import RouterEvidence, route
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        read_only = bool(auto.get("read_only"))
+        stop_event: asyncio.Event = auto["stop_event"]
+        routed: set = auto.setdefault("routed", set())
+        store = self._ctx.store
+        if store is None:
+            return
+        hosts = self._without_deferred_identity(hosts)
+        if not hosts:
+            return
+        for host in hosts:
+            if stop_event.is_set():
+                return
+            try:
+                plan = route(RouterEvidence.from_store(store, str(host).split(":")[0]))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("auto-route: planning failed", host=host, error=str(exc))
+                continue
+            for rec in plan.auto_actions(read_only=read_only):
+                if stop_event.is_set():
+                    return
+                key = (rec.target_url, rec.kind, rec.attack_type)
+                if not rec.target_url or key in routed:
+                    continue
+                routed.add(key)
+                args: Dict[str, Any] = {"url": rec.target_url}
+                if rec.kind == "run_scan" and rec.attack_type:
+                    args["attack_types"] = [rec.attack_type]
+                try:
+                    logger.info("auto-route: running", kind=rec.kind, attack=rec.attack_type,
+                                url=rec.target_url, source=rec.source)
+                    await run_tool(ctx, rec.kind, args)
+                except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                    logger.warning("auto-route tool failed", kind=rec.kind, error=str(exc))
+
+    async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
+        """Drive breadth deterministically in complete mode so it is never left to
+        LLM discretion: per in-scope host (focus hosts expanded with every in-scope
+        host seen in traffic), EXPLORE the SPA to drain the UI frontier,
+        then (active runs only) CONTENT-DISCOVER, SCAN every observed endpoint to
+        exhaustion, and INTROSPECT+SWEEP (or FUZZ captured ops when introspection is
+        disabled) every GraphQL endpoint. The LLM turns that follow focus on depth.
+        Best-effort and stop-aware — any tool failure is logged, never fatal."""
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        hosts = self._effective_hosts(auto.get("hosts") or [])
+        if not hosts:
+            return
+        read_only = bool(auto.get("read_only"))
+        submit_forms = bool(auto.get("submit_forms"))
+        stop_event: asyncio.Event = auto["stop_event"]
+        ctx = self._build_tool_ctx(session)
+
+        async def _call(tool: str, args: dict) -> dict:
+            try:
+                result = await run_tool(ctx, tool, args)
+                return result if isinstance(result, dict) else {}
+            except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
+                logger.warning("complete-mode sweep tool failed", session_id=sid,
+                               tool=tool, error=str(exc))
+                return {}
+
+        async def _loop_until_zero(tool: str, args: dict, key: str, passes: int = 12) -> None:
+            prev = -1
+            for _ in range(passes):
+                if stop_event.is_set():
+                    return
+                result = await _call(tool, args)
+                remaining = int(result.get(key, 0) or 0)
+                if remaining == 0 or remaining == prev:
+                    return
+                prev = remaining
+
+        for host in hosts:
+            if stop_event.is_set():
+                return
+            seed = f"https://{host}/"
+
+            # 1) Exhaustive SPA exploration — drain the UI-route frontier.
+            prev_frontier = -1
+            last_visited = 0
+            for _pass in range(10):
+                if stop_event.is_set():
+                    return
+                result = await _call("explore", {"url": seed, "submit_forms": submit_forms})
+                remaining = int(result.get("frontier_remaining", 0) or 0)
+                last_visited = int(result.get("routes_visited", 0) or 0)
+                await self._broadcast_autonomous(sid, "explore_progress", {
+                    "host": host, "routes_visited": last_visited, "frontier_remaining": remaining,
+                })
+                if remaining == 0 or remaining == prev_frontier:
+                    break
+                prev_frontier = remaining
+
+            # Coordinator decision (NOT automatic): normal DOM/accessibility
+            # navigation found no routes on an app that is clearly authenticated
+            # and rendering (its own traffic reached the store). The nav is likely
+            # a web-component/canvas UI with no enumerable structure — try VISION
+            # navigation once (cheap multimodal model, bounded in the explorer).
+            try:
+                observed = len(self._ctx.store.in_scope_entries()) if self._ctx.store else 0
+            except Exception:  # noqa: BLE001
+                observed = 0
+            if last_visited <= 1 and observed > 3:
+                logger.info("complete-mode: normal nav found no routes — trying vision", host=host)
+                await self._broadcast_autonomous(sid, "vision_fallback", {"host": host})
+                await _call("explore", {"url": seed, "submit_forms": submit_forms, "vision": True})
+
+            if read_only:
+                continue  # active tools below are blocked in read-only
+
+            # 2) Scan every observed-but-unscanned endpoint to exhaustion.
+            #    Surface comes from REAL navigation (the explore above) + the
+            #    authenticated app's own traffic — NOT wordlist forced-browsing.
+            #    content_discovery remains an explicit tool the operator/LLM can
+            #    invoke, but the complete sweep no longer brute-forces paths from
+            #    files (noisy, false-positive-prone on SPAs).
+            await _loop_until_zero("scan_surface", {}, "remaining")
+            # 4) GraphQL: introspect+sweep, or fuzz captured ops when introspection is off.
+            await self._auto_test_graphql(session, ctx, hosts={host})
+            # 5) Auto-route the unambiguous evidence recommendations (id -> sqli/idor,
+            #    AI endpoint -> llm_injection, etc.) — breadth not left to the LLM.
+            await self._auto_route(session, ctx, hosts={host})
+
+    async def _auto_test_graphql(self, session: dict, ctx: Any, hosts: set) -> None:
+        """Automatically test every GraphQL endpoint seen in traffic for the given
+        hosts: introspect, then sweep its schema — or, when introspection is
+        disabled, fuzz the operations captured from traffic. Idempotent (already
+        tested ops are skipped) so it is safe to call every turn. No-op in
+        read-only (the GraphQL query/fuzz traffic is active and network-blocked).
+        This is what makes 'see a GraphQL endpoint -> test it' happen without the
+        operator or the LLM having to ask for it."""
+        from dast.plugins.graphql_analyzer import _is_graphql
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        if auto.get("read_only"):
+            return
+        stop_event: asyncio.Event = auto["stop_event"]
+        store = self._ctx.store
+        if store is None:
+            return
+        hosts = self._without_deferred_identity(hosts)
+        if not hosts:
+            return
+
+        gql_urls = set()
+        try:
+            for entry in store.in_scope_entries():
+                if _is_graphql(entry) and (getattr(entry, "host", "") or "").split(":")[0] in hosts:
+                    gql_urls.add(entry.url)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("auto-graphql: enumeration failed", error=str(exc))
+            return
+
+        async def _call(tool: str, args: dict) -> dict:
+            try:
+                result = await run_tool(ctx, tool, args)
+                return result if isinstance(result, dict) else {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("auto-graphql tool failed", tool=tool, error=str(exc))
+                return {}
+
+        for gql_url in gql_urls:
+            if stop_event.is_set():
+                return
+            intro = await _call("graphql_introspect", {"url": gql_url})
+            op_tool = "graphql_sweep" if intro.get("ok") else "graphql_fuzz"
+            logger.info("auto-graphql: testing endpoint", url=gql_url, via=op_tool)
+            prev = -1
+            for _ in range(12):
+                if stop_event.is_set():
+                    return
+                result = await _call(op_tool, {"url": gql_url})
+                remaining = int(result.get("operations_remaining", 0) or 0)
+                if remaining == 0 or remaining == prev:
+                    break
+                prev = remaining
+
     async def _drive_autonomous(self, sid: str) -> None:
         """The cross-turn autonomy loop: self-continue turns commanding the arsenal
         until a stop condition trips. A plain reply is a checkpoint, not a stop."""
@@ -933,16 +1366,31 @@ class CopilotService:
 
         on_event = self._make_counting_on_event(sid, session, auto)
         wait_for_human = self._make_autonomous_wait(sid, session)
+        mode = auto.get("mode", "bounded")
+
+        # Complete mode: force an exhaustive explore of each focus host up front so
+        # the UI-route frontier is seeded and has_surface is True — this closes the
+        # path where an early self-declared 'complete' is honored because nothing
+        # was mapped yet. Best-effort; never blocks the run on a crawl failure.
+        if mode == "complete" and not auto.get("initial_explore_done"):
+            await self._deterministic_recon_scan_sweep(sid, session)
+            auto["initial_explore_done"] = True
+            await self._session_keepalive(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
+        read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        start_hosts = self._effective_hosts(auto["hosts"])
         prompt = _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
-            leads=self._leads_label(auto["hosts"]),
-            coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+            leads=self._leads_label(start_hosts),
+            router=self._router_block(start_hosts),
+            coverage=self._coverage_block(self._surface_coverage(start_hosts)),
+            read_only=read_only_note,
         )
 
         last_progress = self._progress_snapshot()
         stuck_turns = 0
+        last_keepalive = time.time()
         auto["status"] = "running"
         await self._broadcast_autonomous(sid, "started", {
             "objective": auto["objective"], "hosts": auto["hosts"], "config": cfg,
@@ -978,16 +1426,27 @@ class CopilotService:
                     await self._broadcast_autonomous(sid, "finished",
                                                      {"status": "tool_budget"})
                     return
-                if stuck_turns >= cfg["max_stuck_turns"]:
+                # Complete mode never stops on 'stuck' — only the operator, the
+                # wall-clock, or genuine exhaustion ends it. Bounded mode is unchanged.
+                if mode != "complete" and stuck_turns >= cfg["max_stuck_turns"]:
                     self._finish_autonomous(session, "stopped",
                                             f"no progress for {stuck_turns} turns")
                     await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
                     return
 
+                # ── Session keepalive ────────────────────────────────────────────
+                now_ka = time.time()
+                if now_ka - last_keepalive >= _SESSION_KEEPALIVE_INTERVAL:
+                    await self._session_keepalive(sid, session)
+                    last_keepalive = time.time()
+
                 # ── Run one turn ─────────────────────────────────────────────────
                 auto["turns"] += 1
                 session["status"] = "running"
                 session["updated_at"] = time.time()
+                # Recomputed each turn: traffic grows as the run crawls, so sibling
+                # in-scope hosts surface over time and must enter grounding/targeting.
+                effective_hosts = self._effective_hosts(auto["hosts"])
                 tool_ctx = self._build_tool_ctx(session)
                 try:
                     reply = await session["engine"].send(
@@ -1009,8 +1468,10 @@ class CopilotService:
                     prompt = _AUTONOMOUS_CONTINUE.format(
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
-                        leads=self._leads_label(auto["hosts"]),
-                        coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                        leads=self._leads_label(effective_hosts),
+                        router=self._router_block(effective_hosts),
+                        coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                        read_only=read_only_note,
                     )
                     continue
 
@@ -1020,30 +1481,58 @@ class CopilotService:
                 }
                 blocked_reason = (reply.blocked_reason or "").strip().lower()
 
+                # ── Auto-test any GraphQL endpoint seen so far ───────────────────
+                # The moment the copilot's traffic surfaces a GraphQL endpoint, test
+                # it (introspect -> sweep, or fuzz captured ops) without waiting for
+                # the model to decide to. Idempotent; no-op in read-only. Runs in
+                # bounded AND complete mode so "see GraphQL -> test GraphQL" is
+                # guaranteed, not discretionary.
+                if effective_hosts:
+                    turn_ctx = self._build_tool_ctx(session)
+                    await self._auto_test_graphql(session, turn_ctx, set(effective_hosts))
+                    # Evidence-driven auto-routing of the unambiguous leads (bounded
+                    # and complete). The prompt block surfaces the rest for the LLM.
+                    await self._auto_route(session, turn_ctx, set(effective_hosts))
+
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot()
                 if progress != last_progress:
                     stuck_turns = 0
+                    # Real work happened — refresh the soft-escalation nudge budget so a
+                    # later genuine question isn't starved by earlier permission-asks.
+                    auto["auto_guidance_nudges"] = 0
                     last_progress = progress
                 else:
                     stuck_turns += 1
 
                 # ── Interpret the reply's control signal ─────────────────────────
                 if blocked_reason == "complete":
-                    coverage = self._surface_coverage(auto["hosts"])
+                    coverage = self._surface_coverage(effective_hosts)
                     budget_left = (time.time() < deadline
                                    and auto["tool_calls"] < cfg["max_tool_calls"])
                     # A 'complete' is only premature when a surface has actually been
                     # mapped and part of it is still untested. With nothing discovered
                     # yet there is no coverage to force (the crawl-first prompt already
                     # pushes discovery), and a fully-tested surface is genuinely done.
-                    surface_incomplete = coverage["has_surface"] and not coverage["complete"]
+                    # In read-only mode scan_surface/graphql_sweep are disabled, so a
+                    # scan-based coverage gap can never be closed — don't bounce 'complete'.
+                    # In complete mode, ANY gap (unscanned REST, unswept GraphQL, or an
+                    # unexplored UI route in the frontier) blocks 'complete' — so the run
+                    # keeps exploring/scanning until the whole surface is covered. In
+                    # bounded mode, a gap only counts when a surface was mapped (nothing
+                    # mapped = nothing to force). Read-only can't close scan gaps, so it
+                    # never bounces for them (the explorer still drains the UI frontier).
+                    if mode == "complete":
+                        surface_incomplete = not coverage["complete"] and not auto.get("read_only")
+                    else:
+                        surface_incomplete = (coverage["has_surface"] and not coverage["complete"]
+                                              and not auto.get("read_only"))
                     # Coverage gate: refuse a premature 'complete' while known surface is
-                    # not fully tested and there is budget + rejection headroom to keep
-                    # going. This is what stops the run eyeballing a few operations and
-                    # declaring done — it must sweep every op and scan every endpoint.
-                    if (surface_incomplete and budget_left
-                            and auto["complete_rejections"] < _MAX_COMPLETE_REJECTIONS):
+                    # not fully tested and there is budget headroom. In complete mode the
+                    # rejection cap does not apply — the operator decides when to stop.
+                    rejection_headroom = (mode == "complete"
+                                          or auto["complete_rejections"] < _MAX_COMPLETE_REJECTIONS)
+                    if surface_incomplete and budget_left and rejection_headroom:
                         auto["complete_rejections"] += 1
                         logger.info(
                             "autonomous run: coverage gate rejected premature complete",
@@ -1054,15 +1543,44 @@ class CopilotService:
                         await self._broadcast_autonomous(sid, "coverage_gate", {
                             "rest_untested": len(coverage["rest_untested"]),
                             "gql_untested": len(coverage["gql_untested"]),
+                            "ui_frontier": len(coverage["ui_frontier"]),
                             "rejection": auto["complete_rejections"],
                         })
+                        # Complete mode closes gaps deterministically rather than
+                        # relying on the LLM to do breadth: drain the frontier, scan
+                        # every endpoint, fuzz/sweep GraphQL. Then re-prompt for depth.
+                        if mode == "complete":
+                            await self._deterministic_recon_scan_sweep(sid, session)
                         prompt = _AUTONOMOUS_COVERAGE_GATE.format(
-                            coverage=self._coverage_block(coverage),
+                            coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
                             budget=self._budget_label(auto, cfg, deadline),
                         )
                         continue
 
                     if not surface_incomplete:
+                        # The non-IdP surface is covered. Before completing, test the
+                        # identity-provider hosts LAST — deferred all run so probing
+                        # them could not log the run out mid-scan. This runs once; the
+                        # next turn re-evaluates coverage with the IdP included.
+                        from dast.proxy.session_store import is_identity_host
+                        store = self._ctx.store
+                        identity_pending = (
+                            not auto.get("identity_phase_done")
+                            and store is not None
+                            and getattr(store, "defer_identity_hosts", False)
+                            and any(is_identity_host(h) for h in effective_hosts)
+                        )
+                        if identity_pending:
+                            await self._final_identity_phase(sid, session)
+                            prompt = _AUTONOMOUS_CONTINUE.format(
+                                progress=self._progress_label(last_progress),
+                                budget=self._budget_label(auto, cfg, deadline),
+                                leads=self._leads_label(effective_hosts),
+                                router=self._router_block(effective_hosts),
+                                coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                                read_only=read_only_note,
+                            )
+                            continue
                         # Fully-covered surface, or nothing mapped to cover — honor it.
                         message = ("objective complete; full surface covered"
                                    if coverage["has_surface"]
@@ -1095,6 +1613,29 @@ class CopilotService:
                     return
 
                 if blocked_reason in _ESCALATE_REASONS:
+                    # Soft escalation (the copilot is unsure or asking permission for a
+                    # step it could just take): auto-nudge it to proceed instead of
+                    # pausing the operator. Bounded per no-progress streak so a genuinely
+                    # stuck loop still surfaces to the human after a few nudges.
+                    nudges = auto.get("auto_guidance_nudges", 0)
+                    if (blocked_reason in _SOFT_ESCALATE_REASONS
+                            and nudges < _MAX_AUTO_GUIDANCE_NUDGES):
+                        auto["auto_guidance_nudges"] = nudges + 1
+                        logger.info("autonomous run: auto-nudging past soft escalation",
+                                    session_id=sid, blocked_reason=blocked_reason,
+                                    nudge=nudges + 1)
+                        await self._broadcast_autonomous(sid, "auto_nudge", {
+                            "blocked_reason": blocked_reason, "nudge": nudges + 1,
+                        })
+                        prompt = _AUTONOMOUS_SELF_PROCEED.format(
+                            reason=blocked_reason,
+                            progress=self._progress_label(last_progress),
+                            budget=self._budget_label(auto, cfg, deadline),
+                            leads=self._leads_label(effective_hosts),
+                            router=self._router_block(effective_hosts),
+                            coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                        )
+                        continue
                     guidance = await self._guidance_pause(sid, session, reply, deadline)
                     if stop_event.is_set() or guidance.get("action") == "abort":
                         self._finish_autonomous(session, "stopped", "aborted at escalation")
@@ -1114,8 +1655,10 @@ class CopilotService:
                 prompt = _AUTONOMOUS_CONTINUE.format(
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
-                    leads=self._leads_label(auto["hosts"]),
-                    coverage=self._coverage_block(self._surface_coverage(auto["hosts"])),
+                    leads=self._leads_label(effective_hosts),
+                    router=self._router_block(effective_hosts),
+                    coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    read_only=read_only_note,
                 )
         except asyncio.CancelledError:
             self._finish_autonomous(session, "stopped", "cancelled")
@@ -1145,17 +1688,29 @@ class CopilotService:
         ``complete`` is True only when a surface exists AND nothing on it is untested —
         so 'nothing mapped yet' does not read as 'fully covered'. Best-effort: any error
         degrades to an empty (incomplete) coverage rather than crashing the run."""
+        from dast.plugins.graphql_analyzer import _is_graphql
         from dast.proxy.session_store import normalise_endpoint_path
+        from dast.proxy.ui_route_graph import normalise_route_key
 
         cov: Dict[str, object] = {
             "rest_total": 0, "rest_tested": 0, "rest_untested": [],
             "gql_total": 0, "gql_tested": 0, "gql_untested": [],
+            "gql_captured_total": 0, "gql_captured_tested": 0, "gql_captured_untested": [],
+            "ui_total": 0, "ui_visited": 0, "ui_frontier": [],
             "has_surface": False, "complete": False,
         }
         store = self._ctx.store
         if store is None:
             return cov
         focus = {h.split(":")[0] for h in (hosts or []) if h}
+        # While identity hosts are deferred they are intentionally untested, so they
+        # must not count against coverage — otherwise 'complete' could never be reached
+        # and the final IdP phase (which lifts the deferral) would never run.
+        if getattr(store, "defer_identity_hosts", False):
+            from dast.proxy.session_store import is_identity_host
+            non_identity = {h for h in focus if not is_identity_host(h)}
+            if non_identity:
+                focus = non_identity
 
         # ── REST surface ────────────────────────────────────────────────────────
         try:
@@ -1172,6 +1727,10 @@ class CopilotService:
             if method in ("CONNECT", "OPTIONS", "HEAD"):
                 continue
             if getattr(entry, "source", "") in ("agent", "scanner", "scan", "out-of-scope"):
+                continue
+            # GraphQL endpoints are covered by the GraphQL dimensions (sweep/fuzz),
+            # not by scan_surface — don't double-count them as untested REST.
+            if _is_graphql(entry):
                 continue
             host = (getattr(entry, "host", "") or "").split(":")[0]
             if focus and host not in focus:
@@ -1203,9 +1762,63 @@ class CopilotService:
                     else:
                         cov["gql_untested"].append(f"{kind} {field_name}")
 
-        cov["has_surface"] = cov["rest_total"] > 0 or cov["gql_total"] > 0
+        # ── Captured-GraphQL surface (schema-free; prod introspection disabled) ──
+        # Distinct GraphQL operations observed in traffic, tested once graphql_fuzz
+        # records "fuzz:<op>". This is the coverage dimension for endpoints where
+        # introspection is off (so gql_total above stays 0).
+        try:
+            from dast.plugins.graphql_analyzer import _is_graphql
+            from dast.tools.graphql_fuzz_tools import _op_key
+            import json as _json
+            captured: Dict[str, set] = {}
+            for entry in entries:
+                if not _is_graphql(entry):
+                    continue
+                host = (getattr(entry, "host", "") or "").split(":")[0]
+                if focus and host not in focus:
+                    continue
+                raw = getattr(entry, "request_body", None)
+                if not raw:
+                    continue
+                parsed = _json.loads(raw[:200000].decode("utf-8", errors="replace"))
+                for item in (parsed if isinstance(parsed, list) else [parsed]):
+                    if not isinstance(item, dict) or not isinstance(item.get("query"), str):
+                        continue
+                    if not (item.get("variables") or {}):
+                        continue
+                    captured.setdefault(entry.url, set()).add(_op_key(item))
+            for endpoint, keys in captured.items():
+                done = tested_ops.get(endpoint) or set()
+                for key in keys:
+                    cov["gql_captured_total"] += 1
+                    if f"fuzz:{key}" in done:
+                        cov["gql_captured_tested"] += 1
+                    else:
+                        cov["gql_captured_untested"].append(key)
+        except Exception as exc:  # noqa: BLE001 — coverage is best-effort
+            logger.debug("coverage: captured-graphql enumeration failed", error=str(exc))
+
+        # ── UI-route surface (SPA exploration frontier) ─────────────────────────
+        graph = getattr(store, "ui_route_graph", None)
+        if graph is not None:
+            try:
+                for route in graph.visited() + graph.frontier():
+                    host = normalise_route_key(route.url).split("/")[0].split(":")[0]
+                    if focus and host not in focus:
+                        continue
+                    cov["ui_total"] += 1
+                    if route.state == "visited":
+                        cov["ui_visited"] += 1
+                    else:
+                        cov["ui_frontier"].append(route.url)
+            except Exception as exc:  # noqa: BLE001 — coverage is best-effort
+                logger.debug("coverage: ui enumeration failed", error=str(exc))
+
+        cov["has_surface"] = (cov["rest_total"] > 0 or cov["gql_total"] > 0
+                              or cov["gql_captured_total"] > 0 or cov["ui_total"] > 0)
         cov["complete"] = bool(
             cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
+            and not cov["gql_captured_untested"] and not cov["ui_frontier"]
         )
         return cov
 
@@ -1244,5 +1857,20 @@ class CopilotService:
                 f"- {len(gql_untested)} GraphQL operation(s) untested. Run graphql_sweep on the "
                 f"endpoint (covers every query/mutation) until operations_remaining is 0. Examples: "
                 + wrap_untrusted(", ".join(gql_untested[:8]), "untested_gql_operations")
+            )
+        gql_captured_untested = cov.get("gql_captured_untested") or []
+        if gql_captured_untested:
+            lines.append(
+                f"- {len(gql_captured_untested)} captured GraphQL operation(s) not yet fuzzed "
+                f"(introspection disabled). Run graphql_fuzz on the endpoint until "
+                f"operations_remaining is 0. Examples: "
+                + wrap_untrusted(", ".join(gql_captured_untested[:8]), "unfuzzed_gql_operations")
+            )
+        ui_frontier = cov.get("ui_frontier") or []
+        if ui_frontier:
+            lines.append(
+                f"- {len(ui_frontier)} UI route(s) discovered but not yet explored. Run `explore` "
+                f"on the app until frontier_remaining is 0 to reach every section. Examples: "
+                + wrap_untrusted(", ".join(ui_frontier[:8]), "unexplored_ui_routes")
             )
         return "\n".join(lines)

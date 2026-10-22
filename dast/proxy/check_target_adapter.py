@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Optional
 
+from dast.utils.destructive_paths import destructive_segment
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -22,21 +23,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-
-# Path segments where sending a payload would destroy session state or
-# application data. Matched against the last path segment so /auth/logout,
-# /api/v1/logout, etc. are all caught.
-_DANGEROUS_SEGMENTS = frozenset({
-    # Session termination
-    "logout", "logoff", "log-out", "log_out", "signout", "sign-out", "sign_out",
-    "end-session", "endsession", "invalidate-session", "revoke-session",
-    # Account / data destruction
-    "delete-account", "deleteaccount", "deactivate", "deactivate-account",
-    "close-account", "closeaccount", "cancel-account", "cancelaccount",
-    "unsubscribe",
-    # Password / credential reset (sending a payload here corrupts the reset flow)
-    "reset-password", "resetpassword", "change-password", "changepassword",
-})
 
 
 # Route tokens that are structural, never values — skip so we do not fuzz them.
@@ -178,10 +164,9 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
     parsed = urlparse(entry.url)
 
     # Skip paths that would destroy session state or application data.
-    # Match the last path segment to catch /auth/logout, /api/v1/logout, etc.
-    _last_seg = parsed.path.lower().rstrip("/").rsplit("/", 1)[-1]
-    if _last_seg in _DANGEROUS_SEGMENTS:
-        logger.debug("Scan skipped — session-destructive path", url=entry.url, segment=_last_seg)
+    segment = destructive_segment(parsed.path)
+    if segment:
+        logger.debug("Scan skipped — session-destructive path", url=entry.url, segment=segment)
         return None
     params = []
 
@@ -452,4 +437,5 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
         code_hint=code_hint,
         import_hints=list(entry.import_hints) if entry.import_hints else None,
         named_sessions=named_sessions if named_sessions else None,
+        focus_attack_types=list(getattr(entry, "focus_attack_types", None) or []) or None,
     )

@@ -701,3 +701,20 @@ async def test_mutation_allows_repeated_read_to_observe_new_state():
     assert reply.message == "confirmed"
     obs = [e.get("observation", "") for e in events if e.get("type") == "observation"]
     assert not any("suppressed" in o for o in obs)
+
+
+def test_copilot_step_schema_does_not_require_action():
+    """A gateway model sometimes omits `action` under schema forcing; the step
+    must survive validation so the session can infer the action downstream from
+    tool_name/message (regression for the 'missing required field(s): action'
+    turn-abort loop)."""
+    from dast.ai.schemas import COPILOT_STEP_SCHEMA
+    from dast.ai.bedrock_client import _require_fields
+
+    assert "action" not in COPILOT_STEP_SCHEMA["required"]
+    assert COPILOT_STEP_SCHEMA["required"] == ["thought"]
+
+    step_without_action = {"thought": "crawl the app next", "tool_name": "crawl",
+                           "tool_args": {"url": "https://app.example.com/"}}
+    # Must NOT raise now that `action` is optional.
+    assert _require_fields(step_without_action, COPILOT_STEP_SCHEMA) == step_without_action

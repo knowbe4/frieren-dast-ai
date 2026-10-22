@@ -50,9 +50,11 @@ _SNAPSHOT_JS = r"""
 class AgentBrowser:
     """One lazily-launched headless browser page, driven by the browser_* tools."""
 
-    def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None) -> None:
+    def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None,
+                 read_only: bool = False) -> None:
         self._proxy_port = proxy_port
         self._store = store
+        self._read_only = read_only
         self._pw_ctx: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -75,6 +77,9 @@ class AgentBrowser:
                 args=["--ignore-certificate-errors"],
             )
             self._context = await self._browser.new_context(ignore_https_errors=True)
+            if self._read_only:
+                from dast.utils.read_only import make_route_guard
+                await self._context.route("**/*", make_route_guard("agent-browser"))
             await self._seed_cookies()
             self._page = await self._context.new_page()
             logger.info("AgentBrowser launched", proxy_port=self._proxy_port)

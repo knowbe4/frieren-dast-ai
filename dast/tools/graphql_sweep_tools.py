@@ -48,6 +48,7 @@ _HARD_MAX_OPS = 1000
 _CONCURRENCY = 6
 _REQUEST_TIMEOUT = 10.0
 _MAX_FLAGGED_RETURNED = 40
+_CANARY_SIZE = 5
 
 _AUTH_ERROR_MARKERS = (
     "unauthor", "forbidden", "not authenticated", "authentication required",
@@ -157,6 +158,28 @@ async def _probe_operation(
         })
         try:
             import httpx
+            from urllib.parse import urlparse as _urlparse_gql
+
+            req_headers: Dict[str, str] = {
+                "content-type": "application/json",
+                "accept": "application/json",
+            }
+            if ctx.store is not None:
+                _host = _urlparse_gql(url).hostname or ""
+                try:
+                    jar_cookies = ctx.store.get_cookies_for_host(_host) or []
+                    if jar_cookies:
+                        cookie_header = "; ".join(
+                            f"{c['name']}={c.get('value', '')}"
+                            for c in jar_cookies if c.get("name")
+                        )
+                        if cookie_header:
+                            req_headers["cookie"] = cookie_header
+                except Exception:
+                    pass
+
+            _source = getattr(ctx, "source_label", None) or "agent"
+            req_headers["x-dast-source"] = str(_source)
 
             async with httpx.AsyncClient(
                 proxy=ctx.proxy_url, verify=False, follow_redirects=False,
@@ -164,7 +187,7 @@ async def _probe_operation(
             ) as client:
                 resp = await client.post(
                     url, content=body.encode("utf-8"),
-                    headers={"content-type": "application/json", "accept": "application/json"},
+                    headers=req_headers,
                 )
         except Exception as exc:
             return {"kind": kind, "field": field_name,
@@ -196,7 +219,9 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     schema = store.graphql_schemas.get(url)
     if not schema or not schema.get("introspected"):
         return {"ok": False,
-                "error": "no introspected schema for this endpoint — run graphql_introspect first",
+                "fallback": "graphql_fuzz",
+                "error": "no introspected schema for this endpoint (introspection may be disabled) "
+                         "— use graphql_fuzz to test the operations captured in traffic instead",
                 "url": url}
 
     kinds = _normalise_kinds(args.get("kinds"))
@@ -231,10 +256,40 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
                 batch=len(batch), remaining=len(pending) - len(batch))
 
     semaphore = asyncio.Semaphore(_CONCURRENCY)
-    results = await asyncio.gather(*[
+
+    # Early-bail: probe a small canary batch first. If every canary is
+    # auth_blocked the session has no access to this endpoint — stop instead
+    # of firing hundreds of doomed requests.
+    canary_size = min(_CANARY_SIZE, len(batch))
+    canary_batch = batch[:canary_size]
+    canary_results = await asyncio.gather(*[
         _probe_operation(ctx, url, schema, kind, field_name, semaphore)
-        for kind, field_name in batch
+        for kind, field_name in canary_batch
     ])
+    canary_blocked = sum(
+        1 for r in canary_results if r.get("classification") == "auth_blocked"
+    )
+    if canary_blocked == canary_size and len(batch) > canary_size:
+        logger.warning("graphql_sweep: all canary probes auth_blocked, aborting sweep",
+                       url=url, canary_size=canary_size)
+        for kind, field_name in canary_batch:
+            tested.add(f"{kind}:{field_name}")
+        return {
+            "ok": False,
+            "url": url,
+            "error": (f"all {canary_size} canary probes returned auth_blocked "
+                      f"(401/403) — the session has no access to this endpoint. "
+                      f"Authenticate first or skip this host."),
+            "operations_tested_now": canary_size,
+            "operations_remaining": len(pending) - canary_size,
+        }
+
+    remaining_batch = batch[canary_size:]
+    remaining_results = await asyncio.gather(*[
+        _probe_operation(ctx, url, schema, kind, field_name, semaphore)
+        for kind, field_name in remaining_batch
+    ]) if remaining_batch else []
+    results = list(canary_results) + list(remaining_results)
 
     by_classification: Dict[str, int] = {}
     flagged: List[Dict[str, Any]] = []

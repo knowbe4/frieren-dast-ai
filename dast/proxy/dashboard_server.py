@@ -10,10 +10,12 @@ API routes are split across dast/proxy/api/ modules.
 """
 
 import asyncio
+import re
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from dast.proxy.session_store import SessionStore
@@ -22,6 +24,44 @@ from dast.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _UI_PATH = Path(__file__).parent / "ui" / "index.html"
+
+# index.html and js/*.js change together. Without an explicit policy the browser
+# heuristically caches the JS and pairs a fresh index.html with stale scripts,
+# which breaks the UI after an upgrade. "no-cache" still allows ETag reuse —
+# the browser only revalidates, which is free on loopback.
+_UI_CACHE_CONTROL = "no-cache"
+
+
+_UI_ASSET_REF = re.compile(r'(?P<attr>src|href)="/ui/(?P<path>[^"?#]+)"')
+
+
+def _versioned_index_html() -> str:
+    """index.html with each /ui asset URL suffixed by its mtime (?v=...).
+
+    A changed file gets a new URL, so even a browser that cached the old copy
+    before Cache-Control existed cannot pair new markup with stale JS/CSS.
+    """
+    html = _UI_PATH.read_text(encoding="utf-8")
+
+    def _add_version(match: "re.Match[str]") -> str:
+        asset = _UI_PATH.parent / match.group("path")
+        try:
+            version = asset.stat().st_mtime_ns
+        except OSError as exc:
+            logger.warning("UI asset missing; serving unversioned URL", asset=str(asset), error=str(exc))
+            return match.group(0)
+        return f'{match.group("attr")}="/ui/{match.group("path")}?v={version}"'
+
+    return _UI_ASSET_REF.sub(_add_version, html)
+
+
+class _RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that forces revalidation so UI upgrades are never half-applied."""
+
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = _UI_CACHE_CONTROL
+        return response
 
 
 def _detect_aws_sso_profile() -> str | None:
@@ -268,11 +308,14 @@ def build_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def ui():
-        return HTMLResponse(_UI_PATH.read_text(encoding="utf-8"))
+        return HTMLResponse(
+            _versioned_index_html(),
+            headers={"Cache-Control": _UI_CACHE_CONTROL},
+        )
 
     # Serve the UI's static assets (styles.css, js/*.js) referenced by index.html.
     # Mounted at /ui so it never collides with "/" or the /api/* routers.
-    app.mount("/ui", StaticFiles(directory=str(_UI_PATH.parent)), name="ui")
+    app.mount("/ui", _RevalidatingStaticFiles(directory=str(_UI_PATH.parent)), name="ui")
 
     store.add_listener(ctx.broadcast)
 

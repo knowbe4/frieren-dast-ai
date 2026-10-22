@@ -67,7 +67,13 @@ Generate up to 10 payloads, prioritized by likelihood of success."""
         result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user, schema=PAYLOAD_GEN_SCHEMA)
         payloads = []
         items = result if isinstance(result, list) else result.get("payloads", [])
+        if not isinstance(items, list):
+            logger.warning("AI payload generation returned a non-list", type=type(items).__name__)
+            return []
         for item in items:
+            if not isinstance(item, dict):
+                logger.warning("Skipping malformed generated payload", type=type(item).__name__)
+                continue
             payloads.append(AttackPayload(
                 value=str(item.get("value", "")),
                 attack_type=str(item.get("attack_type", "unknown")),

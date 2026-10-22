@@ -314,3 +314,119 @@ def test_structured_output_missing_required_field_raises(install_fake_client):
     schema = {"type": "object", "properties": {"agents": {}, "reason": {}}, "required": ["agents", "reason"]}
     with pytest.raises(ValueError, match="reason"):
         bedrock_client.invoke_json(system="s", user="u", schema=schema)
+
+
+_PAYLOADS_SCHEMA = {
+    "type": "object",
+    "properties": {"payloads": {"type": "array", "items": {"type": "object"}}},
+    "required": ["payloads"],
+}
+
+
+def test_array_field_sent_as_json_string_is_decoded(install_fake_client):
+    # Seen with the gateway provider: the tool-call argument typed `array` held the
+    # JSON text of the array. Callers iterated it character by character.
+    install_fake_client([_tool_response({"payloads": '[{"value": "a"}, {"value": "b"}]'})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_PAYLOADS_SCHEMA)
+
+    assert result == {"payloads": [{"value": "a"}, {"value": "b"}]}
+
+
+def test_string_that_is_not_the_declared_container_is_left_alone(install_fake_client):
+    install_fake_client([_tool_response({"payloads": '{"value": "a"}'})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=_PAYLOADS_SCHEMA)
+
+    assert result == {"payloads": '{"value": "a"}'}
+
+
+def test_string_typed_field_holding_json_is_not_decoded(install_fake_client):
+    schema = {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]}
+    install_fake_client([_tool_response({"note": "[1, 2]"})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"note": "[1, 2]"}
+
+
+# ── multimodal / image input (vision navigator) ──────────────────────────────
+
+def test_invoke_json_sends_image_block(install_fake_client):
+    fake = install_fake_client([_tool_response({"elements": []})])
+    schema = {"type": "object", "properties": {"elements": {"type": "array"}}, "required": ["elements"]}
+    bedrock_client.invoke_json("sys", "find nav", schema=schema, image_b64="QUJD", temperature=0)
+    content = fake.bodies[0]["messages"][0]["content"]
+    assert isinstance(content, list)
+    kinds = {block["type"] for block in content}
+    assert kinds == {"text", "image"}
+    img = next(b for b in content if b["type"] == "image")
+    assert img["source"] == {"type": "base64", "media_type": "image/png", "data": "QUJD"}
+
+
+def test_text_only_call_keeps_string_content(install_fake_client):
+    fake = install_fake_client([_text_response("hi")])
+    bedrock_client.invoke("sys", "hello")
+    assert fake.bodies[0]["messages"][0]["content"] == "hello"  # unchanged shape
+
+
+def test_image_rejected_for_openai_provider(monkeypatch):
+    monkeypatch.setattr(bedrock_client, "get_active_provider", lambda: "openai")
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "gpt-x")
+    with pytest.raises(ValueError, match="image input is not supported"):
+        bedrock_client.invoke("sys", "u", image_b64="QUJD")
+
+
+# -- Tier model resolution under non-Bedrock providers --
+
+
+@pytest.fixture
+def _gateway_provider(monkeypatch):
+    """Switch to gateway and set ARN-based tier defaults (the startup path)."""
+    monkeypatch.setattr(bedrock_client, "_active_provider", "gateway")
+    monkeypatch.setattr(bedrock_client, "_fast_model_id",
+                        "arn:aws:bedrock:us-east-1:123:application-inference-profile/haiku")
+    monkeypatch.setattr(bedrock_client, "_validation_model_id",
+                        "arn:aws:bedrock:us-east-1:123:application-inference-profile/opus")
+    monkeypatch.setattr(bedrock_client, "_default_model_cache", {})
+    yield
+
+
+def _fake_catalogue_with_tiers():
+    return {"provider": "gateway", "source": "live", "error": "",
+            "models": [
+                {"id": "claude-sonnet-4-20250514", "label": "Claude Sonnet"},
+                {"id": "claude-haiku-4-5-20250514", "label": "Claude Haiku"},
+                {"id": "claude-opus-4-20250514", "label": "Claude Opus"},
+            ]}
+
+
+def test_fast_tier_resolves_haiku_under_gateway(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models", _fake_catalogue_with_tiers)
+    model = bedrock_client.get_fast_model()
+    assert "haiku" in model.lower()
+
+
+def test_validation_tier_resolves_opus_under_gateway(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models", _fake_catalogue_with_tiers)
+    model = bedrock_client.get_validation_model()
+    assert "opus" in model.lower()
+
+
+def test_tier_falls_back_to_active_when_catalogue_empty(_gateway_provider, monkeypatch):
+    monkeypatch.setattr(bedrock_client, "list_models",
+                        lambda: {"provider": "gateway", "models": [], "source": "preset", "error": ""})
+    monkeypatch.setattr(bedrock_client, "get_active_model", lambda: "claude-sonnet-fallback")
+    model = bedrock_client.get_fast_model()
+    assert model == "claude-sonnet-fallback"
+
+
+def test_tier_resolution_reuses_cached_catalogue(_gateway_provider, monkeypatch):
+    call_count = [0]
+    def _counting_list():
+        call_count[0] += 1
+        return _fake_catalogue_with_tiers()
+    monkeypatch.setattr(bedrock_client, "list_models", _counting_list)
+    bedrock_client.get_fast_model()
+    bedrock_client.get_validation_model()
+    assert call_count[0] == 1

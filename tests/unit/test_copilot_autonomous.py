@@ -310,7 +310,7 @@ async def test_escalation_pauses_then_resumes_on_guidance():
                                  budget={"max_stuck_turns": 10})
     session = service.get(sid)
     session["engine"].send = AsyncMock(side_effect=[
-        _Reply("I need the admin token", "need_human"),
+        _Reply("I need the admin token", "auth_required"),
         _Reply("done", "complete"),
     ])
     # Wait until the driver parks on a guidance escalation.
@@ -330,7 +330,7 @@ async def test_escalation_abort_stops_the_run():
     sid = service.run_autonomous("obj", focus_hosts=["h"],
                                  budget={"max_stuck_turns": 10})
     session = service.get(sid)
-    send = AsyncMock(side_effect=[_Reply("blocked", "need_human"),
+    send = AsyncMock(side_effect=[_Reply("blocked", "auth_required"),
                                   _Reply("should not reach", "complete")])
     session["engine"].send = send
     assert await _wait_for(
@@ -340,6 +340,46 @@ async def test_escalation_abort_stops_the_run():
     assert session["autonomous"]["status"] == "stopped"
     assert "aborted" in session["autonomous"]["detail"]
     assert send.await_count == 1                         # never ran the second turn
+
+
+@pytest.mark.asyncio
+async def test_soft_escalation_auto_nudges_instead_of_pausing():
+    # A soft escalation (need_human/need_value) in an autonomous run is the copilot
+    # asking permission for a step it can take — the driver auto-nudges it to proceed
+    # rather than pausing the operator. Here it "asks" once, is nudged, then completes
+    # on the next turn WITHOUT ever parking on a guidance pause.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"], budget={"max_stuck_turns": 10})
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[
+        _Reply("can I scan the API next?", "need_human"),
+        _Reply("done", "complete"),
+    ])
+    await session["_task"]
+    assert session["autonomous"]["status"] == "complete"
+    assert session.get("pause") is None                 # never paused the operator
+    assert session["autonomous"]["auto_guidance_nudges"] >= 1
+    # The nudge prompt pushed it to proceed autonomously.
+    second_prompt = session["engine"].send.await_args_list[1].args[0]
+    assert "not a genuine blocker" in second_prompt.lower() or "proceed" in second_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_soft_escalation_pauses_after_nudge_budget_exhausted():
+    # If the copilot keeps softly escalating without progress, the nudges run out and
+    # it finally surfaces to the operator — a genuinely stuck loop is not hidden forever.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"], budget={"max_stuck_turns": 50})
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(
+        side_effect=[_Reply("still unsure", "need_value")] * 10
+    )
+    assert await _wait_for(
+        lambda: (session.get("pause") or {}).get("kind") == "guidance")
+    # It took the full nudge budget before pausing.
+    assert session["autonomous"]["auto_guidance_nudges"] == 3
+    service.stop_autonomous(sid)
+    await asyncio.gather(session["_task"], return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -498,3 +538,176 @@ async def test_app_context_leads_are_injected_into_start_and_continue_prompts():
     prompts = [c.args[0] for c in session["engine"].send.await_args_list]
     assert "HIGH: BOLA on /users/{id}" in prompts[0]      # start prompt carries leads
     assert "HIGH: BOLA on /users/{id}" in prompts[1]      # continuation carries them too
+
+
+# ── complete-mode: UI-route coverage dimension ───────────────────────────────
+
+from dast.proxy.ui_route_graph import UiRouteGraph, normalise_route_key  # noqa: E402
+
+
+class _UiStore(_FakeStore):
+    """FakeStore that also carries a real UI-route graph (and no GraphQL)."""
+
+    def __init__(self, entries=None, cookies=None):
+        super().__init__(entries, cookies)
+        self.ui_route_graph = UiRouteGraph()
+
+
+def test_surface_coverage_incomplete_while_ui_frontier_nonempty():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["has_surface"] is True          # a discovered route is surface
+    assert cov["ui_total"] == 1 and cov["ui_visited"] == 0
+    assert cov["ui_frontier"]                   # non-empty
+    assert cov["complete"] is False             # frontier not drained
+
+
+@pytest.mark.asyncio
+async def test_run_autonomous_defers_identity_then_restores():
+    store = _FakeStore()
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("obj", focus_hosts=["app.example.com"])
+    # Deferral is armed synchronously at run start.
+    assert store.defer_identity_hosts is True
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    # ...and lifted when the run ends, so it never leaks into manual use.
+    assert store.defer_identity_hosts is False
+
+
+def test_surface_coverage_excludes_deferred_identity_hosts():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    store.ui_route_graph.add_discovered("https://login.identity.example.com/signin")
+    service = CopilotService(_FakeCtx(store))
+    hosts = ["app.example.com", "login.identity.example.com"]
+
+    store.defer_identity_hosts = True
+    cov = service._surface_coverage(hosts)
+    assert cov["ui_total"] == 1          # IdP route excluded while deferred
+
+    store.defer_identity_hosts = False
+    cov2 = service._surface_coverage(hosts)
+    assert cov2["ui_total"] == 2         # both counted once deferral is lifted
+
+
+@pytest.mark.asyncio
+async def test_final_identity_phase_lifts_deferral_and_runs_once():
+    store = _FakeStore()
+    service = CopilotService(_FakeCtx(store))
+    store.defer_identity_hosts = True
+    session = {"autonomous": {"hosts": ["app.example.com"], "read_only": True,
+                              "stop_event": asyncio.Event()}}
+    await service._final_identity_phase("sid", session)
+    assert store.defer_identity_hosts is False
+    assert session["autonomous"]["identity_phase_done"] is True
+
+
+def test_surface_coverage_complete_when_frontier_drained():
+    store = _UiStore()
+    store.ui_route_graph.add_discovered("https://app.example.com/dashboard")
+    store.ui_route_graph.mark_visited(normalise_route_key("https://app.example.com/dashboard"))
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["ui_total"] == 1 and cov["ui_visited"] == 1
+    assert cov["ui_frontier"] == []
+    assert cov["complete"] is True              # no REST/GQL/UI gaps
+
+
+def test_progress_snapshot_advances_on_ui_discovery():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    before = service._progress_snapshot()
+    store.ui_route_graph.add_discovered("https://app.example.com/new-route")
+    after = service._progress_snapshot()
+    assert len(after) == 4
+    assert after != before                      # discovery alone counts as progress
+
+
+@pytest.mark.asyncio
+async def test_complete_mode_defaults_raise_budget_and_record_mode():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    # Avoid the up-front explore + driver doing real work: no hosts, and stop fast.
+    sid = service.run_autonomous("map everything", focus_hosts=[], mode="complete",
+                                 submit_forms=True, read_only=True, auto_ai_mode=False)
+    auto = service._sessions[sid]["autonomous"]
+    assert auto["mode"] == "complete"
+    # submit_forms is forced off under read_only.
+    assert auto["submit_forms"] is False
+    assert auto["config"]["max_tool_calls"] == 2000
+    assert auto["config"]["max_wall_clock_seconds"] == 86400
+    service.stop_autonomous(sid)
+
+
+@pytest.mark.asyncio
+async def test_complete_mode_submit_forms_kept_when_active():
+    store = _UiStore()
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("pentest", focus_hosts=[], mode="complete",
+                                 submit_forms=True, read_only=False, auto_ai_mode=False)
+    assert service._sessions[sid]["autonomous"]["submit_forms"] is True
+    service.stop_autonomous(sid)
+
+
+# ── effective-host expansion (focus host -> all in-scope hosts in traffic) ──────
+class _HostEntry:
+    def __init__(self, host: str) -> None:
+        self.host = host
+
+
+def test_effective_hosts_expands_to_in_scope_subdomains():
+    # Operator typed only the SPA host; the real API lives on sibling subdomains
+    # whose traffic is already captured in scope. The working set must include them.
+    store = _FakeStore(entries=[
+        _HostEntry("console.example.com"),
+        _HostEntry("api.console.example.com"),
+        _HostEntry("bff.console.example.com:443"),   # port stripped
+        _HostEntry("api.console.example.com"),        # dup collapsed
+    ])
+    service = CopilotService(_FakeCtx(store))
+    assert service._effective_hosts(["console.example.com"]) == [
+        "api.console.example.com", "bff.console.example.com", "console.example.com",
+    ]
+
+
+def test_effective_hosts_includes_focus_even_without_traffic():
+    service = CopilotService(_FakeCtx(_FakeStore(entries=[])))
+    assert service._effective_hosts(["Only.Focus.Com:8443"]) == ["only.focus.com"]
+
+
+def test_effective_hosts_degrades_when_store_missing():
+    ctx = _FakeCtx()
+    ctx.store = None
+    service = CopilotService(ctx)
+    assert service._effective_hosts(["h.example.com"]) == ["h.example.com"]
+
+
+def test_effective_hosts_survives_enumeration_error():
+    class _RaisingStore(_FakeStore):
+        def in_scope_entries(self):
+            raise RuntimeError("boom")
+
+    service = CopilotService(_FakeCtx(_RaisingStore()))
+    # Falls back to the focus hosts rather than crashing the run.
+    assert service._effective_hosts(["h.example.com"]) == ["h.example.com"]
+
+
+def test_effective_hosts_puts_identity_providers_last():
+    # Probing the IdP kills the shared SSO session, so identity/login hosts must be
+    # ordered after the rest of the surface — the sweep then tests them last.
+    store = _FakeStore(entries=[
+        _HostEntry("identity.example.com"),
+        _HostEntry("login.sso.example.com"),
+        _HostEntry("api.example.com"),
+        _HostEntry("app.example.com"),
+    ])
+    service = CopilotService(_FakeCtx(store))
+    ordered = service._effective_hosts(["app.example.com"])
+    assert ordered == [
+        "api.example.com", "app.example.com",       # non-IdP first, alphabetical
+        "identity.example.com", "login.sso.example.com",  # IdP hosts last
+    ]

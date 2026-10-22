@@ -149,7 +149,9 @@ def _resolve_default_model(provider: str) -> str:
     """Resolve (and cache) the default model NAME for a non-Bedrock provider from
     its live catalogue, preferring Sonnet. Cached per provider so the catalogue is
     fetched at most once per provider between switches. Never raises — a catalogue
-    failure caches "" so callers can fall back to their own error handling."""
+    failure caches "" so callers can fall back to their own error handling.
+    Also caches the raw catalogue list (key ``_cat_{provider}``) so
+    ``_resolve_tier_default`` can pick tier-specific models without re-fetching."""
     if provider == "bedrock":
         return ""
     if provider in _default_model_cache:
@@ -157,7 +159,9 @@ def _resolve_default_model(provider: str) -> str:
     chosen = ""
     try:
         catalogue = list_models()
-        chosen = _preferred_default_model(catalogue.get("models", []))
+        models = catalogue.get("models", [])
+        _default_model_cache[f"_cat_{provider}"] = models
+        chosen = _preferred_default_model(models)
     except Exception as exc:  # never let model listing crash an LLM call
         logger.warning("Default-model resolution failed", provider=provider, error=str(exc))
     if chosen:
@@ -397,6 +401,36 @@ def _is_bedrock_arn(model_id: str) -> bool:
     return bool(model_id) and model_id.startswith("arn:aws:")
 
 
+_TIER_KEYWORD = {"fast": "haiku", "validation": "opus"}
+
+
+def _resolve_tier_default(tier_name: str, provider: str) -> str:
+    """Pick a tier-appropriate model NAME from the provider's catalogue.
+
+    Uses the same cache as ``_resolve_default_model`` so the catalogue is fetched
+    at most once per provider. For the *fast* tier prefer Haiku, for *validation*
+    prefer Opus; if neither is found, returns "" (caller falls back to the active
+    model, same as before).
+    """
+    keyword = _TIER_KEYWORD.get(tier_name, "")
+    if not keyword:
+        return ""
+    cat_key = f"_cat_{provider}"
+    if cat_key not in _default_model_cache:
+        _resolve_default_model(provider)
+    catalogue_models: list = _default_model_cache.get(cat_key, [])
+    ids = [
+        str(m.get("id"))
+        for m in catalogue_models
+        if m.get("id") and not _is_bedrock_arn(str(m.get("id")))
+    ]
+    plain = [i for i in ids if keyword in i.lower() and "[" not in i]
+    if plain:
+        return plain[0]
+    any_match = [i for i in ids if keyword in i.lower()]
+    return any_match[0] if any_match else ""
+
+
 def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     """Return ``tier_model_id`` only if it is valid for the active provider.
 
@@ -406,17 +440,23 @@ def _usable_tier_model(tier_model_id: str, tier_name: str) -> str:
     openai), a Bedrock ARN is not a model that provider accepts — the gateway
     rejects it with ``HTTP 400: ... not in your role's availableModels
     allowlist``, which silently degrades every planner/canary/baseline/red-team
-    call that uses a tier helper. That produces flaky detection (a vuln is found
-    only when the code path happens to use the active model). Guard against it:
-    when a tier holds a Bedrock ARN but the provider is non-Bedrock, ignore it and
-    fall back to the active model (a provider-appropriate name).
+    call that uses a tier helper. Guard against it: resolve a tier-appropriate
+    model NAME from the provider's catalogue (haiku for fast, opus for validation)
+    so the tier distinction is preserved across providers.
     """
     if not tier_model_id:
         return ""
     provider = get_active_provider()
     if provider != "bedrock" and _is_bedrock_arn(tier_model_id):
+        resolved = _resolve_tier_default(tier_name, provider)
+        if resolved:
+            logger.debug(
+                "Resolved tier model for non-Bedrock provider",
+                tier=tier_name, provider=provider, model=resolved,
+            )
+            return resolved
         logger.warning(
-            "Ignoring Bedrock ARN configured for tier under non-Bedrock provider",
+            "No tier-appropriate model found in catalogue; falling back to active model",
             tier=tier_name, provider=provider,
         )
         return ""
@@ -531,18 +571,29 @@ def _build_body(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Construct the Bedrock InvokeModel request body shared by invoke()/invoke_json().
 
     Optional params are only added to the body when set, so callers that pass
-    nothing get byte-for-byte the previous request shape.
+    nothing get byte-for-byte the previous request shape. When ``image_b64`` is
+    given (a base64 PNG), the user turn becomes a content list carrying a text
+    block + an image block (Anthropic multimodal), used by the vision navigator.
     """
+    if image_b64:
+        user_content: Any = [
+            {"type": "text", "text": user},
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": image_b64}},
+        ]
+    else:
+        user_content = user
     body: Dict[str, Any] = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "system": _build_system_block(system, cache_system),
-        "messages": [{"role": "user", "content": user}],
+        "messages": [{"role": "user", "content": user_content}],
     }
     if temperature is not None:
         body["temperature"] = temperature
@@ -657,6 +708,7 @@ def _invoke_raw(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Send one request to the active provider and return the parsed response
@@ -666,9 +718,12 @@ def _invoke_raw(
     from botocore.exceptions import ClientError
 
     model = _resolve_model(model_id)
-    body = _build_body(system, user, max_tokens, temperature, cache_system, schema)
-
     provider = get_active_provider()
+    if image_b64 and provider in ("openai", "glm"):
+        raise ValueError(f"image input is not supported for provider '{provider}' "
+                         "(use the bedrock/anthropic/gateway provider for vision)")
+    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
+
     if provider != "bedrock":
         result = _invoke_external(provider, body, model)
         _log_cache_usage(result)
@@ -811,6 +866,33 @@ def _require_fields(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[
     missing = [key for key in schema.get("required", []) if key not in structured]
     if missing:
         raise ValueError(f"Structured output missing required field(s): {', '.join(missing)}")
+    return _decode_stringified_containers(structured, schema)
+
+
+_JSON_CONTAINER_TYPES: Dict[str, type] = {"array": list, "object": dict}
+
+
+def _decode_stringified_containers(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode top-level array/object properties the model sent as a JSON string.
+
+    Models sometimes fill a tool-call argument typed ``array`` with the JSON text
+    of the array instead of the array itself. Callers then iterate the string
+    character by character. Only a string that parses to the declared container
+    type is replaced; anything else is left for the caller to reject.
+    """
+    for key, property_schema in (schema.get("properties") or {}).items():
+        value = structured.get(key)
+        expected_type = _JSON_CONTAINER_TYPES.get((property_schema or {}).get("type", ""))
+        if expected_type is None or not isinstance(value, str):
+            continue
+        try:
+            decoded = json.loads(_strip_json_fence(value))
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Structured field is a non-JSON string", field=key, error=str(exc))
+            continue
+        if isinstance(decoded, expected_type):
+            logger.warning("Structured field arrived as a JSON string; decoded", field=key)
+            structured[key] = decoded
     return structured
 
 
@@ -886,6 +968,7 @@ def invoke(
     max_tokens: int = 2048,
     temperature: Optional[float] = None,
     cache_system: bool = False,
+    image_b64: Optional[str] = None,
 ) -> str:
     """
     Send a system+user message to Claude and return the text response.
@@ -895,10 +978,13 @@ def invoke(
                     (model default). Set 0 for deterministic decisions.
     cache_system  — cache the system prompt with an ephemeral breakpoint; use for
                     large static system prompts re-sent across many calls.
+    image_b64     — optional base64 PNG attached to the user turn (multimodal;
+                    bedrock/anthropic/gateway only).
     """
     result = _invoke_raw(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=None,
+        image_b64=image_b64,
     )
     return _extract_text(result)
 
@@ -924,6 +1010,7 @@ def invoke_json(
     temperature: Optional[float] = None,
     cache_system: bool = False,
     schema: Optional[Dict[str, Any]] = None,
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Like invoke() but returns parsed JSON.
@@ -943,8 +1030,10 @@ def invoke_json(
     schema, max_tokens) tuple returns a stored decision instead of a fresh LLM
     call. Non-deterministic calls bypass the cache entirely.
     """
+    # Image calls are never cached: the screenshot varies per page and is not part
+    # of the cache key, so caching would collide across different views.
     cache_key: Optional[str] = None
-    if temperature == 0 and response_cache.is_enabled():
+    if image_b64 is None and temperature == 0 and response_cache.is_enabled():
         cache_key = response_cache.make_key(
             provider=get_active_provider(),
             model=_resolve_model(model_id),
@@ -960,6 +1049,7 @@ def invoke_json(
     result = _invoke_json_uncached(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=schema,
+        image_b64=image_b64,
     )
 
     if cache_key is not None and isinstance(result, dict):
@@ -975,6 +1065,7 @@ def _invoke_json_uncached(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The uncached invoke_json body — one LLM round-trip (plus repair retry on
     the legacy text path). Wrapped by invoke_json, which layers optional
@@ -987,6 +1078,7 @@ def _invoke_json_uncached(
             result = _invoke_raw(
                 system=system, user=user, model_id=model_id, max_tokens=max_tokens,
                 temperature=temperature, cache_system=cache_system, schema=schema,
+                image_b64=image_b64,
             )
         except providers.ProviderError as exc:
             # The server refused forced tool-use outright (e.g. a tool-less local

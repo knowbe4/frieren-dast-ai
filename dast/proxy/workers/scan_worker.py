@@ -9,8 +9,10 @@ import asyncio
 from typing import TYPE_CHECKING
 from datetime import datetime, timezone
 
-from dast.proxy.check_target_adapter import _DANGEROUS_SEGMENTS, _entry_to_check_target
+from dast.proxy.check_target_adapter import _entry_to_check_target
+from dast.utils.destructive_paths import destructive_segment
 from dast.proxy.scan_support import detection_method, normalise_dedup_path, update_import_stubs
+from dast.proxy.session_store import is_identity_host
 from dast.proxy.suggestions import record_param_hit
 from dast.utils.tasks import spawn_tracked
 
@@ -189,13 +191,12 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
 
             target = _entry_to_check_target(entry, store=runner._store)
             if not target:
-                from urllib.parse import urlparse as _up2
-                _seg = _up2(entry.url).path.rstrip("/").rsplit("/", 1)[-1].lower()
-                if _seg in _DANGEROUS_SEGMENTS:
+                segment = destructive_segment(entry.url)
+                if segment:
                     log_event("scan-worker", "warn",
                               f"Scan skipped — session-destructive path: {entry.url}",
                               url=entry.url, source="agent")
-                    qs.finish(entry_id, 0, "skipped", f"Destructive path blocked: /{_seg}")
+                    qs.finish(entry_id, 0, "skipped", f"Destructive path blocked: /{segment}")
                 else:
                     qs.finish(entry_id, 0, "skipped", "No injectable parameters found (no query params or JSON body)")
                 runner._store.add_finding(entry_id, {}, "safe")
@@ -298,6 +299,7 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                     session_intelligence=runner._store.session_intelligence,
                     budget_seconds=budget_override,
                     probe_diff=bool(runner._engine_config.get("probe_diff", False)),
+                    replan=bool(runner._engine_config.get("coordinator_replan", False)),
                     taint_store=runner._store.taint_store,
                     budget_ceiling=budget_ceiling,
                 )
@@ -429,6 +431,11 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
         if entry.queued_for_scan or entry.scan_result:
             return
         if not runner._settings.is_in_scope(entry.url):
+            return
+        # Defer identity-provider hosts during an autonomous run: scanning the IdP's
+        # login/token endpoints invalidates the shared SSO session every other host
+        # depends on, so they are tested only in the run's final phase.
+        if getattr(runner._store, "defer_identity_hosts", False) and is_identity_host(entry.host):
             return
 
         # Normalise path: replace UUIDs, numeric IDs, and hex strings with {id}

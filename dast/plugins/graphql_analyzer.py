@@ -45,12 +45,26 @@ _INTERNAL_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A `/graphql` path *segment*: /graphql, /graphql/, /graphql/<suffix>, /api/graphql.
+# Deliberately a segment match, not a bare substring, so /graphql-docs and the like
+# do not false-positive.
+_GRAPHQL_PATH_RE = re.compile(r"/graphql(?:/|$)", re.IGNORECASE)
+
+
+def graphql_path_matches(path: str) -> bool:
+    """True when a URL path targets a GraphQL endpoint by path convention.
+
+    Shared by the analyzer and the introspection plugin so both agree on what counts
+    as a GraphQL endpoint by path — otherwise one matched `/graphql/<suffix>` (e.g.
+    `/graphql/dashboards`) while the other, keyed on an exact trailing `/graphql`,
+    missed it and never registered the endpoint for introspection."""
+    return bool(_GRAPHQL_PATH_RE.search(path or ""))
+
 
 def _is_graphql(entry: "ProxyEntry") -> bool:
     if entry.method != "POST":
         return False
-    path = (entry.path or "").lower()
-    if "/graphql" in path:
+    if graphql_path_matches(entry.path or ""):
         return True
     if entry.request_body:
         try:
@@ -99,7 +113,7 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
         q = req_body.get("query", "")
         if isinstance(q, str) and "__schema" in q:
             is_introspection = True
-    if is_introspection and entry.status_code == 200:
+    if is_introspection and entry.response_status == 200:
         schema = (resp_data.get("data") or {}).get("__schema") if isinstance(resp_data, dict) else None
         if schema:
             type_count = len(schema.get("types") or [])
@@ -120,7 +134,7 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
     # ── 2. Batching allowed ──────────────────────────────────────────────
     if isinstance(req_body, list) and len(req_body) > 1:
         all_gql = all(isinstance(op, dict) and "query" in op for op in req_body)
-        if all_gql and entry.status_code == 200:
+        if all_gql and entry.response_status == 200:
             findings.append({
                 "title": "GraphQL Batching Enabled",
                 "severity": "low",
@@ -207,7 +221,7 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
         # an Authorization header. Bearer-authenticated endpoints are not CSRF-able.
         uses_cookie_auth = "cookie" in lowered_headers and "authorization" not in lowered_headers
         has_content_type_json = "application/json" in lowered_headers.get("content-type", "").lower()
-        if is_mutation and not has_csrf and uses_cookie_auth and entry.status_code == 200:
+        if is_mutation and not has_csrf and uses_cookie_auth and entry.response_status == 200:
             # A cross-site page cannot send Content-Type: application/json without a
             # CORS preflight, so a JSON-only endpoint is exploitable only if it ALSO
             # accepts text/plain or form bodies — unverified passively, so lower severity.
@@ -284,7 +298,7 @@ async def _llm_validate_finding(
         f"Response body (first 1500 chars):\n{safe_resp}\n\n"
         f"Request method: {entry.method}\n"
         f"URL: {entry.url}\n"
-        f"Status: {entry.status_code}\n"
+        f"Status: {entry.response_status}\n"
         f"Auth headers present: {bool({'authorization', 'cookie'} & {k.lower() for k in entry.request_headers})}\n"
     )
 

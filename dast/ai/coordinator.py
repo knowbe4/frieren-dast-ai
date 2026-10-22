@@ -743,6 +743,7 @@ class Coordinator:
         budget_seconds: Optional[float] = None,
         probe_diff: bool = False,
         budget_ceiling: Optional[float] = None,
+        replan: bool = False,
     ) -> List[AgentFinding]:
         if not cls._registry:
             return []
@@ -772,7 +773,7 @@ class Coordinator:
                 cls._run_inner(
                     target, client, collaborator, use_llm_planner,
                     model_id, confidence_threshold, session_intelligence,
-                    probe_diff, collected,
+                    probe_diff, collected, replan,
                 ),
                 timeout=effective_budget,
             )
@@ -801,6 +802,7 @@ class Coordinator:
         session_intelligence: Optional[object] = None,
         probe_diff: bool = False,
         collected: Optional[List[AgentFinding]] = None,
+        replan: bool = False,
     ) -> List[AgentFinding]:
         from urllib.parse import urlparse as _urlparse
         _parsed_url = _urlparse(target.url)
@@ -1056,6 +1058,16 @@ class Coordinator:
         if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
             selected_types = [*selected_types, "csrf"]
 
+        # Caller-requested attack focus (e.g. run_scan recommended by the evidence
+        # router for an LLM endpoint -> guarantee llm_injection runs). Additive, so
+        # it never REDUCES the planner's selection — it only ensures the requested,
+        # evidence-backed types are included.
+        focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
+                 if t in cls._registry and t not in selected_types]
+        if focus:
+            selected_types = [*selected_types, *focus]
+            logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
+
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented
         # parameters, mine them now. Discovered names become recon suggestions
@@ -1310,11 +1322,91 @@ class Coordinator:
                     url=target.url, source="agent",
                 )
 
+        # ── Within-target observe -> replan (bounded feedback loop) ───────────────
+        # A confirmed injection means this endpoint reaches an interpreter with
+        # unsanitised input, so the adjacent injection classes are worth one more
+        # pass on the SAME target. Gated (replan=False by default), single extra
+        # pass, only newly-implied agents not already run — reuses the shared
+        # implication map in evidence_router so the decision logic lives in one place.
+        if replan:
+            try:
+                confirmed_types = {
+                    atype for atype, fs in agent_raw.items()
+                    if any(f.title in confirmed_titles for f in fs)
+                }
+                if confirmed_types:
+                    from dast.ai.evidence_router import implied_followups
+                    implied = [
+                        t for t in implied_followups(confirmed_types, selected_types)
+                        if t in cls._registry
+                    ]
+                    if implied:
+                        extra = await cls._run_followup_pass(
+                            implied, target, client, collaborator, model_id,
+                            confidence_threshold, confirmed_titles, collected,
+                            confirmed, review,
+                        )
+                        if extra:
+                            _log_event(
+                                "coordinator", "info",
+                                f"Replan: confirmed {sorted(confirmed_types)} -> tested "
+                                f"follow-up {implied}; {len(extra)} new confirmed",
+                                url=target.url, source="agent",
+                            )
+            except Exception as exc:  # noqa: BLE001 — replan must never break the base scan
+                logger.warning("Coordinator replan pass failed", url=target.url, error=str(exc))
+
         # Return confirmed vulns plus any held-for-review findings. Held findings
         # carry needs_review=True so the runner serializes them as unconfirmed;
         # they are not in confirmed_titles, so session intelligence and outcome
         # logs above never treat them as confirmed vulns.
         return confirmed + review
+
+    @classmethod
+    async def _run_followup_pass(
+        cls, attack_types, target, client, collaborator, model_id,
+        confidence_threshold, confirmed_titles, collected, confirmed, review,
+    ) -> List[AgentFinding]:
+        """Run a bounded second batch of agents (the replan-implied types) on the
+        same target, validate, and fold results into the running confirmed/review/
+        collected sets. Returns the newly-confirmed findings."""
+        agents = [cls._registry[t]() for t in attack_types if t in cls._registry]
+        if not agents:
+            return []
+        if getattr(target, "host_intel", None) is None:
+            pass  # host_intel already attached in the main pass when available
+        new_confirmed: List[AgentFinding] = []
+        for agent in agents:
+            findings = await agent.run_safe(target, client, collaborator)
+            findings = findings if isinstance(findings, list) else []
+            deterministic = [f for f in findings if f.bypass_validation]
+            non_deterministic = [f for f in findings if not f.bypass_validation]
+            for finding in non_deterministic:
+                try:
+                    ok = await cls._validate(
+                        finding, target, model_id=model_id,
+                        confidence_threshold=confidence_threshold,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Replan validation error — not confirmed",
+                                   title=finding.title, error=str(exc))
+                    continue
+                if ok and finding.title not in confirmed_titles:
+                    confirmed.append(finding)
+                    confirmed_titles.add(finding.title)
+                    new_confirmed.append(finding)
+                elif getattr(finding, "needs_review", False):
+                    review.append(finding)
+            for finding in deterministic:
+                if finding.title not in confirmed_titles:
+                    confirmed.append(finding)
+                    confirmed_titles.add(finding.title)
+                    new_confirmed.append(finding)
+        if collected is not None:
+            collected.clear()
+            collected.extend(confirmed)
+            collected.extend(review)
+        return new_confirmed
 
     @classmethod
     async def _fetch_canary_baseline(cls, client: "httpx.AsyncClient", target: "CheckTarget") -> str:

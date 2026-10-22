@@ -16,6 +16,7 @@ from urllib.parse import parse_qsl, urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
+from dast.utils import read_only
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -137,6 +138,9 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     method = str(args.get("method", "GET")).upper()
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
         return {"ok": False, "error": f"unsupported method: {method}"}
+    if getattr(ctx, "read_only", False) and not read_only.is_safe_method(method):
+        return {"ok": False, "read_only": True,
+                "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS are sent"}
 
     # Scope gate BEFORE anything is sent. Out-of-scope is denied by default, but an
     # MCP caller (no in-process store) can ask the dashboard operator for an
@@ -151,6 +155,28 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             return {"ok": False, "error": "url is out of scope", "url": url}
 
     headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
+
+    # Copilot's _apply_session_auth injects jar+handoff cookies and marks them
+    # trusted via x-dast-cookies-injected. Otherwise strip LLM-supplied cookies
+    # (often stale) and inject fresh ones from the proxy jar.
+    trusted_cookies = headers.pop("x-dast-cookies-injected", None)
+    if not trusted_cookies:
+        headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+        if ctx.store is not None:
+            _host = urlparse(url).hostname or ""
+            try:
+                jar_cookies = ctx.store.get_cookies_for_host(_host) or []
+                if jar_cookies:
+                    cookie_header = "; ".join(
+                        f"{c['name']}={c.get('value', '')}"
+                        for c in jar_cookies if c.get("name")
+                    )
+                    if cookie_header:
+                        headers["Cookie"] = cookie_header
+            except Exception as exc:
+                logger.debug("send_request: cookie jar lookup failed",
+                             host=_host, error=str(exc))
+
     body = args.get("body") or ""
 
     # Tag the proxy-history entry with the caller's source (e.g. "copilot") so the

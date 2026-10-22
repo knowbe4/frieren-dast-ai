@@ -117,6 +117,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "could not start exploration"}, status_code=503)
         return {"session_id": sid, "status": "running"}
 
+    @router.get("/api/ui-routes")
+    async def ui_routes():
+        """Discovered SPA routes (frontier + visited) from the SpaExplorer, so the
+        operator can watch a complete run map the app."""
+        store = getattr(ctx, "store", None)
+        if store is None or getattr(store, "ui_route_graph", None) is None:
+            return {"stats": {}, "routes": []}
+        graph = store.ui_route_graph
+        return {"stats": graph.stats(), "routes": graph.to_list()}
+
     @router.post("/api/copilot/autonomous")
     async def autonomous(body: dict):
         """Start a fully autonomous orchestrator run.
@@ -126,7 +136,9 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         budget?: {max_tool_calls, max_wall_clock_seconds, max_stuck_turns,
         allow_scope_escalation}}. Missing budget fields fall back to the defaults.
         session_safe skips the ambient auto-scan and caps crawl volume for targets
-        with strict/single-concurrent session management.
+        with strict/single-concurrent session management. read_only (production
+        targets) sends only GET/HEAD/OPTIONS, refuses probe/attack tools and keeps
+        the crawler off action buttons; it also pauses AI mode for the run.
         """
         objective = (body.get("objective") or "").strip()
         if not objective:
@@ -145,10 +157,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         profile_slug = (body.get("profile_slug") or "").strip() or None
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
         session_safe = bool(body.get("session_safe", False))
+        read_only = bool(body.get("read_only", False))
+        mode = (body.get("mode") or "bounded").strip().lower()
+        if mode not in ("bounded", "complete"):
+            return JSONResponse({"error": "mode must be 'bounded' or 'complete'"}, status_code=400)
+        submit_forms = bool(body.get("submit_forms", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
                 budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
+                read_only=read_only, mode=mode, submit_forms=submit_forms,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

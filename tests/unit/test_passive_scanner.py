@@ -103,6 +103,23 @@ class TestSecurityHeaders:
         # X-Frame-Options rule removed (superseded by CSP frame-ancestors)
         assert "Missing X-Frame-Options Header" not in titles
 
+    def test_csp_meta_tag_suppresses_missing_csp(self):
+        # A page serving CSP via <meta http-equiv> must NOT be flagged missing.
+        body = (b'<!doctype html><html><head>'
+                b'<meta http-equiv="Content-Security-Policy" content="default-src \'self\'">'
+                b'</head><body>x</body></html>')
+        e = _entry(url="https://example.com/", response_headers={"content-type": "text/html"},
+                   response_body=body)
+        titles = {f[0] for f in _run_rules_by_source(e, "security_headers")}
+        assert "Missing Content Security Policy (CSP)" not in titles
+
+    def test_missing_csp_still_fires_without_meta_or_header(self):
+        body = b'<!doctype html><html><head><title>no csp here</title></head><body>x</body></html>'
+        e = _entry(url="https://example.com/", response_headers={"content-type": "text/html"},
+                   response_body=body)
+        titles = {f[0] for f in _run_rules_by_source(e, "security_headers")}
+        assert "Missing Content Security Policy (CSP)" in titles
+
     def test_no_findings_when_headers_present(self):
         e = _entry(
             url="https://example.com/",
@@ -387,6 +404,56 @@ class TestSensitiveData:
         titles = {f[0] for f in _run_rules_by_source(e, "sensitive_data")}
         assert "AWS Access Key Exposed in Response" in titles
 
+    def test_aws_secret_key_detected(self):
+        body = b'{"aws_secret_access_key": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_key_detected_camel_case(self):
+        body = b'{"SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_rule_ignores_pagination_cursor(self):
+        # Real FP: base64 cursor under a generic "*_key" label.
+        body = (
+            b'{"total":1,"next_page_key":"eyJ2IjpbMTc4NDMwNzkyNjAwMCwiZTQzYzk4ZjMtYzJkNy00'
+            b'Y2VjLWJhYTgtODA1MjRkOTM5ZTA5Il0sInMiOiJyZXBvcnRlZF9hdDpkZXNjLF9pZDpkZXNjIn0=",'
+            b'"previous_page_key":null}'
+        )
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "aws-secret-key")
+
+    def test_aws_secret_rule_ignores_longer_value_under_aws_label(self):
+        body = b'{"aws_secret_access_key": "' + b"A" * 39 + b"B" * 20 + b'"}'
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "aws-secret-key")
+
+    def test_openai_key_detected(self):
+        body = b'{"openai_key": "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "openai-api-key")
+
+    def test_openai_rule_ignores_uppercase_sk_inside_jwt_signature(self):
+        # Real FP: base64url JWT signature containing "SK-" mid-token.
+        body = (
+            b'{"token":"eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.kAbCjzoxoHaT1wPhsVt_uP1kTc'
+            b'FJCsMixp1A9SK-gbwrLH534v44gYKfWF1SvcI5dGJ2Xo6euCiuv-uBkR6FEXAu7c0NcYx"}'
+        )
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "openai-api-key")
+
+    def test_openai_rule_ignores_lowercase_sk_mid_token(self):
+        body = b'{"sig":"Mixp1A9sk-gbwrLH534v44gYKfWF1SvcI5dGJ2Xo6euCiuv"}'
+        e = _entry(response_body=body)
+        assert not _run_rule_by_id(e, "openai-api-key")
+
+    def test_anthropic_key_not_double_reported_as_openai(self):
+        body = b'{"key": "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"}'
+        e = _entry(response_body=body)
+        assert _run_rule_by_id(e, "anthropic-api-key")
+        assert not _run_rule_by_id(e, "openai-api-key")
+
     def test_snippet_shows_real_value_redacted_is_separate(self):
         body = b'{"token": "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234"}'
         e = _entry(response_body=body)
@@ -664,3 +731,81 @@ class TestAiValidateFindingFailsClosed:
         for f in findings:
             assert f.get("validated_by") == ["passive"]
             assert "validated_at" not in f
+
+
+class TestPassiveDedupAndSyntheticTraffic:
+    """Seen on a live SPA scan: one wildcard-CORS host produced 23 identical
+    findings — every crawler revisit and every agent replay of the same endpoint
+    re-reported it. One finding per rule per endpoint; probes are not scanned."""
+
+    _CORS_HEADERS = {"content-type": "application/json", "access-control-allow-origin": "*"}
+
+    @staticmethod
+    def _record(store, url: str, source: str = "proxy"):
+        entry_id = store.new_entry("GET", url, {}, None, source=source)
+        store.complete_entry(entry_id, 200, dict(TestPassiveDedupAndSyntheticTraffic._CORS_HEADERS), b"{}", 5.0)
+        return store.get_entry(entry_id)
+
+    @staticmethod
+    def _cors_findings(entry) -> list:
+        return [f for f in entry.findings if f.get("rule_id") == "cors-wildcard-origin"]
+
+    @pytest.mark.asyncio
+    async def test_same_endpoint_reported_once(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        first = self._record(store, "https://example.com/api/items?page=1")
+        await plugin.on_entry(first, store)
+        revisit = self._record(store, "https://example.com/api/items?page=2")
+        await plugin.on_entry(revisit, store)
+
+        assert len(self._cors_findings(first)) == 1
+        assert self._cors_findings(revisit) == []
+
+    @pytest.mark.asyncio
+    async def test_distinct_endpoints_each_reported(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        items = self._record(store, "https://example.com/api/items")
+        users = self._record(store, "https://example.com/api/users")
+        await plugin.on_entry(items, store)
+        await plugin.on_entry(users, store)
+
+        assert len(self._cors_findings(items)) == 1
+        assert len(self._cors_findings(users)) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["agent", "passive"])
+    async def test_synthetic_probe_traffic_is_not_scanned(self, source):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        probe = self._record(store, "https://example.com/api/items", source=source)
+        await PassiveScannerPlugin().on_entry(probe, store)
+
+        assert probe.findings == []
+        # The real entry for the same endpoint must still be reported afterwards.
+        real = self._record(store, "https://example.com/api/items")
+        await PassiveScannerPlugin().on_entry(real, store)
+        assert len(self._cors_findings(real)) == 1
+
+    @pytest.mark.asyncio
+    async def test_clear_resets_endpoint_dedup(self):
+        from dast.plugins.passive_scanner import PassiveScannerPlugin
+        from dast.proxy.session_store import SessionStore
+
+        store = SessionStore()
+        plugin = PassiveScannerPlugin()
+        await plugin.on_entry(self._record(store, "https://example.com/api/items"), store)
+        store.clear()
+        again = self._record(store, "https://example.com/api/items")
+        await plugin.on_entry(again, store)
+
+        assert len(self._cors_findings(again)) == 1

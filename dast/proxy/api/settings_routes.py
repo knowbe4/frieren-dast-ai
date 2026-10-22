@@ -260,7 +260,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             _scan_config["host_scan_concurrency"] = n
             _ac.configure_host_scan_concurrency(n)
         for flag in ("passive_enabled", "passive_ai", "active_enabled", "llm_planner",
-                     "llm_validator", "discovery_llm_classify", "probe_diff"):
+                     "llm_validator", "discovery_llm_classify", "probe_diff",
+                     "coordinator_replan"):
             if flag in body:
                 _scan_config[flag] = bool(body[flag])
         if "confidence_threshold" in body:

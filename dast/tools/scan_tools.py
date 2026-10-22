@@ -56,6 +56,14 @@ _SCAN_SCHEMA: Dict[str, Any] = {
             "description": "Optional exact history entry id to scan, instead of matching by url. "
                            "Use the id from get_history when you want to scan one specific request.",
         },
+        "attack_types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Optional attack types to guarantee are tested on this endpoint (e.g. "
+                           "['llm_injection'] for an AI endpoint, ['sqli'] for a numeric id). Additive "
+                           "— the planner still runs its own evidence-based selection; these are added "
+                           "on top, never a restriction. Omit to let the planner decide entirely.",
+        },
     },
     "required": ["url"],
 }
@@ -118,6 +126,13 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "resolved entry is out of scope", "url": entry.url}
 
     agents_ran = entry.source == "imported" or bool(getattr(store, "ai_mode", False))
+
+    # Optional caller-requested attack focus (additive; the coordinator unions
+    # these into the planner's selection). Stashed on the entry so it reaches the
+    # CheckTarget built by the scan worker.
+    focus = args.get("attack_types")
+    if isinstance(focus, list):
+        entry.focus_attack_types = [str(t).strip() for t in focus if str(t).strip()]
 
     # Mark it the way "Send to AI" does: ai_queued bypasses the once-per-endpoint
     # dedup so a deliberate re-scan actually runs.
@@ -193,7 +208,10 @@ def _untested_surface_entries(store: Any, ctx: ToolContext, methods: List[str]) 
     so only real observed endpoints are scanned."""
     from dast.proxy.session_store import normalise_endpoint_path
 
+    from dast.proxy.session_store import is_identity_host
+
     wanted = {m.strip().upper() for m in methods if m and m.strip()}
+    defer_identity = getattr(store, "defer_identity_hosts", False)
     seen_endpoints: set = set()
     representatives: List[Any] = []
     try:
@@ -207,6 +225,9 @@ def _untested_surface_entries(store: Any, ctx: ToolContext, methods: List[str]) 
         if wanted and method not in wanted:
             continue
         if getattr(entry, "source", "") in ("agent", "scanner", "scan", "out-of-scope"):
+            continue
+        # Defer IdP hosts during the main autonomous run (tested last, see driver).
+        if defer_identity and is_identity_host(getattr(entry, "host", "")):
             continue
         if getattr(entry, "scan_result", None):
             continue  # already scanned

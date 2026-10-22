@@ -67,12 +67,15 @@ def hostile_dashboard(tmp_path, monkeypatch):
     store = SessionStore()
     entry_id = store.new_entry(
         "POST",
-        "https://evil.test/p" + _marker("path").replace(" ", "%20").replace('"', "%22"),
-        {"X-Hdr": _marker("request_header"), "Content-Type": "application/json"},
+        "https://evil.test/p" + _marker("path").replace(" ", "%20").replace('"', "%22")
+        + "?q=" + _marker("query").replace(" ", "%20").replace('"', "%22"),
+        {"X-Hdr": _marker("request_header"), "Content-Type": "application/json",
+         "Cookie": "sid=" + _marker("request_cookie")},
         ('{"k": "' + _marker("request_body").replace('"', '\\"') + '"}').encode(),
     )
     store.complete_entry(
-        entry_id, 200, {"content-type": "text/html", "x-r": _marker("response_header")},
+        entry_id, 200, {"content-type": "text/html", "x-r": _marker("response_header"),
+                        "set-cookie": "s=" + _marker("set_cookie") + "; Path=/"},
         ("<html>" + _marker("response_body") + "</html>").encode(), 12.0,
     )
     for field in ("title", "evidence", "payload", "parameter", "reasoning", "snippet",
@@ -165,13 +168,18 @@ def test_hostile_target_content_never_executes(hostile_dashboard):
         page.wait_for_timeout(400)
 
         broken: list = []
-        # The request-detail "Findings" pane renders agent HTTP evidence (probe
-        # requests carrying XSS payloads) into "Send to Repeater" handlers.
-        page.evaluate("(() => { try { setDTab('findings') } catch (_) {} })()")
-        page.wait_for_timeout(500)
-        broken.extend(page.evaluate(_BROKEN_HANDLERS_JS))
-        page.evaluate(_CLICK_MARKED_HANDLERS_JS)
-        page.wait_for_timeout(300)
+        # The request detail pane renders headers, cookies, query params and
+        # bodies in Pretty and Raw on both sides, then the findings badge opens
+        # the Findings view scoped to this entry (chip carries the hostile path).
+        for step in ("_setPaneView('req','pretty'); _setPaneView('resp','pretty')",
+                     "_setPaneView('req','raw'); _setPaneView('resp','raw')",
+                     "_setPaneView('req','pretty'); _setPaneView('resp','pretty')",
+                     f"showEntryFindings('{entry_id}')"):
+            page.evaluate(f"(() => {{ try {{ {step} }} catch (_) {{}} }})()")
+            page.wait_for_timeout(400)
+            broken.extend(page.evaluate(_BROKEN_HANDLERS_JS))
+            page.evaluate(_CLICK_MARKED_HANDLERS_JS)
+            page.wait_for_timeout(300)
         for view in _VIEWS:
             # Tolerate views a given UI revision does not have.
             page.evaluate(f"(() => {{ try {{ {view} }} catch (_) {{}} }})()")

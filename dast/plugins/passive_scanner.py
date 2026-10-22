@@ -7,12 +7,14 @@ startup. Adding a new check requires only a new YAML file — no code changes.
 
 Special match types handled by the engine:
   header_absent         — fires if a named response header is missing
+  unless_body_regex     — with header_absent: suppress if body matches (e.g. meta CSP)
   header_present        — fires if a named response header exists
   header_value_regex    — fires if header value matches regex
   header_name_any       — multi-header variant of header_value_regex
   cookie_flag_absent    — fires for each Set-Cookie missing the flag
   cookie_name_regex     — additional filter on cookie name (used with cookie checks)
-  body_regex            — fires if response body matches regex
+  body_regex            — fires if response body matches regex (case-insensitive
+                          unless body_regex_case_sensitive: true)
   path_regex            — fires if request path matches regex
   cors_check            — stateful: compares request Origin vs response ACAO
   also_header_name/val  — secondary header assertion (AND condition)
@@ -45,6 +47,12 @@ if TYPE_CHECKING:
 # only evaluated when the operator opts in via POST /api/scan-config. This is a
 # per-loop gate (not applied in the @lru_cache'd loader, which stays config-agnostic).
 _AGGRESSIVE_RULES_ENABLED = False
+
+# Entry sources that are Frieren's own probes, not observed application traffic:
+# agent/plugin replays and this scanner's CORS proof requests. Their responses
+# repeat the real entry's headers (or reflect injected values), so a passive
+# finding there is a duplicate at best and payload-induced at worst.
+_SYNTHETIC_SOURCES = frozenset({"agent", "passive"})
 
 
 def set_aggressive_rules(enabled: bool) -> None:
@@ -174,6 +182,17 @@ def _eval_header_absent(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[F
     hdrs = _hdrs(entry)
     if hdr in hdrs:
         return None
+    # Suppress when the body already provides the control another way — e.g. a
+    # CSP delivered as a <meta http-equiv> tag instead of a header. Without this
+    # the rule flags pages that DO have a (meta) CSP, a false positive.
+    unless_body = match.get("unless_body_regex", "")
+    if unless_body:
+        body = _body(entry, match.get("body_max_scan_bytes", 65536))
+        try:
+            if body and re.search(unless_body, body, re.IGNORECASE | re.DOTALL):
+                return None
+        except re.error:
+            pass
     evidence = _format_evidence(
         rule.get("evidence_template", f"Header '{hdr}' not present in response"),
         header=hdr,
@@ -245,6 +264,15 @@ def _eval_header_value_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optio
     return None
 
 
+def _body_regex_flags(match: Dict[str, Any]) -> int:
+    """Regex flags for body_regex. Secret-token prefixes (sk-, ghp_, AKIA) are
+    case-sensitive by spec, so rules can opt out of IGNORECASE — otherwise an
+    uppercase 'SK-' inside a base64 JWT signature reads as an OpenAI key."""
+    if match.get("body_regex_case_sensitive", False):
+        return re.DOTALL
+    return re.IGNORECASE | re.DOTALL
+
+
 def _eval_body_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Finding]:
     match = rule.get("match", {})
     pattern_str = match.get("body_regex", "")
@@ -255,7 +283,7 @@ def _eval_body_regex(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Find
     if not body:
         return None
     try:
-        m = re.search(pattern_str, body, re.IGNORECASE | re.DOTALL)
+        m = re.search(pattern_str, body, _body_regex_flags(match))
     except re.error:
         return None
     if not m:
@@ -451,7 +479,7 @@ def _eval_clickjacking(rule: Dict[str, Any], entry: "ProxyEntry") -> Optional[Fi
         max_bytes = match.get("body_max_scan_bytes", 8192)
         body = _body(entry, max_bytes)
         try:
-            if not re.search(body_pattern, body, re.IGNORECASE | re.DOTALL):
+            if not re.search(body_pattern, body, _body_regex_flags(match)):
                 return None
         except re.error:
             return None
@@ -758,9 +786,13 @@ class PassiveScannerPlugin(ProxyPlugin):
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         if entry.response_status is None or entry.method == "CONNECT":
             return
+        if getattr(entry, "source", "proxy") in _SYNTHETIC_SOURCES:
+            return
 
         # Use session-level fired_hosts so re-instantiation doesn't reset deduplication
         fired_hosts = store.passive_fired_hosts
+        fired_endpoints = store.passive_fired_endpoints
+        endpoint_key = (entry.method, entry.host, entry.path)
 
         rules = _load_all_rules()
         # (rule_id, finding_tuple)
@@ -781,6 +813,8 @@ class PassiveScannerPlugin(ProxyPlugin):
                 logger.warning("passive rule evaluation failed", rule_id=rule.get("id", ""), error=str(exc))
 
         for rule_id, finding_tuple in all_findings:
+            if endpoint_key in fired_endpoints.get(rule_id, set()):
+                continue
             title, severity, cwe, evidence, line_no, snippet, needs_ai = finding_tuple[:7]
             redacted_snippet = finding_tuple[7] if len(finding_tuple) > 7 else snippet
             rule_confirmed = finding_tuple[8] if len(finding_tuple) > 8 else True
@@ -812,6 +846,9 @@ class PassiveScannerPlugin(ProxyPlugin):
                             raw_body = entry.response_body.decode("utf-8", errors="replace")[:2000]
                         confirmed, _ = await _ai_validate_finding(title, validate_snippet, raw_response_body=raw_body)
                         if confirmed is False:
+                            # A rejection is a decision for this endpoint too —
+                            # do not pay for the same verdict on every revisit.
+                            fired_endpoints.setdefault(rule_id, set()).add(endpoint_key)
                             continue
                         if confirmed is True:
                             validated_by = ["passive", "ai"]
@@ -866,3 +903,4 @@ class PassiveScannerPlugin(ProxyPlugin):
             logger.debug("Passive finding recorded", rule_id=rule_id, title=finding_dict.get("title"),
                          severity=finding_dict.get("severity"), url=entry.url)
             store.add_finding(entry.id, finding_dict, "vulnerable")
+            fired_endpoints.setdefault(rule_id, set()).add(endpoint_key)

@@ -182,6 +182,36 @@ _NOISE_EXTENSIONS = {
     ".woff", ".woff2", ".ttf", ".eot", ".css", ".map",
 }
 
+# Host-name tokens that mark an identity provider / SSO / login host. Actively
+# scanning these floods the login/token endpoints and invalidates the shared SSO
+# session every other in-scope host depends on, so callers defer them until last.
+# Matched as substrings — common IdP naming conventions, not tied to any one deployment.
+_IDENTITY_HOST_TOKENS = (
+    "identity", "login", "sso", "oauth", "openid", "idp",
+    "okta", "auth0", "keycloak", "authentik", "accounts",
+)
+
+
+def is_identity_host(host: str) -> bool:
+    """True when the host looks like an identity provider / SSO / login host."""
+    lowered = (host or "").split(":")[0].lower()
+    return any(token in lowered for token in _IDENTITY_HOST_TOKENS)
+
+
+# Single-use OIDC/OAuth login-flow cookies left behind by the SSO handshake
+# (.AspNetCore.OpenIdConnect.Nonce.*, .AspNetCore.Correlation.*, OAuth state/nonce).
+# They are useless after login but accumulate by the dozen and bloat every later
+# request's Cookie header — enough that strict servers reject the request with
+# HTTP 400 before the app even runs. Dropped when building a request's cookies; the
+# real session/auth cookie is matched by none of these markers and is kept.
+_TRANSIENT_COOKIE_MARKERS = ("openidconnect.nonce", ".correlation.", "oauth.nonce", "oauth.state")
+
+
+def _is_transient_login_cookie(name: str) -> bool:
+    """True for a single-use OIDC/OAuth handshake cookie safe to drop post-login."""
+    lowered = (name or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_COOKIE_MARKERS)
+
 
 class SessionStore:
     """
@@ -202,6 +232,14 @@ class SessionStore:
         self._cookies: Dict[str, Dict[str, dict]] = {}
         # active browse session tag — set while user browses manually
         self.active_browse_session_id: Optional[str] = None
+        # The live BrowseSession object (if a Browse/named login window is open),
+        # so the crawler/explorer can snapshot its real authenticated Playwright
+        # storage_state (httpOnly cookies + localStorage) instead of the lossy
+        # Set-Cookie jar. Set by the browse worker; never serialized.
+        self.active_browse_session: Optional[object] = None
+        # Last captured storage_state blob from a (possibly now-closed) browse
+        # login, so a crawl shortly after login still authenticates.
+        self.auth_storage_state: Optional[dict] = None
         # active crawler session tag — set while SpaCrawler is running
         self.active_crawler_session_id: Optional[str] = None
         # service graph, discovery engine and session intelligence
@@ -227,6 +265,12 @@ class SessionStore:
         # Read by the autonomous copilot's coverage gate to know which introspected
         # operations still need testing before a run may declare complete.
         self.graphql_tested_ops: Dict[str, set] = {}
+        # Discovered SPA UI routes (frontier + visited), populated by SpaExplorer.
+        # The autonomous "complete" run consults this so it does not finish while
+        # routes remain unexplored. Lazy import avoids a module cycle
+        # (ui_route_graph imports normalise_endpoint_path from here).
+        from dast.proxy.ui_route_graph import UiRouteGraph
+        self.ui_route_graph = UiRouteGraph()
         # background executor for passive analysis (fingerprinting, plugins, discovery)
         # keeps the proxy hot path free — responses are returned before analysis runs
         self._bg_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="dast-bg")
@@ -234,6 +278,11 @@ class SessionStore:
         self.named_sessions: Dict[str, NamedSession] = {}
         # AI mode: when True, every completed in-scope entry is auto-queued for scan
         self.ai_mode: bool = False
+        # When True, identity-provider hosts (SSO/login) are skipped by the ambient
+        # auto-scan and scan_surface. The autonomous driver sets this for the main run
+        # so probing the IdP cannot invalidate the shared session, then clears it for a
+        # final phase that tests the IdP last. Off outside autonomous runs.
+        self.defer_identity_hosts: bool = False
         # Pending findings: imported findings whose host wasn't in proxy yet.
         # Each item: {"path": str, "method": str, "nf": NormalisedFinding-like dict,
         #             "hints": list, "stub": dict}
@@ -242,6 +291,10 @@ class SessionStore:
         # Passive scanner one_per_host state — keyed by rule_id → set of hosts.
         # Lives on SessionStore so plugin re-instantiation doesn't reset deduplication.
         self.passive_fired_hosts: Dict[str, set] = {}
+        # Passive scanner per-endpoint state — keyed by rule_id → set of
+        # (method, host, path). The same endpoint is re-requested constantly
+        # (crawler revisits, SPA polling); one finding per rule per endpoint.
+        self.passive_fired_endpoints: Dict[str, set] = {}
 
     def _init_passive_analysers(self) -> None:
         """Instantiate the per-store passive analysers fed from complete_entry()."""
@@ -565,7 +618,10 @@ class SessionStore:
                     result.update(jar)
             # Also exact host
             result.update(self._cookies.get(host, {}))
-            return list(result.values())
+            # Drop single-use OIDC/OAuth handshake cookies: they are dead weight after
+            # login and their bulk can push the Cookie header past a server's limit.
+            return [c for c in result.values()
+                    if not _is_transient_login_cookie(c.get("name", ""))]
 
     def save_named_session_from_playwright(
         self,
@@ -830,6 +886,10 @@ class SessionStore:
             # Parked imported findings wait for a matching history entry; with the
             # history gone they would attach to unrelated future traffic.
             self.pending_import_findings = []
+            # Passive dedup state refers to the cleared entries; without a reset
+            # those findings could never be reported again in this session.
+            self.passive_fired_hosts = {}
+            self.passive_fired_endpoints = {}
         # Give previously-unreachable hosts a fresh chance after a clear —
         # the network may have changed (VPN up, DNS propagated).
         try:

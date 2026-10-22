@@ -81,6 +81,15 @@ class ProxyRunner:
         self._ai_model_id = ai_model_id
 
         self._store = SessionStore()
+        # Reuse a previously captured authenticated browser session across restarts
+        # so the operator does not have to log in again until it actually expires.
+        from dast.proxy.auth_state_store import load_auth_state
+        persisted_auth = load_auth_state()
+        if persisted_auth:
+            self._store.auth_storage_state = persisted_auth
+            logger.info("restored persisted auth session",
+                        cookies=len(persisted_auth.get("cookies") or []),
+                        origins=len(persisted_auth.get("origins") or []))
         self._ca = CertAuthority()
         from dast.proxy.proxy_settings import ProxySettings
         from dast.proxy.plugin_manager import PluginManager
@@ -119,6 +128,7 @@ class ProxyRunner:
             "llm_planner": True,
             "llm_validator": True,
             "probe_diff": False,
+            "coordinator_replan": False,
             "model_id": ai_model_id or "",
             "confidence_threshold": 0.5,
         }

@@ -4,6 +4,7 @@ Proxy core routes: entries, scan, scan-queue, clear, overview, hosts, ca.crt.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from html import escape as _esc
 from importlib.metadata import version as _pkg_version
@@ -13,6 +14,7 @@ from fastapi import APIRouter
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 from dast.proxy.api.context import DashboardContext
+from dast.proxy.history_search import search_entries
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -188,7 +190,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     continue
                 if f.get("dismissed"):
                     continue
-                key = (f.get("title", ""), e.host, e.path, f.get("parameter", ""), f.get("attack_type", ""))
+                key = (f.get("title", ""), e.host, f.get("attack_type", ""))
                 if key in _seen:
                     continue
                 _seen.add(key)
@@ -274,6 +276,12 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     @router.get("/api/entries")
     async def get_entries():
         return [e.to_dict() for e in store.all_entries()]
+
+    @router.get("/api/history/search")
+    async def search_history(q: str = ""):
+        """Full-text search over URL, headers and bodies of every history entry."""
+        ids = await asyncio.to_thread(search_entries, store.all_entries(), q)
+        return {"query": q, "ids": ids}
 
     @router.get("/api/entry/{entry_id}")
     async def get_entry(entry_id: str):

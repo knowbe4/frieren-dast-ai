@@ -94,11 +94,13 @@ class _StubService:
         self.sessions: dict = {}
 
     def run_autonomous(self, objective, focus_hosts=None, profile_slug=None,
-                       budget=None, auto_ai_mode=True, session_safe=False) -> str:
+                       budget=None, auto_ai_mode=True, session_safe=False,
+                       read_only=False, mode="bounded", submit_forms=False) -> str:
         self.started = {
             "objective": objective, "focus_hosts": focus_hosts,
             "profile_slug": profile_slug, "budget": budget, "auto_ai_mode": auto_ai_mode,
-            "session_safe": session_safe,
+            "session_safe": session_safe, "read_only": read_only,
+            "mode": mode, "submit_forms": submit_forms,
         }
         return "sid-auto"
 
@@ -147,6 +149,9 @@ def test_autonomous_start_passes_args(auto_client):
         "profile_slug": "admin",
         "auto_ai_mode": False,
         "session_safe": True,
+        "read_only": True,
+        "mode": "complete",
+        "submit_forms": True,
         "budget": {"max_tool_calls": 50},
     })
     assert resp.status_code == 200
@@ -157,7 +162,23 @@ def test_autonomous_start_passes_args(auto_client):
     assert started["profile_slug"] == "admin"
     assert started["auto_ai_mode"] is False
     assert started["session_safe"] is True
+    assert started["read_only"] is True
+    assert started["mode"] == "complete"
+    assert started["submit_forms"] is True
     assert started["budget"] == {"max_tool_calls": 50}
+
+
+def test_autonomous_start_defaults_to_bounded_mode(auto_client):
+    resp = auto_client.post("/api/copilot/autonomous", json={"objective": "x"})
+    assert resp.status_code == 200
+    assert auto_client.service.started["mode"] == "bounded"
+    assert auto_client.service.started["submit_forms"] is False
+
+
+def test_autonomous_start_rejects_bad_mode(auto_client):
+    resp = auto_client.post("/api/copilot/autonomous",
+                            json={"objective": "x", "mode": "turbo"})
+    assert resp.status_code == 400
 
 
 def test_autonomous_start_requires_objective(auto_client):

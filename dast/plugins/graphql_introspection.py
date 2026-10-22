@@ -69,8 +69,11 @@ query IntrospectionQuery {
 def _is_graphql_endpoint(entry: "ProxyEntry") -> bool:
     if entry.method != "POST":
         return False
-    path = entry.path.lower()
-    if path.endswith("/graphql") or path.endswith("/graphql/"):
+    # Shared path predicate with the analyzer so both agree on what is a GraphQL
+    # endpoint — a `/graphql` segment (incl. `/graphql/<suffix>`), not only a path
+    # ending in `/graphql`.
+    from dast.plugins.graphql_analyzer import graphql_path_matches
+    if graphql_path_matches(entry.path or ""):
         return True
     # Body-based detection: JSON with a "query" key containing GraphQL syntax
     if entry.request_body:

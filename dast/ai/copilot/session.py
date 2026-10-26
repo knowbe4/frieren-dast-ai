@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 # Hard ceiling on tool calls within a single operator turn. The LLM's
 # action="reply" is the primary turn boundary; this only fires if it never
 # replies (a bug, not normal dialogue).
-_MAX_TOOL_CALLS_PER_TURN = 12
+_MAX_TOOL_CALLS_PER_TURN = 20
 
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
 # neither a tool call nor a reply) before the turn gives up and hands back.
@@ -184,13 +184,31 @@ Operational notes:
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.
-- CSRF-protected / token-bearing forms: raw send_request replay fails when a form
-  carries a single-use token (ComposeToken, __VIEWSTATE, draftId). Drive the real
+- CSRF-protected / token-bearing forms: when a form carries a single-use token
+  (ComposeToken, __VIEWSTATE, draftId), raw send_request replay fails. Drive the real
   browser instead: browser_navigate to the page, browser_snapshot to see the form
   fields, browser_fill the inputs, browser_extract any fresh hidden token if you
   need it in a follow-up request, then browser_click the submit button
   (expect_navigation=true). Use verify_reflection to check whether an injected
   payload survived in the rendered output.
+- Interactive exploration and business-logic testing: do not limit browser tools to
+  CSRF-protected forms. Use them as your PRIMARY exploration workflow for SPAs:
+  browser_navigate to each discovered route, browser_snapshot to read the page structure
+  (forms, buttons, links, visible data), browser_fill to enter test values, browser_click
+  to submit or navigate. This is how you UNDERSTAND the app before testing it — reading
+  the DOM reveals parameter semantics, hidden fields, client-side validation, role-gated
+  UI, and state machines that raw HTTP calls miss.
+- Parameter-level semantic reasoning: for every state-changing endpoint (POST/PUT/PATCH),
+  examine each parameter by name and infer what it represents. Identity-bearing parameters
+  (email, user_id, account_id, org_id, role, is_admin, privilege) are high-value targets:
+  (a) swap the value to another user's id/email and observe ownership enforcement;
+  (b) add or modify role/privilege fields the client does not normally send (mass assignment);
+  (c) omit required authorization fields and observe the response.
+  Test via send_request (change one parameter at a time) and compare to the baseline.
+- Response differential analysis: always establish a BASELINE first (the normal, authorized
+  request from get_history or send_request), then issue the MODIFIED request (swapped id,
+  added field, removed auth), and COMPARE the two. Report the specific difference as
+  evidence — do not just say "it returned 200".
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.

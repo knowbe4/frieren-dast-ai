@@ -205,7 +205,12 @@ _AUTONOMOUS_COVERAGE_GATE = (
     "{coverage}\n\n"
     "Close these gaps now: run scan_surface until it reports remaining=0, and graphql_sweep on "
     "each introspected GraphQL endpoint until operations_remaining=0 (crawl / graphql_introspect "
-    "first if the surface is not yet mapped). Then go deep on anything they flag. Budget "
+    "first if the surface is not yet mapped). Then go deep on anything they flag.\n\n"
+    "After closing automated scan gaps, go DEEP on the high-value leads: examine state-changing "
+    "endpoints for business-logic bugs (identity parameter manipulation, mass assignment, "
+    "privilege boundaries) using browser_navigate + browser_snapshot to understand the UI, then "
+    "send_request with parameter-level reasoning. The automated agents cover injection vulns; "
+    "your job in this phase is the auth/logic bugs they miss. Budget "
     "remaining: {budget}. Only set 'complete' once every endpoint and operation has been tested."
 )
 
@@ -1390,12 +1395,21 @@ class CopilotService:
         if mode == "complete" and not auto.get("initial_explore_done"):
             await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
+            auto["breadth_done"] = True
             await self._session_keepalive(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        breadth_note = (
+            "[BREADTH PHASE COMPLETE] The automated scan arsenal has already covered every "
+            "discovered REST endpoint and GraphQL operation. Your job now is DEPTH: examine "
+            "the high-value leads for business-logic, auth, and access-control issues that "
+            "automated payload injection misses. Use browser tools to interact with the app, "
+            "send_request to test parameter manipulation hypotheses, and idor_probe for stored-"
+            "object BOLA. Focus on state-changing endpoints with identity-bearing parameters.\n\n"
+        ) if auto.get("breadth_done") else ""
         start_hosts = self._effective_hosts(auto["hosts"])
-        prompt = _AUTONOMOUS_START.format(
+        prompt = breadth_note + _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(start_hosts),
             router=self._router_block(start_hosts),

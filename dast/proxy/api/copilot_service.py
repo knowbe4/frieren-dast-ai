@@ -784,6 +784,10 @@ class CopilotService:
         # Release a guidance escalation, if one is waiting.
         session["_pause_result"] = {"action": "abort"}
         session["_pause_event"].set()
+        # Clear stale pause state so the UI does not show guidance controls
+        # on a stopped session.
+        session["pause"] = None
+        auto["status"] = "stopped"
         task = session.get("_task")
         if task is not None and not task.done():
             task.cancel()
@@ -1002,6 +1006,7 @@ class CopilotService:
             if self._ctx.store is not None:
                 self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
+        session["pause"] = None
         session["updated_at"] = time.time()
 
         # Clean up resources the copilot acquired during the run.

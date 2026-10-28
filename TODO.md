@@ -118,6 +118,12 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   now checks jar via _jar_has_cookies_for() and auto-injects cookies before pausing.
 - [x] **send_request Set-Cookie persistence** — fixed: Set-Cookie values from responses are
   now written synchronously to the proxy jar via _ingest_cookies.
+- [ ] **Copilot full login flow** — the copilot needs a complete login primitive that:
+  (a) GETs a page to obtain the CSRF-TOKEN cookie (KMSAT sets it on page load, not login);
+  (b) POSTs login with session + CSRF cookies;
+  (c) uses the resulting session + CSRF for all subsequent API calls with X-CSRF-Token
+  and X-Requested-With headers. Currently send_request can login but the CSRF-TOKEN is
+  missing because it's only set on page GETs, not on the login response.
 - [ ] **Copilot auth resume with jar cookies still gets 403** — `from_jar: true` resume
   collects cookies from the proxy jar and retries, but the retry may still fail (403) if
   the cookies are incomplete (e.g., missing CSRF token header, or the endpoint needs

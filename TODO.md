@@ -60,6 +60,26 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 - [ ] **browser_snapshot anti-repeat false positive** — the anti-repeat guard treats `browser_snapshot` (no args) as a duplicate even when the browser navigated to a different page between calls. The dedup key should include the current page URL.
 - [ ] **Tool tabs need server-side storage + API** — Repeater, Intruder, GraphQL, Decoder, JWT tabs store state client-side only with no read API. The copilot cannot list, read, or replay saved requests. Each tab needs: (a) server-side storage for named request/response pairs; (b) CRUD API (`GET/POST/PUT/DELETE /api/repeater/tabs`, etc.); (c) copilot tool wrappers so the copilot can read operator-prepared requests, replay with modifications, and use as baselines for differential testing.
+## GraphQL IDOR / Access Control backlog (2026-10-28)
+
+- [ ] **GraphQL mutation IDOR agent** — for every mutation that takes an `id` argument:
+  (a) run the sibling list/query to enumerate visible resources;
+  (b) attempt to mutate IDs outside the user's expected scope (system IDs, other-tenant IDs,
+  sequential probing);
+  (c) confirm the mutation succeeded by re-querying. Deterministic, no LLM needed. Should
+  detect vulns like notificationTemplateCategoryUpdate allowing account admins to rename
+  shared system categories.
+- [ ] **Multi-session IDOR testing** — use named profiles (`dast/profiles/`) to run the same
+  mutation as two different users (user A, user B in different accounts/tenants). If A can
+  mutate B's resource, confirmed cross-tenant IDOR. The profiles infra exists but the copilot
+  and agents never use it for automated cross-session differential testing.
+- [ ] **Resource scope heuristic** — compare the set of resources a list query returns vs what
+  the user "owns" (created_by, account_id match). Resources visible but not owned are
+  candidates for IDOR write testing. Heuristic signals: very low sequential IDs (system
+  seeds), names containing "system"/"default"/"global", missing account_id field in response.
+
+## Copilot auth/cookie backlog (2026-10-28)
+
 - [ ] **Copilot should check proxy cookie jar before requesting auth** — when send_request
   hits a 401/403, the copilot pauses for operator auth even when valid session cookies for
   that host already exist in the proxy cookie jar (from the operator's browser traffic).

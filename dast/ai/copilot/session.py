@@ -916,6 +916,9 @@ class CopilotSession:
             if name.lower() not in present:
                 headers[name] = value
 
+        if "x-requested-with" not in present and cookies:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+
         if headers:
             tool_args["headers"] = headers
 

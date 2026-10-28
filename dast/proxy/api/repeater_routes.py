@@ -27,18 +27,12 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
         headers = strip_recomputed_headers(headers)
 
-        proxy_port = getattr(ctx, "proxy_port", None)
-        proxy_kwargs = {}
-        if proxy_port:
-            proxy_kwargs["proxy"] = f"http://127.0.0.1:{proxy_port}"
-
         t0 = _time.monotonic()
         try:
             async with _httpx.AsyncClient(
                 follow_redirects=follow_redirects,
                 timeout=_httpx.Timeout(30.0),
                 verify=False,
-                **proxy_kwargs,
             ) as client:
                 resp = await client.request(method, url, headers=headers,
                                             content=body.encode() if body else None)

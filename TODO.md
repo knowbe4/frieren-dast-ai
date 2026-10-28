@@ -60,3 +60,11 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 - [ ] **browser_snapshot anti-repeat false positive** — the anti-repeat guard treats `browser_snapshot` (no args) as a duplicate even when the browser navigated to a different page between calls. The dedup key should include the current page URL.
 - [ ] **Tool tabs need server-side storage + API** — Repeater, Intruder, GraphQL, Decoder, JWT tabs store state client-side only with no read API. The copilot cannot list, read, or replay saved requests. Each tab needs: (a) server-side storage for named request/response pairs; (b) CRUD API (`GET/POST/PUT/DELETE /api/repeater/tabs`, etc.); (c) copilot tool wrappers so the copilot can read operator-prepared requests, replay with modifications, and use as baselines for differential testing.
+- [ ] **Copilot should check proxy cookie jar before requesting auth** — when send_request
+  hits a 401/403, the copilot pauses for operator auth even when valid session cookies for
+  that host already exist in the proxy cookie jar (from the operator's browser traffic).
+  The copilot should auto-inject jar cookies before escalating to an auth pause.
+- [ ] **Copilot auth resume with jar cookies still gets 403** — `from_jar: true` resume
+  collects cookies from the proxy jar and retries, but the retry may still fail (403) if
+  the cookies are incomplete (e.g., missing CSRF token header, or the endpoint needs
+  a specific auth mechanism beyond session cookies).

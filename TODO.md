@@ -78,6 +78,12 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   candidates for IDOR write testing. Heuristic signals: very low sequential IDs (system
   seeds), names containing "system"/"default"/"global", missing account_id field in response.
 
+- [ ] **Repeater API should route through proxy** — `/api/repeater/send` uses a direct
+  httpx client and bypasses the proxy entirely. Requests don't appear in History, plugins
+  don't process them, and cookies aren't auto-injected. Should route through
+  `127.0.0.1:<proxy_port>` like `send_request` does, so all traffic is captured and
+  processed uniformly.
+
 ## Copilot auth/cookie backlog (2026-10-28)
 
 - [ ] **Copilot should check proxy cookie jar before requesting auth** — when send_request

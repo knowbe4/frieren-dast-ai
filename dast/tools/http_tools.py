@@ -229,6 +229,14 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         }
         if set_cookies:
             result["set_cookies"] = set_cookies
+            if ctx.store is not None:
+                try:
+                    _host_netloc = urlparse(url).netloc
+                    ctx.store._ingest_cookies(_host_netloc, {"set-cookie": set_cookies[0]})
+                    for sc in set_cookies[1:]:
+                        ctx.store._ingest_cookies(_host_netloc, {"set-cookie": sc})
+                except Exception:
+                    pass
         if history:
             result["redirects"] = [
                 {"status": hop.status_code, "url": str(hop.url)} for hop in history

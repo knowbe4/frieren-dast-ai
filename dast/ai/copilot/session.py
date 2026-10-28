@@ -429,6 +429,7 @@ class CopilotSession:
         self._seen_calls: set[str] = set()
         self._session_cookies: Dict[str, str] = {}
         self._auth_prompted_hosts: set[str] = set()
+        self._store: Optional[object] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
         # or hypothesis target) make the brief available from the very first turn;
         # hosts the copilot then touches via tools accumulate for later turns.
@@ -941,6 +942,17 @@ class CopilotSession:
                 return True
         return False
 
+    def _jar_has_cookies_for(self, host: str) -> bool:
+        """Check whether the proxy cookie jar has session cookies for a host."""
+        store = self._store
+        if store is None:
+            return False
+        try:
+            cookies = store.get_cookies_for_host(host)
+            return bool(cookies)
+        except Exception:
+            return False
+
     async def _auth_gate(
         self,
         result: Dict[str, Any],
@@ -954,10 +966,6 @@ class CopilotSession:
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
         collected and the identical call should be allowed to retry."""
-        # ``status`` is the HTTP code on request-shaped tools, but this gate runs on
-        # every tool result and non-request tools (e.g. run_scan) put a non-numeric
-        # status here ("vulnerable"/"scanning"/"safe"). A non-numeric status is by
-        # definition not an HTTP auth wall, so treat it as 0 rather than crashing.
         try:
             status_code = int(result.get("status", 0) or 0)
         except (TypeError, ValueError):
@@ -973,6 +981,21 @@ class CopilotSession:
             and looks_like_auth_wall(status_code, final_url, body)
         ):
             return False
+        if self._jar_has_cookies_for(host):
+            try:
+                jar_cookies = {
+                    c.get("name", ""): c.get("value", "")
+                    for c in (self._store.get_cookies_for_host(host) or [])
+                    if c.get("name")
+                }
+                if jar_cookies:
+                    self._session_cookies.update(jar_cookies)
+                    self._seen_calls.discard(call_key)
+                    await observe(entry, f"Auth wall (HTTP {status_code}); auto-injected "
+                                  f"{len(jar_cookies)} cookies from proxy jar. Retrying.")
+                    return True
+            except Exception:
+                pass
         self._auth_prompted_hosts.add(host)
         auth = await wait_for_human("auth", {"url": final_url, "host": host,
                                              "status": status_code})

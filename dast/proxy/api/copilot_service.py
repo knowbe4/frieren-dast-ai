@@ -284,11 +284,16 @@ class CopilotService:
             for k in oldest[:len(self._sessions) - _MAX_SESSIONS]:
                 self._sessions.pop(k, None)
 
-    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
+    def _init_engine(self, sid: str, focus_hosts: Optional[List[str]] = None):
         from dast.ai.copilot import CopilotSession
+        engine = CopilotSession(sid, focus_hosts=focus_hosts)
+        engine._store = self._ctx.store
+        return engine
+
+    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
         sid = str(uuid.uuid4())[:12]
         self._sessions[sid] = {
-            "engine": CopilotSession(sid, focus_hosts=focus_hosts),
+            "engine": self._init_engine(sid, focus_hosts),
             "status": "idle",
             "created_at": time.time(),
             "updated_at": time.time(),

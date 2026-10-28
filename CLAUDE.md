@@ -265,6 +265,13 @@ Tiered helpers: `get_fast_model()` (planning/baseline, default Haiku), `get_vali
 - **browser_snapshot anti-repeat false positive** — the copilot's anti-repeat guard treats
   `browser_snapshot` (no args) as a duplicate even when the browser navigated to a different
   page between calls. The dedup key should include the current page URL
+- **Repeater/Intruder/GraphQL tabs are browser-only** — all tool tabs (Repeater, Intruder,
+  GraphQL, Decoder, JWT) store state client-side only and have no read API. The copilot and
+  external API consumers cannot list, read, or replay saved requests. Each tool tab needs:
+  (a) server-side storage for named request/response pairs;
+  (b) CRUD API (`GET/POST/PUT/DELETE /api/repeater/tabs`, same for intruder/graphql);
+  (c) copilot tool wrappers so the copilot can read operator-prepared requests, replay them
+  with modifications, and use them as baselines for differential testing
 
 ---
 

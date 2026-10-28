@@ -782,6 +782,16 @@ class CopilotSession:
                         continue
 
                     consecutive_tool_failures = 0
+                    if tool_name == "send_request" and result.get("set_cookies"):
+                        from http.cookies import SimpleCookie
+                        for sc_str in result["set_cookies"]:
+                            try:
+                                sc = SimpleCookie()
+                                sc.load(sc_str)
+                                for name, morsel in sc.items():
+                                    self._session_cookies[name] = morsel.value
+                            except Exception:
+                                pass
                     await _observe(entry, _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
                     # dedup keys: the copilot must be able to re-issue a prior read

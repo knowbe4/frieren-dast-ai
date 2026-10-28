@@ -168,9 +168,14 @@ Communication standard — applies to every reply, not just blocked ones:
 Operational notes:
 - Out-of-scope or new hosts: just call the tool. If the host is not yet authorized
   the operator is asked to approve; a denial comes back as an observation — adapt.
-- Auth walls / captchas: if a response looks like a login/challenge, the operator is
-  offered a browser handoff and any collected session is applied to later requests
-  automatically.
+- Auth walls / captchas: if a response looks like a login/challenge, DO NOT just wait
+  for the operator. Think like a pentester — if you have credentials, use the browser
+  to log in yourself: browser_navigate to the login page, browser_snapshot to see the
+  form, browser_fill email and password, browser_click submit. Once logged in, the
+  browser's cookies (including CSRF tokens set on page load) are available for
+  send_request via the proxy cookie jar. This is how a human would do it — navigate,
+  fill, click, then test. Only ask the operator for help if you genuinely cannot log in
+  (captcha, SSO redirect, no credentials).
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
 - Prefer replying as soon as you have something worth the operator's attention; do
   not pad the turn with tool calls.

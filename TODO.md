@@ -81,6 +81,11 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 - [x] **Repeater API should route through proxy** — fixed: requests now route through
   the local proxy when proxy_port is set, so traffic appears in History and plugins
   process it.
+- [ ] **Repeater proxy routing strips/modifies operator-set headers** — the Repeater now
+  routes through the MITM proxy, but the proxy overwrites headers like X-Forwarded-Host,
+  X-Forwarded-For, X-Real-IP that the operator set explicitly. This breaks header injection
+  tests (e.g. SSRF via X-Forwarded-Host). The Repeater should preserve operator-defined
+  headers through the proxy, or offer a "direct (no proxy)" mode for header injection tests.
 
 ## Copilot auth/cookie backlog (2026-10-28)
 

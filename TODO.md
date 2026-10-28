@@ -87,6 +87,26 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   tests (e.g. SSRF via X-Forwarded-Host). The Repeater should preserve operator-defined
   headers through the proxy, or offer a "direct (no proxy)" mode for header injection tests.
 
+## New detection rules from KMSAT pentest (2026-10-28)
+
+- [ ] **MFA bypass param fuzzer agent** — for every login endpoint detected (path contains
+  login, sign_in, authenticate), test with extra params that might bypass MFA: mfa_forced,
+  skip_mfa, bypass_2fa, otp_bypass, mfa_skip, no_mfa, force_login. Compare responses:
+  if the response changes from MFA challenge (routeTo MFA route) to direct session
+  (redirectTo + Set-Cookie) when the param is added, confirmed MFA bypass. Deterministic.
+- [ ] **OAuth state validation checker** — enhance the existing `oauth_flow_analyzer` plugin
+  to detect OAuth callbacks that don't validate the state parameter. Pattern: callback URL
+  with ?code= parameter that returns a success response regardless of state value. Test by
+  replaying the callback with a different/missing state and comparing responses.
+- [ ] **GraphQL sensitive field exposure scanner** — for each GraphQL type with fields like
+  otpSecretKey, otpCode, encryptedPassword, resetPasswordToken, etc., test if field-level
+  authorization is properly enforced by querying other users' records. Needs multi-session
+  (see GraphQL IDOR backlog).
+- [ ] **GraphQL cursor injection scanner** — test pagination cursors (after/before) with
+  arbitrary sort_field values (e.g. encrypted_password, otp_secret_key) and check if the
+  cursor text field leaks column values. Deterministic: if cursor.text contains a value
+  that looks like a hash/token/email when sorting by a sensitive column, confirmed leak.
+
 ## Copilot auth/cookie backlog (2026-10-28)
 
 - [ ] **Copilot should check proxy cookie jar before requesting auth** — when send_request

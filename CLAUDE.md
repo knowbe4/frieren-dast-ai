@@ -250,29 +250,6 @@ Tiered helpers: `get_fast_model()` (planning/baseline, default Haiku), `get_vali
 - **AWS token expiry** → set `AWS_PROFILE`; credentials auto-refresh on `ExpiredTokenException`
 - **Stuck proxy/dashboard ports** → `make kill`
 
-## Dashboard UI Backlog
-
-- **GraphQL mode hides response** — switching a request to GraphQL view in the Proxy tab
-  makes the response panel below disappear
-- **Findings "Go to request" shows original, not vuln request** — clicking "Go to request"
-  on a finding navigates to the clean intercepted request, not the probe that triggered the
-  vulnerability. Should show original request/response + vuln request/response side by side
-  (like Burp Suite)
-- **No pretty view in Repeater** — request/response bodies are shown raw; need formatted
-  JSON/HTML/XML view with syntax highlighting
-- **No pretty view in GraphQL tab** — same as Repeater; GraphQL queries and responses need
-  formatted display
-- **browser_snapshot anti-repeat false positive** — the copilot's anti-repeat guard treats
-  `browser_snapshot` (no args) as a duplicate even when the browser navigated to a different
-  page between calls. The dedup key should include the current page URL
-- **Repeater/Intruder/GraphQL tabs are browser-only** — all tool tabs (Repeater, Intruder,
-  GraphQL, Decoder, JWT) store state client-side only and have no read API. The copilot and
-  external API consumers cannot list, read, or replay saved requests. Each tool tab needs:
-  (a) server-side storage for named request/response pairs;
-  (b) CRUD API (`GET/POST/PUT/DELETE /api/repeater/tabs`, same for intruder/graphql);
-  (c) copilot tool wrappers so the copilot can read operator-prepared requests, replay them
-  with modifications, and use them as baselines for differential testing
-
 ---
 
 **Last Updated:** 2026-10-28 · **Version:** 0.8.2

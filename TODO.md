@@ -78,9 +78,14 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   candidates for IDOR write testing. Heuristic signals: very low sequential IDs (system
   seeds), names containing "system"/"default"/"global", missing account_id field in response.
 
-- [x] **Repeater API should route through proxy** — fixed: requests now route through
-  the local proxy when proxy_port is set, so traffic appears in History and plugins
-  process it.
+- [ ] **Repeater API should route through proxy with cookie isolation** — the Repeater
+  needs to route through the proxy so traffic appears in History and plugins process it,
+  BUT it must use an isolated cookie jar (copy-on-use from the main jar) so that session
+  rotation from Repeater requests does not invalidate the browser's session. The naive
+  proxy routing (cfdf231, reverted in 7a42ffd) caused the KMSAT backend to rotate
+  _knowbe4_session_new on the Repeater response, which then logged the browser out.
+  Solution: per-source cookie jar isolation in the proxy, or a dedicated proxy session
+  for Repeater traffic that doesn't share cookies with the browser.
 - [ ] **Repeater proxy routing strips/modifies operator-set headers** — the Repeater now
   routes through the MITM proxy, but the proxy overwrites headers like X-Forwarded-Host,
   X-Forwarded-For, X-Real-IP that the operator set explicitly. This breaks header injection

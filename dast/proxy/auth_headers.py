@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_AUTH_HEADER_NAMES = ("authorization", "x-auth-token", "x-api-key", "cookie")
+_AUTH_HEADER_NAMES = ("authorization", "x-auth-token", "x-api-key", "x-csrf-token", "cookie")
 
 
 def extract_auth_headers(

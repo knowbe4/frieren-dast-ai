@@ -51,7 +51,7 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 ## Dashboard UI backlog (2026-10-28)
 
-- [ ] **GraphQL mode hides response** — switching a request to GraphQL view in the Proxy tab makes the response panel below disappear.
+- [x] **GraphQL mode hides response** — fixed: GraphQL content now renders in the Request pane while the Response pane stays visible.
 - [ ] **Findings "Go to request" shows original, not vuln request** — clicking "Go to request" on a finding navigates to the clean intercepted request, not the probe that triggered the vulnerability. Should show original request/response + vuln request/response side by side (like Burp Suite).
 - [ ] **No pretty view in Repeater** — request/response bodies are shown raw; need formatted JSON/HTML/XML view with syntax highlighting.
 - [ ] **No pretty view in GraphQL tab** — same as Repeater; GraphQL queries and responses need formatted display.
@@ -114,10 +114,10 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 ## Copilot auth/cookie backlog (2026-10-28)
 
-- [ ] **Copilot should check proxy cookie jar before requesting auth** — when send_request
-  hits a 401/403, the copilot pauses for operator auth even when valid session cookies for
-  that host already exist in the proxy cookie jar (from the operator's browser traffic).
-  The copilot should auto-inject jar cookies before escalating to an auth pause.
+- [x] **Copilot should check proxy cookie jar before requesting auth** — fixed: auth gate
+  now checks jar via _jar_has_cookies_for() and auto-injects cookies before pausing.
+- [x] **send_request Set-Cookie persistence** — fixed: Set-Cookie values from responses are
+  now written synchronously to the proxy jar via _ingest_cookies.
 - [ ] **Copilot auth resume with jar cookies still gets 403** — `from_jar: true` resume
   collects cookies from the proxy jar and retries, but the retry may still fail (403) if
   the cookies are incomplete (e.g., missing CSRF token header, or the endpoint needs

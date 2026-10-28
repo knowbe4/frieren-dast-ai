@@ -58,7 +58,7 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 ## Copilot engine backlog (2026-10-28)
 
-- [ ] **browser_snapshot anti-repeat false positive** — the anti-repeat guard treats `browser_snapshot` (no args) as a duplicate even when the browser navigated to a different page between calls. The dedup key should include the current page URL.
+- [x] **browser_snapshot anti-repeat false positive** — fixed: dedup key now includes the browser's current page URL for browser read tools (snapshot, extract, wait_for).
 - [ ] **Tool tabs need server-side storage + API** — Repeater, Intruder, GraphQL, Decoder, JWT tabs store state client-side only with no read API. The copilot cannot list, read, or replay saved requests. Each tab needs: (a) server-side storage for named request/response pairs; (b) CRUD API (`GET/POST/PUT/DELETE /api/repeater/tabs`, etc.); (c) copilot tool wrappers so the copilot can read operator-prepared requests, replay with modifications, and use as baselines for differential testing.
 ## GraphQL IDOR / Access Control backlog (2026-10-28)
 
@@ -78,11 +78,9 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   candidates for IDOR write testing. Heuristic signals: very low sequential IDs (system
   seeds), names containing "system"/"default"/"global", missing account_id field in response.
 
-- [ ] **Repeater API should route through proxy** — `/api/repeater/send` uses a direct
-  httpx client and bypasses the proxy entirely. Requests don't appear in History, plugins
-  don't process them, and cookies aren't auto-injected. Should route through
-  `127.0.0.1:<proxy_port>` like `send_request` does, so all traffic is captured and
-  processed uniformly.
+- [x] **Repeater API should route through proxy** — fixed: requests now route through
+  the local proxy when proxy_port is set, so traffic appears in History and plugins
+  process it.
 
 ## Copilot auth/cookie backlog (2026-10-28)
 

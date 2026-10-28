@@ -1,0 +1,17 @@
+rules:
+  - id: password-reset-endpoint-detected
+    title: "Password Reset/Change Endpoint Detected"
+    severity: info
+    cwe: CWE-640
+    description: >
+      A password reset or change endpoint was observed in proxy traffic. These
+      endpoints are high-value targets for authentication bypass testing —
+      verify that the reset token is validated server-side and bound to the
+      requesting email.
+    match:
+      path_regex: '(?i)(reset.?password|change.?password|forgot.?password|password.?reset|password.?change|auth.?reset|auth.?password|password.?update)'
+    conditions:
+      method: POST
+      one_per_host: true
+    evidence_template: "Password reset/change endpoint at {method} {path}"
+    needs_ai_validation: false

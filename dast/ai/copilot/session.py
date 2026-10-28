@@ -734,6 +734,16 @@ class CopilotSession:
                         continue
 
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
+                    if tool_name in ("browser_snapshot", "browser_extract",
+                                     "browser_wait_for") and hasattr(tool_ctx, "browser"):
+                        browser = getattr(tool_ctx, "browser", None)
+                        if browser is not None:
+                            try:
+                                page_url = browser.page.url if browser.page else ""
+                            except Exception:
+                                page_url = ""
+                            if page_url:
+                                call_key = f"{tool_name}:{page_url}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
                         reply = await _record_tool_failure(
                             entry, "Repeat of an earlier identical call — suppressed. "

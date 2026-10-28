@@ -905,6 +905,10 @@ class CopilotSession:
         if cookies and "cookie" not in present:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
+            if "x-csrf-token" not in present:
+                csrf = cookies.get("CSRF-TOKEN") or cookies.get("csrf-token") or cookies.get("csrf_token")
+                if csrf:
+                    headers["X-CSRF-Token"] = csrf
 
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":

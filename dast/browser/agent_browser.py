@@ -111,6 +111,17 @@ class AgentBrowser:
             except Exception as exc:
                 logger.warning("AgentBrowser: add_cookies failed", error=str(exc))
 
+    async def export_cookies(self) -> Dict[str, str]:
+        """Export all browser cookies as a {name: value} dict for send_request fallback."""
+        if self._context is None:
+            return {}
+        try:
+            cookies = await self._context.cookies()
+            return {c["name"]: c["value"] for c in cookies if c.get("name")}
+        except Exception as exc:
+            logger.debug("AgentBrowser: export_cookies failed", error=str(exc))
+            return {}
+
     async def clear_cookies(self) -> None:
         """Clear all browser cookies so stale sessions don't interfere with login."""
         if self._context is not None:

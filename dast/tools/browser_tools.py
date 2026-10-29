@@ -136,3 +136,57 @@ register(Tool(name="browser_wait_for", input_schema=_SEL_SCHEMA, handler=_wait_f
 register(Tool(name="browser_extract", input_schema=_SEL_SCHEMA, handler=_extract, tags=["browser", "read"],
     description="Read a value from the current page: an input's value (default), an element's text, or any HTML attribute. "
                 "Use to pull a fresh CSRF/hidden token out of a form before building a request."))
+
+
+_FETCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "URL to fetch (absolute or relative to current page origin)."},
+        "method": {"type": "string", "description": "HTTP method (default POST).", "default": "POST"},
+        "headers": {"type": "object", "description": "Request headers (Content-Type defaults to application/json)."},
+        "body": {"type": "string", "description": "Request body (JSON string for POST/PUT)."},
+    },
+    "required": ["url"],
+}
+
+
+async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    browser = _browser(ctx)
+    if browser is None:
+        return {"ok": False, "error": "browser driving is not available in this context"}
+    page = await browser._ensure_page()
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    method = str(args.get("method", "POST")).upper()
+    headers = args.get("headers") or {"Content-Type": "application/json"}
+    body = args.get("body")
+    result = await page.evaluate("""async (args) => {
+        try {
+            const opts = {
+                method: args.method,
+                headers: args.headers,
+                credentials: 'include',
+            };
+            if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
+                opts.body = args.body;
+            }
+            const resp = await fetch(args.url, opts);
+            const text = await resp.text();
+            const hdrs = {};
+            resp.headers.forEach((v, k) => { hdrs[k] = v; });
+            return { ok: true, status: resp.status, headers: hdrs,
+                     body: text.substring(0, 8000), length: text.length };
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    }""", {"url": url, "method": method, "headers": headers, "body": body})
+    return result
+
+
+register(Tool(name="browser_fetch", input_schema=_FETCH_SCHEMA, handler=_fetch, tags=["browser", "active"],
+    description="Make an HTTP request from inside the browser using fetch(). Uses the browser's own cookies "
+                "(session, CSRF) automatically — no proxy, no cookie jar issues. Use this for authenticated "
+                "API calls after logging in via browser_navigate/browser_fill/browser_click. More reliable "
+                "than send_request for SPAs that manage cookies client-side (e.g. CSRF tokens set on page "
+                "load). The request does NOT appear in proxy history."))

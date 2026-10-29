@@ -803,6 +803,19 @@ class CopilotSession:
                                     self._session_cookies[name] = morsel.value
                             except Exception:
                                 pass
+                    if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
+                        new_url = str(result.get("url", ""))
+                        if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():
+                            browser = getattr(tool_ctx, "browser", None)
+                            if browser is not None:
+                                try:
+                                    exported = await browser.export_cookies()
+                                    if exported:
+                                        self._session_cookies.update(exported)
+                                        logger.debug("Synced browser cookies to session",
+                                                     count=len(exported))
+                                except Exception:
+                                    pass
                     await _observe(entry, _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
                     # dedup keys: the copilot must be able to re-issue a prior read

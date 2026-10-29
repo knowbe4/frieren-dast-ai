@@ -199,7 +199,7 @@ async def test_send_request_reports_raw_reflection_past_truncation(monkeypatch):
     # in the truncated `body`, so send_request must surface it as a reflection
     # signal — the decisive evidence for reflected XSS.
     marker = "<script>alert('FrierenXSS123')</script>"
-    big_body = ("x" * 9000) + f"Hello {marker}, welcome" + ("y" * 500)
+    big_body = ("x" * 510_000) + f"Hello {marker}, welcome" + ("y" * 500)
 
     class _Resp:
         status_code = 200
@@ -220,7 +220,7 @@ async def test_send_request_reports_raw_reflection_past_truncation(monkeypatch):
                             {"url": "https://api.acme-corp.com/xss?name=" + marker})
 
     assert result["ok"] is True
-    assert marker not in result["body"]  # reflection lives past the 8000-char slice
+    assert marker not in result["body"]  # reflection lives past the 500K-char slice
     reflections = result["reflections"]
     assert len(reflections) == 1
     hit = reflections[0]

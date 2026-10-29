@@ -934,19 +934,28 @@ class CopilotSession:
         if cookies and "cookie" not in present:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
-            if "x-csrf-token" not in present:
-                csrf = cookies.get("CSRF-TOKEN") or cookies.get("csrf-token") or cookies.get("csrf_token")
-                if csrf:
-                    headers["X-CSRF-Token"] = csrf
+
+        # CSRF and XHR headers: inject whenever we have cookies, even if the
+        # copilot already set the Cookie header manually.  Previous code nested
+        # these inside the cookie-injection block, so they were silently skipped
+        # when the copilot provided its own Cookie header.
+        if cookies and "x-csrf-token" not in present:
+            csrf = (cookies.get("CSRF-TOKEN")
+                    or cookies.get("csrf-token")
+                    or cookies.get("csrf_token")
+                    or cookies.get("XSRF-TOKEN")
+                    or cookies.get("xsrf-token"))
+            if csrf:
+                headers["X-CSRF-Token"] = csrf
+
+        if cookies and "x-requested-with" not in present:
+            headers["X-Requested-With"] = "XMLHttpRequest"
 
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":
                 continue  # cookies come from the host-scoped jar above
             if name.lower() not in present:
                 headers[name] = value
-
-        if "x-requested-with" not in present and cookies:
-            headers["X-Requested-With"] = "XMLHttpRequest"
 
         if headers:
             tool_args["headers"] = headers

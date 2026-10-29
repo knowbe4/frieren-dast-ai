@@ -176,6 +176,12 @@ Operational notes:
   send_request via the proxy cookie jar. This is how a human would do it — navigate,
   fill, click, then test. Only ask the operator for help if you genuinely cannot log in
   (captcha, SSO redirect, no credentials).
+- Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
+  may need time to render, or the URL may be wrong. Before giving up: (1) check
+  get_history for the same host to find URLs that returned real content — the operator's
+  browser traffic shows which URLs work; (2) try browser_wait_for with a broader
+  selector like "button, input, a" for up to 15s; (3) try a different URL path from
+  history. Never classify an empty snapshot as WAF_BLOCK — it is a rendering issue.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
 - Prefer replying as soon as you have something worth the operator's attention; do
   not pad the turn with tool calls.

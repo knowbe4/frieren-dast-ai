@@ -111,8 +111,19 @@ class AgentBrowser:
             except Exception as exc:
                 logger.warning("AgentBrowser: add_cookies failed", error=str(exc))
 
+    async def clear_cookies(self) -> None:
+        """Clear all browser cookies so stale sessions don't interfere with login."""
+        if self._context is not None:
+            try:
+                await self._context.clear_cookies()
+                logger.info("AgentBrowser cookies cleared")
+            except Exception as exc:
+                logger.debug("AgentBrowser: clear_cookies failed", error=str(exc))
+
     async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         page = await self._ensure_page()
+        if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
+            await self.clear_cookies()
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
                 "title": await page.title()}

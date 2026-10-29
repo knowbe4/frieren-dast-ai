@@ -810,9 +810,13 @@ class CopilotSession:
                     # the anti-repeat set so that confirming re-read is not wrongly
                     # suppressed as a duplicate (which previously made it misread a
                     # stale get_history entry as the live post-mutation response).
-                    if tool_name == "send_request" and str(
-                        tool_args.get("method", "")
-                    ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                    if (
+                        (tool_name == "send_request" and str(
+                            tool_args.get("method", "")
+                        ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"))
+                        or tool_name in ("browser_fill", "browser_click",
+                                         "browser_navigate", "browser_wait_for")
+                    ):
                         self._seen_calls.clear()
                     continue
 

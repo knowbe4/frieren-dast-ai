@@ -223,6 +223,12 @@ Operational notes:
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
+- GraphQL schema-aware testing: use graphql_introspect to discover available queries,
+  mutations, and types on any /graphql endpoint. Use graphql_type_info to inspect field
+  names, argument types, and enum values BEFORE crafting queries — this eliminates
+  guessing and avoids validation errors. Use graphql_find_sensitive to scan the schema
+  for fields that may leak credentials or secrets (otpSecretKey, sharedSecret, etc.).
+  Always introspect before testing a GraphQL target.
 - external retest objective ("retest H1 #XXXX"): (1) read the report with the
   triage tools to understand the vuln and endpoints; (2) you are already logged in
   (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via

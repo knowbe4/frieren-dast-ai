@@ -127,3 +127,196 @@ register(Tool(
     handler=_graphql_introspect,
     tags=["recon", "graphql"],
 ))
+
+
+# ---------------------------------------------------------------------------
+# graphql_type_info — inspect a single type from the cached schema
+# ---------------------------------------------------------------------------
+
+_TYPE_INFO_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "GraphQL endpoint URL (must have been introspected first).",
+        },
+        "type_name": {
+            "type": "string",
+            "description": (
+                "Name of the GraphQL type to inspect "
+                "(e.g. 'User', 'PhishingCampaignAttributes', 'ApiScopes')."
+            ),
+        },
+    },
+    "required": ["url", "type_name"],
+}
+
+_SENSITIVE_PATTERNS = (
+    "secret", "token", "password", "otp", "credential", "apikey",
+    "privatekey", "encryptedpassword", "resetpassword", "confirmationtoken",
+    "sharedsecret", "mfa", "totp", "auth_token", "jwt",
+)
+
+
+def _get_cached_schema(ctx: ToolContext, url: str) -> Dict[str, Any]:
+    """Return the cached compact schema for *url*, or an empty dict."""
+    if ctx.store is not None:
+        schema = ctx.store.graphql_schemas.get(url)
+        if schema and schema.get("introspected"):
+            return schema
+    return {}
+
+
+def _lookup_type(schema: Dict[str, Any], type_name: str) -> Dict[str, Any]:
+    """Find *type_name* across all type categories in the compact schema."""
+    for category in ("input_types", "object_types", "enum_types", "union_types"):
+        types_map = schema.get(category) or {}
+        if type_name in types_map:
+            kind_map = {
+                "input_types": "INPUT_OBJECT",
+                "object_types": types_map.get(type_name, {}).get("kind", "OBJECT"),
+                "enum_types": "ENUM",
+                "union_types": "UNION",
+            }
+            return {"found": True, "category": category, "kind": kind_map[category],
+                    "data": types_map[type_name]}
+    # Check if it's a query or mutation root field name
+    for root in ("queries", "mutations"):
+        root_map = schema.get(root) or {}
+        if type_name in root_map:
+            return {"found": True, "category": root, "kind": root.upper().rstrip("S"),
+                    "data": root_map[type_name]}
+    return {"found": False}
+
+
+async def _graphql_type_info(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(args.get("url", "")).strip()
+    type_name = str(args.get("type_name", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not type_name:
+        return {"ok": False, "error": "type_name is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+
+    schema = _get_cached_schema(ctx, url)
+    if not schema:
+        return {"ok": False, "error": "no cached schema for this URL — run graphql_introspect first",
+                "url": url}
+
+    result = _lookup_type(schema, type_name)
+    if not result["found"]:
+        available = []
+        for cat in ("input_types", "object_types", "enum_types", "union_types"):
+            available.extend(sorted((schema.get(cat) or {}).keys()))
+        suggestions = [n for n in available if type_name.lower() in n.lower()][:10]
+        return {"ok": False, "error": f"type '{type_name}' not found in schema",
+                "suggestions": suggestions}
+
+    data = result["data"]
+    kind = result["kind"]
+    out: Dict[str, Any] = {"ok": True, "name": type_name, "kind": kind}
+
+    if kind == "ENUM":
+        out["enum_values"] = data.get("values", [])
+    elif kind == "UNION":
+        out["possible_types"] = data.get("possible_types", [])
+    elif kind in ("QUERY", "MUTATION"):
+        out["args"] = data.get("args", [])
+        out["return_type"] = data.get("return_type")
+    else:
+        fields = data.get("fields", [])
+        out["fields"] = [
+            {
+                "name": f["name"],
+                "type": f.get("type", ""),
+                "required": f.get("wrapper", "") == "NON_NULL",
+                "is_list": "LIST" in (f.get("wrapper") or ""),
+            }
+            for f in fields
+        ]
+
+    return out
+
+
+register(Tool(
+    name="graphql_type_info",
+    description=(
+        "Inspect a single GraphQL type from the cached schema: its fields (with types, "
+        "required/optional, list), enum values, or union members. The schema must have "
+        "been introspected first with graphql_introspect.\n"
+        "Use this to look up field names and argument types BEFORE crafting a query or "
+        "mutation — eliminates guessing and avoids GraphQL validation errors.\n"
+        "Works for: object types (User, Account), input types (PhishingCampaignAttributes), "
+        "enums (ApiScopes, TimeZones), unions, and root query/mutation fields."
+    ),
+    input_schema=_TYPE_INFO_SCHEMA,
+    handler=_graphql_type_info,
+    tags=["recon", "graphql"],
+))
+
+
+# ---------------------------------------------------------------------------
+# graphql_find_sensitive — scan schema for fields that may leak secrets
+# ---------------------------------------------------------------------------
+
+_FIND_SENSITIVE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "GraphQL endpoint URL (must have been introspected first).",
+        },
+    },
+    "required": ["url"],
+}
+
+
+async def _graphql_find_sensitive(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+
+    schema = _get_cached_schema(ctx, url)
+    if not schema:
+        return {"ok": False, "error": "no cached schema for this URL — run graphql_introspect first",
+                "url": url}
+
+    hits: list = []
+    for category in ("object_types", "input_types"):
+        types_map = schema.get(category) or {}
+        for type_name, type_data in types_map.items():
+            if type_name.startswith("__"):
+                continue
+            for field in (type_data.get("fields") or []):
+                field_name = field.get("name", "")
+                normalised = field_name.lower().replace("_", "")
+                if any(p in normalised for p in _SENSITIVE_PATTERNS):
+                    hits.append({
+                        "type": type_name,
+                        "field": field_name,
+                        "field_type": field.get("type", ""),
+                        "category": "input" if category == "input_types" else "object",
+                    })
+
+    hits.sort(key=lambda h: (h["type"], h["field"]))
+    return {"ok": True, "url": url, "sensitive_fields": hits, "count": len(hits)}
+
+
+register(Tool(
+    name="graphql_find_sensitive",
+    description=(
+        "Scan the cached GraphQL schema for fields whose names suggest they may expose "
+        "credentials or secrets: *secret*, *token*, *password*, *otp*, *credential*, "
+        "*apiKey*, *privateKey*, *sharedSecret*, etc.\n"
+        "Run graphql_introspect first to populate the cache. Returns a list of "
+        "{type, field, field_type} hits ranked by type name.\n"
+        "Use this to quickly identify field-level authorization gaps — e.g. a "
+        "'PartnerAdmin.apiTokens.sharedSecret' field that returns raw credentials."
+    ),
+    input_schema=_FIND_SENSITIVE_SCHEMA,
+    handler=_graphql_find_sensitive,
+    tags=["recon", "graphql"],
+))

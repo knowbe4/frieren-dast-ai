@@ -243,6 +243,116 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         return {"ok": False, "error": f"request failed: {str(exc)[:200]}"}
 
 
+_TEST_UNAUTH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "Absolute target URL to test without authentication. Must be in scope."},
+        "method": {
+            "type": "string",
+            "description": "HTTP method (default GET).",
+            "default": "GET",
+        },
+        "headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Optional request headers. Cookie and Authorization headers are always stripped.",
+        },
+        "body": {"type": "string", "description": "Optional request body."},
+    },
+    "required": ["url"],
+}
+
+_AUTH_HEADER_NAMES = frozenset({
+    "cookie", "authorization", "x-csrf-token", "x-api-key", "x-auth-token",
+    "x-session-token", "x-requested-with",
+})
+
+
+async def _test_unauth(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Send a request deliberately stripped of all auth to test for missing authentication."""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+
+    method = str(args.get("method", "GET")).upper()
+    raw_headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
+    headers = {k: v for k, v in raw_headers.items() if k.lower() not in _AUTH_HEADER_NAMES}
+    body = args.get("body") or ""
+
+    try:
+        import httpx
+        request_body = body if method in ("POST", "PUT", "PATCH", "DELETE") else ""
+        async with httpx.AsyncClient(verify=False, follow_redirects=False, timeout=15) as client:
+            resp = await client.request(
+                method, url, headers=headers or None,
+                content=request_body.encode("utf-8") if request_body else None,
+            )
+        full_text = resp.text
+        content_type = resp.headers.get("content-type", "")
+        is_accessible = resp.status_code not in (301, 302, 401, 403)
+        result: Dict[str, Any] = {
+            "ok": True,
+            "status": resp.status_code,
+            "content_type": content_type,
+            "body": full_text[:500000],
+            "length": len(full_text),
+            "is_accessible": is_accessible,
+        }
+        if is_accessible and resp.status_code in (200, 204):
+            result["note"] = "endpoint accessible without authentication"
+            logger.info("test_unauth: endpoint accessible without auth",
+                        url=url, status=resp.status_code, content_type=content_type)
+        return result
+    except ImportError:
+        try:
+            import urllib.request
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(url, method=method, headers=headers)
+            if body and method in ("POST", "PUT", "PATCH", "DELETE"):
+                req.data = body.encode("utf-8")
+            with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as resp:
+                resp_body = resp.read().decode("utf-8", errors="replace")
+                status = resp.status
+            return {
+                "ok": True, "status": status,
+                "content_type": resp.headers.get("content-type", ""),
+                "body": resp_body[:500000], "length": len(resp_body),
+                "is_accessible": status not in (301, 302, 401, 403),
+            }
+        except urllib.error.HTTPError as exc:
+            return {
+                "ok": True, "status": exc.code,
+                "content_type": exc.headers.get("content-type", ""),
+                "body": "", "length": 0,
+                "is_accessible": exc.code not in (301, 302, 401, 403),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": f"request failed (urllib fallback): {str(exc)[:200]}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"request failed: {str(exc)[:200]}"}
+
+
+register(Tool(
+    name="test_unauth",
+    description=(
+        "Send a request WITHOUT any cookies or auth headers to test if an endpoint "
+        "requires authentication. All Cookie, Authorization, X-CSRF-Token, and similar "
+        "auth headers are deliberately stripped. The request goes DIRECTLY to the target "
+        "(not through the proxy) to avoid automatic cookie injection from the jar. "
+        "Use this to detect unauthenticated access vulnerabilities: if status is 200 or "
+        "204, the endpoint may be missing authentication. Returns is_accessible=true when "
+        "the status is not 301/302/401/403."
+    ),
+    input_schema=_TEST_UNAUTH_SCHEMA,
+    handler=_test_unauth,
+    tags=["http", "active"],
+))
+
 register(Tool(
     name="send_request",
     description=(

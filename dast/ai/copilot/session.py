@@ -193,6 +193,12 @@ Operational notes:
   both users and compare. Report a finding when a low-privilege session accesses
   resources that should require higher privilege. Tell the operator which session
   you are using for each request so they can follow your reasoning.
+- Authentication testing: for every new endpoint you discover, also test it
+  without authentication using test_unauth. If test_unauth returns status 200 or
+  204, the endpoint may be missing auth controls — investigate what data it
+  exposes and whether it should require a session. Common unauthenticated vulns:
+  CSV/data exports, webhook receivers, admin panels, API endpoints that forgot
+  a before_action authenticate check.
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.

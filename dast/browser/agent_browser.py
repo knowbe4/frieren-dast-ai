@@ -179,6 +179,112 @@ class AgentBrowser:
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
 
+    _EMAIL_SELECTORS = [
+        "#REGISTRATION-EMAIL", "#LOGIN-EMAIL", "#email",
+        "input[type=email]", "input[name=email]",
+    ]
+    _SUBMIT_SELECTORS = [
+        "#LOGIN-SUBMIT-BTN", "button[type=submit]",
+        "button:has-text('Continue')", "button:has-text('Next')",
+        "button:has-text('Log In')", "button:has-text('Sign In')",
+        "input[type=submit]",
+    ]
+    _PASSWORD_SELECTORS = ["#LOGIN-PASSWORD", "input[type=password]"]
+
+    async def login(self, url: str, email: str, password: str,
+                    timeout_ms: int = 30000) -> Dict[str, Any]:
+        """Autonomous multi-step login: email -> [Continue] -> password -> submit.
+
+        Handles both single-page and two-step login flows (e.g. KMSAT where
+        the password field only appears after submitting the email).
+        """
+        page = await self._ensure_page()
+        await self.clear_cookies()
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        except Exception as exc:
+            return {"ok": False, "error": f"navigate failed: {str(exc)[:200]}"}
+
+        async def _find_visible(selectors: List[str]) -> Any:
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        return loc.first
+                except Exception:
+                    continue
+            return None
+
+        email_field = await _find_visible(self._EMAIL_SELECTORS)
+        if email_field is None:
+            return {"ok": False, "error": "no email field found on the page",
+                    "url": page.url}
+
+        await email_field.fill(email)
+        logger.info("browser_login: filled email", url=page.url)
+
+        submit_btn = await _find_visible(self._SUBMIT_SELECTORS)
+        if submit_btn is None:
+            return {"ok": False, "error": "no submit button found after email",
+                    "url": page.url}
+        await submit_btn.click()
+        await page.wait_for_timeout(2000)
+
+        password_field = None
+        for sel in self._PASSWORD_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0:
+                    await loc.first.wait_for(state="visible", timeout=5000)
+                    password_field = loc.first
+                    break
+            except Exception:
+                continue
+
+        if password_field is not None:
+            logger.info("browser_login: two-step flow, filling password")
+            for sel in self._EMAIL_SELECTORS:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        current_val = await loc.first.input_value()
+                        if not current_val or current_val != email:
+                            await loc.first.fill(email)
+                        break
+                except Exception:
+                    continue
+
+            await password_field.fill(password)
+
+            submit_btn2 = await _find_visible(self._SUBMIT_SELECTORS)
+            if submit_btn2 is not None:
+                try:
+                    async with page.expect_navigation(
+                        wait_until="networkidle", timeout=15000
+                    ):
+                        await submit_btn2.click()
+                except Exception as exc:
+                    logger.debug("browser_login: nav wait ended", error=str(exc)[:100])
+
+        await page.wait_for_timeout(3000)
+
+        logged_in = "/login" not in page.url.lower() and "/signin" not in page.url.lower()
+        cookies = await self.export_cookies()
+        csrf_token = cookies.get("CSRF-TOKEN")
+
+        logger.info("browser_login: complete",
+                     logged_in=logged_in, url=page.url, cookies=len(cookies))
+
+        return {
+            "ok": logged_in,
+            "url": page.url,
+            "logged_in": logged_in,
+            "cookies_count": len(cookies),
+            "csrf_token": csrf_token[:20] + "..." if csrf_token and len(csrf_token) > 20 else csrf_token,
+            "cookies": cookies,
+        }
+
     async def close(self) -> None:
         try:
             if self._browser is not None:

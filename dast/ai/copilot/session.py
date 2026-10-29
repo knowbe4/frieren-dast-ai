@@ -169,13 +169,14 @@ Operational notes:
 - Out-of-scope or new hosts: just call the tool. If the host is not yet authorized
   the operator is asked to approve; a denial comes back as an observation — adapt.
 - Auth walls / captchas: if a response looks like a login/challenge, DO NOT just wait
-  for the operator. Think like a pentester — if you have credentials, use the browser
-  to log in yourself: browser_navigate to the login page, browser_snapshot to see the
-  form, browser_fill email and password, browser_click submit. Once logged in, the
-  browser's cookies (including CSRF tokens set on page load) are available for
-  send_request via the proxy cookie jar. This is how a human would do it — navigate,
-  fill, click, then test. Only ask the operator for help if you genuinely cannot log in
-  (captcha, SSO redirect, no credentials).
+  for the operator. Use browser_login as step 0 to authenticate — it handles multi-step
+  login flows (email-first, then password) autonomously, discovers form fields, fills
+  credentials, clicks submit, and exports session + CSRF cookies automatically. Only
+  fall back to manual browser_navigate/fill/click if browser_login fails for an unusual
+  login form. After browser_login succeeds, use browser_fetch for authenticated API calls
+  (it uses the browser's own cookies natively — no CSRF mismatch). Use send_request when
+  you need the request to appear in proxy history. Only ask the operator for help if you
+  genuinely cannot log in (captcha, SSO redirect, no credentials).
 - Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
   may need time to render, or the URL may be wrong. Before giving up: (1) check
   get_history for the same host to find URLs that returned real content — the operator's

@@ -176,7 +176,7 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             const hdrs = {};
             resp.headers.forEach((v, k) => { hdrs[k] = v; });
             return { ok: true, status: resp.status, headers: hdrs,
-                     body: text.substring(0, 8000), length: text.length };
+                     body: text.substring(0, 50000), length: text.length };
         } catch (e) {
             return { ok: false, error: e.message };
         }

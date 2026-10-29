@@ -38,7 +38,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                                             content=body.encode() if body else None)
             elapsed = int((_time.monotonic() - t0) * 1000)
             try:
-                body_text = resp.text[:50000]
+                body_text = resp.text[:500_000]
             except Exception:
                 body_text = ""
             # Expose the redirect chain so the operator can see each hop that was

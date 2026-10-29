@@ -223,7 +223,7 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "ok": True,
             "status": resp.status_code,
             "headers": dict(resp.headers),
-            "body": full_text[:8000],
+            "body": full_text[:500_000],
             "length": len(full_text),
             "final_url": str(resp.url),
         }

@@ -229,18 +229,26 @@ class AgentBrowser:
             return {"ok": False, "error": "no submit button found after email",
                     "url": page.url}
         await submit_btn.click()
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
 
         password_field = None
-        for sel in self._PASSWORD_SELECTORS:
-            try:
-                loc = page.locator(sel)
-                if await loc.count() > 0:
-                    await loc.first.wait_for(state="visible", timeout=5000)
-                    password_field = loc.first
-                    break
-            except Exception:
-                continue
+        for _attempt in range(3):
+            for sel in self._PASSWORD_SELECTORS:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.wait_for(state="visible", timeout=5000)
+                        password_field = loc.first
+                        break
+                except Exception:
+                    continue
+            if password_field is not None:
+                break
+            await page.wait_for_timeout(2000)
 
         if password_field is not None:
             logger.info("browser_login: two-step flow, filling password")
@@ -269,7 +277,9 @@ class AgentBrowser:
 
         await page.wait_for_timeout(3000)
 
-        logged_in = "/login" not in page.url.lower() and "/signin" not in page.url.lower()
+        final_path = page.url.lower().split("?")[0]
+        login_paths = ("/login", "/signin", "/sign_in", "/sign-in", "/auth/login")
+        logged_in = not any(final_path.endswith(p) or f"{p}/" in final_path for p in login_paths)
         cookies = await self.export_cookies()
         csrf_token = cookies.get("CSRF-TOKEN")
 

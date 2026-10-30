@@ -210,10 +210,28 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if not url:
         return {"ok": False, "error": "url is required"}
     method = str(args.get("method", "POST")).upper()
-    headers = args.get("headers") or {"Content-Type": "application/json"}
+    headers = dict(args.get("headers") or {"Content-Type": "application/json"})
     body = args.get("body")
     result = await page.evaluate("""async (args) => {
         try {
+            // Resolve relative URLs against the current page origin
+            let targetUrl = args.url;
+            if (targetUrl.startsWith('/')) {
+                targetUrl = window.location.origin + targetUrl;
+            }
+            // Auto-inject CSRF token from cookies if not already in headers
+            const hdrsLower = Object.fromEntries(
+                Object.entries(args.headers).map(([k,v]) => [k.toLowerCase(), v])
+            );
+            if (!hdrsLower['x-csrf-token']) {
+                const csrfMatch = document.cookie.match(/CSRF-TOKEN=([^;]+)/);
+                if (csrfMatch) {
+                    args.headers['X-CSRF-Token'] = decodeURIComponent(csrfMatch[1]);
+                }
+            }
+            if (!hdrsLower['x-requested-with']) {
+                args.headers['X-Requested-With'] = 'XMLHttpRequest';
+            }
             const opts = {
                 method: args.method,
                 headers: args.headers,
@@ -222,11 +240,11 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
                 opts.body = args.body;
             }
-            const resp = await fetch(args.url, opts);
+            const resp = await fetch(targetUrl, opts);
             const text = await resp.text();
-            const hdrs = {};
-            resp.headers.forEach((v, k) => { hdrs[k] = v; });
-            return { ok: true, status: resp.status, headers: hdrs,
+            const respHdrs = {};
+            resp.headers.forEach((v, k) => { respHdrs[k] = v; });
+            return { ok: true, status: resp.status, headers: respHdrs,
                      body: text.substring(0, 50000), length: text.length };
         } catch (e) {
             return { ok: false, error: e.message };

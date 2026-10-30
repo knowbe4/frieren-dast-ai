@@ -358,17 +358,35 @@ class AgentBrowser:
                 pass
 
         if mfa_required:
-            cookies = await self.export_cookies()
-            logger.info("browser_login: MFA required, returning for manual completion",
-                        url=page.url)
-            return {
-                "ok": False,
-                "url": page.url,
-                "logged_in": False,
-                "mfa_required": True,
-                "cookies_count": len(cookies),
-                "cookies": cookies,
-            }
+            if not self._headless:
+                logger.info("browser_login: MFA detected, waiting for operator "
+                            "to complete in visible browser", url=page.url)
+                for _poll in range(24):
+                    await page.wait_for_timeout(5000)
+                    poll_url = page.url.lower()
+                    still_mfa = any(ind in poll_url for ind in self._MFA_INDICATORS)
+                    on_sso = any(d in poll_url for d in self._SSO_DOMAINS)
+                    if not still_mfa and not on_sso:
+                        logger.info("browser_login: MFA completed by operator",
+                                    url=page.url)
+                        mfa_required = False
+                        break
+                    if _poll % 6 == 0:
+                        logger.debug("browser_login: waiting for MFA completion",
+                                     attempt=_poll, url=page.url[:60])
+
+            if mfa_required:
+                cookies = await self.export_cookies()
+                logger.info("browser_login: MFA not completed within timeout",
+                            url=page.url)
+                return {
+                    "ok": False,
+                    "url": page.url,
+                    "logged_in": False,
+                    "mfa_required": True,
+                    "cookies_count": len(cookies),
+                    "cookies": cookies,
+                }
 
         # Determine if login succeeded: not on a login page and not on an IdP domain
         final_path = final_url_lower.split("?")[0]

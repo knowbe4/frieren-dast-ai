@@ -79,6 +79,25 @@ def _named_sessions_block() -> str:
     return "Named sessions with saved credentials:\n" + "\n".join(lines)
 
 
+def _scope_hosts_block(store: Any) -> str:
+    """List the in-scope hosts from proxy settings so the copilot knows which
+    targets to use without being told explicitly each session."""
+    try:
+        settings = getattr(store, "_settings", None)
+        if settings is None:
+            return ""
+        get_hosts = getattr(settings, "get_scope_hosts", None)
+        if get_hosts is None:
+            return ""
+        hosts = get_hosts()
+        if not hosts:
+            return ""
+        return "Target hosts in scope: " + ", ".join(hosts) + ". Always use these hosts for your requests."
+    except Exception as exc:
+        logger.warning("context brief: could not read scope hosts", error=str(exc))
+        return ""
+
+
 def build_context_brief(
     store: Any,
     hosts: Sequence[str],
@@ -94,6 +113,12 @@ def build_context_brief(
     if store is None or not hosts:
         return ""
 
+    blocks: List[str] = []
+
+    scope_block = _scope_hosts_block(store)
+    if scope_block:
+        blocks.append(scope_block)
+
     ordered: List[str] = []
     for raw in hosts:
         host = (raw or "").strip().lower()
@@ -102,7 +127,8 @@ def build_context_brief(
         if len(ordered) >= max_hosts:
             break
 
-    blocks = [block for block in (_host_block(store, host) for host in ordered) if block]
+    host_blocks = [block for block in (_host_block(store, host) for host in ordered) if block]
+    blocks.extend(host_blocks)
 
     sessions_block = _named_sessions_block()
     if sessions_block:

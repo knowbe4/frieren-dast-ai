@@ -230,6 +230,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         import dast.scanners.active_checks as _ac
         import asyncio as _asyncio
 
+        if "target_hosts" in body:
+            hosts = [h.strip().lower() for h in body["target_hosts"] if isinstance(h, str) and h.strip()]
+            existing = settings.get_scope_hosts()
+            for host in hosts:
+                if host not in existing:
+                    settings.add_scope_rule({
+                        "enabled": True, "protocol": "any", "host": host,
+                        "port": "", "file": "", "kind": "include",
+                    })
+
         def _resize_global_probe_sem() -> int:
             # probe_concurrency is per endpoint scan; the semaphore is global across
             # all concurrently-scanning endpoints. Scale by worker count so each

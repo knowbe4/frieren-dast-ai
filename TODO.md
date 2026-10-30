@@ -78,6 +78,16 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   candidates for IDOR write testing. Heuristic signals: very low sequential IDs (system
   seeds), names containing "system"/"default"/"global", missing account_id field in response.
 
+- [ ] **browser_fetch returns HTML instead of JSON on proxy-routed browser** — `browser_fetch`
+  runs `page.evaluate(fetch())` which goes through the Frieren proxy (the AgentBrowser is
+  launched with `proxy: http://127.0.0.1:8080`). The proxy intercepts the request and may
+  dessynchronize the CSRF token or session cookie, causing the server to return the SPA HTML
+  shell instead of the API JSON response. Workaround: use `send_request` after `browser_login`
+  (the CSRF auto-injection from `_session_cookies` works). Fix: either (a) launch a secondary
+  browser context without proxy for `browser_fetch` API calls, or (b) implement per-source
+  cookie jar isolation in the proxy (same root cause as the Repeater cookie issue below).
+  Confirmed: `page.evaluate(fetch())` works perfectly when the browser is NOT proxy-routed
+  (tested with vanilla Playwright — returns `{"data":{"currentUser":{...}}}` correctly).
 - [ ] **Repeater API should route through proxy with cookie isolation** — the Repeater
   needs to route through the proxy so traffic appears in History and plugins process it,
   BUT it must use an isolated cookie jar (copy-on-use from the main jar) so that session

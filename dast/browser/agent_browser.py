@@ -388,13 +388,14 @@ class AgentBrowser:
                     "cookies": cookies,
                 }
 
-        # Determine if login succeeded: not on a login page and not on an IdP domain
-        final_path = final_url_lower.split("?")[0]
+        # Re-read the current URL (may have changed during MFA polling)
+        current_url = page.url.lower()
+        final_path = current_url.split("?")[0]
         login_paths = ("/login", "/signin", "/sign_in", "/sign-in",
                         "/auth/login", "/u/login", "/authorize")
         on_login_page = any(final_path.endswith(p) or f"{p}/" in final_path
                            for p in login_paths)
-        on_sso_domain = any(d in final_url_lower for d in self._SSO_DOMAINS)
+        on_sso_domain = any(d in current_url for d in self._SSO_DOMAINS)
         logged_in = not on_login_page and not on_sso_domain
 
         cookies = await self.export_cookies()

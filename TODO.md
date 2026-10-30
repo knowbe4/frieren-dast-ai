@@ -104,6 +104,12 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 ## Dashboard UI backlog (2026-10-28)
 
 - [x] **GraphQL mode hides response** — fixed: GraphQL content now renders in the Request pane while the Response pane stays visible.
+- [ ] **Match/replace modified requests should show original vs modified diff** — when the
+  proxy applies a match/replace rule that modifies a request or response, it should flag
+  the entry in History and show both the original and modified versions side by side (like
+  Burp Suite's "Edited request" indicator). Currently there's no visual indicator that a
+  request was modified by match/replace, and no way to see what was changed. Needed for
+  debugging match/replace rules and for pentest evidence.
 - [ ] **Findings "Go to request" shows original, not vuln request** — clicking "Go to request" on a finding navigates to the clean intercepted request, not the probe that triggered the vulnerability. Should show original request/response + vuln request/response side by side (like Burp Suite).
 - [ ] **No pretty view in Repeater** — request/response bodies are shown raw; need formatted JSON/HTML/XML view with syntax highlighting.
 - [ ] **No pretty view in GraphQL tab** — same as Repeater; GraphQL queries and responses need formatted display.

@@ -48,13 +48,25 @@ _SNAPSHOT_JS = r"""
 
 
 class AgentBrowser:
-    """One lazily-launched headless browser page, driven by the browser_* tools."""
+    """Browser page driven by the browser_* tools.
+
+    Headed (visible) by default so the operator can complete MFA prompts,
+    captchas, and other interactive challenges that automation cannot handle.
+    Set ``headless=True`` via the constructor or the ``BROWSER_HEADLESS=true``
+    env var for CI/unattended runs — note that any login flow requiring manual
+    interaction (MFA, captcha) will fail in headless mode.
+    """
 
     def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None,
-                 read_only: bool = False) -> None:
+                 read_only: bool = False, headless: Optional[bool] = None) -> None:
         self._proxy_port = proxy_port
         self._store = store
         self._read_only = read_only
+        if headless is not None:
+            self._headless = headless
+        else:
+            import os
+            self._headless = os.environ.get("BROWSER_HEADLESS", "").lower() in ("true", "1", "yes")
         self._pw_ctx: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -72,10 +84,13 @@ class AgentBrowser:
             self._pw_ctx = async_playwright()
             pw = await self._pw_ctx.__aenter__()
             self._browser = await pw.chromium.launch(
-                headless=True,
+                headless=self._headless,
                 proxy={"server": f"http://127.0.0.1:{self._proxy_port}"},
                 args=["--ignore-certificate-errors"],
             )
+            if not self._headless:
+                logger.info("AgentBrowser launched in headed mode (visible window)")
+
             self._context = await self._browser.new_context(ignore_https_errors=True)
             if self._read_only:
                 from dast.utils.read_only import make_route_guard

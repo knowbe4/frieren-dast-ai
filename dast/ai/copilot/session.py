@@ -459,6 +459,7 @@ class CopilotSession:
         self._session_cookies: Dict[str, str] = {}
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
+        self._last_relogin_ts: float = 0.0
         self._auth_prompted_hosts: set[str] = set()
         self._store: Optional[object] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
@@ -824,10 +825,11 @@ class CopilotSession:
                             except Exception:
                                 pass
                     if (
-                        tool_name == "send_request"
+                        tool_name in ("send_request", "browser_navigate")
                         and not self._relogin_in_progress
                         and self._last_login is not None
                     ):
+                        import time as _time
                         status = result.get("status")
                         final_url = str(result.get("final_url") or result.get("url") or "").lower()
                         login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
@@ -835,11 +837,15 @@ class CopilotSession:
                             (status == 302 and any(p in final_url for p in login_paths))
                             or status == 401
                         )
-                        if session_expired:
+                        cooldown_ok = (_time.time() - self._last_relogin_ts) > 60
+                        if session_expired and cooldown_ok:
                             browser = getattr(tool_ctx, "browser", None)
                             if browser is not None:
-                                logger.info("auto-relogin: session expired, re-authenticating")
+                                logger.info("auto-relogin: session expired, re-authenticating",
+                                            request_host=urlparse(str(result.get("url", ""))).hostname,
+                                            login_url=self._last_login["url"][:60])
                                 self._relogin_in_progress = True
+                                self._last_relogin_ts = _time.time()
                                 try:
                                     login_result = await browser.login(
                                         self._last_login["url"],

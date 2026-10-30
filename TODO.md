@@ -36,6 +36,17 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 ## Copilot reliability backlog (2026-10-30)
 
+- [ ] **Copilot GraphQL requests should feed the GraphQL tab** — when the copilot sends
+  GraphQL queries/mutations via send_request, the proxy should auto-detect the GraphQL
+  body (JSON with `query` field), parse the operation name/type, and save it to the
+  GraphQL tab's operation list. Currently copilot GraphQL traffic passes through the proxy
+  but is not parsed or saved — dozens of test queries are lost after the session ends.
+  This also means the schema introspection the copilot runs doesn't populate the tab.
+- [ ] **Copilot `save_to_repeater` / `save_to_graphql` tools** — the copilot should be
+  able to explicitly save a request to the Repeater or GraphQL tab for operator reuse.
+  Requires the "Tool tabs server-side storage + API" item below. The copilot would call
+  `save_to_repeater(name, request, response)` after a finding, so the operator can replay
+  the exact request from the UI.
 - [ ] **browser_login auto-retry with snapshot feedback** — when password field not found
   after 3 retries, take a browser_snapshot and include it in the error response so the
   copilot LLM can see the DOM and adapt. Also retry the email submit click if it didn't

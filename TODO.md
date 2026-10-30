@@ -13,6 +13,49 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
 
 - [x] **Sanitizer bypass payloads** — three bypass payloads (null-byte prefix, DOM nesting/mXSS, encoded ontoggle) added to the `bypass` category.
 
+## Copilot pentest tools (2026-10-29) — implemented
+
+- [x] **browser_login tool** — autonomous multi-step login (email→submit→detect password→fill→
+  submit). Handles 2-step flows (KMSAT, Okta). Exports cookies + CSRF to `_session_cookies`.
+  Validated live via copilot: logged in to KMSAT and made authenticated GraphQL calls.
+- [x] **browser_fetch CSRF auto-inject** — resolves relative URLs, auto-injects X-CSRF-Token
+  from `document.cookie` and X-Requested-With header. Note: still has proxy interference bug
+  (returns HTML instead of JSON when browser is proxy-routed — workaround: use send_request).
+- [x] **test_unauth tool** — sends requests with NO cookies/auth to detect unauthenticated
+  endpoints. Validated live: detected CDRMS CSV export (HIGH), Hermes webhooks (Medium).
+- [x] **unauthenticated_endpoint passive rule** — flags 200/204 responses without session
+  cookies. `one_per_host: true`, `needs_ai_validation: true`.
+- [x] **CSRF auto-injection in send_request** — reliably extracts CSRF-TOKEN from
+  `_session_cookies` and injects as `X-CSRF-Token` + `X-Requested-With` headers.
+- [x] **Response body limits increased** — send_request 500KB, browser_fetch 50KB, repeater
+  500KB (was 8KB/8KB/50KB). Validated: CDRMS CSV returns 1053 rows instead of 99.
+- [x] **graphql_type_info tool** — inspect any GraphQL type: fields, enums, unions, args.
+  Reads from cached schema (`ctx.store.graphql_schemas`).
+- [x] **graphql_find_sensitive tool** — scans schema for credential-leaking field names
+  (secret, token, password, otp, key, credential, apiKey, sharedSecret).
+
+## Copilot reliability backlog (2026-10-30)
+
+- [ ] **browser_login auto-retry with snapshot feedback** — when password field not found
+  after 3 retries, take a browser_snapshot and include it in the error response so the
+  copilot LLM can see the DOM and adapt. Also retry the email submit click if it didn't
+  register (SPA timing).
+- [ ] **Auto-relogin on 302/401** — when send_request gets a 302 to /login or 401, and
+  `_last_login` credentials are stored, automatically re-login and retry the request once.
+  Prevents session expiry from breaking multi-step test sequences.
+- [ ] **Scope + target injection in copilot prompt** — inject current scope hosts into the
+  copilot system prompt so every session knows the target. Prevents the copilot from
+  navigating to wrong hosts (e.g. api.console.knowbe4.com instead of training.knowbe4.com).
+- [ ] **graphql_type_info filter/limit** — add optional `filter` (string match on field name)
+  and `limit` (default 50) parameters. Types like Account have hundreds of fields and
+  truncate the copilot's observation window.
+- [ ] **browser_fetch direct mode** — for API calls, bypass the proxy by extracting browser
+  cookies and using httpx directly. The proxy intercepts fetch() and desynchronizes CSRF
+  tokens. Same root cause as the Repeater cookie isolation issue.
+- [ ] **Scope persistence across restarts** — save scope config to `~/.dast-ai/scope.json`
+  on change, auto-load on startup. Currently must reconfigure via /api/scan-config after
+  every restart.
+
 ## Copilot improvements
 
 - [x] **Copilot source label in history** — copilot `send_request` entries are now tagged `source: "copilot"` with a dedicated history badge and filter checkbox.
@@ -128,13 +171,12 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   now checks jar via _jar_has_cookies_for() and auto-injects cookies before pausing.
 - [x] **send_request Set-Cookie persistence** — fixed: Set-Cookie values from responses are
   now written synchronously to the proxy jar via _ingest_cookies.
-- [ ] **Copilot full login flow** — the copilot needs a complete login primitive that:
-  (a) GETs a page to obtain the CSRF-TOKEN cookie (KMSAT sets it on page load, not login);
-  (b) POSTs login with session + CSRF cookies;
-  (c) uses the resulting session + CSRF for all subsequent API calls with X-CSRF-Token
-  and X-Requested-With headers. Currently send_request can login but the CSRF-TOKEN is
-  missing because it's only set on page GETs, not on the login response.
-- [ ] **Copilot auth resume with jar cookies still gets 403** — `from_jar: true` resume
-  collects cookies from the proxy jar and retries, but the retry may still fail (403) if
-  the cookies are incomplete (e.g., missing CSRF token header, or the endpoint needs
-  a specific auth mechanism beyond session cookies).
+- [x] **Copilot full login flow** — solved via `browser_login` tool + CSRF auto-injection.
+  `browser_login` handles multi-step SPA login (email→Continue→password→submit), exports
+  cookies (including CSRF-TOKEN) to `_session_cookies`. `send_request` auto-injects
+  `X-CSRF-Token` and `X-Requested-With: XMLHttpRequest` headers from session cookies.
+  Validated live: copilot logged in to KMSAT and queried GraphQL autonomously.
+- [x] **Copilot auth resume with jar cookies still gets 403** — resolved by the CSRF
+  auto-injection fix. The 403 was caused by missing X-CSRF-Token header, not stale cookies.
+  KMSAT does NOT rotate session cookies (confirmed via code review: Redis session store with
+  stable session ID). The real issue was CSRF token mismatch.

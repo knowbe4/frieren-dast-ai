@@ -182,21 +182,35 @@ class AgentBrowser:
     _EMAIL_SELECTORS = [
         "#REGISTRATION-EMAIL", "#LOGIN-EMAIL", "#email",
         "input[type=email]", "input[name=email]",
+        "input[name=username]", "input[name=login]",
     ]
     _SUBMIT_SELECTORS = [
         "#LOGIN-SUBMIT-BTN", "button[type=submit]",
+        "button[data-action-button-primary=true]",
         "button:has-text('Continue')", "button:has-text('Next')",
         "button:has-text('Log In')", "button:has-text('Sign In')",
         "input[type=submit]",
     ]
-    _PASSWORD_SELECTORS = ["#LOGIN-PASSWORD", "input[type=password]"]
+    _PASSWORD_SELECTORS = [
+        "#LOGIN-PASSWORD", "input[type=password]",
+        "#password", "input[name=password]",
+    ]
+    _SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
+                    "accounts.google", "hrmauth", "cognito")
+    _MFA_INDICATORS = ("/mfa", "/otp", "/challenge", "/two-factor",
+                       "/u/mfa-otp-challenge", "/u/mfa-detect-browser")
 
     async def login(self, url: str, email: str, password: str,
                     timeout_ms: int = 30000) -> Dict[str, Any]:
         """Autonomous multi-step login: email -> [Continue] -> password -> submit.
 
-        Handles both single-page and two-step login flows (e.g. KMSAT where
-        the password field only appears after submitting the email).
+        Handles single-page, two-step, and SSO/Auth0 cross-domain flows:
+        - Single-page: email + password on one page, click submit.
+        - Two-step (KMSAT): email -> Continue -> password appears on same domain.
+        - SSO (Auth0/Okta): email -> Continue -> redirect to IdP domain ->
+          password on IdP -> MFA prompt -> redirect back to app.
+        If MFA is required, returns mfa_required=True so the operator can
+        complete the challenge manually.
         """
         page = await self._ensure_page()
         await self.clear_cookies()
@@ -228,12 +242,18 @@ class AgentBrowser:
         if submit_btn is None:
             return {"ok": False, "error": "no submit button found after email",
                     "url": page.url}
+        pre_submit_url = page.url
         await submit_btn.click()
         await page.wait_for_timeout(3000)
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
+
+        # Detect SSO redirect: the page may have navigated to an IdP domain
+        if page.url != pre_submit_url:
+            logger.info("browser_login: page navigated after email submit",
+                        from_url=pre_submit_url[:60], to_url=page.url[:60])
 
         password_field = None
         for _attempt in range(3):
@@ -310,9 +330,40 @@ class AgentBrowser:
 
         await page.wait_for_timeout(3000)
 
-        final_path = page.url.lower().split("?")[0]
-        login_paths = ("/login", "/signin", "/sign_in", "/sign-in", "/auth/login")
-        logged_in = not any(final_path.endswith(p) or f"{p}/" in final_path for p in login_paths)
+        # Detect MFA prompt: still on IdP with a challenge path
+        final_url_lower = page.url.lower()
+        mfa_required = any(ind in final_url_lower for ind in self._MFA_INDICATORS)
+        if not mfa_required:
+            # Also check for OTP/code input fields on the page
+            try:
+                otp_loc = page.locator("input[name=code], input[name=otp], input[type=tel][maxlength='6']")
+                if await otp_loc.count() > 0:
+                    mfa_required = True
+            except Exception:
+                pass
+
+        if mfa_required:
+            cookies = await self.export_cookies()
+            logger.info("browser_login: MFA required, returning for manual completion",
+                        url=page.url)
+            return {
+                "ok": False,
+                "url": page.url,
+                "logged_in": False,
+                "mfa_required": True,
+                "cookies_count": len(cookies),
+                "cookies": cookies,
+            }
+
+        # Determine if login succeeded: not on a login page and not on an IdP domain
+        final_path = final_url_lower.split("?")[0]
+        login_paths = ("/login", "/signin", "/sign_in", "/sign-in",
+                        "/auth/login", "/u/login", "/authorize")
+        on_login_page = any(final_path.endswith(p) or f"{p}/" in final_path
+                           for p in login_paths)
+        on_sso_domain = any(d in final_url_lower for d in self._SSO_DOMAINS)
+        logged_in = not on_login_page and not on_sso_domain
+
         cookies = await self.export_cookies()
         csrf_token = cookies.get("CSRF-TOKEN")
 

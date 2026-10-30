@@ -171,12 +171,17 @@ Operational notes:
 - Auth walls / captchas: if a response looks like a login/challenge, DO NOT just wait
   for the operator. Use browser_login as step 0 to authenticate — it handles multi-step
   login flows (email-first, then password) autonomously, discovers form fields, fills
-  credentials, clicks submit, and exports session + CSRF cookies automatically. Only
-  fall back to manual browser_navigate/fill/click if browser_login fails for an unusual
-  login form. After browser_login succeeds, use browser_fetch for authenticated API calls
-  (it uses the browser's own cookies natively — no CSRF mismatch). Use send_request when
-  you need the request to appear in proxy history. Only ask the operator for help if you
-  genuinely cannot log in (captcha, SSO redirect, no credentials).
+  credentials, clicks submit, and exports session + CSRF cookies automatically.
+  browser_login also handles SSO/Auth0/Okta cross-domain flows: it follows redirects
+  to the IdP domain, fills password there, and detects when MFA is required. If it
+  returns mfa_required=true, the operator must complete the MFA challenge manually
+  (browser is visible on their screen). Only fall back to manual
+  browser_navigate/fill/click if browser_login fails for an unusual login form.
+  After browser_login succeeds, use send_request for authenticated API calls — the
+  CSRF token and session cookies are auto-injected. Use send_request (not
+  browser_fetch) for GraphQL/API calls because browser_fetch has a proxy
+  interference issue. Only ask the operator for help if you genuinely cannot log
+  in (captcha, no credentials).
 - Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
   may need time to render, or the URL may be wrong. Before giving up: (1) check
   get_history for the same host to find URLs that returned real content — the operator's

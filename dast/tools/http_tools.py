@@ -115,6 +115,15 @@ _SEND_REQUEST_SCHEMA: Dict[str, Any] = {
             "description": "Optional request headers.",
         },
         "body": {"type": "string", "description": "Optional request body for methods that take one."},
+        "follow_redirects": {
+            "type": "boolean",
+            "description": (
+                "Whether to follow HTTP redirects (default true). Set to false to capture "
+                "the raw 302/301 response and its Location header without following it. "
+                "Useful for inspecting redirect targets (e.g. OAuth authorize URLs)."
+            ),
+            "default": True,
+        },
     },
     "required": ["url"],
 }
@@ -202,9 +211,10 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     try:
         import httpx
 
+        follow = bool(args.get("follow_redirects", True))
         request_body = body if method in ("POST", "PUT", "PATCH", "DELETE") else ""
         async with httpx.AsyncClient(
-            proxy=ctx.proxy_url, verify=False, follow_redirects=True, timeout=15,
+            proxy=ctx.proxy_url, verify=False, follow_redirects=follow, timeout=15,
         ) as client:
             resp = await client.request(
                 method, url, headers=headers or None,
@@ -363,6 +373,9 @@ register(Tool(
         "Set-Cookie the server issued is returned as the 'set_cookies' list (including cookies "
         "set on any redirect hop) -- read that, not 'headers', to observe issued cookies, since "
         "'headers' collapses repeated Set-Cookie to one value.\n"
+        "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
+        "without following the redirect chain. This is useful when you need to inspect redirect "
+        "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
         "Use this when: reproducing or probing a specific endpoint, testing whether a "
         "payload reflects/changes behavior, replaying a captured request with a tweak, or "
         "delivering an SSRF/XXE payload that embeds an OOB URL from oob_generate.\n"

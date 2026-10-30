@@ -58,6 +58,24 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   creates persisted scope rules.
 - [x] **graphql_type_info filter/limit** — `filter` (case-insensitive field name match) and
   `limit` (default 50) parameters added. Response includes `total_fields` and `truncated`.
+- [ ] **send_request follow_redirects option** — add `follow_redirects: false` parameter to
+  send_request so the copilot can capture 302 Location headers without following them.
+  During IS-8600 testing, the copilot needed the Auth0 /authorize redirect URL but
+  send_request always followed it. Currently the only way to see the Location is via
+  proxy history, which the copilot can't query mid-test.
+- [ ] **Match-replace on response headers not working** — the match-replace rule with
+  `scope: response, type: header` did not modify the Location header of a 302 response
+  during IS-8600 testing. The request URL scope worked. Need to investigate if response
+  header match-replace is implemented correctly in the proxy.
+- [ ] **Auto-relogin should work cross-domain** — `_last_login` stores the login URL but
+  after SSO redirect the session cookies are on a different domain. When the API domain
+  returns 401, auto-relogin should use the original login URL (SSO entry point), not the
+  API domain. Currently only works for same-domain sessions.
+- [ ] **Copilot pentest aggression level** — the copilot is too cautious for pentest work:
+  asks for approval before every step, repeats the problem instead of trying alternatives,
+  blocks instead of retrying. Add a "pentest mode" to the autonomous prompt that: (a) tries
+  alternatives automatically before blocking, (b) retries on transient failures (401, timeout),
+  (c) only blocks for genuinely unresolvable issues (captcha, no credentials).
 - [ ] **browser_fetch direct mode** — for API calls, bypass the proxy by extracting browser
   cookies and using httpx directly. The proxy intercepts fetch() and desynchronizes CSRF
   tokens. Same root cause as the Repeater cookie isolation issue.

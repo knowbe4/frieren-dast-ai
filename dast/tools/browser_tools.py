@@ -136,3 +136,128 @@ register(Tool(name="browser_wait_for", input_schema=_SEL_SCHEMA, handler=_wait_f
 register(Tool(name="browser_extract", input_schema=_SEL_SCHEMA, handler=_extract, tags=["browser", "read"],
     description="Read a value from the current page: an input's value (default), an element's text, or any HTML attribute. "
                 "Use to pull a fresh CSRF/hidden token out of a form before building a request."))
+
+
+_LOGIN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "Login page URL (e.g. https://app.example.com/login)."},
+        "email": {"type": "string", "description": "Email / username to log in with."},
+        "password": {"type": "string", "description": "Password for the account."},
+    },
+    "required": ["url", "email", "password"],
+}
+
+
+async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    browser = _browser(ctx)
+    if browser is None:
+        return _unavailable()
+    url = str(args.get("url", "")).strip()
+    email = str(args.get("email", "")).strip()
+    password = str(args.get("password", ""))
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not email:
+        return {"ok": False, "error": "email is required"}
+    if not password:
+        return {"ok": False, "error": "password is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+    try:
+        result = await browser.login(url, email, password)
+        if result.get("ok") and result.get("cookies"):
+            session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+            if session is not None and hasattr(session, "_session_cookies"):
+                session._session_cookies.update(result["cookies"])
+                logger.info("browser_login: synced cookies to copilot session",
+                            count=len(result["cookies"]))
+            if session is not None and result.get("logged_in"):
+                session._last_login = {"url": url, "email": email, "password": password}
+        safe_result = {k: v for k, v in result.items() if k != "cookies"}
+        return safe_result
+    except Exception as exc:
+        return {"ok": False, "error": f"login failed: {str(exc)[:200]}", "url": url}
+
+
+register(Tool(name="browser_login", input_schema=_LOGIN_SCHEMA, handler=_login,
+    tags=["browser", "active"],
+    description="Autonomous login via the agent browser. Handles multi-step flows "
+                "(email-first, then password on a second page) like KMSAT, Okta, and "
+                "other SSO-style login pages. Clears stale cookies, discovers form "
+                "fields automatically, fills credentials, clicks submit, waits for "
+                "redirect, and exports the resulting session cookies (including CSRF "
+                "tokens set on page load). Use this as step 0 before any authenticated "
+                "testing. Returns logged_in status, final URL, and cookie count."))
+
+
+_FETCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "URL to fetch (absolute or relative to current page origin)."},
+        "method": {"type": "string", "description": "HTTP method (default POST).", "default": "POST"},
+        "headers": {"type": "object", "description": "Request headers (Content-Type defaults to application/json)."},
+        "body": {"type": "string", "description": "Request body (JSON string for POST/PUT)."},
+    },
+    "required": ["url"],
+}
+
+
+async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    browser = _browser(ctx)
+    if browser is None:
+        return {"ok": False, "error": "browser driving is not available in this context"}
+    page = await browser._ensure_page()
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    method = str(args.get("method", "POST")).upper()
+    headers = dict(args.get("headers") or {"Content-Type": "application/json"})
+    body = args.get("body")
+    result = await page.evaluate("""async (args) => {
+        try {
+            // Resolve relative URLs against the current page origin
+            let targetUrl = args.url;
+            if (targetUrl.startsWith('/')) {
+                targetUrl = window.location.origin + targetUrl;
+            }
+            // Auto-inject CSRF token from cookies if not already in headers
+            const hdrsLower = Object.fromEntries(
+                Object.entries(args.headers).map(([k,v]) => [k.toLowerCase(), v])
+            );
+            if (!hdrsLower['x-csrf-token']) {
+                const csrfMatch = document.cookie.match(/CSRF-TOKEN=([^;]+)/);
+                if (csrfMatch) {
+                    args.headers['X-CSRF-Token'] = decodeURIComponent(csrfMatch[1]);
+                }
+            }
+            if (!hdrsLower['x-requested-with']) {
+                args.headers['X-Requested-With'] = 'XMLHttpRequest';
+            }
+            const opts = {
+                method: args.method,
+                headers: args.headers,
+                credentials: 'include',
+            };
+            if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
+                opts.body = args.body;
+            }
+            const resp = await fetch(targetUrl, opts);
+            const text = await resp.text();
+            const respHdrs = {};
+            resp.headers.forEach((v, k) => { respHdrs[k] = v; });
+            return { ok: true, status: resp.status, headers: respHdrs,
+                     body: text.substring(0, 50000), length: text.length };
+        } catch (e) {
+            return { ok: false, error: e.message };
+        }
+    }""", {"url": url, "method": method, "headers": headers, "body": body})
+    return result
+
+
+register(Tool(name="browser_fetch", input_schema=_FETCH_SCHEMA, handler=_fetch, tags=["browser", "active"],
+    description="Make an HTTP request from inside the browser using fetch(). Uses the browser's own cookies "
+                "(session, CSRF) automatically — no proxy, no cookie jar issues. Use this for authenticated "
+                "API calls after logging in via browser_navigate/browser_fill/browser_click. More reliable "
+                "than send_request for SPAs that manage cookies client-side (e.g. CSRF tokens set on page "
+                "load). The request does NOT appear in proxy history."))

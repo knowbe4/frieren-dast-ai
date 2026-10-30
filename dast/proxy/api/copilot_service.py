@@ -133,13 +133,45 @@ _AUTONOMOUS_START = (
     "registered; a raw request that you eyeball registers nothing.\n"
     "- crawl / content_discovery / param_mining to expand the surface; get_history to reuse what "
     "you already captured; record_finding for anything you confirm yourself.\n"
+    "- browser_navigate / browser_snapshot / browser_fill / browser_click to INTERACT with the "
+    "app like a real user: load pages, read form structures, fill fields, click buttons. This is "
+    "how you understand what each endpoint does and what parameters mean before you test them.\n"
+    "- browser_fetch to make authenticated API calls (GraphQL, REST) from inside the browser. "
+    "It uses the browser's own cookies (session, CSRF) automatically — more reliable than "
+    "send_request for SPAs. Use after logging in via browser tools.\n"
     "- send_request / validate_chain ONLY for a targeted check no dedicated tool covers.\n"
-    "BE A PENTESTER, NOT A READER. When you observe auth material (decode JWTs and reason about "
-    "claims/roles/expiry), permission or ACL maps (e.g. /spa/session), or user-scoped endpoints "
-    "(e.g. /lx/profile), form a concrete hypothesis and TEST it: IDOR/BOLA by swapping ids or "
-    "account context, privilege escalation, mass assignment, reflected/stored XSS, parameter "
-    "tampering. Non-destructive, detection-only, any time delay <= 5s. Reading an endpoint and "
+    "BE A PENTESTER, NOT A SCANNER. Your edge over the automated agents is UNDERSTANDING the app:\n"
+    "0. AUTHENTICATE like a human: if you have credentials, use browser_navigate to the login "
+    "page, browser_snapshot to see the form, browser_fill to enter email/password, browser_click "
+    "to submit. This gives you session cookies AND CSRF tokens (set on page load). Then use "
+    "send_request for API testing — the cookies from the browser are in the proxy jar. Never "
+    "skip this step and go straight to send_request with raw cookies — apps need CSRF tokens "
+    "that are only set when a real browser loads the page.\n"
+    "1. EXPLORE interactively: browser_navigate to key pages, browser_snapshot to read what the "
+    "UI shows (forms, fields, user data, role indicators). Read get_history to see the API calls "
+    "each page makes. Decode JWTs and reason about claims/roles/expiry.\n"
+    "2. REASON about parameters: for every state-changing endpoint, examine each parameter by "
+    "name. Is it an identity field (user_id, email, account_id, org_id)? A role/privilege "
+    "field (role, is_admin, permission)? A resource reference (file_path, url, redirect)? "
+    "Each category implies a specific test.\n"
+    "3. TEST with precision: IDOR/BOLA by swapping identity values, mass assignment by adding "
+    "role/privilege fields the client does not send, privilege escalation by replaying a "
+    "low-privilege session's request against a high-privilege endpoint (use idor_probe when the "
+    "pattern is stored-object BOLA). Always compare against a baseline — a finding needs a "
+    "differential, not a guess.\n"
+    "Non-destructive, detection-only, any time delay <= 5s. Reading an endpoint and "
     "moving on WITHOUT testing it is a failure.\n\n"
+    "PENTEST MINDSET — be resilient, not passive:\n"
+    "- If a request fails (401, 302 to login, timeout), retry with a different approach "
+    "before asking the operator. Try: re-login with browser_login, use cookies from "
+    "get_history, try a different path.\n"
+    "- If session expired, use browser_login to re-authenticate immediately — do not ask "
+    "the operator unless MFA is needed and the browser is headless.\n"
+    "- If a URL returns 404 or you are unsure of the hostname, check get_history for the "
+    "correct host and path pattern, then retry. NEVER invent placeholder hostnames.\n"
+    "- Only block and ask the operator for: captcha that needs human eyes, MFA OTP entry "
+    "in a headless browser, credentials you do not have.\n"
+    "- Never describe the same error twice without trying a fix between descriptions.\n\n"
     "COVER THE WHOLE SURFACE — breadth first, then depth. Map every endpoint (crawl) and "
     "every GraphQL endpoint's schema (graphql_introspect), then TEST all of it: scan_surface "
     "scans every observed-but-unscanned REST endpoint in one call, and graphql_sweep exercises "
@@ -160,13 +192,18 @@ _AUTONOMOUS_START = (
 
 _AUTONOMOUS_CONTINUE = (
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
-    "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding), and actively "
-    "TEST leads (IDOR/BOLA/XSS/privilege/param-tampering), don't just map them.\n"
+    "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding, "
+    "browser_navigate, browser_snapshot, send_request), and actively TEST leads "
+    "(IDOR/BOLA/XSS/privilege/mass-assignment/param-tampering) with parameter-level reasoning, "
+    "don't just map them.\n"
     "{read_only}"
     "Progress so far: {progress}. Budget remaining: {budget}.\n\n"
     "{leads}\n\n"
     "{router}"
     "{coverage}\n\n"
+    "If a request fails (401/timeout/302-to-login), retry with a different approach "
+    "(re-login, different cookies, correct URL from get_history) before blocking. Only "
+    "block for genuinely unresolvable issues (captcha, missing credentials, MFA in headless).\n"
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
     "blocked (say what a vulnerable vs. normal response would look like)."
@@ -176,7 +213,8 @@ _AUTONOMOUS_SELF_PROCEED = (
     "You set blocked_reason='{reason}', but this is NOT a genuine blocker — you do not need my "
     "permission to run safe, in-scope next steps you have already planned. Proceed autonomously "
     "right now: execute your plan with the internal tools (run_scan, scan_surface, idor_probe, "
-    "param_mining, validate_chain, record_finding). Reserve a blocked_reason for a TRUE blocker "
+    "param_mining, validate_chain, record_finding, browser_navigate, browser_snapshot, "
+    "send_request). Reserve a blocked_reason for a TRUE blocker "
     "only I can resolve: a credential/value I hold, or an out-of-scope authorization decision — "
     "never to confirm a step you can already take. Progress: {progress}. Budget: {budget}.\n\n"
     "{leads}\n\n"
@@ -190,7 +228,12 @@ _AUTONOMOUS_COVERAGE_GATE = (
     "{coverage}\n\n"
     "Close these gaps now: run scan_surface until it reports remaining=0, and graphql_sweep on "
     "each introspected GraphQL endpoint until operations_remaining=0 (crawl / graphql_introspect "
-    "first if the surface is not yet mapped). Then go deep on anything they flag. Budget "
+    "first if the surface is not yet mapped). Then go deep on anything they flag.\n\n"
+    "After closing automated scan gaps, go DEEP on the high-value leads: examine state-changing "
+    "endpoints for business-logic bugs (identity parameter manipulation, mass assignment, "
+    "privilege boundaries) using browser_navigate + browser_snapshot to understand the UI, then "
+    "send_request with parameter-level reasoning. The automated agents cover injection vulns; "
+    "your job in this phase is the auth/logic bugs they miss. Budget "
     "remaining: {budget}. Only set 'complete' once every endpoint and operation has been tested."
 )
 
@@ -264,11 +307,16 @@ class CopilotService:
             for k in oldest[:len(self._sessions) - _MAX_SESSIONS]:
                 self._sessions.pop(k, None)
 
-    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
+    def _init_engine(self, sid: str, focus_hosts: Optional[List[str]] = None):
         from dast.ai.copilot import CopilotSession
+        engine = CopilotSession(sid, focus_hosts=focus_hosts)
+        engine._store = self._ctx.store
+        return engine
+
+    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
         sid = str(uuid.uuid4())[:12]
         self._sessions[sid] = {
-            "engine": CopilotSession(sid, focus_hosts=focus_hosts),
+            "engine": self._init_engine(sid, focus_hosts),
             "status": "idle",
             "created_at": time.time(),
             "updated_at": time.time(),
@@ -764,6 +812,10 @@ class CopilotService:
         # Release a guidance escalation, if one is waiting.
         session["_pause_result"] = {"action": "abort"}
         session["_pause_event"].set()
+        # Clear stale pause state so the UI does not show guidance controls
+        # on a stopped session.
+        session["pause"] = None
+        auto["status"] = "stopped"
         task = session.get("_task")
         if task is not None and not task.done():
             task.cancel()
@@ -982,6 +1034,7 @@ class CopilotService:
             if self._ctx.store is not None:
                 self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
+        session["pause"] = None
         session["updated_at"] = time.time()
 
         # Clean up resources the copilot acquired during the run.
@@ -1375,12 +1428,21 @@ class CopilotService:
         if mode == "complete" and not auto.get("initial_explore_done"):
             await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
+            auto["breadth_done"] = True
             await self._session_keepalive(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        breadth_note = (
+            "[BREADTH PHASE COMPLETE] The automated scan arsenal has already covered every "
+            "discovered REST endpoint and GraphQL operation. Your job now is DEPTH: examine "
+            "the high-value leads for business-logic, auth, and access-control issues that "
+            "automated payload injection misses. Use browser tools to interact with the app, "
+            "send_request to test parameter manipulation hypotheses, and idor_probe for stored-"
+            "object BOLA. Focus on state-changing endpoints with identity-bearing parameters.\n\n"
+        ) if auto.get("breadth_done") else ""
         start_hosts = self._effective_hosts(auto["hosts"])
-        prompt = _AUTONOMOUS_START.format(
+        prompt = breadth_note + _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(start_hosts),
             router=self._router_block(start_hosts),

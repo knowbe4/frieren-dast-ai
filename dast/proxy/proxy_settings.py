@@ -437,6 +437,17 @@ class ProxySettings:
         with self._lock:
             return list(self._scope_rules)
 
+    def get_scope_hosts(self) -> List[str]:
+        """Extract unique host patterns from enabled include scope rules."""
+        with self._lock:
+            hosts: List[str] = []
+            for rule in self._scope_rules:
+                if rule.get("kind") == "include" and rule.get("enabled", True):
+                    host = (rule.get("host") or "").strip()
+                    if host and host not in hosts:
+                        hosts.append(host)
+            return hosts
+
     # ── project settings (scope snapshots) ────────────────────────────
 
     def save_project(self, name: str) -> str:

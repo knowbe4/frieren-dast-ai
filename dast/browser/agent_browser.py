@@ -48,13 +48,25 @@ _SNAPSHOT_JS = r"""
 
 
 class AgentBrowser:
-    """One lazily-launched headless browser page, driven by the browser_* tools."""
+    """Browser page driven by the browser_* tools.
+
+    Headed (visible) by default so the operator can complete MFA prompts,
+    captchas, and other interactive challenges that automation cannot handle.
+    Set ``headless=True`` via the constructor or the ``BROWSER_HEADLESS=true``
+    env var for CI/unattended runs — note that any login flow requiring manual
+    interaction (MFA, captcha) will fail in headless mode.
+    """
 
     def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None,
-                 read_only: bool = False) -> None:
+                 read_only: bool = False, headless: Optional[bool] = None) -> None:
         self._proxy_port = proxy_port
         self._store = store
         self._read_only = read_only
+        if headless is not None:
+            self._headless = headless
+        else:
+            import os
+            self._headless = os.environ.get("BROWSER_HEADLESS", "").lower() in ("true", "1", "yes")
         self._pw_ctx: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -72,10 +84,13 @@ class AgentBrowser:
             self._pw_ctx = async_playwright()
             pw = await self._pw_ctx.__aenter__()
             self._browser = await pw.chromium.launch(
-                headless=True,
+                headless=self._headless,
                 proxy={"server": f"http://127.0.0.1:{self._proxy_port}"},
                 args=["--ignore-certificate-errors"],
             )
+            if not self._headless:
+                logger.info("AgentBrowser launched in headed mode (visible window)")
+
             self._context = await self._browser.new_context(ignore_https_errors=True)
             if self._read_only:
                 from dast.utils.read_only import make_route_guard
@@ -111,8 +126,30 @@ class AgentBrowser:
             except Exception as exc:
                 logger.warning("AgentBrowser: add_cookies failed", error=str(exc))
 
+    async def export_cookies(self) -> Dict[str, str]:
+        """Export all browser cookies as a {name: value} dict for send_request fallback."""
+        if self._context is None:
+            return {}
+        try:
+            cookies = await self._context.cookies()
+            return {c["name"]: c["value"] for c in cookies if c.get("name")}
+        except Exception as exc:
+            logger.debug("AgentBrowser: export_cookies failed", error=str(exc))
+            return {}
+
+    async def clear_cookies(self) -> None:
+        """Clear all browser cookies so stale sessions don't interfere with login."""
+        if self._context is not None:
+            try:
+                await self._context.clear_cookies()
+                logger.info("AgentBrowser cookies cleared")
+            except Exception as exc:
+                logger.debug("AgentBrowser: clear_cookies failed", error=str(exc))
+
     async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         page = await self._ensure_page()
+        if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
+            await self.clear_cookies()
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
                 "title": await page.title()}
@@ -156,6 +193,225 @@ class AgentBrowser:
         page = await self._ensure_page()
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
+
+    _EMAIL_SELECTORS = [
+        "#REGISTRATION-EMAIL", "#LOGIN-EMAIL", "#email",
+        "input[type=email]", "input[name=email]",
+        "input[name=username]", "input[name=login]",
+    ]
+    _SUBMIT_SELECTORS = [
+        "#LOGIN-SUBMIT-BTN", "button[type=submit]",
+        "button[data-action-button-primary=true]",
+        "button:has-text('Continue')", "button:has-text('Next')",
+        "button:has-text('Log In')", "button:has-text('Sign In')",
+        "input[type=submit]",
+    ]
+    _PASSWORD_SELECTORS = [
+        "#LOGIN-PASSWORD", "input[type=password]",
+        "#password", "input[name=password]",
+    ]
+    _SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
+                    "accounts.google", "hrmauth", "cognito")
+    _MFA_INDICATORS = ("/mfa", "/otp", "/challenge", "/two-factor",
+                       "/u/mfa-otp-challenge", "/u/mfa-detect-browser")
+
+    async def login(self, url: str, email: str, password: str,
+                    timeout_ms: int = 30000) -> Dict[str, Any]:
+        """Autonomous multi-step login: email -> [Continue] -> password -> submit.
+
+        Handles single-page, two-step, and SSO/Auth0 cross-domain flows:
+        - Single-page: email + password on one page, click submit.
+        - Two-step (KMSAT): email -> Continue -> password appears on same domain.
+        - SSO (Auth0/Okta): email -> Continue -> redirect to IdP domain ->
+          password on IdP -> MFA prompt -> redirect back to app.
+        If MFA is required, returns mfa_required=True so the operator can
+        complete the challenge manually.
+        """
+        page = await self._ensure_page()
+        await self.clear_cookies()
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        except Exception as exc:
+            return {"ok": False, "error": f"navigate failed: {str(exc)[:200]}"}
+
+        async def _find_visible(selectors: List[str]) -> Any:
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        return loc.first
+                except Exception:
+                    continue
+            return None
+
+        email_field = await _find_visible(self._EMAIL_SELECTORS)
+        if email_field is None:
+            return {"ok": False, "error": "no email field found on the page",
+                    "url": page.url}
+
+        await email_field.fill(email)
+        logger.info("browser_login: filled email", url=page.url)
+
+        submit_btn = await _find_visible(self._SUBMIT_SELECTORS)
+        if submit_btn is None:
+            return {"ok": False, "error": "no submit button found after email",
+                    "url": page.url}
+        pre_submit_url = page.url
+        await submit_btn.click()
+        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+
+        # Detect SSO redirect: the page may have navigated to an IdP domain
+        if page.url != pre_submit_url:
+            logger.info("browser_login: page navigated after email submit",
+                        from_url=pre_submit_url[:60], to_url=page.url[:60])
+
+        password_field = None
+        for _attempt in range(3):
+            logger.debug("browser_login: password field attempt",
+                         attempt=_attempt + 1, url=page.url)
+            for sel in self._PASSWORD_SELECTORS:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.wait_for(state="visible", timeout=5000)
+                        password_field = loc.first
+                        break
+                except Exception:
+                    continue
+            if password_field is not None:
+                break
+            if _attempt == 1:
+                retry_btn = await _find_visible(self._SUBMIT_SELECTORS)
+                if retry_btn is not None:
+                    logger.info("browser_login: re-clicking submit (SPA may not have registered first click)")
+                    await retry_btn.click()
+                    await page.wait_for_timeout(3000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    continue
+            await page.wait_for_timeout(2000)
+
+        if password_field is None:
+            snapshot = None
+            try:
+                snapshot = await self.snapshot()
+            except Exception:
+                pass
+            logger.warning("browser_login: no password field after retries",
+                           url=page.url, snapshot_buttons=len(
+                               (snapshot or {}).get("buttons", [])))
+            return {
+                "ok": False,
+                "error": "no password field found after email submission",
+                "url": page.url,
+                "snapshot": snapshot,
+                "cookies": await self.export_cookies(),
+            }
+
+        logger.info("browser_login: two-step flow, filling password")
+        for sel in self._EMAIL_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    current_val = await loc.first.input_value()
+                    if not current_val or current_val != email:
+                        await loc.first.fill(email)
+                    break
+            except Exception:
+                continue
+
+        await password_field.fill(password)
+
+        submit_btn2 = await _find_visible(self._SUBMIT_SELECTORS)
+        if submit_btn2 is not None:
+            try:
+                async with page.expect_navigation(
+                    wait_until="networkidle", timeout=15000
+                ):
+                    await submit_btn2.click()
+            except Exception as exc:
+                logger.debug("browser_login: nav wait ended", error=str(exc)[:100])
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(3000)
+
+        # Detect MFA prompt: still on IdP with a challenge path
+        final_url_lower = page.url.lower()
+        mfa_required = any(ind in final_url_lower for ind in self._MFA_INDICATORS)
+        if not mfa_required:
+            # Also check for OTP/code input fields on the page
+            try:
+                otp_loc = page.locator("input[name=code], input[name=otp], input[type=tel][maxlength='6']")
+                if await otp_loc.count() > 0:
+                    mfa_required = True
+            except Exception:
+                pass
+
+        if mfa_required:
+            if not self._headless:
+                logger.info("browser_login: MFA detected, waiting for operator "
+                            "to complete in visible browser", url=page.url)
+                for _poll in range(24):
+                    await page.wait_for_timeout(5000)
+                    poll_url = page.url.lower()
+                    still_mfa = any(ind in poll_url for ind in self._MFA_INDICATORS)
+                    on_sso = any(d in poll_url for d in self._SSO_DOMAINS)
+                    if not still_mfa and not on_sso:
+                        logger.info("browser_login: MFA completed by operator",
+                                    url=page.url)
+                        mfa_required = False
+                        break
+                    if _poll % 6 == 0:
+                        logger.debug("browser_login: waiting for MFA completion",
+                                     attempt=_poll, url=page.url[:60])
+
+            if mfa_required:
+                cookies = await self.export_cookies()
+                logger.info("browser_login: MFA not completed within timeout",
+                            url=page.url)
+                return {
+                    "ok": False,
+                    "url": page.url,
+                    "logged_in": False,
+                    "mfa_required": True,
+                    "cookies_count": len(cookies),
+                    "cookies": cookies,
+                }
+
+        # Re-read the current URL (may have changed during MFA polling)
+        current_url = page.url.lower()
+        final_path = current_url.split("?")[0]
+        login_paths = ("/login", "/signin", "/sign_in", "/sign-in",
+                        "/auth/login", "/u/login", "/authorize")
+        on_login_page = any(final_path.endswith(p) or f"{p}/" in final_path
+                           for p in login_paths)
+        on_sso_domain = any(d in current_url for d in self._SSO_DOMAINS)
+        logged_in = not on_login_page and not on_sso_domain
+
+        cookies = await self.export_cookies()
+        csrf_token = cookies.get("CSRF-TOKEN")
+
+        logger.info("browser_login: complete",
+                     logged_in=logged_in, url=page.url, cookies=len(cookies))
+
+        return {
+            "ok": logged_in,
+            "url": page.url,
+            "logged_in": logged_in,
+            "cookies_count": len(cookies),
+            "csrf_token": csrf_token[:20] + "..." if csrf_token and len(csrf_token) > 20 else csrf_token,
+            "cookies": cookies,
+        }
 
     async def close(self) -> None:
         try:

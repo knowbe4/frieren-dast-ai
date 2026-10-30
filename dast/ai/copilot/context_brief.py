@@ -92,7 +92,10 @@ def _scope_hosts_block(store: Any) -> str:
         hosts = get_hosts()
         if not hosts:
             return ""
-        return "Target hosts in scope: " + ", ".join(hosts) + ". Always use these hosts for your requests."
+        return ("Target hosts in scope: " + ", ".join(hosts) + ". "
+                "ALWAYS use these hosts for requests. NEVER use placeholder hostnames "
+                "(example.com, localhost, unknown). If you need a URL and are unsure of "
+                "the host, check get_history for real URLs the operator has visited.")
     except Exception as exc:
         logger.warning("context brief: could not read scope hosts", error=str(exc))
         return ""

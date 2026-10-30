@@ -237,6 +237,8 @@ class AgentBrowser:
 
         password_field = None
         for _attempt in range(3):
+            logger.debug("browser_login: password field attempt",
+                         attempt=_attempt + 1, url=page.url)
             for sel in self._PASSWORD_SELECTORS:
                 try:
                     loc = page.locator(sel)
@@ -248,32 +250,63 @@ class AgentBrowser:
                     continue
             if password_field is not None:
                 break
+            if _attempt == 1:
+                retry_btn = await _find_visible(self._SUBMIT_SELECTORS)
+                if retry_btn is not None:
+                    logger.info("browser_login: re-clicking submit (SPA may not have registered first click)")
+                    await retry_btn.click()
+                    await page.wait_for_timeout(3000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    continue
             await page.wait_for_timeout(2000)
 
-        if password_field is not None:
-            logger.info("browser_login: two-step flow, filling password")
-            for sel in self._EMAIL_SELECTORS:
-                try:
-                    loc = page.locator(sel)
-                    if await loc.count() > 0 and await loc.first.is_visible():
-                        current_val = await loc.first.input_value()
-                        if not current_val or current_val != email:
-                            await loc.first.fill(email)
-                        break
-                except Exception:
-                    continue
+        if password_field is None:
+            snapshot = None
+            try:
+                snapshot = await self.snapshot()
+            except Exception:
+                pass
+            logger.warning("browser_login: no password field after retries",
+                           url=page.url, snapshot_buttons=len(
+                               (snapshot or {}).get("buttons", [])))
+            return {
+                "ok": False,
+                "error": "no password field found after email submission",
+                "url": page.url,
+                "snapshot": snapshot,
+                "cookies": await self.export_cookies(),
+            }
 
-            await password_field.fill(password)
+        logger.info("browser_login: two-step flow, filling password")
+        for sel in self._EMAIL_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    current_val = await loc.first.input_value()
+                    if not current_val or current_val != email:
+                        await loc.first.fill(email)
+                    break
+            except Exception:
+                continue
 
-            submit_btn2 = await _find_visible(self._SUBMIT_SELECTORS)
-            if submit_btn2 is not None:
-                try:
-                    async with page.expect_navigation(
-                        wait_until="networkidle", timeout=15000
-                    ):
-                        await submit_btn2.click()
-                except Exception as exc:
-                    logger.debug("browser_login: nav wait ended", error=str(exc)[:100])
+        await password_field.fill(password)
+
+        submit_btn2 = await _find_visible(self._SUBMIT_SELECTORS)
+        if submit_btn2 is not None:
+            try:
+                async with page.expect_navigation(
+                    wait_until="networkidle", timeout=15000
+                ):
+                    await submit_btn2.click()
+            except Exception as exc:
+                logger.debug("browser_login: nav wait ended", error=str(exc)[:100])
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass
 
         await page.wait_for_timeout(3000)
 

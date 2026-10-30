@@ -147,6 +147,18 @@ _TYPE_INFO_SCHEMA: Dict[str, Any] = {
                 "(e.g. 'User', 'PhishingCampaignAttributes', 'ApiScopes')."
             ),
         },
+        "filter": {
+            "type": "string",
+            "description": (
+                "Only return fields whose name contains this string (case-insensitive). "
+                "Use to narrow results for large types (e.g. filter='token' on Account type)."
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "description": "Maximum number of fields to return (default 50).",
+            "default": 50,
+        },
     },
     "required": ["url", "type_name"],
 }
@@ -192,6 +204,8 @@ def _lookup_type(schema: Dict[str, Any], type_name: str) -> Dict[str, Any]:
 async def _graphql_type_info(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     type_name = str(args.get("type_name", "")).strip()
+    field_filter = str(args.get("filter", "")).strip().lower()
+    limit = int(args.get("limit", 50) or 50)
     if not url:
         return {"ok": False, "error": "url is required"}
     if not type_name:
@@ -218,14 +232,24 @@ async def _graphql_type_info(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     out: Dict[str, Any] = {"ok": True, "name": type_name, "kind": kind}
 
     if kind == "ENUM":
-        out["enum_values"] = data.get("values", [])
+        values = data.get("values", [])
+        if field_filter:
+            values = [v for v in values if field_filter in v.lower()]
+        out["total_values"] = len(data.get("values", []))
+        out["enum_values"] = values[:limit]
+        out["filtered"] = bool(field_filter)
     elif kind == "UNION":
         out["possible_types"] = data.get("possible_types", [])
     elif kind in ("QUERY", "MUTATION"):
         out["args"] = data.get("args", [])
         out["return_type"] = data.get("return_type")
     else:
-        fields = data.get("fields", [])
+        raw_fields = data.get("fields", [])
+        total = len(raw_fields)
+        if field_filter:
+            raw_fields = [f for f in raw_fields if field_filter in f.get("name", "").lower()]
+        out["total_fields"] = total
+        out["filtered"] = bool(field_filter)
         out["fields"] = [
             {
                 "name": f["name"],
@@ -233,8 +257,11 @@ async def _graphql_type_info(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
                 "required": f.get("wrapper", "") == "NON_NULL",
                 "is_list": "LIST" in (f.get("wrapper") or ""),
             }
-            for f in fields
+            for f in raw_fields[:limit]
         ]
+        if len(raw_fields) > limit:
+            out["truncated"] = True
+            out["showing"] = limit
 
     return out
 
@@ -247,6 +274,9 @@ register(Tool(
         "been introspected first with graphql_introspect.\n"
         "Use this to look up field names and argument types BEFORE crafting a query or "
         "mutation — eliminates guessing and avoids GraphQL validation errors.\n"
+        "For large types (Account has 200+ fields), use the filter parameter to narrow "
+        "results (e.g. filter='token' returns only token-related fields). Default limit "
+        "is 50 fields; increase with the limit parameter if needed.\n"
         "Works for: object types (User, Account), input types (PhishingCampaignAttributes), "
         "enums (ApiScopes, TimeZones), unions, and root query/mutation fields."
     ),

@@ -452,6 +452,8 @@ class CopilotSession:
         self.messages: List[Dict[str, str]] = []
         self._seen_calls: set[str] = set()
         self._session_cookies: Dict[str, str] = {}
+        self._last_login: Optional[Dict[str, str]] = None
+        self._relogin_in_progress: bool = False
         self._auth_prompted_hosts: set[str] = set()
         self._store: Optional[object] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
@@ -816,6 +818,43 @@ class CopilotSession:
                                     self._session_cookies[name] = morsel.value
                             except Exception:
                                 pass
+                    if (
+                        tool_name == "send_request"
+                        and not self._relogin_in_progress
+                        and self._last_login is not None
+                    ):
+                        status = result.get("status")
+                        final_url = str(result.get("final_url") or result.get("url") or "").lower()
+                        login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
+                        session_expired = (
+                            (status == 302 and any(p in final_url for p in login_paths))
+                            or status == 401
+                        )
+                        if session_expired:
+                            browser = getattr(tool_ctx, "browser", None)
+                            if browser is not None:
+                                logger.info("auto-relogin: session expired, re-authenticating")
+                                self._relogin_in_progress = True
+                                try:
+                                    login_result = await browser.login(
+                                        self._last_login["url"],
+                                        self._last_login["email"],
+                                        self._last_login["password"],
+                                    )
+                                    if login_result.get("ok") and login_result.get("logged_in"):
+                                        if login_result.get("cookies"):
+                                            self._session_cookies.update(login_result["cookies"])
+                                        logger.info("auto-relogin: succeeded, retrying request")
+                                        self._apply_session_auth(tool_ctx, tool_args)
+                                        result = await run_tool(tool_ctx, tool_name, tool_args)
+                                    else:
+                                        logger.warning("auto-relogin: login failed",
+                                                       error=str(login_result.get("error", ""))[:100])
+                                except Exception as exc:
+                                    logger.warning("auto-relogin: exception", error=str(exc)[:200])
+                                finally:
+                                    self._relogin_in_progress = False
+
                     if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
                         new_url = str(result.get("url", ""))
                         if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():

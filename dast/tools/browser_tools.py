@@ -172,6 +172,8 @@ async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                 session._session_cookies.update(result["cookies"])
                 logger.info("browser_login: synced cookies to copilot session",
                             count=len(result["cookies"]))
+            if session is not None and result.get("logged_in"):
+                session._last_login = {"url": url, "email": email, "password": password}
         safe_result = {k: v for k, v in result.items() if k != "cookies"}
         return safe_result
     except Exception as exc:

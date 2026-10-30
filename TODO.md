@@ -47,19 +47,17 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   Requires the "Tool tabs server-side storage + API" item below. The copilot would call
   `save_to_repeater(name, request, response)` after a finding, so the operator can replay
   the exact request from the UI.
-- [ ] **browser_login auto-retry with snapshot feedback** — when password field not found
-  after 3 retries, take a browser_snapshot and include it in the error response so the
-  copilot LLM can see the DOM and adapt. Also retry the email submit click if it didn't
-  register (SPA timing).
-- [ ] **Auto-relogin on 302/401** — when send_request gets a 302 to /login or 401, and
-  `_last_login` credentials are stored, automatically re-login and retry the request once.
-  Prevents session expiry from breaking multi-step test sequences.
-- [ ] **Scope + target injection in copilot prompt** — inject current scope hosts into the
-  copilot system prompt so every session knows the target. Prevents the copilot from
-  navigating to wrong hosts (e.g. api.console.knowbe4.com instead of training.knowbe4.com).
-- [ ] **graphql_type_info filter/limit** — add optional `filter` (string match on field name)
-  and `limit` (default 50) parameters. Types like Account have hundreds of fields and
-  truncate the copilot's observation window.
+- [x] **browser_login auto-retry with snapshot feedback** — after 3 password-field retries
+  fail, takes a browser_snapshot and returns it in the error. Also retries the submit click
+  on attempt 2, and adds networkidle wait after password submit.
+- [x] **Auto-relogin on 302/401** — `_last_login` stores credentials from browser_login.
+  When send_request gets 302-to-login or 401, auto re-authenticates and retries once.
+  `_relogin_in_progress` flag prevents infinite loops.
+- [x] **Scope + target injection in copilot prompt** — `_scope_hosts_block()` in
+  context_brief.py injects current scope hosts. `POST /api/scan-config` with `target_hosts`
+  creates persisted scope rules.
+- [x] **graphql_type_info filter/limit** — `filter` (case-insensitive field name match) and
+  `limit` (default 50) parameters added. Response includes `total_fields` and `truncated`.
 - [ ] **browser_fetch direct mode** — for API calls, bypass the proxy by extracting browser
   cookies and using httpx directly. The proxy intercepts fetch() and desynchronizes CSRF
   tokens. Same root cause as the Repeater cookie isolation issue.

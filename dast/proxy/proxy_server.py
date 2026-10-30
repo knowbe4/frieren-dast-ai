@@ -292,9 +292,17 @@ class ProxyServer:
             resp_reason = resp.reason_phrase
 
             # ── Match & Replace (response phase) ──────────────────────────────
+            # Track whether any response rule fired so we use the modified
+            # headers when writing back to the client (below).
+            _resp_mr_applied = False
             if self._settings and headers.get(_SOURCE_HEADER) is None:
                 resp_headers_dict = dict(resp.headers.multi_items())
-                resp_headers_dict, body_bytes = self._settings.apply_to_response(resp_headers_dict, body_bytes)
+                modified_headers, body_bytes = self._settings.apply_to_response(
+                    dict(resp_headers_dict), body_bytes
+                )
+                if modified_headers != resp_headers_dict:
+                    _resp_mr_applied = True
+                    resp_headers_dict = modified_headers
             # ── End Match & Replace ────────────────────────────────────────────
 
             # ── Response intercept phase ───────────────────────────────────────
@@ -330,9 +338,14 @@ class ProxyServer:
             if entry_id:
                 # Build headers dict preserving multiple set-cookie values as a list
                 # so the session store cookie jar sees all of them.
+                # Use modified headers if response match-replace fired.
                 resp_headers_for_store: dict = {}
                 set_cookies = []
-                for k, v in resp.headers.multi_items():
+                header_source = (
+                    resp_headers_dict.items() if _resp_mr_applied
+                    else resp.headers.multi_items()
+                )
+                for k, v in header_source:
                     if k.lower() == "set-cookie":
                         set_cookies.append(v)
                     else:
@@ -352,10 +365,18 @@ class ProxyServer:
             # the last — which breaks CSRF tokens and CloudFront cookies.
             # Always strip content-length: httpx decompresses the body so the
             # original length is wrong, and we append our own correct value below.
-            resp_header_pairs = [
-                (k, v) for k, v in resp.headers.multi_items()
-                if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"
-            ]
+            # When response match-replace fired, use the modified headers dict
+            # instead of the original httpx headers.
+            if _resp_mr_applied:
+                resp_header_pairs = [
+                    (k, v) for k, v in resp_headers_dict.items()
+                    if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"
+                ]
+            else:
+                resp_header_pairs = [
+                    (k, v) for k, v in resp.headers.multi_items()
+                    if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"
+                ]
             # 304/204/1xx must not carry a body or content-length
             no_body = resp_status in (204, 304) or 100 <= resp_status < 200
             if not no_body:

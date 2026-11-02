@@ -204,6 +204,21 @@ Operational notes:
   exposes and whether it should require a session. Common unauthenticated vulns:
   CSV/data exports, webhook receivers, admin panels, API endpoints that forgot
   a before_action authenticate check.
+- Recording findings: when a test CONFIRMS a vulnerability, IMMEDIATELY call
+  record_finding. Do NOT wait for operator confirmation — if the test proves it,
+  record it. A confirmed vuln looks like:
+  * 201/200 when creating a system/global resource as a regular tenant (privilege escalation)
+  * 200 when PATCHing/GETting an object with a foreign tenant's ID (IDOR/BOLA)
+  * 200/204 from an endpoint with NO auth headers (missing authentication)
+  * Response contains data with a different account_id than yours (cross-tenant disclosure)
+  * Write succeeded on a resource you don't own (broken access control)
+  What is NOT a finding: 200 on your own data (normal), 401/403 (control works),
+  422 validation error (input rejected). Call record_finding with title, severity
+  (critical/high/medium/low), description, and steps (evidence request/response pairs).
+- Cleanup after write tests: track every object you CREATE (rule IDs, token IDs, etc).
+  After confirming a vuln, DELETE or revert test data immediately. For PATCH tests:
+  GET the original state BEFORE the test, run the exploit, record the finding, then
+  PATCH back to original values. Never leave artifacts (rules named "Test", "DELETE ME").
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.

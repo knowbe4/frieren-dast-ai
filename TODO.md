@@ -76,6 +76,18 @@ Improvements identified during HackerOne retest sessions (2026-10-01).
   blocks instead of retrying. Add a "pentest mode" to the autonomous prompt that: (a) tries
   alternatives automatically before blocking, (b) retries on transient failures (401, timeout),
   (c) only blocks for genuinely unresolvable issues (captcha, no credentials).
+- [x] **browser_fetch CORS fix** — replaced `page.evaluate(fetch())` with Playwright's
+  `page.request.fetch()` which bypasses CORS entirely. Cookies re-synced from proxy jar.
+- [x] **Browse session navigate/refresh API** — `POST /api/browse/navigate` and
+  `/api/browse/refresh` allow copilot to control operator's browser.
+- [x] **Cookie re-sync from proxy jar** — `resync_cookies()` and `ensure_fresh_cookies()`
+  (30s TTL) keep the AgentBrowser context current with the proxy jar.
+- [x] **Shared AgentBrowser across copilot sessions** — stored on CopilotService, not
+  per-session. Login state persists between messages. One browser window.
+- [x] **Copilot auto-record findings** — prompt teaches copilot to call record_finding
+  immediately when a test confirms a vuln (IDOR, privilege escalation, missing auth, etc.)
+- [x] **Copilot auto-cleanup after writes** — prompt instructs GET before PATCH, revert
+  after confirming, DELETE created test objects.
 - [ ] **browser_fetch direct mode** — for API calls, bypass the proxy by extracting browser
   cookies and using httpx directly. The proxy intercepts fetch() and desynchronizes CSRF
   tokens. Same root cause as the Repeater cookie isolation issue.

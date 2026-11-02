@@ -527,26 +527,29 @@ class CopilotSession:
         domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
         import time as _time
         for entry in reversed(entries):
-            entry_host = (entry.get("host") or "").lower()
-            if domain_suffix not in entry_host:
-                continue
-            req_headers = entry.get("request_headers") or {}
-            auth_val = ""
-            for k, v in req_headers.items():
-                if k.lower() == "authorization":
-                    auth_val = str(v)
-                    break
-            if not auth_val.startswith("Bearer "):
-                continue
-            token_val = auth_val[7:].strip()
-            exp = self._decode_jwt_exp(token_val)
-            now = _time.time()
-            if exp is not None and exp < now:
-                continue
-            entry_host_actual = entry.get("host") or host
-            auth_endpoint = entry.get("path") or None
-            source_id = entry.get("id") or ""
-            if entry.get("source") == "copilot":
+            try:
+                entry_host = (entry.get("host") or "").lower()
+                if domain_suffix not in entry_host:
+                    continue
+                req_headers = entry.get("request_headers") or {}
+                auth_val = ""
+                for k, v in req_headers.items():
+                    if k.lower() == "authorization":
+                        auth_val = str(v)
+                        break
+                if not auth_val.startswith("Bearer "):
+                    continue
+                token_val = auth_val[7:].strip()
+                exp = self._decode_jwt_exp(token_val)
+                now = _time.time()
+                if exp is not None and exp < now:
+                    continue
+                entry_host_actual = entry.get("host") or host
+                auth_endpoint = entry.get("path") or None
+                source_id = entry.get("id") or ""
+                if entry.get("source") == "copilot":
+                    continue
+            except Exception:
                 continue
             self._bearer_tokens[entry_host_actual] = {
                 "token": token_val,
@@ -1161,6 +1164,9 @@ class CopilotSession:
 
         if "authorization" not in present and host:
             cached = self._bearer_tokens.get(host)
+            if cached is None and store is not None:
+                self._capture_bearer_tokens(store, host)
+                cached = self._bearer_tokens.get(host)
             if cached:
                 import time as _time
                 exp = cached.get("exp")

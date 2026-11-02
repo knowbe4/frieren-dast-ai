@@ -411,6 +411,16 @@ async def _get_bearer_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str,
 
     if host:
         cached = bearer_tokens.get(host)
+        if cached is None and ctx.store:
+            try:
+                from dast.ai.copilot.session import CopilotSession
+                session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+                if session and hasattr(session, "_capture_bearer_tokens"):
+                    session._capture_bearer_tokens(ctx.store, host)
+                    bearer_tokens = getattr(ctx, "bearer_tokens", {})
+                    cached = bearer_tokens.get(host)
+            except Exception:
+                pass
         if cached:
             exp = cached.get("exp")
             expired = exp is not None and exp < now

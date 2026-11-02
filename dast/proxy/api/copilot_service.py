@@ -292,6 +292,19 @@ class CopilotService:
         # Hypothesis key -> session id, so re-exploring the same hypothesis
         # (e.g. a double-click) reuses the live session instead of duplicating it.
         self._hypothesis_sessions: Dict[str, str] = {}
+        # Shared AgentBrowser across all copilot sessions — login state, cookies,
+        # and page context persist between messages. One browser window, never
+        # recreated unless closed or crashed.
+        self._shared_browser: Any = None
+
+    async def close_browser(self) -> None:
+        """Close the shared AgentBrowser (e.g. on proxy shutdown)."""
+        if self._shared_browser is not None:
+            try:
+                await self._shared_browser.close()
+            except Exception as exc:
+                logger.debug("shared AgentBrowser close error", error=str(exc))
+            self._shared_browser = None
 
     # ── Session store ──────────────────────────────────────────────────────────
     def has(self, sid: str) -> bool:
@@ -581,20 +594,22 @@ class CopilotService:
         run_scan) reach the live queues through the extra fields; they are present
         only for the in-process copilot, so the tools degrade gracefully elsewhere."""
         ctx = self._ctx
-        # One AgentBrowser per session, created lazily and reused across turns so
-        # multi-step form state (and a fresh CSRF token) survives between tool calls.
-        browser = session.get("_agent_browser")
-        if browser is None:
+        # Shared AgentBrowser across ALL copilot sessions — login state, cookies,
+        # and page context persist between messages. Created lazily on first use;
+        # recreated if closed or crashed.
+        browser = self._shared_browser
+        if browser is None or getattr(browser, "_browser", None) is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
                 browser = AgentBrowser(
                     proxy_port=ctx.proxy_port, store=ctx.store,
                     read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
                 )
-                session["_agent_browser"] = browser
+                self._shared_browser = browser
             except Exception as exc:
                 logger.warning("could not create AgentBrowser", error=str(exc))
                 browser = None
+        session["_agent_browser"] = browser
         return AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
@@ -1043,14 +1058,9 @@ class CopilotService:
     def _cleanup_session(self, session: dict) -> None:
         """Release per-session resources: close the agent browser and remove any
         match/replace rules the copilot added (tagged with [copilot_session])."""
-        # Close the agent browser so it doesn't leak Playwright processes.
-        browser = session.pop("_agent_browser", None)
-        if browser is not None:
-            import asyncio
-            try:
-                asyncio.ensure_future(browser.close())
-            except Exception as exc:
-                logger.debug("AgentBrowser cleanup error", error=str(exc))
+        # Detach the shared browser from this session but do NOT close it —
+        # it persists across sessions so login state survives.
+        session.pop("_agent_browser", None)
         # Remove copilot-scoped match/replace rules so the operator's browsing
         # is not affected after the copilot finishes.
         settings = getattr(self._ctx, "settings", None)

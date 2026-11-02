@@ -247,9 +247,14 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 
     # Primary path: Playwright's network-level fetch (bypasses CORS entirely,
     # carries the browser context's cookies automatically).
+    # Strip Cookie/Authorization from caller-supplied headers — the browser
+    # context handles auth via its own cookie jar. Manual Cookie headers
+    # conflict with context cookies and cause "Invalid token" / "Access denied".
+    fetch_headers = {k: v for k, v in headers.items()
+                     if k.lower() not in ("cookie", "authorization")}
     primary_error = ""
     try:
-        fetch_kwargs: Dict[str, Any] = {"method": method, "headers": headers}
+        fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}
         if body and method in ("POST", "PUT", "PATCH", "DELETE"):
             fetch_kwargs["data"] = body
         response = await page.request.fetch(url, **fetch_kwargs)

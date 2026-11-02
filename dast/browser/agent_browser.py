@@ -243,7 +243,7 @@ class AgentBrowser:
                        "/u/mfa-otp-challenge", "/u/mfa-detect-browser")
 
     async def login(self, url: str, email: str, password: str,
-                    timeout_ms: int = 30000) -> Dict[str, Any]:
+                    timeout_ms: int = 60000) -> Dict[str, Any]:
         """Autonomous multi-step login: email -> [Continue] -> password -> submit.
 
         Handles single-page, two-step, and SSO/Auth0 cross-domain flows:
@@ -258,9 +258,13 @@ class AgentBrowser:
         await self.clear_cookies()
 
         try:
-            await page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         except Exception as exc:
             return {"ok": False, "error": f"navigate failed: {str(exc)[:200]}"}
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
 
         async def _find_visible(selectors: List[str]) -> Any:
             for sel in selectors:
@@ -272,7 +276,14 @@ class AgentBrowser:
                     continue
             return None
 
-        email_field = await _find_visible(self._EMAIL_SELECTORS)
+        email_field = None
+        for _email_attempt in range(3):
+            email_field = await _find_visible(self._EMAIL_SELECTORS)
+            if email_field is not None:
+                break
+            logger.debug("browser_login: email field not visible yet",
+                         attempt=_email_attempt + 1, url=page.url)
+            await page.wait_for_timeout(2000)
         if email_field is None:
             return {"ok": False, "error": "no email field found on the page",
                     "url": page.url}
@@ -288,17 +299,40 @@ class AgentBrowser:
         await submit_btn.click()
         await page.wait_for_timeout(3000)
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
 
-        # Detect SSO redirect: the page may have navigated to an IdP domain
-        if page.url != pre_submit_url:
-            logger.info("browser_login: page navigated after email submit",
+        # Detect SSO redirect: the page may have navigated to an IdP domain.
+        # Federated login often lands on a new email-first form on the IdP
+        # (e.g. PhishER → KMSAT SSO → email → Continue → password).
+        # If we detect an email field but no password, fill + submit again.
+        sso_redirected = page.url != pre_submit_url
+        if sso_redirected:
+            logger.info("browser_login: SSO redirect detected",
                         from_url=pre_submit_url[:60], to_url=page.url[:60])
+            await page.wait_for_timeout(3000)
+            idp_email = await _find_visible(self._EMAIL_SELECTORS)
+            idp_password = await _find_visible(self._PASSWORD_SELECTORS)
+            if idp_email is not None and idp_password is None:
+                logger.info("browser_login: IdP has email-first form, filling + submitting")
+                try:
+                    current_val = await idp_email.input_value()
+                    if not current_val or current_val != email:
+                        await idp_email.fill(email)
+                except Exception:
+                    await idp_email.fill(email)
+                idp_submit = await _find_visible(self._SUBMIT_SELECTORS)
+                if idp_submit is not None:
+                    await idp_submit.click()
+                    await page.wait_for_timeout(3000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
 
         password_field = None
-        for _attempt in range(3):
+        for _attempt in range(5):
             logger.debug("browser_login: password field attempt",
                          attempt=_attempt + 1, url=page.url)
             for sel in self._PASSWORD_SELECTORS:
@@ -312,18 +346,18 @@ class AgentBrowser:
                     continue
             if password_field is not None:
                 break
-            if _attempt == 1:
+            if _attempt == 2:
                 retry_btn = await _find_visible(self._SUBMIT_SELECTORS)
                 if retry_btn is not None:
                     logger.info("browser_login: re-clicking submit (SPA may not have registered first click)")
                     await retry_btn.click()
                     await page.wait_for_timeout(3000)
                     try:
-                        await page.wait_for_load_state("networkidle", timeout=8000)
+                        await page.wait_for_load_state("networkidle", timeout=10000)
                     except Exception:
                         pass
                     continue
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
         if password_field is None:
             snapshot = None
@@ -360,13 +394,13 @@ class AgentBrowser:
         if submit_btn2 is not None:
             try:
                 async with page.expect_navigation(
-                    wait_until="networkidle", timeout=15000
+                    wait_until="domcontentloaded", timeout=15000
                 ):
                     await submit_btn2.click()
             except Exception as exc:
                 logger.debug("browser_login: nav wait ended", error=str(exc)[:100])
             try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
 
@@ -424,6 +458,35 @@ class AgentBrowser:
                            for p in login_paths)
         on_sso_domain = any(d in current_url for d in self._SSO_DOMAINS)
         logged_in = not on_login_page and not on_sso_domain
+
+        # SSO flows may land back on /login even when authenticated (SPA
+        # hasn't checked session yet). If we have cookies but are still on
+        # a login page, navigate to the app root to trigger a client-side
+        # redirect to the dashboard.
+        if on_login_page and not on_sso_domain:
+            cookies_check = await self.export_cookies()
+            if len(cookies_check) >= 3:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                root_url = f"{parsed.scheme}://{parsed.netloc}/"
+                logger.info("browser_login: on login page with cookies, "
+                            "navigating to root to verify auth", root=root_url)
+                try:
+                    await page.goto(root_url, wait_until="domcontentloaded",
+                                    timeout=15000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    current_url = page.url.lower()
+                    final_path = current_url.split("?")[0]
+                    on_login_page = any(
+                        final_path.endswith(p) or f"{p}/" in final_path
+                        for p in login_paths)
+                    logged_in = not on_login_page
+                except Exception as exc:
+                    logger.debug("browser_login: root navigation failed",
+                                 error=str(exc)[:100])
 
         cookies = await self.export_cookies()
         csrf_token = cookies.get("CSRF-TOKEN")

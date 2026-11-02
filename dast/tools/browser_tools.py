@@ -203,6 +203,32 @@ _FETCH_SCHEMA = {
 }
 
 
+async def _resolve_url(page: Any, raw: str) -> str:
+    """Resolve a relative URL against the current page origin."""
+    if raw.startswith("/"):
+        parts = page.url.split("//", 1)
+        if len(parts) == 2:
+            origin = parts[0] + "//" + parts[1].split("/", 1)[0]
+            return origin + raw
+    return raw
+
+
+async def _inject_csrf(browser: Any, headers: Dict[str, str]) -> None:
+    """Auto-inject CSRF token and X-Requested-With if not already present."""
+    lower = {k.lower(): v for k, v in headers.items()}
+    if "x-csrf-token" not in lower:
+        try:
+            cookies = await browser.export_cookies()
+            csrf = cookies.get("CSRF-TOKEN") or cookies.get("XSRF-TOKEN") or ""
+            if csrf:
+                from urllib.parse import unquote
+                headers["X-CSRF-Token"] = unquote(csrf)
+        except Exception:
+            pass
+    if "x-requested-with" not in lower:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+
+
 async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     browser = _browser(ctx)
     if browser is None:
@@ -211,53 +237,66 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
         return {"ok": False, "error": "url is required"}
+    url = await _resolve_url(page, url)
     method = str(args.get("method", "POST")).upper()
     headers = dict(args.get("headers") or {"Content-Type": "application/json"})
     body = args.get("body")
-    result = await page.evaluate("""async (args) => {
-        try {
-            // Resolve relative URLs against the current page origin
-            let targetUrl = args.url;
-            if (targetUrl.startsWith('/')) {
-                targetUrl = window.location.origin + targetUrl;
-            }
-            // Auto-inject CSRF token from cookies if not already in headers
-            const hdrsLower = Object.fromEntries(
-                Object.entries(args.headers).map(([k,v]) => [k.toLowerCase(), v])
-            );
-            if (!hdrsLower['x-csrf-token']) {
-                const csrfMatch = document.cookie.match(/CSRF-TOKEN=([^;]+)/);
-                if (csrfMatch) {
-                    args.headers['X-CSRF-Token'] = decodeURIComponent(csrfMatch[1]);
-                }
-            }
-            if (!hdrsLower['x-requested-with']) {
-                args.headers['X-Requested-With'] = 'XMLHttpRequest';
-            }
-            const opts = {
-                method: args.method,
-                headers: args.headers,
-                credentials: 'include',
-            };
-            if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
-                opts.body = args.body;
-            }
-            const resp = await fetch(targetUrl, opts);
-            const text = await resp.text();
-            const respHdrs = {};
-            resp.headers.forEach((v, k) => { respHdrs[k] = v; });
-            return { ok: true, status: resp.status, headers: respHdrs,
-                     body: text.substring(0, 50000), length: text.length };
-        } catch (e) {
-            return { ok: false, error: e.message };
+
+    await _inject_csrf(browser, headers)
+
+    # Primary path: Playwright's network-level fetch (bypasses CORS entirely,
+    # carries the browser context's cookies automatically).
+    primary_error = ""
+    try:
+        fetch_kwargs: Dict[str, Any] = {"method": method, "headers": headers}
+        if body and method in ("POST", "PUT", "PATCH", "DELETE"):
+            fetch_kwargs["data"] = body
+        response = await page.request.fetch(url, **fetch_kwargs)
+        text = await response.text()
+        resp_headers = {k: v for k, v in response.headers.items()}
+        return {
+            "ok": True,
+            "status": response.status,
+            "headers": resp_headers,
+            "body": text[:50000],
+            "length": len(text),
         }
-    }""", {"url": url, "method": method, "headers": headers, "body": body})
-    return result
+    except Exception as exc:
+        primary_error = str(exc)[:100]
+        logger.debug("browser_fetch: page.request.fetch failed, trying in-page fallback",
+                     error=primary_error)
+
+    # Fallback: in-page JS fetch (works for same-origin; subject to CORS).
+    try:
+        result = await page.evaluate("""async (args) => {
+            try {
+                const opts = {
+                    method: args.method,
+                    headers: args.headers,
+                    credentials: 'include',
+                };
+                if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
+                    opts.body = args.body;
+                }
+                const resp = await fetch(args.url, opts);
+                const text = await resp.text();
+                const respHdrs = {};
+                resp.headers.forEach((v, k) => { respHdrs[k] = v; });
+                return { ok: true, status: resp.status, headers: respHdrs,
+                         body: text.substring(0, 50000), length: text.length };
+            } catch (e) {
+                return { ok: false, error: e.message };
+            }
+        }""", {"url": url, "method": method, "headers": headers, "body": body})
+        return result
+    except Exception as fallback_exc:
+        return {"ok": False, "error": f"fetch failed: {primary_error}; "
+                f"fallback also failed: {str(fallback_exc)[:100]}"}
 
 
 register(Tool(name="browser_fetch", input_schema=_FETCH_SCHEMA, handler=_fetch, tags=["browser", "active"],
-    description="Make an HTTP request from inside the browser using fetch(). Uses the browser's own cookies "
-                "(session, CSRF) automatically — no proxy, no cookie jar issues. Use this for authenticated "
-                "API calls after logging in via browser_navigate/browser_fill/browser_click. More reliable "
-                "than send_request for SPAs that manage cookies client-side (e.g. CSRF tokens set on page "
-                "load). The request does NOT appear in proxy history."))
+    description="Make an HTTP request using the browser's session (cookies, auth state). Works cross-origin "
+                "(no CORS restrictions) — use this for API calls to a different subdomain than the current "
+                "page (e.g. api.example.com from example.com). Automatically injects X-CSRF-Token from "
+                "browser cookies and X-Requested-With header. Relative URLs are resolved against the current "
+                "page origin. Use after logging in via browser_login or browser_navigate/fill/click."))

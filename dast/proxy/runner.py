@@ -465,6 +465,54 @@ class ProxyRunner:
                 job.get("result_cb", lambda r: None)(result)
                 continue
 
+            # ── navigate / refresh existing browse session ───────────────────
+            if action == "navigate":
+                target = _active
+                if job.get("name"):
+                    target = _named.get(job["name"])
+                if not target or not target.running or not target._context:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no active browse session"})
+                    continue
+                pages = target._context.pages
+                if not pages:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no page in browse session"})
+                    continue
+                page = pages[0]
+                try:
+                    await page.goto(job.get("url", ""), wait_until="domcontentloaded",
+                                    timeout=30000)
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": True, "url": page.url, "title": await page.title()})
+                except Exception as exc:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": str(exc)[:200]})
+                continue
+
+            if action == "refresh":
+                target = _active
+                if job.get("name"):
+                    target = _named.get(job["name"])
+                if not target or not target.running or not target._context:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no active browse session"})
+                    continue
+                pages = target._context.pages
+                if not pages:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no page in browse session"})
+                    continue
+                page = pages[0]
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": True, "url": page.url})
+                except Exception as exc:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": str(exc)[:200]})
+                continue
+
             # ── headless credential login ────────────────────────────────────
             if action == "credentials":
                 name = job.get("name", "")

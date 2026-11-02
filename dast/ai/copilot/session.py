@@ -129,9 +129,15 @@ failure.
 Each turn, respond with a single step object:
   action="call_tool" — run one tool. Set tool_name to the exact registered name and
       tool_args to its arguments. Understand the endpoint first: read the request/
-      response context before firing payloads. Detection only — never send a
-      destructive payload (data deletion/modification, DoS, > 5s delay); the tools
-      refuse these anyway. You may call several tools across a turn before replying.
+      response context before firing payloads. You MAY send write requests
+      (POST, PUT, PATCH, DELETE) for testing: creating test objects, testing
+      authorization boundaries (IDOR, privesc, mass assignment). You MUST NOT
+      send destructive payloads: mass deletion, DoS, delays > 5s, or actions
+      that permanently corrupt state beyond what you can immediately revert;
+      the tools refuse these anyway via payload_safety. When the operator
+      explicitly authorizes writes or says "do not stop" / "do not ask",
+      execute the full sequence without pausing for confirmation.
+      You may call several tools across a turn before replying.
       When you CONFIRM a real, exploitable issue, call record_finding to persist it
       to the Findings tab BEFORE you reply — a finding that only lives in your reply
       text is not tracked, reported, or exported. Redact secrets/token values in the
@@ -475,6 +481,8 @@ class CopilotSession:
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
         self._last_relogin_ts: float = 0.0
+        self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
+        self._last_bearer_refresh_ts: float = 0.0
         self._auth_prompted_hosts: set[str] = set()
         self._store: Optional[object] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
@@ -488,6 +496,70 @@ class CopilotSession:
     def get_known_hosts(self) -> List[str]:
         """All hosts this session has targeted (focus + any touched during tool calls)."""
         return sorted(set(self._focus_hosts) | self._context_hosts)
+
+    @staticmethod
+    def _decode_jwt_exp(token: str) -> Optional[float]:
+        """Extract the ``exp`` claim from a JWT without verifying the signature."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return None
+            import base64
+            payload = parts[1]
+            payload += "=" * (4 - len(payload) % 4)
+            import json as _json
+            claims = _json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp")
+            return float(exp) if exp is not None else None
+        except Exception:
+            return None
+
+    def _capture_bearer_tokens(self, store: Any, host: str) -> None:
+        """Scan proxy history for Bearer tokens targeting *host* and cache them."""
+        if store is None:
+            return
+        try:
+            entries = store.all_entries()
+        except Exception:
+            return
+        host_lower = host.lower()
+        parts = host_lower.split(".")
+        domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
+        import time as _time
+        for entry in reversed(entries):
+            entry_host = (entry.get("host") or "").lower()
+            if domain_suffix not in entry_host:
+                continue
+            req_headers = entry.get("request_headers") or {}
+            auth_val = ""
+            for k, v in req_headers.items():
+                if k.lower() == "authorization":
+                    auth_val = str(v)
+                    break
+            if not auth_val.startswith("Bearer "):
+                continue
+            token_val = auth_val[7:].strip()
+            exp = self._decode_jwt_exp(token_val)
+            now = _time.time()
+            if exp is not None and exp < now:
+                continue
+            entry_host_actual = entry.get("host") or host
+            auth_endpoint = entry.get("path") or None
+            source_id = entry.get("id") or ""
+            if entry.get("source") == "copilot":
+                continue
+            self._bearer_tokens[entry_host_actual] = {
+                "token": token_val,
+                "captured_at": now,
+                "source_entry_id": source_id,
+                "auth_endpoint": auth_endpoint,
+                "exp": exp,
+            }
+            ttl = int(exp - now) if exp else "unknown"
+            logger.info("Captured Bearer token for host",
+                        host=entry_host_actual, ttl=ttl,
+                        source_entry=source_id[:20])
+            break
 
     def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
         """Preload an authenticated session (e.g. from an activated login profile)
@@ -805,6 +877,7 @@ class CopilotSession:
                     # + borrowed auth headers) on a request-shaped call. Runs after
                     # the anti-repeat key is computed so the injected session never
                     # changes the dedup identity of the model's intended call.
+                    tool_ctx.bearer_tokens = self._bearer_tokens
                     self._apply_session_auth(tool_ctx, tool_args)
 
                     if await self._scope_gate(
@@ -846,6 +919,8 @@ class CopilotSession:
                     ):
                         import time as _time
                         status = result.get("status")
+                        request_url = str(tool_args.get("url") or result.get("url") or "")
+                        host = urlparse(request_url).hostname or ""
                         final_url = str(result.get("final_url") or result.get("url") or "").lower()
                         login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
                         session_expired = (
@@ -855,7 +930,51 @@ class CopilotSession:
                         cooldown_ok = (_time.time() - self._last_relogin_ts) > 60
                         if session_expired and cooldown_ok:
                             browser = getattr(tool_ctx, "browser", None)
-                            if browser is not None:
+                            bearer_refreshed = False
+                            # Fast path: refresh Bearer token via auth endpoint
+                            if (
+                                status == 401
+                                and host in self._bearer_tokens
+                                and browser is not None
+                                and (_time.time() - self._last_bearer_refresh_ts) > 15
+                            ):
+                                cached = self._bearer_tokens[host]
+                                auth_ep = cached.get("auth_endpoint")
+                                if auth_ep:
+                                    logger.info("bearer-refresh: trying fast path",
+                                                host=host, endpoint=auth_ep[:60])
+                                    self._last_bearer_refresh_ts = _time.time()
+                                    try:
+                                        page = await browser._ensure_page()
+                                        resp = await page.request.fetch(
+                                            f"https://{host}{auth_ep}",
+                                            method="GET")
+                                        if resp.status == 200:
+                                            import json as _json
+                                            body = _json.loads(await resp.text())
+                                            new_token = (body.get("token")
+                                                         or body.get("access_token") or "")
+                                            if new_token:
+                                                exp = self._decode_jwt_exp(new_token)
+                                                self._bearer_tokens[host] = {
+                                                    "token": new_token,
+                                                    "captured_at": _time.time(),
+                                                    "source_entry_id": cached.get("source_entry_id", ""),
+                                                    "auth_endpoint": auth_ep,
+                                                    "exp": exp,
+                                                }
+                                                logger.info("bearer-refresh: succeeded",
+                                                            host=host,
+                                                            ttl=int(exp - _time.time()) if exp else -1)
+                                                self._apply_session_auth(tool_ctx, tool_args)
+                                                result = await run_tool(tool_ctx, tool_name, tool_args)
+                                                bearer_refreshed = True
+                                    except Exception as exc:
+                                        logger.debug("bearer-refresh: failed, falling back to login",
+                                                     error=str(exc)[:100])
+
+                            # Slow path: full browser re-login
+                            if not bearer_refreshed and browser is not None:
                                 logger.info("auto-relogin: session expired, re-authenticating",
                                             request_host=urlparse(str(result.get("url", ""))).hostname,
                                             login_url=self._last_login["url"][:60])
@@ -871,6 +990,8 @@ class CopilotSession:
                                         if login_result.get("cookies"):
                                             self._session_cookies.update(login_result["cookies"])
                                         logger.info("auto-relogin: succeeded, retrying request")
+                                        self._capture_bearer_tokens(
+                                            getattr(tool_ctx, "store", None), host)
                                         self._apply_session_auth(tool_ctx, tool_args)
                                         result = await run_tool(tool_ctx, tool_name, tool_args)
                                     else:
@@ -892,6 +1013,10 @@ class CopilotSession:
                                         self._session_cookies.update(exported)
                                         logger.debug("Synced browser cookies to session",
                                                      count=len(exported))
+                                    nav_host = urlparse(new_url).hostname or ""
+                                    if nav_host:
+                                        self._capture_bearer_tokens(
+                                            getattr(tool_ctx, "store", None), nav_host)
                                 except Exception:
                                     pass
                     await _observe(entry, _summarize_result(result))
@@ -1033,6 +1158,19 @@ class CopilotSession:
                 continue  # cookies come from the host-scoped jar above
             if name.lower() not in present:
                 headers[name] = value
+
+        if "authorization" not in present and host:
+            cached = self._bearer_tokens.get(host)
+            if cached:
+                import time as _time
+                exp = cached.get("exp")
+                if exp is None or exp > _time.time():
+                    headers["Authorization"] = f"Bearer {cached['token']}"
+                    logger.debug("Injected cached Bearer token",
+                                 host=host, ttl=int(exp - _time.time()) if exp else -1)
+                else:
+                    logger.debug("Cached Bearer token expired, will rely on 401 refresh",
+                                 host=host)
 
         if headers:
             tool_args["headers"] = headers

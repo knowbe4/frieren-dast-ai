@@ -388,3 +388,92 @@ register(Tool(
     handler=_send_request,
     tags=["http"],
 ))
+
+
+_GET_BEARER_TOKEN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "host": {
+            "type": "string",
+            "description": "Target API host (e.g. 'api.phisher.knowbe4.com'). "
+                           "If omitted, returns tokens for all hosts.",
+        },
+    },
+    "required": [],
+}
+
+
+async def _get_bearer_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    host = str(args.get("host", "")).strip().lower()
+    bearer_tokens: Dict[str, Any] = getattr(ctx, "bearer_tokens", {})
+    import time as _time
+    now = _time.time()
+
+    if host:
+        cached = bearer_tokens.get(host)
+        if cached:
+            exp = cached.get("exp")
+            expired = exp is not None and exp < now
+            return {
+                "ok": True,
+                "host": host,
+                "token_preview": cached["token"][:20] + "...",
+                "status": "expired" if expired else "valid",
+                "expires_in": int(exp - now) if exp else None,
+                "age_seconds": int(now - cached.get("captured_at", now)),
+                "auth_endpoint": cached.get("auth_endpoint"),
+            }
+        if ctx.store:
+            try:
+                entries = ctx.store.all_entries()
+                for entry in reversed(entries):
+                    entry_host = (entry.get("host") or "").lower()
+                    if entry_host != host:
+                        continue
+                    req_h = entry.get("request_headers") or {}
+                    for k, v in req_h.items():
+                        if k.lower() == "authorization" and str(v).startswith("Bearer "):
+                            token_val = str(v)[7:].strip()
+                            from dast.ai.copilot.session import CopilotSession
+                            exp = CopilotSession._decode_jwt_exp(token_val)
+                            expired = exp is not None and exp < now
+                            return {
+                                "ok": True,
+                                "host": host,
+                                "source": "proxy_history",
+                                "token_preview": token_val[:20] + "...",
+                                "status": "expired" if expired else "valid",
+                                "expires_in": int(exp - now) if exp else None,
+                                "entry_id": entry.get("id", ""),
+                            }
+            except Exception:
+                pass
+        return {"ok": False, "error": f"No Bearer token found for {host}. "
+                "Use browser_login first, then navigate to a page that triggers API calls."}
+
+    if bearer_tokens:
+        result = {"ok": True, "tokens": {}}
+        for h, cached in bearer_tokens.items():
+            exp = cached.get("exp")
+            expired = exp is not None and exp < now
+            result["tokens"][h] = {
+                "status": "expired" if expired else "valid",
+                "expires_in": int(exp - now) if exp else None,
+                "auth_endpoint": cached.get("auth_endpoint"),
+            }
+        return result
+    return {"ok": False, "error": "No Bearer tokens cached. Use browser_login first."}
+
+
+register(Tool(
+    name="get_bearer_token",
+    description=(
+        "Look up the current Bearer/JWT token for an API host. Returns the token "
+        "status (valid/expired/missing), expiry, and the endpoint that issued it. "
+        "Use after browser_login when you need to verify token availability or when "
+        "send_request returns 401 on a Bearer-authenticated API."
+    ),
+    input_schema=_GET_BEARER_TOKEN_SCHEMA,
+    handler=_get_bearer_token,
+    tags=["auth"],
+))

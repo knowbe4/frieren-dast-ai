@@ -207,6 +207,7 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     browser = _browser(ctx)
     if browser is None:
         return {"ok": False, "error": "browser driving is not available in this context"}
+    await browser.ensure_fresh_cookies()
     page = await browser._ensure_page()
     url = str(args.get("url", "")).strip()
     if not url:

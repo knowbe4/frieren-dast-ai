@@ -15,6 +15,7 @@ and reused so multi-step form state persists between tool calls.
 from __future__ import annotations
 
 import asyncio
+import time as _time
 from typing import Any, Dict, List, Optional
 
 from dast.utils.logger import get_logger
@@ -72,6 +73,7 @@ class AgentBrowser:
         self._context: Any = None
         self._page: Any = None
         self._lock = asyncio.Lock()
+        self._last_cookie_sync: float = 0.0
 
     async def _ensure_page(self) -> Any:
         if self._page is not None:
@@ -122,6 +124,7 @@ class AgentBrowser:
         if pw_cookies:
             try:
                 await self._context.add_cookies(pw_cookies)
+                self._last_cookie_sync = _time.time()
                 logger.info("AgentBrowser seeded cookies from jar", count=len(pw_cookies))
             except Exception as exc:
                 logger.warning("AgentBrowser: add_cookies failed", error=str(exc))
@@ -145,6 +148,30 @@ class AgentBrowser:
                 logger.info("AgentBrowser cookies cleared")
             except Exception as exc:
                 logger.debug("AgentBrowser: clear_cookies failed", error=str(exc))
+
+    async def resync_cookies(self) -> int:
+        """Re-read cookies from the proxy jar into the browser context.
+
+        Replaces all browser cookies with current jar contents so that tokens
+        refreshed by operator browsing (or by a login flow) are picked up by
+        subsequent ``browser_fetch`` / ``browser_navigate`` calls.
+        """
+        if self._context is None or self._store is None:
+            return 0
+        try:
+            await self._context.clear_cookies()
+            await self._seed_cookies()
+            cookies = await self._context.cookies()
+            logger.info("AgentBrowser cookies re-synced from jar", count=len(cookies))
+            return len(cookies)
+        except Exception as exc:
+            logger.debug("AgentBrowser: resync_cookies failed", error=str(exc))
+            return 0
+
+    async def ensure_fresh_cookies(self) -> None:
+        """Re-sync cookies if the last sync was more than 30 seconds ago."""
+        if _time.time() - self._last_cookie_sync > 30:
+            await self.resync_cookies()
 
     async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         page = await self._ensure_page()

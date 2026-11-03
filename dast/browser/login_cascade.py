@@ -92,6 +92,7 @@ async def adaptive_login(
     decide: Optional[AuthDecider] = None,
     success_url_suffix: Optional[str] = None,
     max_llm_steps: int = _MAX_LLM_STEPS,
+    in_scope: Optional[Callable[[str], bool]] = None,
 ) -> LoginCascadeResult:
     """Log in, trying the deterministic engine first and the LLM only on failure.
 
@@ -154,7 +155,7 @@ async def adaptive_login(
             break
 
         history.append(action)
-        ok = await _apply_action(browser, action)
+        ok = await _apply_action(browser, action, in_scope)
         if not ok:
             logger.debug("adaptive_login: action did not apply cleanly",
                          action=action.get("action"), selector=action.get("selector"))
@@ -171,8 +172,15 @@ async def adaptive_login(
     )
 
 
-async def _apply_action(browser: Any, action: Dict[str, Any]) -> bool:
-    """Execute one decider action against the browser. Returns False on error."""
+async def _apply_action(browser: Any, action: Dict[str, Any],
+                        in_scope: Optional[Callable[[str], bool]] = None) -> bool:
+    """Execute one decider action against the browser. Returns False on error.
+
+    A ``navigate`` action is scope-gated: the decider reads untrusted target page
+    content, so a prompt-injected navigate to an out-of-scope URL (credential/SSRF
+    exfil) must be refused. ``fill``/``click``/``wait`` act on the already-loaded,
+    in-scope page.
+    """
     kind = str(action.get("action") or "").lower()
     selector = str(action.get("selector") or "")
     try:
@@ -183,6 +191,10 @@ async def _apply_action(browser: Any, action: Dict[str, Any]) -> bool:
         elif kind == "wait":
             await browser.wait_for(selector)
         elif kind == "navigate":
+            if in_scope is not None and not in_scope(selector):
+                logger.warning("adaptive_login: refused out-of-scope navigate",
+                               url=selector[:120])
+                return False
             await browser.navigate(selector)
         else:
             return False

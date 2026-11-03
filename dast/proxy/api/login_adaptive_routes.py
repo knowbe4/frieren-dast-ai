@@ -59,7 +59,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         try:
             result = await asyncio.wait_for(
                 adaptive_login(browser, url, email, password,
-                               success_url_suffix=success_url_suffix),
+                               success_url_suffix=success_url_suffix,
+                               in_scope=settings.is_in_scope),
                 timeout=_ADAPTIVE_LOGIN_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:

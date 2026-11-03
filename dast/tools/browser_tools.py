@@ -239,6 +239,11 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if not url:
         return {"ok": False, "error": "url is required"}
     url = await _resolve_url(page, url)
+    # Scope-gate BEFORE any outbound request (same rule as every other URL tool):
+    # browser_fetch carries the authenticated browser session and injects the CSRF
+    # token, so an out-of-scope destination would be SSRF + token leakage.
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
     method = str(args.get("method", "POST")).upper()
     headers = dict(args.get("headers") or {"Content-Type": "application/json"})
     body = args.get("body")

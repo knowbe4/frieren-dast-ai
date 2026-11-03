@@ -58,6 +58,7 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
 
         result = await adaptive_login(
             browser, url, email, password, success_url_suffix=success_url_suffix,
+            in_scope=ctx.is_in_scope,
         )
         # On success, sync the browser's session cookies into the copilot session
         # so subsequent authenticated calls carry them (parity with browser_login).

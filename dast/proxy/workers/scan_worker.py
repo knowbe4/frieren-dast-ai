@@ -326,6 +326,18 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                 qs.finish(entry_id, 0, "error")
                 return
 
+            # Persist which attack types the coordinator actually evaluated on this
+            # endpoint (side-channel set on the target) for per-dimension coverage.
+            attempted = getattr(target, "attempted_attack_types", None)
+            if attempted:
+                try:
+                    entry.scanned_attack_types = sorted(
+                        set(entry.scanned_attack_types or []) | set(attempted)
+                    )
+                except Exception as exc:
+                    logger.debug("recording scanned attack types failed",
+                                 url=entry.url, error=str(exc))
+
             # Update any stub imported findings on this entry to reflect scan outcome
             update_import_stubs(entry, bool(findings))
 

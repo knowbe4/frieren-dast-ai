@@ -100,6 +100,10 @@ class ProxyEntry:
     queued_for_scan: bool = False
     scan_result: Optional[str] = None  # "vulnerable" | "safe" | "error"
     findings: List[dict] = field(default_factory=list)
+    # attack types the scan actually evaluated on this endpoint (canary-probed +
+    # dispatched agents), for per-dimension coverage tracking. Set by the scan worker
+    # from the coordinator's side-channel on CheckTarget.
+    scanned_attack_types: List[str] = field(default_factory=list)
     # hints from imported reports: [{parameter, payload, attack_type}]
     import_hints: List[dict] = field(default_factory=list)
     # payload injected by an agent probe (for display in HTTP history)
@@ -126,6 +130,7 @@ class ProxyEntry:
             "queued_for_scan": self.queued_for_scan,
             "scan_result": self.scan_result,
             "findings": self.findings,
+            "scanned_attack_types": self.scanned_attack_types or [],
             "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
@@ -164,6 +169,7 @@ class ProxyEntry:
             queued_for_scan=d.get("queued_for_scan", False),
             scan_result=d.get("scan_result"),
             findings=d.get("findings") or [],
+            scanned_attack_types=d.get("scanned_attack_types") or [],
             import_hints=d.get("import_hints") or [],
             ai_queued=d.get("ai_queued", False),
             manual_note=d.get("manual_note"),

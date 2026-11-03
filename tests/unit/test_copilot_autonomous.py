@@ -711,3 +711,72 @@ def test_effective_hosts_puts_identity_providers_last():
         "api.example.com", "app.example.com",       # non-IdP first, alphabetical
         "identity.example.com", "login.sso.example.com",  # IdP hosts last
     ]
+
+
+# ── complete-mode: per-dimension coverage matrix + cross-tenant gate ──────────
+
+class _CovEntry:
+    """Richer fake entry carrying the fields _surface_coverage reads for the
+    per-dimension matrix."""
+    def __init__(self, method, path, host, scan_result="safe",
+                 scanned_attack_types=None, findings=None):
+        self.method = method
+        self.path = path
+        self.host = host
+        self.url = f"https://{host}{path}"
+        self.source = "proxy"
+        self.scan_result = scan_result
+        self.scanned_attack_types = scanned_attack_types or []
+        self.findings = findings or []
+        self.request_body = None
+        self.content_type = ""
+
+
+class _DimStore(_FakeStore):
+    def __init__(self, entries, named_sessions=0):
+        super().__init__(entries)
+        self._named = named_sessions
+
+    def get_named_sessions(self):
+        return [object()] * self._named
+
+
+def test_coverage_dimension_matrix_and_cross_tenant_gate():
+    # One scanned endpoint tested for injection (sqli) + access_control (idor) but NOT
+    # cross_tenant. With two named sessions saved, cross-tenant is applicable → gap.
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli", "idor"])
+    store = _DimStore([e], named_sessions=2)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+
+    dims = cov["dimensions"]
+    assert dims["injection"]["untested"] == []          # sqli covers injection
+    assert dims["access_control"]["untested"] == []     # idor covers access_control
+    assert dims["cross_tenant"]["untested"] == ["POST /app/backend/x"]
+    assert cov["cross_tenant_applicable"] is True
+    assert cov["cross_tenant_gap"] is True
+    assert cov["complete"] is False                     # cross-tenant gap blocks complete
+
+
+def test_coverage_cross_tenant_closed_when_replayed():
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli", "idor", "cross_session_idor"])
+    store = _DimStore([e], named_sessions=2)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["cross_tenant_gap"] is False
+    assert cov["complete"] is True                      # all gaps closed
+
+
+def test_coverage_cross_tenant_na_without_two_sessions():
+    # Only one identity → cross-tenant is N/A and must NOT count as a gap.
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli"])
+    store = _DimStore([e], named_sessions=1)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["cross_tenant_applicable"] is False
+    assert "cross_tenant" not in cov["dimensions"]
+    assert cov["cross_tenant_gap"] is False
+    assert cov["complete"] is True

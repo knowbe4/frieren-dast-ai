@@ -94,6 +94,31 @@ _MAX_COMPLETE_REJECTIONS = 8
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
 
+# Per-dimension coverage: map Frieren's agent attack_type vocabulary onto the pentest
+# test dimensions an operator reasons about, so coverage can report "injection tested,
+# access-control not" per endpoint instead of a single tested/untested bit.
+_ATTACK_TYPE_DIMENSION = {
+    # injection family
+    "xss": "injection", "sqli": "injection", "cmdi": "injection", "ssti": "injection",
+    "nosql": "injection", "xxe": "injection", "lfi": "injection", "file_read": "injection",
+    "ssrf": "injection", "prototype_pollution": "injection", "host_header": "injection",
+    "open_redirect": "injection", "cache_poisoning": "injection", "blazor": "injection",
+    "graphql": "injection", "oob_headers": "injection",
+    # access control / authz / token
+    "idor": "access_control", "auth": "access_control", "jwt": "access_control",
+    # cross-tenant (multi-user replay) — only applicable with >=2 named sessions
+    "cross_session_idor": "cross_tenant",
+    # business logic (incl. mass assignment)
+    "business_logic": "business_logic",
+    # prompt / LLM injection
+    "llm_injection": "llm_injection",
+    # csrf
+    "csrf": "csrf",
+}
+# Order shown to the operator / model.
+_COVERAGE_DIMENSIONS = ("injection", "access_control", "cross_tenant",
+                        "business_logic", "llm_injection", "csrf")
+
 def _order_hosts(hosts) -> List[str]:
     """Sorted host list with identity-provider hosts pushed to the end.
 
@@ -1648,6 +1673,13 @@ class CopilotService:
                             "rest_untested": len(coverage["rest_untested"]),
                             "gql_untested": len(coverage["gql_untested"]),
                             "ui_frontier": len(coverage["ui_frontier"]),
+                            # Per-dimension gaps on scanned endpoints, so the dashboard can
+                            # render the coverage checklist (endpoint x dimension).
+                            "dimensions": {
+                                dim: len(info.get("untested") or [])
+                                for dim, info in (coverage.get("dimensions") or {}).items()
+                            },
+                            "cross_tenant_gap": coverage.get("cross_tenant_gap", False),
                             "rejection": auto["complete_rejections"],
                         })
                         # Complete mode closes gaps deterministically rather than
@@ -1823,6 +1855,7 @@ class CopilotService:
             logger.debug("coverage: rest enumeration failed", error=str(exc))
             entries = []
         rest_status: Dict[Tuple[str, str, str], bool] = {}
+        rest_dims: Dict[Tuple[str, str, str], set] = {}  # key -> dimensions evaluated
         for entry in entries:
             method = (getattr(entry, "method", "") or "").upper()
             path = getattr(entry, "path", "") or ""
@@ -1842,10 +1875,53 @@ class CopilotService:
             key = (host, method, normalise_endpoint_path(path))
             tested = bool(getattr(entry, "scan_result", None))
             rest_status[key] = rest_status.get(key, False) or tested
+            # Which test dimensions were evaluated on this endpoint — from the attack
+            # types the scan ran plus any finding's attack type.
+            dims = rest_dims.setdefault(key, set())
+            for at in (getattr(entry, "scanned_attack_types", None) or []):
+                dim = _ATTACK_TYPE_DIMENSION.get(at)
+                if dim:
+                    dims.add(dim)
+            for finding in (getattr(entry, "findings", None) or []):
+                dim = _ATTACK_TYPE_DIMENSION.get((finding or {}).get("attack_type", ""))
+                if dim:
+                    dims.add(dim)
         cov["rest_total"] = len(rest_status)
         cov["rest_tested"] = sum(1 for tested in rest_status.values() if tested)
         cov["rest_untested"] = sorted(
             f"{method} {path}" for (_h, method, path), tested in rest_status.items() if not tested
+        )
+
+        # ── Per-dimension coverage matrix over the scanned REST endpoints ─────────
+        # cross_tenant is only applicable (expected) when >=2 named sessions exist to
+        # replay across; otherwise it is N/A and must not count as a gap.
+        try:
+            named_count = len(store.get_named_sessions() or [])
+        except Exception:
+            named_count = 0
+        cross_tenant_applicable = named_count >= 2
+        dim_summary: Dict[str, Dict[str, object]] = {}
+        for dim in _COVERAGE_DIMENSIONS:
+            if dim == "cross_tenant" and not cross_tenant_applicable:
+                continue
+            evaluated = [k for k, dims in rest_dims.items() if dim in dims]
+            # Only endpoints that were scanned at all are candidates for a dimension gap
+            # (an unscanned endpoint is already reported under rest_untested).
+            scanned_keys = [k for k, t in rest_status.items() if t]
+            missing = [k for k in scanned_keys if dim not in rest_dims.get(k, set())]
+            dim_summary[dim] = {
+                "tested": len(evaluated),
+                "scanned_endpoints": len(scanned_keys),
+                "untested": sorted(f"{m} {p}" for (_h, m, p) in missing),
+            }
+        cov["dimensions"] = dim_summary
+        cov["cross_tenant_applicable"] = cross_tenant_applicable
+        # The one hard per-dimension gate: with >=2 identities saved, cross-tenant MUST be
+        # exercised on the scanned endpoints — not testing it is the exact gap that made the
+        # run miss every cross-account check.
+        cov["cross_tenant_gap"] = bool(
+            cross_tenant_applicable
+            and dim_summary.get("cross_tenant", {}).get("untested")
         )
 
         # ── GraphQL surface ─────────────────────────────────────────────────────
@@ -1923,6 +1999,7 @@ class CopilotService:
         cov["complete"] = bool(
             cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
             and not cov["gql_captured_untested"] and not cov["ui_frontier"]
+            and not cov["cross_tenant_gap"]
         )
         return cov
 
@@ -1976,5 +2053,29 @@ class CopilotService:
                 f"- {len(ui_frontier)} UI route(s) discovered but not yet explored. Run `explore` "
                 f"on the app until frontier_remaining is 0 to reach every section. Examples: "
                 + wrap_untrusted(", ".join(ui_frontier[:8]), "unexplored_ui_routes")
+            )
+        # Per-dimension gaps on the ALREADY-scanned endpoints — so the copilot does not
+        # stop after a shallow injection-only pass and call the surface "covered".
+        dims = cov.get("dimensions") or {}
+        _DIM_HINT = {
+            "injection": "injection probes (scan_surface / run_scan reach these)",
+            "access_control": "authz / IDOR — reason about id/owner params and run idor_probe or run_scan",
+            "cross_tenant": "cross-account replay — run run_multiuser_idor across the saved named sessions",
+            "business_logic": "business-logic / mass-assignment — add fields the client does not send",
+            "llm_injection": "prompt / LLM injection on any field that reaches an AI classifier",
+            "csrf": "CSRF protection checks on state-changing endpoints",
+        }
+        for dim in _COVERAGE_DIMENSIONS:
+            info = dims.get(dim)
+            if not info:
+                continue
+            missing = info.get("untested") or []
+            if not missing:
+                continue
+            hard = " (REQUIRED: you have >=2 identities saved)" if dim == "cross_tenant" else ""
+            lines.append(
+                f"- {len(missing)} scanned endpoint(s) NOT yet tested for {dim}{hard} — "
+                f"{_DIM_HINT.get(dim, dim)}. Examples: "
+                + wrap_untrusted(", ".join(missing[:6]), f"untested_{dim}")
             )
         return "\n".join(lines)

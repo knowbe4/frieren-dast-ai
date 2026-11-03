@@ -265,6 +265,7 @@ def build_app(
     from dast.proxy.api.jwt_routes import make_router as jwt_router
     from dast.proxy.api.profiles_routes import make_router as profiles_router
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
+    from dast.proxy.api.login_adaptive_routes import make_router as login_adaptive_router
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
     from dast.proxy.api.copilot_routes import make_router as copilot_router
     from dast.proxy.api.copilot_service import CopilotService
@@ -344,6 +345,7 @@ def build_app(
     app.include_router(jwt_router(ctx))
     app.include_router(profiles_router(ctx))
     app.include_router(login_flow_router(ctx))
+    app.include_router(login_adaptive_router(ctx))
     app.include_router(mcp_approval_router(ctx))
     app.include_router(copilot_router(ctx))
 

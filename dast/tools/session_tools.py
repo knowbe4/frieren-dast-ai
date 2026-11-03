@@ -38,9 +38,47 @@ _SAVE_SCHEMA = {
                                                   "jar (e.g. app.example.com). Log in / browse it first so the jar has the session."},
         "role": {"type": "string", "description": "Privilege level / role label for cross-session comparison "
                                                   "(e.g. 'admin', 'member', 'user'). Default 'user'."},
+        "username": {"type": "string", "description": "Optional login username/email. Store it (with password + "
+                                                      "auth_url) so an autonomous run can AUTO-RELOGIN this identity "
+                                                      "when the session expires, instead of pausing. Never echoed back."},
+        "password": {"type": "string", "description": "Optional login password, stored encrypted alongside username. "
+                                                      "Only used for auto-relogin; never returned in any result."},
+        "auth_url": {"type": "string", "description": "Optional login page URL for auto-relogin (required together "
+                                                      "with username/password for relogin to work)."},
     },
     "required": ["name", "host"],
 }
+
+
+def _store_profile_credentials(name: str, host: str, role: str, cookies: list,
+                               auth_headers: Dict[str, str], username: str,
+                               password: str, auth_url: str) -> bool:
+    """Persist a credentialed login profile (encrypted) so the autonomous run can
+    auto-relogin this identity on session expiry. Returns True if stored."""
+    try:
+        from dast.profiles.models import LoginProfile, Credential, slugify
+        from dast.profiles.store import load_profile, save_profile
+    except Exception as exc:
+        logger.warning("save_login_session: profile store unavailable", error=str(exc)[:120])
+        return False
+    slug = slugify(name)
+    profile = load_profile(slug) or LoginProfile(slug=slug, name=name)
+    profile.name = name
+    if not profile.host_pattern:
+        profile.host_pattern = host
+    profile.auth_url = auth_url
+    profile.privilege_level = role
+    profile.credentials = [Credential(label="default", username=username, secret=password)]
+    state: Dict[str, Any] = {"cookies": cookies, "origins": []}
+    if auth_headers:
+        state["_auth_headers"] = auth_headers
+    profile.saved_session = state
+    import time as _time
+    profile.updated_at = _time.time()
+    save_profile(profile)
+    logger.info("save_login_session: stored credentialed profile for auto-relogin",
+                slug=slug, host=host, has_auth_url=bool(auth_url))
+    return True
 
 
 async def _save_via_http(ctx: ToolContext, name: str, host: str, role: str) -> Dict[str, Any]:
@@ -108,12 +146,23 @@ async def _save_login_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         return {"ok": False, "error": f"save failed: {str(exc)[:160]}"}
     logger.info("save_login_session: saved named session", name=name, host=host, role=role,
                 cookies=len(session.cookies), auth_headers=len(session.auth_headers))
+    # Optionally persist credentials (encrypted) so an autonomous run can auto-relogin
+    # this identity on expiry instead of pausing. All three fields are required together.
+    username = str(args.get("username") or "").strip()
+    password = str(args.get("password") or "")
+    auth_url = str(args.get("auth_url") or "").strip()
+    credentials_stored = False
+    if username and password and auth_url:
+        credentials_stored = _store_profile_credentials(
+            name, host, role, cookies, auth_headers, username, password, auth_url)
     return {
         "ok": True, "name": name, "host": host, "role": role,
         "cookies": len(session.cookies), "auth_headers": len(session.auth_headers),
         "named_sessions_total": len(store.get_named_sessions()),
+        "credentials_stored": credentials_stored,
         "note": "saved as a named session; with >=2 named sessions, run_multiuser_idor will replay "
-                "requests across them to find cross-account / privilege-escalation leaks",
+                "requests across them to find cross-account / privilege-escalation leaks"
+                + ("; credentials stored for auto-relogin on expiry" if credentials_stored else ""),
     }
 
 

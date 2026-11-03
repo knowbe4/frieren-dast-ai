@@ -1668,6 +1668,41 @@ async def test_code_list_reads_dashboard(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_save_login_session_stores_credentials_for_relogin(monkeypatch):
+    store = _FakeSessionStore(jar_cookies={"app.acme-corp.com": [
+        {"name": "sid", "value": "secret-cookie", "domain": "app.acme-corp.com"}]})
+    saved = {}
+    import dast.profiles.store as pstore
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: None)
+    monkeypatch.setattr(pstore, "save_profile", lambda profile: saved.setdefault("profile", profile))
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "save_login_session", {
+        "name": "tenant_a", "host": "app.acme-corp.com", "role": "user",
+        "username": "qa@x.com", "password": "hunter2",
+        "auth_url": "https://app.acme-corp.com/login"})
+    assert result["ok"] is True and result["credentials_stored"] is True
+    assert "hunter2" not in str(result)  # secret-free result
+    prof = saved["profile"]
+    assert prof.auth_url == "https://app.acme-corp.com/login"
+    assert prof.credentials and prof.credentials[0].username == "qa@x.com"
+    assert prof.credentials[0].secret == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_without_creds_skips_profile(monkeypatch):
+    store = _FakeSessionStore(jar_cookies={"app.acme-corp.com": [
+        {"name": "sid", "value": "v", "domain": "app.acme-corp.com"}]})
+    called = {"save": False}
+    import dast.profiles.store as pstore
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: None)
+    monkeypatch.setattr(pstore, "save_profile", lambda p: called.__setitem__("save", True))
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "app.acme-corp.com"})
+    assert result["ok"] is True and result["credentials_stored"] is False
+    assert called["save"] is False
+
+
+@pytest.mark.asyncio
 async def test_code_lookup_path_falls_back_to_search(monkeypatch):
     # In the test process no analyses are loaded, so lookup_code_for_path returns "" and the
     # tool falls back to a dashboard search on the last real path segment.

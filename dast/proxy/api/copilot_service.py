@@ -621,7 +621,7 @@ class CopilotService:
                 logger.warning("could not create AgentBrowser", error=str(exc))
                 browser = None
         session["_agent_browser"] = browser
-        return AgentToolContext(
+        tool_ctx = AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
             store=ctx.store,
@@ -635,6 +635,11 @@ class CopilotService:
             read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
             browser=browser,
         )
+        # Attach the engine session so tools (e.g. browser_login) can record the last
+        # successful login on it. Without this the engine's auto-relogin on 401/expiry
+        # (session.py) stays dormant because `_last_login` is never populated.
+        tool_ctx._session = session.get("engine")
+        return tool_ctx
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,
                              timeout: float, defaults: dict) -> dict:
@@ -993,6 +998,22 @@ class CopilotService:
             logger.info("autonomous run activated login profile", slug=slug, cookies=imported)
         except Exception as exc:
             logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
+        # Seed the engine's relogin credentials from the profile so the existing
+        # 401/expiry auto-relogin (session.py) can re-authenticate WITHOUT pausing the
+        # run. Needs a credential + auth_url on the profile; cookie-only profiles skip this.
+        try:
+            creds = getattr(profile, "credentials", None) or []
+            auth_url = (getattr(profile, "auth_url", "") or "").strip()
+            engine = session.get("engine")
+            if engine is not None and auth_url and creds and creds[0].username and creds[0].secret:
+                engine._last_login = {
+                    "url": auth_url, "email": creds[0].username, "password": creds[0].secret,
+                }
+                logger.info("autonomous run seeded relogin credentials from profile", slug=slug)
+            elif engine is not None:
+                logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
+        except Exception as exc:
+            logger.warning("autonomous run: relogin-credential seed failed", slug=slug, error=str(exc))
 
     def _seed_engine_session(self, session: dict, hosts: List[str]) -> None:
         """Seed the engine's session cookies for the primary focus host so the

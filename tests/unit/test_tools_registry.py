@@ -1332,3 +1332,89 @@ async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
     assert result["ok"] is True
     assert result["agents_ran"] is False
     assert "note" in result
+
+
+# ── session tools: save/list/activate + run_multiuser_idor ─────────────────────
+
+class _FakeNamedSession:
+    def __init__(self, name, role, cookies, auth_headers):
+        self.name = name; self.role = role
+        self.cookies = cookies; self.auth_headers = auth_headers
+
+
+class _FakeSessionStore:
+    def __init__(self, jar_cookies=None, named=None):
+        self._jar = jar_cookies or {}            # host -> list[cookie dict]
+        self.named_sessions = dict(named or {})
+
+    def get_cookies_for_host(self, host):
+        return self._jar.get(host, [])
+
+    def entries_newest_first(self):
+        return []
+
+    def save_named_session_from_playwright(self, name, role, playwright_cookies, auth_headers=None):
+        s = _FakeNamedSession(name, role,
+                              {c["name"]: c for c in playwright_cookies if c.get("name")},
+                              auth_headers or {})
+        self.named_sessions[name] = s
+        return s
+
+    def get_named_sessions(self):
+        return list(self.named_sessions.values())
+
+
+def test_registry_lists_session_tools():
+    names = {t.name for t in tools.all_tools()}
+    assert {"save_login_session", "list_login_sessions", "activate_login_profile",
+            "run_multiuser_idor"}.issubset(names)
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_persists_named_session():
+    store = _FakeSessionStore(jar_cookies={"app.acme-corp.com": [
+        {"name": "sid", "value": "secret-value", "domain": "app.acme-corp.com"}]})
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "save_login_session",
+                            {"name": "tenant_a", "host": "app.acme-corp.com", "role": "admin"})
+    assert result["ok"] is True
+    assert result["cookies"] == 1 and result["role"] == "admin"
+    assert "tenant_a" in store.named_sessions
+    # secret-free: no cookie values in the result
+    assert "secret-value" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(False), store=_FakeSessionStore())
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "evil.example.com"})
+    assert result["ok"] is False and "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_no_cookies():
+    ctx = ToolContext(settings=_Scope(True), store=_FakeSessionStore())
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "app.acme-corp.com"})
+    assert result["ok"] is False and "no cookies" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_list_login_sessions_secret_free():
+    store = _FakeSessionStore(named={
+        "a": _FakeNamedSession("a", "admin", {"sid": {"name": "sid", "value": "SEKRET", "domain": "x.com"}}, {}),
+    })
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "list_login_sessions", {})
+    assert result["ok"] is True and result["count"] == 1
+    assert result["sessions"][0]["name"] == "a" and result["sessions"][0]["cookies"] == 1
+    assert "SEKRET" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_run_multiuser_idor_requires_two_sessions():
+    store = _FakeSessionStore(named={
+        "a": _FakeNamedSession("a", "admin", {}, {})})  # only one
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "run_multiuser_idor", {"url": "https://app.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert ">=2" in result["error"] or "2 saved" in result["error"]

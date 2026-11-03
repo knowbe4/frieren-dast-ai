@@ -1,0 +1,115 @@
+# Login-difficulty tier catalogue.
+#
+# Single source of truth for the harness: the deterministic browser suite
+# (tests/integration/test_login_difficulty_browser.py) and the LLM-free bearer
+# suite (tests/unit/test_login_difficulty_bearer.py) assert these outcomes today.
+# It also doubles as the input spec for the (future) LLM-driven fallback runner:
+# for any tier whose `deterministic` outcome is not `pass`, the operator intent is
+# "escalate to the model and drive it like a human over the browser_* primitives".
+#
+# outcome vocabulary:
+#   pass       engine reaches an authenticated state (/dashboard or /api/me 200)
+#   mfa_bail   engine correctly detects MFA and stops without a false success
+#   captcha    engine must recognise a CAPTCHA and bail cleanly
+#   xfail      known gap in the deterministic engine; LLM-driven path is expected
+#              to solve it (this is where the human-like fallback earns its cost)
+
+credentials:
+  username: pentester@test.local
+  password: "Frieren!2026"
+
+tiers:
+  - id: T0
+    name: trivial single-page
+    url: /t0/login
+    engine: browser
+    deterministic: pass
+    exercises: single-page email+password form
+
+  - id: T1
+    name: two-step
+    url: /t1/login
+    engine: browser
+    deterministic: pass
+    exercises: email -> Continue -> password revealed (same page, JS)
+
+  - id: T2
+    name: non-standard identifiers
+    url: /t2/login
+    engine: browser
+    deterministic: xfail
+    llm_fallback: true
+    exercises: j_username / pwd names, <div role=button> submit; defeats the fixed
+      selector lists in AgentBrowser
+
+  - id: T3
+    name: consent banner + honeypot
+    url: /t3/login
+    engine: browser
+    deterministic: pass
+    exercises: cookie-consent banner, hidden honeypot that must stay empty,
+      placeholder-only labels
+
+  - id: T4
+    name: iframe fields
+    url: /t4/login
+    engine: browser
+    deterministic: xfail
+    llm_fallback: false  # unsolved even by the LLM: main-frame snapshot has no fields
+    exercises: credential fields inside an <iframe>; neither login() nor the LLM
+      fallback can reach them (the snapshot is main-frame only - needs frame-aware
+      primitives, confirmed in login_adaptive_eval)
+
+  - id: T5
+    name: captcha
+    url: /t5/login
+    engine: signal
+    deterministic: captcha
+    exercises: recaptcha signature; has_captcha() must flag it so the flow bails
+
+  - id: T6
+    name: SPA bearer / JWT
+    url: /t6/login
+    engine: bearer
+    deterministic: pass
+    exercises: POST /api/auth/login -> JWT in localStorage -> Authorization Bearer
+      on /api/me; capture from proxy history + inject on the next call
+
+  - id: T7
+    name: short-lived JWT / refresh
+    url: /t7/login
+    engine: bearer
+    deterministic: pass
+    exercises: expired cached token is not injected (relies on the 401 fast-path
+      refresh)
+
+  - id: T8
+    name: hybrid cookie + csrf + bearer
+    url: /t6/login
+    engine: bearer
+    deterministic: pass
+    exercises: session cookie + X-CSRF-Token + Authorization Bearer injected together
+
+  - id: T9
+    name: SSO redirect
+    url: /t9/login
+    engine: browser
+    deterministic: pass
+    exercises: app -> second-origin IdP -> back to /dashboard with a session cookie
+
+  - id: T10
+    name: MFA / OTP
+    url: /t10/login
+    engine: browser
+    deterministic: mfa_bail
+    exercises: OTP challenge after password; engine reports mfa_required, no false
+      success
+
+  - id: T11
+    name: OAuth authorize consent
+    url: /t11/login
+    engine: browser
+    deterministic: xfail
+    llm_fallback: true
+    exercises: an "Authorize" consent button after password; engine stops on the
+      consent screen instead of clicking through to /dashboard

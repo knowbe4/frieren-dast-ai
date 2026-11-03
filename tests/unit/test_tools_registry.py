@@ -1332,3 +1332,61 @@ async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
     assert result["ok"] is True
     assert result["agents_ran"] is False
     assert "note" in result
+
+
+# ── browser_login_adaptive (deterministic-first, LLM-fallback) ─────────────────
+
+class _FakeLoginBrowser:
+    """Minimal AgentBrowser stand-in for the adaptive-login tool wiring."""
+
+    def __init__(self, login_result: dict):
+        self._login_result = login_result
+        self._url = login_result.get("url", "")
+
+    async def login(self, url: str, email: str, password: str) -> dict:
+        return self._login_result
+
+    async def snapshot(self) -> dict:
+        return {"url": self._url, "title": "", "forms": [], "buttons": [], "links": []}
+
+    async def navigate(self, url: str) -> dict:
+        self._url = url
+        return {"ok": True, "url": url}
+
+    async def export_cookies(self) -> dict:
+        return {"session": "abc"}
+
+
+def test_registry_lists_adaptive_login():
+    names = {t.name for t in tools.all_tools()}
+    assert "browser_login_adaptive" in names
+
+
+@pytest.mark.asyncio
+async def test_adaptive_login_browser_unavailable():
+    ctx = ToolContext(settings=_Scope(True))  # no browser
+    result = await run_tool(ctx, "browser_login_adaptive", {
+        "url": "https://app.acme-corp.com/login", "email": "a@b.com", "password": "x"})
+    assert result["ok"] is False
+    assert "not available" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_adaptive_login_out_of_scope_blocked():
+    ctx = ToolContext(settings=_Scope(allow=False),
+                      browser=_FakeLoginBrowser({"logged_in": True, "url": "x"}))
+    result = await run_tool(ctx, "browser_login_adaptive", {
+        "url": "https://evil.example.com/login", "email": "a@b.com", "password": "x"})
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_adaptive_login_deterministic_success():
+    browser = _FakeLoginBrowser({"logged_in": True, "url": "https://app.acme-corp.com/dashboard"})
+    ctx = ToolContext(settings=_Scope(True), browser=browser)
+    result = await run_tool(ctx, "browser_login_adaptive", {
+        "url": "https://app.acme-corp.com/login", "email": "a@b.com", "password": "x"})
+    assert result["ok"] is True
+    assert result["engine"] == "deterministic"
+    assert result["llm_steps"] == 0

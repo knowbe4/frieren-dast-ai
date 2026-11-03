@@ -33,6 +33,27 @@ logger = get_logger(__name__)
 # action="reply" is the primary turn boundary; this only fires if it never
 # replies (a bug, not normal dialogue).
 _MAX_TOOL_CALLS_PER_TURN = 20
+# Watchdog: how many times the SAME normalized call (same tool+method+url+body, ignoring
+# volatile headers) may repeat before the coordinator kills the looping turn.
+_MAX_NORMALIZED_REPEATS = 3
+
+
+def _normalized_call_sig(tool_name: str, args: Dict[str, Any]) -> str:
+    """Intent-level signature of a tool call, IGNORING volatile header literals (Cookie,
+    X-CSRF-Token, ...). The exact-dedup key includes headers, so a model that pastes a
+    different Cookie/CSRF literal on each call slips past it while doing the same thing;
+    this signature catches that so the watchdog can break the loop."""
+    a = dict(args or {})
+    a.pop("headers", None)
+    parts = [tool_name,
+             str(a.get("method", "")).upper(),
+             str(a.get("url") or a.get("target") or a.get("base_url") or ""),
+             str(a.get("body") or a.get("data") or "")]
+    # Any remaining non-header args (e.g. slug, query) keep distinct intents distinct.
+    rest = {k: v for k, v in a.items() if k not in ("method", "url", "target", "base_url", "body", "data")}
+    if rest:
+        parts.append(_canonical(rest))
+    return "|".join(parts)
 
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
 # neither a tool call nor a reply) before the turn gives up and hands back.
@@ -477,6 +498,10 @@ class CopilotSession:
         self.session_id = session_id
         self.messages: List[Dict[str, str]] = []
         self._seen_calls: set[str] = set()
+        # Watchdog: counts of NORMALIZED tool-call signatures (tool+method+url+body, no
+        # volatile headers) so the exact-dedup miss — the model pasting a different Cookie/
+        # CSRF literal each call — is still caught and the looping turn can be killed.
+        self._repeat_sigs: Dict[str, int] = {}
         self._session_cookies: Dict[str, str] = {}
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
@@ -876,6 +901,29 @@ class CopilotSession:
                         continue
                     self._seen_calls.add(call_key)
 
+                    # Coordinator watchdog: the exact-dedup above misses a call that repeats
+                    # with only a different pasted header literal (the model loops pasting
+                    # Cookie/CSRF). Count the NORMALIZED signature and kill the turn when the
+                    # same intent repeats too often — the agent self-diagnoses the loop yet
+                    # cannot break it, so the supervisor must. The driver escalates on
+                    # blocked_reason='stuck_loop'.
+                    _norm_sig = _normalized_call_sig(tool_name, tool_args)
+                    self._repeat_sigs[_norm_sig] = self._repeat_sigs.get(_norm_sig, 0) + 1
+                    if self._repeat_sigs[_norm_sig] >= _MAX_NORMALIZED_REPEATS:
+                        self._repeat_sigs[_norm_sig] = 0  # don't instantly re-trip on resume
+                        logger.warning("copilot watchdog: killing looping turn",
+                                       session_id=self.session_id, tool=tool_name,
+                                       count=_MAX_NORMALIZED_REPEATS)
+                        return _finalize(
+                            f"Stopped: the same request ({tool_name} "
+                            f"{str(tool_args.get('method', '')).upper()} "
+                            f"{tool_args.get('url', '')}) was issued "
+                            f"{_MAX_NORMALIZED_REPEATS} times with no new outcome. The tool "
+                            "manages the session — do NOT paste Cookie or X-CSRF-Token headers. "
+                            "Change the endpoint, parameter, or tool, or conclude.",
+                            blocked_reason="stuck_loop",
+                        )
+
                     # Reuse the operator's already-captured session (proxy cookie jar
                     # + borrowed auth headers) on a request-shaped call. Runs after
                     # the anti-repeat key is computed so the injected session never
@@ -1090,10 +1138,13 @@ class CopilotSession:
         whatever the model did not set itself — so the copilot picks up the logged-in
         session from history instead of bouncing off a login wall on every request.
 
-        Precedence: browser-handoff cookies (collected on an auth-wall pause) beat
-        the passive jar; anything the model set explicitly beats both (never
-        overwritten). Cookies are host-scoped via the jar; borrowed non-cookie auth
-        headers come from the freshest matching request to the same host.
+        Precedence: browser-handoff cookies (collected on an auth-wall pause) beat the
+        passive jar. For the SESSION COOKIE + CSRF header the TOOL wins, not the model:
+        a model-pasted Cookie/X-CSRF-Token is stripped and replaced with the active
+        session's (so the model cannot pin a stale/foreign session — see below). For
+        non-cookie auth headers (Authorization/X-Auth-Token/X-Api-Key), anything the model
+        set explicitly is kept; otherwise they are borrowed from the freshest matching
+        request to the same host.
         """
         urls = _candidate_urls(tool_args)
         if not urls:
@@ -1134,19 +1185,30 @@ class CopilotSession:
             return
 
         headers = dict(tool_args.get("headers") or {})
-        present = {key.lower() for key in headers}
 
-        if cookies and "cookie" not in present:
+        # The model must NOT be able to pin a stale or foreign session by pasting its own
+        # Cookie / X-CSRF-Token literal — it loops doing exactly that, which defeats
+        # activate_login_profile and multi-user (cross-tenant) switching. The tool owns the
+        # session: unless WE injected the cookie on a prior pass (trusted marker), drop any
+        # model-supplied Cookie + CSRF header for this host and re-seed from the jar's ACTIVE
+        # session. (A model Cookie carrying x-dast-cookies-injected=1 is ours — keep it.)
+        model_marked = str(headers.get("x-dast-cookies-injected", "")) == "1"
+        if cookies and not model_marked:
+            for key in [k for k in list(headers)
+                        if k.lower() in ("cookie", "x-csrf-token", "x-xsrf-token")]:
+                del headers[key]
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
 
-        # CSRF and XHR headers: inject whenever we have cookies, even if the copilot
-        # already set the Cookie header manually. Shared with the active-scan path via
-        # inject_csrf (single implementation). refresh=False: never clobber a header the
-        # copilot set deliberately.
+        present = {key.lower() for key in headers}
+
+        # CSRF and XHR headers from the ACTIVE session cookies (shared injector; single
+        # implementation with the active-scan path). refresh=True so a stale token the model
+        # pasted (and we did not strip above, e.g. when the trusted marker was present) is
+        # corrected to the active session's value.
         if cookies:
             from dast.proxy.auth_headers import inject_csrf
-            inject_csrf(headers, cookies, refresh=False)
+            inject_csrf(headers, cookies, refresh=True)
 
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":

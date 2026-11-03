@@ -561,6 +561,49 @@ async def test_session_auth_never_overwrites_model_set_headers():
     assert headers["Cookie"] == "session=abc"  # jar cookie still added
 
 
+@pytest.mark.asyncio
+async def test_session_auth_strips_model_pasted_stale_cookie():
+    # The model must NOT be able to pin a stale/foreign session by pasting its own
+    # Cookie/X-CSRF-Token — the tool replaces them with the ACTIVE jar session (this is
+    # the loop that stalled the 2nd run).
+    session = CopilotSession("s-auth3")
+    _, on_event = _collector()
+
+    store = _FakeStore(
+        cookies=[{"name": "session", "value": "ACTIVE"},
+                 {"name": "CSRF-TOKEN", "value": "FRESH"}],
+        entries=[],
+    )
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_tool(_ctx, _name, args):
+        captured["args"] = args
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x",
+                       "headers": {"Cookie": "session=STALE; CSRF-TOKEN=old",
+                                   "X-CSRF-Token": "oldtok"}}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    headers = captured["args"]["headers"]
+    # stale cookie replaced with the active jar session
+    assert "STALE" not in headers["Cookie"]
+    assert "session=ACTIVE" in headers["Cookie"]
+    # stale CSRF refreshed from the active session cookie, not the model's "oldtok"
+    assert headers["X-CSRF-Token"] == "FRESH"
+    assert headers["x-dast-cookies-injected"] == "1"
+
+
 def test_render_arg_signature_marks_required_and_anyof():
     from dast.ai.copilot.session import _render_arg_signature
 
@@ -718,3 +761,46 @@ def test_copilot_step_schema_does_not_require_action():
                            "tool_args": {"url": "https://app.example.com/"}}
     # Must NOT raise now that `action` is optional.
     assert _require_fields(step_without_action, COPILOT_STEP_SCHEMA) == step_without_action
+
+
+# ── coordinator watchdog: kill a turn looping on the same normalized call ─────
+
+def test_normalized_call_sig_ignores_header_literals():
+    from dast.ai.copilot.session import _normalized_call_sig
+    a = {"url": "https://in.scope/x", "method": "POST", "body": "b",
+         "headers": {"Cookie": "session=1", "X-CSRF-Token": "t1"}}
+    b = {"url": "https://in.scope/x", "method": "POST", "body": "b",
+         "headers": {"Cookie": "session=2", "X-CSRF-Token": "t2"}}
+    assert _normalized_call_sig("send_request", a) == _normalized_call_sig("send_request", b)
+    # a different endpoint is a different signature
+    c = dict(a); c["url"] = "https://in.scope/y"
+    assert _normalized_call_sig("send_request", c) != _normalized_call_sig("send_request", a)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_kills_turn_repeating_same_normalized_call():
+    # The model pastes a DIFFERENT Cookie literal each call (slips the exact-dedup) but
+    # the intent is identical — the watchdog must break the turn with stuck_loop.
+    session = CopilotSession("s-watchdog")
+    _, on_event = _collector()
+    store = _FakeStore(cookies=[{"name": "session", "value": "A"}], entries=[])
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    async def fake_run_tool(_ctx, _name, args):
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "p", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x", "method": "POST", "body": "b",
+                       "headers": {"Cookie": f"session=STALE{i}"}}}
+        for i in range(4)
+    ] + [{"action": "reply", "thought": "d", "message": "ok"}]
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "stuck_loop"
+    assert "cookie" in reply.message.lower()

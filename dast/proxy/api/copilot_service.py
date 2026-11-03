@@ -90,6 +90,9 @@ _SESSION_KEEPALIVE_INTERVAL = 1200.0
 # run end anyway (with an honest "coverage incomplete" report). Guards against a loop
 # where the copilot cannot make coverage progress; the stuck detector is the other bound.
 _MAX_COMPLETE_REJECTIONS = 8
+# How many times the engine may report a stuck_loop (an agent repeating the same
+# normalized call) before the coordinator KILLS the run instead of re-prompting it.
+_MAX_STUCK_LOOPS = 2
 
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
@@ -243,6 +246,18 @@ _AUTONOMOUS_CONTINUE = (
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
     "blocked (say what a vulnerable vs. normal response would look like)."
+)
+
+_AUTONOMOUS_STUCK_LOOP = (
+    "LOOP BROKEN BY THE COORDINATOR. You repeated the same request over and over with no "
+    "new result:\n{detail}\n\n"
+    "Root cause: do NOT paste Cookie or X-CSRF-Token headers into send_request — the tool "
+    "manages the session for the active identity (activate_login_profile / the named session). "
+    "Pasting a header literal pins a stale session and changes nothing.\n"
+    "Do something DIFFERENT now: a different endpoint, a different parameter, or a different "
+    "tool (scan_surface, run_scan, run_multiuser_idor, idor_probe). If you have genuinely "
+    "exhausted this endpoint, move to the next one or conclude. Budget: {budget}.\n\n"
+    "{coverage}"
 )
 
 _AUTONOMOUS_SELF_PROCEED = (
@@ -1635,6 +1650,36 @@ class CopilotService:
                     stuck_turns += 1
 
                 # ── Interpret the reply's control signal ─────────────────────────
+                # Watchdog: the engine killed a turn whose agent looped on the same
+                # normalized call. The coordinator breaks it — re-prompt once with a hard
+                # corrective, and KILL the run if it keeps happening (the agent cannot
+                # self-correct; the supervisor must stop it rather than burn the budget).
+                if blocked_reason == "stuck_loop":
+                    auto["stuck_loops"] = auto.get("stuck_loops", 0) + 1
+                    await self._broadcast_autonomous(sid, "stuck_loop",
+                                                     {"count": auto["stuck_loops"]})
+                    logger.warning("autonomous run: agent stuck in a loop",
+                                   session_id=sid, count=auto["stuck_loops"])
+                    if auto["stuck_loops"] >= _MAX_STUCK_LOOPS:
+                        self._finish_autonomous(
+                            session, "stuck",
+                            "agent repeatedly looped on the same call and could not self-correct")
+                        await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
+                        return
+                    # Clear the engine's dedup + repeat counters so the corrected strategy
+                    # is not itself suppressed, then re-prompt with a hard constraint.
+                    try:
+                        session["engine"]._seen_calls.clear()
+                        session["engine"]._repeat_sigs.clear()
+                    except Exception as exc:
+                        logger.debug("stuck_loop: could not clear engine dedup", error=str(exc))
+                    prompt = _AUTONOMOUS_STUCK_LOOP.format(
+                        detail=(reply.message or "")[:400],
+                        budget=self._budget_label(auto, cfg, deadline),
+                        coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    )
+                    continue
+
                 if blocked_reason == "complete":
                     coverage = self._surface_coverage(effective_hosts)
                     budget_left = (time.time() < deadline

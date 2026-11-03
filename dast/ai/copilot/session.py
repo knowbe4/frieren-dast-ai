@@ -416,7 +416,7 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
             lambda: bedrock_client.invoke_json(
                 system=system,
                 user=user,
-                model_id=bedrock_client.get_fast_model(),
+                model_id=bedrock_client.get_copilot_model(),
                 max_tokens=1024,
                 temperature=0,
                 schema=COPILOT_STEP_SCHEMA,
@@ -455,7 +455,7 @@ async def _repair_tool_args(
         repaired = await loop.run_in_executor(
             None,
             lambda: bedrock_client.invoke_json(
-                system=system, user=user, model_id=bedrock_client.get_fast_model(),
+                system=system, user=user, model_id=bedrock_client.get_copilot_model(),
                 max_tokens=1024, temperature=0, schema=tool_schema,
             ),
         )

@@ -504,18 +504,69 @@ def _resolve_model(model_id: Optional[str]) -> str:
     return model
 
 
+def _settings_tier(attr: str) -> str:
+    """Persistent tier default from .env (dast.config.settings). Lazy import to
+    avoid a circular import at module load."""
+    try:
+        from dast.config import settings
+        return (getattr(settings, attr, "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _tier_chain(tier: str) -> list:
+    """Parsed, provider-usable model fallback chain for a tier ('fast'|'validation'),
+    read from settings.ai_<tier>_models (comma list, best first). Empty when unset."""
+    raw = _settings_tier(f"ai_{tier}_models")
+    out = []
+    for name in (m.strip() for m in raw.split(",")):
+        if name and _usable_tier_model(name, tier):
+            out.append(name)
+    return out
+
+
 def get_fast_model() -> str:
     """Return the model to use for fast, low-stakes decisions (planning, baseline).
-    Falls back to active model if no fast model configured (or the configured one
-    is not valid for the active provider)."""
-    return _usable_tier_model(_fast_model_id, "fast") or get_active_model()
+    Precedence: fallback-chain first entry > runtime override (dashboard) >
+    .env ai_fast_model > active model."""
+    chain = _tier_chain("fast")
+    if chain:
+        return chain[0]
+    return (_usable_tier_model(_fast_model_id or _settings_tier("ai_fast_model"), "fast")
+            or get_active_model())
 
 
 def get_validation_model() -> str:
-    """Return the model to use for high-stakes validation (red-team exploit proof).
-    Falls back to active model if no validation model configured (or the configured
-    one is not valid for the active provider)."""
-    return _usable_tier_model(_validation_model_id, "validation") or get_active_model()
+    """Return the model to use for high-stakes validation (red-team, IDOR, copilot
+    pentest). Precedence: fallback-chain first entry > runtime override >
+    .env ai_validation_model > active model."""
+    chain = _tier_chain("validation")
+    if chain:
+        return chain[0]
+    return (_usable_tier_model(_validation_model_id or _settings_tier("ai_validation_model"),
+                               "validation")
+            or get_active_model())
+
+
+def get_copilot_model() -> str:
+    """Model for the interactive copilot. Selects the tier named by
+    settings.copilot_model_tier ('fast' default, or 'validation'). Provider
+    agnostic and per-install configurable — no model name is hardcoded here."""
+    tier = (_settings_tier("copilot_model_tier") or "fast").lower()
+    return get_validation_model() if tier == "validation" else get_fast_model()
+
+
+def _fallback_models(model: str) -> list:
+    """Given a resolved model, return [model, *remaining fallbacks] from the
+    configured tier chains. If the model sits in a chain, returns that chain from
+    the model onward (so a failure/block falls to the next); otherwise just the
+    single model. Validation is checked before fast so a model shared by both
+    falls through the higher-stakes chain."""
+    for tier in ("validation", "fast"):
+        chain = _tier_chain(tier)
+        if model in chain:
+            return chain[chain.index(model):]
+    return [model] if model else []
 
 
 def get_client():
@@ -700,29 +751,11 @@ def _invoke_external(
             raise
 
 
-def _invoke_raw(
-    system: str,
-    user: str,
-    model_id: Optional[str],
-    max_tokens: int,
-    temperature: Optional[float],
-    cache_system: bool,
-    schema: Optional[Dict[str, Any]],
-    image_b64: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Send one request to the active provider and return the parsed response
-    envelope (always Anthropic-shaped, regardless of provider). Handles
-    throttling and credential expiry automatically.
-    """
+def _invoke_one(provider: str, body: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Send one request to a SINGLE named model on the active provider. Raises on
+    terminal failure (the fallback loop in _invoke_raw decides whether to retry
+    with the next model)."""
     from botocore.exceptions import ClientError
-
-    model = _resolve_model(model_id)
-    provider = get_active_provider()
-    if image_b64 and provider in ("openai", "glm"):
-        raise ValueError(f"image input is not supported for provider '{provider}' "
-                         "(use the bedrock/anthropic/gateway provider for vision)")
-    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
 
     if provider != "bedrock":
         result = _invoke_external(provider, body, model)
@@ -756,6 +789,55 @@ def _invoke_raw(
     # (user needs to run 'aws sso login' again). Signal the scan queue to pause.
     mark_ai_unavailable()
     raise AiUnavailableError("AWS credentials expired — run 'aws sso login' then click Resume")
+
+
+def _invoke_raw(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Send one request to the active provider and return the parsed response
+    envelope (always Anthropic-shaped, regardless of provider). Handles
+    throttling and credential expiry automatically, and — when the resolved model
+    sits in a configured tier fallback chain (ai_fast_models/ai_validation_models)
+    — falls through to the next model on an API failure/block.
+    """
+    model = _resolve_model(model_id)
+    provider = get_active_provider()
+    if image_b64 and provider in ("openai", "glm"):
+        raise ValueError(f"image input is not supported for provider '{provider}' "
+                         "(use the bedrock/anthropic/gateway provider for vision)")
+    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
+
+    candidates = _fallback_models(model) or [model]
+    last_exc: Optional[Exception] = None
+    for index, candidate in enumerate(candidates):
+        try:
+            return _invoke_one(provider, body, candidate)
+        except AiUnavailableError:
+            # Credential/SSO exhaustion is not model-specific — every model fails
+            # the same way, so do not burn the rest of the chain on it.
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if index < len(candidates) - 1:
+                logger.warning(
+                    "Model call failed/blocked; falling back to next model in chain",
+                    failed_model=candidate, next_model=candidates[index + 1],
+                    error=str(exc)[:200],
+                )
+                continue
+            raise
+    # Unreachable (loop either returns or raises), but keeps type-checkers happy.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("no model candidates to invoke")
 
 
 def _extract_text(result: Dict[str, Any]) -> str:

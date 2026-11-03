@@ -54,6 +54,29 @@ Never use `python3` directly. Never activate a venv manually.
 
 ---
 
+## Feature coverage — every feature is API + MCP (hard rule)
+
+1. **Every operator-facing feature MUST have an HTTP API route AND an agent-callable MCP
+   tool.** The `dast/tools/` registry is the single definition that drives both the internal
+   agent/copilot loop and the external MCP server (`dast/mcp/server.py`). Pure-UI affordances
+   are the only exception. A feature the operator can click but the copilot cannot call over
+   MCP is a gap to close.
+2. **If you — or the copilot — need to drive a feature and no MCP tool exists, create one.**
+   Add a thin `dast/tools/<name>_tools.py` wrapper over the existing route/scanner/store
+   function (follow `dast/tools/CLAUDE.md`). Never reimplement logic; never curl the dashboard
+   HTTP API from an agent — call (or add) the MCP tool.
+3. **MCP-first for AI consumers.** The copilot and any AI driver use MCP tools; the HTTP API is
+   for the dashboard UI. State-changing/secret-handling tools are allowed (see
+   `dast/tools/CLAUDE.md`) with guardrails: scope-gate before acting, and never return secrets.
+4. **Default pentest methodology.** On a "full / blackbox / greybox / whitebox pentest" request,
+   follow the playbook (overridable by prompt): recon → enumerate the surface (navigate/crawl +
+   known endpoint sources) → test every endpoint BOTH authenticated AND unauthenticated (authz,
+   BOLA/IDOR, privesc) → per-endpoint injection/business-logic/limits → ground every result in
+   the recorded proxy request/response, never the model's narration. Reference OWASP WSTG, OWASP
+   API Security Top 10, and PTES; emit a methodology-structured report so coverage is auditable.
+
+---
+
 ## Extension Recipes (how to add X — no code changes beyond the drop-in)
 
 **Agent vs Plugin — which do I write?** The `dast/agents/` and `dast/plugins/` folders stay

@@ -68,11 +68,18 @@ tools are idempotent-ish, well-scoped, and safe to expose.
 Do NOT add a tool for:
 - **Multi-step orchestration** — that's the coordinator's / agent's job. Tools are primitives the
   planner composes, not workflows.
-- **State-changing admin actions** — e.g. activating a login profile is intentionally NOT exposed
-  (`list_login_profiles` is read-only and secret-free via `to_public_dict()`). Anything that
-  changes server state or handles secrets stays off the tool layer unless there's a clear reason.
 - **One-off internal helpers** — if only one call site needs it and it's not a capability an agent
   would pick, keep it a plain function in its own module.
+
+**State-changing / secret-handling actions ARE allowed as tools** when an agent/the copilot needs
+to drive them (per the root `CLAUDE.md` "every feature is API + MCP" rule). This reverses the earlier
+blanket ban — e.g. saving a named session (`save_login_session`), activating a login profile
+(`activate_login_profile`), and launching a scan (`run_scan`, `run_multiuser_idor`) are exposed.
+Guardrails are mandatory:
+- **Scope-gate** any target URL/host with `ctx.is_in_scope(...)` before acting (as every write tool does).
+- **Never return secrets** in the tool result — reads stay secret-free (counts/labels, `to_public_dict()`);
+  writes report what changed (names, roles, counts), never cookie/token/password values.
+- **Keep handlers thin** — wrap the existing route/store/scanner function; do not reimplement logic.
 
 ## When to expose over MCP (vs. keep internal-only)
 

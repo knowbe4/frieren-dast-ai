@@ -84,6 +84,33 @@ class Settings(BaseSettings):
     # when left unset in .env.
     ai_model_id: str = ""
 
+    # Persistent model-tier defaults (survive restarts), read from .env. These
+    # seed the runtime tiers used by get_fast_model()/get_validation_model() when
+    # the dashboard has not overridden them at runtime. Set to a provider-correct
+    # model name (e.g. a gateway/Anthropic name like "claude-opus-4-6" /
+    # "claude-haiku-5-5", or a Bedrock ARN). Empty = fall back to the active model.
+    #   ai_fast_model       — low-stakes work: planner, recon/search, triage, classifier
+    #   ai_validation_model — high-stakes security work: red-team, IDOR, copilot pentest
+    ai_fast_model: str = ""
+    ai_validation_model: str = ""
+
+    # Optional model FALLBACK CHAINS (comma-separated, best first). When set, a
+    # tier call tries each model in order and falls to the next on an API
+    # failure/block (provider error, throttle-exhaustion, refusal/4xx, timeout).
+    # Note: a successful-but-wrong answer is NOT a failure, so the chain does not
+    # catch quality issues — only hard failures/blocks. The first entry is what
+    # get_fast_model()/get_validation_model() report; the rest are fallbacks.
+    #   e.g. ai_validation_models=claude-opus-5-5,claude-sonnet-5,claude-opus-4-6
+    ai_fast_models: str = ""
+    ai_validation_models: str = ""
+
+    # Which tier the interactive copilot (pentest driver) runs on. Default "fast"
+    # keeps the historical behaviour (shared with the planner). Set "validation"
+    # in .env to run the copilot on the higher-stakes tier/chain instead. Provider
+    # agnostic — it just selects which configured tier the copilot's model comes
+    # from, whatever provider you use.
+    copilot_model_tier: str = "fast"
+
     @model_validator(mode="after")
     def _default_ai_model_id(self) -> "Settings":
         if not self.ai_model_id:

@@ -1140,21 +1140,13 @@ class CopilotSession:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
 
-        # CSRF and XHR headers: inject whenever we have cookies, even if the
-        # copilot already set the Cookie header manually.  Previous code nested
-        # these inside the cookie-injection block, so they were silently skipped
-        # when the copilot provided its own Cookie header.
-        if cookies and "x-csrf-token" not in present:
-            csrf = (cookies.get("CSRF-TOKEN")
-                    or cookies.get("csrf-token")
-                    or cookies.get("csrf_token")
-                    or cookies.get("XSRF-TOKEN")
-                    or cookies.get("xsrf-token"))
-            if csrf:
-                headers["X-CSRF-Token"] = csrf
-
-        if cookies and "x-requested-with" not in present:
-            headers["X-Requested-With"] = "XMLHttpRequest"
+        # CSRF and XHR headers: inject whenever we have cookies, even if the copilot
+        # already set the Cookie header manually. Shared with the active-scan path via
+        # inject_csrf (single implementation). refresh=False: never clobber a header the
+        # copilot set deliberately.
+        if cookies:
+            from dast.proxy.auth_headers import inject_csrf
+            inject_csrf(headers, cookies, refresh=False)
 
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":

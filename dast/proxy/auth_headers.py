@@ -64,3 +64,50 @@ def extract_auth_headers(
             break
 
     return auth_headers
+
+
+# CSRF cookie names a double-submit / SPA framework typically mirrors into a header.
+_CSRF_COOKIE_NAMES = ("CSRF-TOKEN", "csrf-token", "csrf_token", "XSRF-TOKEN", "xsrf-token")
+
+
+def _cookie_value_map(cookies) -> Dict[str, str]:
+    """Normalise cookies (a {name: value} map, a {name: playwright-dict} map, or an
+    iterable of playwright cookie dicts) into a flat {name: value} map."""
+    out: Dict[str, str] = {}
+    if isinstance(cookies, dict):
+        for name, val in cookies.items():
+            out[name] = val.get("value", "") if isinstance(val, dict) else (val or "")
+    else:
+        for cookie in cookies or []:
+            name = cookie.get("name")
+            if name:
+                out[name] = cookie.get("value", "") or ""
+    return out
+
+
+def inject_csrf(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:
+    """Add the CSRF + XHR headers a cookie-authenticated SPA requires on a
+    state-changing request, mutating and returning ``headers``.
+
+    A SPA (Rails, Django, Angular, ...) mirrors a CSRF/XSRF cookie into an
+    ``X-CSRF-Token`` request header; without it the server 403s every POST/PUT/
+    PATCH/DELETE. ``cookies`` may be a ``{name: value}`` map, a ``{name:
+    playwright-dict}`` map, or an iterable of playwright cookie dicts.
+
+    - Sets ``X-CSRF-Token`` from the first matching CSRF/XSRF cookie.
+    - Sets ``X-Requested-With: XMLHttpRequest`` when cookies exist.
+    - ``refresh=False`` (copilot default): never overwrite a header already present.
+    - ``refresh=True`` (scan default): overwrite a stale ``X-CSRF-Token`` with the
+      current cookie value (the jar is the source of truth for active probes).
+    """
+    if not cookies:
+        return headers
+    cookie_map = _cookie_value_map(cookies)
+    present = {k.lower(): k for k in headers}
+    csrf = next((cookie_map[name] for name in _CSRF_COOKIE_NAMES if cookie_map.get(name)), None)
+    if csrf and ("x-csrf-token" not in present or refresh):
+        # Overwrite under the existing header key if one is present (any case), else add.
+        headers[present.get("x-csrf-token", "X-CSRF-Token")] = csrf
+    if "x-requested-with" not in present:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+    return headers

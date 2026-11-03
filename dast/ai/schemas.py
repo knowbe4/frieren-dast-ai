@@ -771,3 +771,38 @@ VISION_CLICKABLES_SCHEMA: Dict[str, Any] = {
     },
     "required": ["elements"],
 }
+
+
+# One browser action chosen by the LLM fallback when the deterministic login
+# heuristic fails. The model sees a page snapshot (forms/buttons/links) and the
+# available credentials, and returns exactly ONE next action to advance the login.
+LOGIN_ACTION_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reasoning": {
+            "type": "string",
+            "description": "One short sentence on why this action advances the login.",
+        },
+        "action": {
+            "type": "string",
+            "enum": ["fill", "click", "wait", "navigate", "stop"],
+            "description": "fill a field, click an element, wait for a selector, "
+                           "navigate to a URL, or stop when login is complete or impossible.",
+        },
+        "selector": {
+            "type": "string",
+            "description": "CSS selector of the target element (fill/click/wait), or the "
+                           "URL to open (navigate). Pick selectors from the snapshot; do not guess.",
+        },
+        "value": {
+            "type": "string",
+            "description": "For fill only: the literal value. Use the provided email or "
+                           "password verbatim; never invent credentials.",
+        },
+        "expect_navigation": {
+            "type": "boolean",
+            "description": "For click only: true when the click loads a new page.",
+        },
+    },
+    "required": ["action"],
+}

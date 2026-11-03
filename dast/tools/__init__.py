@@ -29,6 +29,7 @@ from dast.tools import history_tools as _history_tools  # noqa: F401
 from dast.tools import http_tools as _http_tools  # noqa: F401
 from dast.tools import match_replace_tools as _match_replace_tools  # noqa: F401
 from dast.tools import idor_tools as _idor_tools  # noqa: F401
+from dast.tools import login_tools as _login_tools  # noqa: F401
 from dast.tools import idor_scan_tools as _idor_scan_tools  # noqa: F401
 from dast.tools import oob_tools as _oob_tools  # noqa: F401
 from dast.tools import session_tools as _session_tools  # noqa: F401

@@ -804,3 +804,34 @@ async def test_watchdog_kills_turn_repeating_same_normalized_call():
 
     assert reply.blocked_reason == "stuck_loop"
     assert "cookie" in reply.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_kills_model_repeatedly_pasting_session_headers_across_endpoints():
+    # The per-call watchdog misses this: the model pastes Cookie on DIFFERENT urls each time.
+    # The cross-endpoint strip-counter must trip stuck_loop once it is clear the model keeps
+    # supplying session headers the tool ignores.
+    from dast.ai.copilot.session import _MAX_HEADER_STRIPS
+    session = CopilotSession("s-strip")
+    _, on_event = _collector()
+    store = _FakeStore(cookies=[{"name": "session", "value": "ACTIVE"}], entries=[])
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    async def fake_run_tool(_ctx, _name, args):
+        return {"ok": True, "status": 200}
+
+    n = _MAX_HEADER_STRIPS * 2
+    steps = [
+        {"action": "call_tool", "thought": "p", "tool_name": "send_request",
+         "tool_args": {"url": f"https://in.scope/e{i}", "headers": {"Cookie": "session=STALE"}}}
+        for i in range(n)
+    ] + [{"action": "reply", "thought": "d", "message": "ok"}]
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "stuck_loop"
+    assert "cookie" in reply.message.lower()

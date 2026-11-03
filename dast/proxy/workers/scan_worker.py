@@ -168,7 +168,13 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
             #   3. AI agents (coordinator + LLM planner) — only with AI on.
             # `ai_mode` off is NOT a reason to skip the whole scan anymore: it
             # only downgrades this entry to the deterministic layer.
-            run_agents = bool(is_imported or runner._store.ai_mode)
+            # Agents run when: an import targeted this entry, ambient AI mode is on, OR this
+            # was an EXPLICIT scan (run_scan/scan_surface set ai_queued). The explicit case is
+            # what lets a session_safe autonomous run — which keeps ambient ai_mode OFF to avoid
+            # flooding a strict single-session target — still run the full VulnAgent arsenal on
+            # the endpoints it deliberately scans (ambient crawl-queued entries stay deterministic).
+            run_agents = bool(is_imported or runner._store.ai_mode
+                              or getattr(entry, "ai_queued", False))
 
             # Scope is a hard safety boundary — never bypassed by a queue click.
             # Only an explicit import (a deliberate, specific target list) may

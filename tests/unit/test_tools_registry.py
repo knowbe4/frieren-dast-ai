@@ -1309,12 +1309,15 @@ async def test_run_scan_enqueues_awaits_and_returns_findings():
 
 
 @pytest.mark.asyncio
-async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
+async def test_run_scan_runs_agents_even_when_ai_mode_off():
+    # An EXPLICIT run_scan sets ai_queued, and the scan worker runs the full arsenal on an
+    # ai_queued entry regardless of ambient ai_mode — so a session_safe run (ambient ai_mode
+    # OFF) still gets real agents. The tool reports agents_ran=True accordingly.
     from dast.proxy.scan_queue_state import ScanQueueState
     import asyncio
 
     entry = _ScanEntry("GET", "https://api.acme-corp.com/x?q=1", "api.acme-corp.com")
-    store = _ScanStore([entry], ai_mode=False)  # AI off, proxied entry → deterministic only
+    store = _ScanStore([entry], ai_mode=False)  # ambient AI off — but explicit scan still runs agents
     queue: asyncio.Queue = asyncio.Queue()
     qs = ScanQueueState()
 
@@ -1330,8 +1333,8 @@ async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
     await worker_task
 
     assert result["ok"] is True
-    assert result["agents_ran"] is False
-    assert "note" in result
+    assert result["agents_ran"] is True        # explicit scan runs agents via ai_queued
+    assert entry.ai_queued is True
 
 
 # ── browser_login_adaptive (deterministic-first, LLM-fallback) ─────────────────

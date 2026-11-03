@@ -36,6 +36,9 @@ _MAX_TOOL_CALLS_PER_TURN = 20
 # Watchdog: how many times the SAME normalized call (same tool+method+url+body, ignoring
 # volatile headers) may repeat before the coordinator kills the looping turn.
 _MAX_NORMALIZED_REPEATS = 3
+# Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
+# once; after 2x, kill the turn with stuck_loop so the driver escalates.
+_MAX_HEADER_STRIPS = 4
 
 
 def _normalized_call_sig(tool_name: str, args: Dict[str, Any]) -> str:
@@ -502,6 +505,12 @@ class CopilotSession:
         # volatile headers) so the exact-dedup miss — the model pasting a different Cookie/
         # CSRF literal each call — is still caught and the looping turn can be killed.
         self._repeat_sigs: Dict[str, int] = {}
+        # Cross-endpoint watchdog: how many times we had to STRIP a model-pasted session
+        # header (Cookie/CSRF). The per-call watchdog misses this when it happens on
+        # different URLs, so count it URL-independently and break the run once it is clear
+        # the model is stuck supplying ignored headers.
+        self._stripped_header_count: int = 0
+        self._header_strip_warned: bool = False
         self._session_cookies: Dict[str, str] = {}
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
@@ -931,6 +940,25 @@ class CopilotSession:
                     tool_ctx.bearer_tokens = self._bearer_tokens
                     self._apply_session_auth(tool_ctx, tool_args)
 
+                    # Cross-endpoint watchdog: the model keeps pasting Cookie/CSRF headers
+                    # (now stripped, so a no-op) across different endpoints — the per-call
+                    # watchdog misses it. Warn once, then kill the turn so the driver
+                    # escalates rather than letting it narrate self-sabotage for many turns.
+                    if self._stripped_header_count >= _MAX_HEADER_STRIPS:
+                        if not self._header_strip_warned:
+                            self._header_strip_warned = True
+                            logger.warning("copilot watchdog: model repeatedly pasting stripped "
+                                           "session headers", session_id=self.session_id,
+                                           count=self._stripped_header_count)
+                        if self._stripped_header_count >= _MAX_HEADER_STRIPS * 2:
+                            self._stripped_header_count = 0
+                            self._header_strip_warned = False
+                            return _finalize(
+                                "Stopped: you keep setting Cookie / X-CSRF-Token headers on your "
+                                "requests. They are IGNORED — the tool injects the active session "
+                                "automatically. Stop setting them and switch endpoint, parameter, "
+                                "or tool.", blocked_reason="stuck_loop")
+
                     if await self._scope_gate(
                         tool_name, tool_args, tool_ctx, approved_hosts,
                         entry, wait_for_human, _observe,
@@ -1194,9 +1222,15 @@ class CopilotSession:
         # session. (A model Cookie carrying x-dast-cookies-injected=1 is ours — keep it.)
         model_marked = str(headers.get("x-dast-cookies-injected", "")) == "1"
         if cookies and not model_marked:
-            for key in [k for k in list(headers)
-                        if k.lower() in ("cookie", "x-csrf-token", "x-xsrf-token")]:
+            stripped = [k for k in list(headers)
+                        if k.lower() in ("cookie", "x-csrf-token", "x-xsrf-token")]
+            for key in stripped:
                 del headers[key]
+            if stripped:
+                # The model pasted a session header we had to override. Count it (URL-
+                # independent) so the dispatch loop can break a model that keeps doing this
+                # across many endpoints — the per-call watchdog misses it (different URLs).
+                self._stripped_header_count += 1
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
 

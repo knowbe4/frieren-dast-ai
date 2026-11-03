@@ -354,7 +354,7 @@ class AgentBrowser:
 
         Handles single-page, two-step, and SSO/Auth0 cross-domain flows:
         - Single-page: email + password on one page, click submit.
-        - Two-step (KMSAT): email -> Continue -> password appears on same domain.
+        - Two-step (SSO): email -> Continue -> password appears on same domain.
         - SSO (Auth0/Okta): email -> Continue -> redirect to IdP domain ->
           password on IdP -> MFA prompt -> redirect back to app.
         If MFA is required, returns mfa_required=True so the operator can
@@ -456,7 +456,7 @@ class AgentBrowser:
 
         # Detect SSO redirect: the page may have navigated to an IdP domain.
         # Federated login often lands on a new email-first form on the IdP
-        # (e.g. PhishER → KMSAT SSO → email → Continue → password).
+        # (e.g. app → SSO → email → Continue → password).
         # If we detect an email field but no password, fill + submit again.
         sso_redirected = page.url != pre_submit_url
         if sso_redirected:

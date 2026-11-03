@@ -182,8 +182,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             )
         cookies = list(profile.saved_session.get("cookies", []))
         auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
+        # Use the privilege level as the named-session role (what cross-session IDOR
+        # compares on); fall back to the profile name when no privilege level is set.
+        session_role = (profile.privilege_level or "").strip() or profile.name
         ctx.store.save_named_session_from_playwright(
-            name=profile.slug, role=profile.name, playwright_cookies=cookies,
+            name=profile.slug, role=session_role, playwright_cookies=cookies,
             auth_headers=auth_headers,
         )
         imported = ctx.store.import_playwright_cookies(cookies)

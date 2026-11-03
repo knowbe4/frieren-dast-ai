@@ -1476,3 +1476,209 @@ async def test_run_multiuser_idor_requires_two_sessions():
     result = await run_tool(ctx, "run_multiuser_idor", {"url": "https://app.acme-corp.com/x"})
     assert result["ok"] is False
     assert ">=2" in result["error"] or "2 saved" in result["error"]
+
+
+# ── session tools: external-MCP HTTP fallback (store=None) ─────────────────────
+
+class _FakeDashResp:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
+
+class _FakeDashClient:
+    """Routes dashboard GET/POST to a handler(method, path, json) -> _FakeDashResp,
+    so the store-less (MCP) tool path can be tested without a live dashboard."""
+
+    def __init__(self, handler, **kw):
+        self._handler = handler
+        self.calls: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    @staticmethod
+    def _path(url):
+        from urllib.parse import urlparse
+        return urlparse(url).path
+
+    async def get(self, url, params=None):
+        p = self._path(url)
+        self.calls.append(("GET", p, params))
+        return self._handler("GET", p, params)
+
+    async def post(self, url, json=None):
+        p = self._path(url)
+        self.calls.append(("POST", p, json))
+        return self._handler("POST", p, json)
+
+
+@pytest.mark.asyncio
+async def test_list_login_sessions_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        assert method == "GET" and path == "/api/named-sessions"
+        return _FakeDashResp(200, [{"name": "tenant_a", "role": "admin", "cookie_count": 4}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None → HTTP fallback (MCP path)
+    result = await run_tool(ctx, "list_login_sessions", {})
+    assert result["ok"] is True and result["count"] == 1
+    assert result["sessions"][0]["name"] == "tenant_a"
+    assert result["sessions"][0]["cookies"] == 4
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        if path == "/api/profiles/quick-capture":
+            assert body["name"] == "tenant_a" and body["privilege_level"] == "admin"
+            return _FakeDashResp(200, {"slug": "tenant_a",
+                                       "captured": {"host": body["host"], "cookies": 5, "auth_headers": 2}})
+        if path.endswith("/activate"):
+            assert path == "/api/profiles/tenant_a/activate"
+            return _FakeDashResp(200, {"named_session": "tenant_a", "cookies_imported": 5})
+        raise AssertionError(f"unexpected path {path}")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "save_login_session",
+                            {"name": "tenant_a", "host": "app.acme-corp.com", "role": "admin"})
+    assert result["ok"] is True
+    assert result["cookies"] == 5 and result["auth_headers"] == 2
+    assert result["name"] == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback_no_cookies(monkeypatch):
+    def handler(method, path, body):
+        return _FakeDashResp(404, {"error": "no cookies found in proxy jar"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "app.acme-corp.com"})
+    assert result["ok"] is False and "no cookies" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback_still_scope_gated(monkeypatch):
+    def boom(**kw):
+        raise AssertionError("dashboard must not be called for an out-of-scope host")
+    monkeypatch.setattr(httpx, "AsyncClient", boom)
+    ctx = ToolContext(settings=_Scope(False))  # store=None AND out of scope
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "evil.example.com"})
+    assert result["ok"] is False and "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        assert method == "POST" and path == "/api/profiles/tenant_a/activate"
+        return _FakeDashResp(200, {"activated": True, "cookies_imported": 7, "named_session": "tenant_a"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "activate_login_profile", {"slug": "tenant_a"})
+    assert result["ok"] is True and result["cookies_imported"] == 7
+    assert result["named_session"] == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_http_fallback_missing(monkeypatch):
+    def handler(method, path, body):
+        return _FakeDashResp(404, {"error": "profile not found"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "activate_login_profile", {"slug": "nope"})
+    assert result["ok"] is False and "no login profile" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_multiuser_idor_external_mcp_is_in_process_only():
+    # store=None + scan_queue=None is exactly the external MCP ToolContext.
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "run_multiuser_idor", {"url": "https://app.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "in-process" in result["error"]
+
+
+# ── code_* tools: thin wrappers over the existing code-analysis subsystem ──────
+
+def test_registry_lists_code_tools():
+    names = {t.name for t in tools.all_tools()}
+    assert {"code_search", "code_file", "code_list", "code_lookup_path"}.issubset(names)
+
+
+@pytest.mark.asyncio
+async def test_code_search_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert method == "GET" and path == "/api/code/search"
+        assert params and params.get("q") == "integrations"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "file_path": "app/controllers/integrations_controller.rb",
+                                    "language": "ruby", "preview": "def index", "content_length": 1200}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_search", {"query": "integrations"})
+    assert result["ok"] is True and result["count"] == 1
+    assert result["matches"][0]["file_path"].endswith("integrations_controller.rb")
+
+
+@pytest.mark.asyncio
+async def test_code_search_requires_query():
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_search", {"query": "  "})
+    assert result["ok"] is False and "query is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_file_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert path == "/api/code/file"
+        return _FakeDashResp(200, {"path": "a.rb", "language": "ruby", "content": "class A; end"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_file", {"analysis_id": "a1", "path": "a.rb"})
+    assert result["ok"] is True and result["content"] == "class A; end"
+
+
+@pytest.mark.asyncio
+async def test_code_file_not_found(monkeypatch):
+    def handler(method, path, params):
+        return _FakeDashResp(404, {"error": "file not found"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_file", {"analysis_id": "a1", "path": "missing.rb"})
+    assert result["ok"] is False and "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_list_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert path == "/api/code/list"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "status": "scanned", "files_scanned": 42}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_list", {})
+    assert result["ok"] is True and result["count"] == 1 and result["analyses"][0]["analysis_id"] == "a1"
+
+
+@pytest.mark.asyncio
+async def test_code_lookup_path_falls_back_to_search(monkeypatch):
+    # In the test process no analyses are loaded, so lookup_code_for_path returns "" and the
+    # tool falls back to a dashboard search on the last real path segment.
+    def handler(method, path, params):
+        assert path == "/api/code/search"
+        assert params and params.get("q") == "integrations"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "file_path": "integrations_controller.rb",
+                                    "preview": "def show"}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_lookup_path",
+                            {"url_path": "/app/backend/integrations/11111111-2222-3333-4444-555555555555"})
+    assert result["ok"] is True
+    assert result["count"] == 1 and "integrations" in result.get("note", "")

@@ -36,7 +36,15 @@ _SCHEMA = {
 async def _run_multiuser_idor(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     store = getattr(ctx, "store", None)
     if store is None:
-        return {"ok": False, "error": "run_multiuser_idor is not available in this context"}
+        # Launching an active scan needs the live in-process scan queue (like run_scan),
+        # which the external MCP process does not have. Set the sessions up over MCP with
+        # save_login_session / activate_login_profile, then run this from the Frieren copilot.
+        # (When store IS present but scan_queue is not, the >=2-session check below still
+        # runs and the delegated run_scan returns its own "not available" message.)
+        return {"ok": False, "error": "run_multiuser_idor launches an active scan and is only "
+                                      "available to the in-process copilot driver (like run_scan); "
+                                      "set up the named sessions over MCP, then run it from the "
+                                      "Frieren copilot"}
     try:
         sessions = store.get_named_sessions()
     except Exception as exc:

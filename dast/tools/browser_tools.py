@@ -183,7 +183,7 @@ async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 register(Tool(name="browser_login", input_schema=_LOGIN_SCHEMA, handler=_login,
     tags=["browser", "active"],
     description="Autonomous login via the agent browser. Handles multi-step flows "
-                "(email-first, then password on a second page) like KMSAT, Okta, and "
+                "(email-first, then password on a second page) like Okta and "
                 "other SSO-style login pages. Clears stale cookies, discovers form "
                 "fields automatically, fills credentials, clicks submit, waits for "
                 "redirect, and exports the resulting session cookies (including CSRF "

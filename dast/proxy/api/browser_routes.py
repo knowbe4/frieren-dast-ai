@@ -267,6 +267,61 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "browser failed to open"}, status_code=500)
         return result
 
+    @router.post("/api/browse/navigate")
+    async def browse_navigate(body: dict):
+        """Navigate the active browse session to a new URL."""
+        if not browse_queue:
+            return JSONResponse({"error": "browse not available"}, status_code=503)
+        url = (body.get("url") or "").strip()
+        if not url:
+            return JSONResponse({"error": "url required"}, status_code=400)
+        result: dict = {}
+        done = asyncio.Event()
+
+        def result_cb(r: dict) -> None:
+            result.update(r)
+            done.set()
+
+        await browse_queue.put({
+            "action": "navigate",
+            "url": url,
+            "name": body.get("name"),
+            "result_cb": result_cb,
+        })
+        try:
+            await asyncio.wait_for(done.wait(), timeout=35)
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "navigate timed out"}, status_code=500)
+        if not result.get("ok"):
+            return JSONResponse({"error": result.get("error", "unknown")}, status_code=400)
+        return result
+
+    @router.post("/api/browse/refresh")
+    async def browse_refresh(body: dict = None):
+        """Reload the current page in the active browse session."""
+        if not browse_queue:
+            return JSONResponse({"error": "browse not available"}, status_code=503)
+        body = body or {}
+        result: dict = {}
+        done = asyncio.Event()
+
+        def result_cb(r: dict) -> None:
+            result.update(r)
+            done.set()
+
+        await browse_queue.put({
+            "action": "refresh",
+            "name": body.get("name"),
+            "result_cb": result_cb,
+        })
+        try:
+            await asyncio.wait_for(done.wait(), timeout=35)
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "refresh timed out"}, status_code=500)
+        if not result.get("ok"):
+            return JSONResponse({"error": result.get("error", "unknown")}, status_code=400)
+        return result
+
     @router.post("/api/browse/stop")
     async def browse_stop():
         if browse_queue:

@@ -20,6 +20,7 @@ from dast.agents import (  # noqa: F401
     mfa_agent,
     nosql_agent,
     open_redirect_agent,
+    password_reset_agent,
     prototype_pollution_agent,
     race_condition_agent,
     secrets_agent,

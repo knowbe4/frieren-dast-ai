@@ -133,7 +133,7 @@ def _detect_aws_sso_profile() -> str | None:
 
 
 _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "CONNECT"}
-_ALLOWED_SOURCES = {"proxy", "crawler", "browse", "agent", "imported", "out-of-scope", "passive", "scanner"}
+_ALLOWED_SOURCES = {"proxy", "crawler", "browse", "agent", "imported", "out-of-scope", "passive", "scanner", "copilot", "param-mining"}
 _ALLOWED_PROTOCOLS = {"any", "http", "https", ""}
 _ALLOWED_KINDS = {"include", "exclude"}
 

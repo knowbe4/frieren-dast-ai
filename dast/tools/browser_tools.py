@@ -136,3 +136,173 @@ register(Tool(name="browser_wait_for", input_schema=_SEL_SCHEMA, handler=_wait_f
 register(Tool(name="browser_extract", input_schema=_SEL_SCHEMA, handler=_extract, tags=["browser", "read"],
     description="Read a value from the current page: an input's value (default), an element's text, or any HTML attribute. "
                 "Use to pull a fresh CSRF/hidden token out of a form before building a request."))
+
+
+_LOGIN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "Login page URL (e.g. https://app.example.com/login)."},
+        "email": {"type": "string", "description": "Email / username to log in with."},
+        "password": {"type": "string", "description": "Password for the account."},
+    },
+    "required": ["url", "email", "password"],
+}
+
+
+async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    browser = _browser(ctx)
+    if browser is None:
+        return _unavailable()
+    url = str(args.get("url", "")).strip()
+    email = str(args.get("email", "")).strip()
+    password = str(args.get("password", ""))
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not email:
+        return {"ok": False, "error": "email is required"}
+    if not password:
+        return {"ok": False, "error": "password is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+    try:
+        result = await browser.login(url, email, password)
+        if result.get("ok") and result.get("cookies"):
+            session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+            if session is not None and hasattr(session, "_session_cookies"):
+                session._session_cookies.update(result["cookies"])
+                logger.info("browser_login: synced cookies to copilot session",
+                            count=len(result["cookies"]))
+            if session is not None and result.get("logged_in"):
+                session._last_login = {"url": url, "email": email, "password": password}
+        safe_result = {k: v for k, v in result.items() if k != "cookies"}
+        return safe_result
+    except Exception as exc:
+        return {"ok": False, "error": f"login failed: {str(exc)[:200]}", "url": url}
+
+
+register(Tool(name="browser_login", input_schema=_LOGIN_SCHEMA, handler=_login,
+    tags=["browser", "active"],
+    description="Autonomous login via the agent browser. Handles multi-step flows "
+                "(email-first, then password on a second page) like KMSAT, Okta, and "
+                "other SSO-style login pages. Clears stale cookies, discovers form "
+                "fields automatically, fills credentials, clicks submit, waits for "
+                "redirect, and exports the resulting session cookies (including CSRF "
+                "tokens set on page load). Use this as step 0 before any authenticated "
+                "testing. Returns logged_in status, final URL, and cookie count."))
+
+
+_FETCH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "URL to fetch (absolute or relative to current page origin)."},
+        "method": {"type": "string", "description": "HTTP method (default POST).", "default": "POST"},
+        "headers": {"type": "object", "description": "Request headers (Content-Type defaults to application/json)."},
+        "body": {"type": "string", "description": "Request body (JSON string for POST/PUT)."},
+    },
+    "required": ["url"],
+}
+
+
+async def _resolve_url(page: Any, raw: str) -> str:
+    """Resolve a relative URL against the current page origin."""
+    if raw.startswith("/"):
+        parts = page.url.split("//", 1)
+        if len(parts) == 2:
+            origin = parts[0] + "//" + parts[1].split("/", 1)[0]
+            return origin + raw
+    return raw
+
+
+async def _inject_csrf(browser: Any, headers: Dict[str, str]) -> None:
+    """Auto-inject CSRF token and X-Requested-With if not already present."""
+    lower = {k.lower(): v for k, v in headers.items()}
+    if "x-csrf-token" not in lower:
+        try:
+            cookies = await browser.export_cookies()
+            csrf = cookies.get("CSRF-TOKEN") or cookies.get("XSRF-TOKEN") or ""
+            if csrf:
+                from urllib.parse import unquote
+                headers["X-CSRF-Token"] = unquote(csrf)
+        except Exception:
+            pass
+    if "x-requested-with" not in lower:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+
+
+async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    browser = _browser(ctx)
+    if browser is None:
+        return {"ok": False, "error": "browser driving is not available in this context"}
+    await browser.ensure_fresh_cookies()
+    page = await browser._ensure_page()
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    url = await _resolve_url(page, url)
+    method = str(args.get("method", "POST")).upper()
+    headers = dict(args.get("headers") or {"Content-Type": "application/json"})
+    body = args.get("body")
+
+    await _inject_csrf(browser, headers)
+
+    # Primary path: Playwright's network-level fetch (bypasses CORS entirely,
+    # carries the browser context's cookies automatically).
+    # Strip Cookie/Authorization from caller-supplied headers — the browser
+    # context handles auth via its own cookie jar. Manual Cookie headers
+    # conflict with context cookies and cause "Invalid token" / "Access denied".
+    fetch_headers = {k: v for k, v in headers.items()
+                     if k.lower() not in ("cookie", "authorization")}
+    primary_error = ""
+    try:
+        fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}
+        if body and method in ("POST", "PUT", "PATCH", "DELETE"):
+            fetch_kwargs["data"] = body
+        response = await page.request.fetch(url, **fetch_kwargs)
+        text = await response.text()
+        resp_headers = {k: v for k, v in response.headers.items()}
+        return {
+            "ok": True,
+            "status": response.status,
+            "headers": resp_headers,
+            "body": text[:50000],
+            "length": len(text),
+        }
+    except Exception as exc:
+        primary_error = str(exc)[:100]
+        logger.debug("browser_fetch: page.request.fetch failed, trying in-page fallback",
+                     error=primary_error)
+
+    # Fallback: in-page JS fetch (works for same-origin; subject to CORS).
+    try:
+        result = await page.evaluate("""async (args) => {
+            try {
+                const opts = {
+                    method: args.method,
+                    headers: args.headers,
+                    credentials: 'include',
+                };
+                if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
+                    opts.body = args.body;
+                }
+                const resp = await fetch(args.url, opts);
+                const text = await resp.text();
+                const respHdrs = {};
+                resp.headers.forEach((v, k) => { respHdrs[k] = v; });
+                return { ok: true, status: resp.status, headers: respHdrs,
+                         body: text.substring(0, 50000), length: text.length };
+            } catch (e) {
+                return { ok: false, error: e.message };
+            }
+        }""", {"url": url, "method": method, "headers": headers, "body": body})
+        return result
+    except Exception as fallback_exc:
+        return {"ok": False, "error": f"fetch failed: {primary_error}; "
+                f"fallback also failed: {str(fallback_exc)[:100]}"}
+
+
+register(Tool(name="browser_fetch", input_schema=_FETCH_SCHEMA, handler=_fetch, tags=["browser", "active"],
+    description="Make an HTTP request using the browser's session (cookies, auth state). Works cross-origin "
+                "(no CORS restrictions) — use this for API calls to a different subdomain than the current "
+                "page (e.g. api.example.com from example.com). Automatically injects X-CSRF-Token from "
+                "browser cookies and X-Requested-With header. Relative URLs are resolved against the current "
+                "page origin. Use after logging in via browser_login or browser_navigate/fill/click."))

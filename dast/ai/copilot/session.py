@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 # Hard ceiling on tool calls within a single operator turn. The LLM's
 # action="reply" is the primary turn boundary; this only fires if it never
 # replies (a bug, not normal dialogue).
-_MAX_TOOL_CALLS_PER_TURN = 12
+_MAX_TOOL_CALLS_PER_TURN = 20
 
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
 # neither a tool call nor a reply) before the turn gives up and hands back.
@@ -129,9 +129,15 @@ failure.
 Each turn, respond with a single step object:
   action="call_tool" — run one tool. Set tool_name to the exact registered name and
       tool_args to its arguments. Understand the endpoint first: read the request/
-      response context before firing payloads. Detection only — never send a
-      destructive payload (data deletion/modification, DoS, > 5s delay); the tools
-      refuse these anyway. You may call several tools across a turn before replying.
+      response context before firing payloads. You MAY send write requests
+      (POST, PUT, PATCH, DELETE) for testing: creating test objects, testing
+      authorization boundaries (IDOR, privesc, mass assignment). You MUST NOT
+      send destructive payloads: mass deletion, DoS, delays > 5s, or actions
+      that permanently corrupt state beyond what you can immediately revert;
+      the tools refuse these anyway via payload_safety. When the operator
+      explicitly authorizes writes or says "do not stop" / "do not ask",
+      execute the full sequence without pausing for confirmation.
+      You may call several tools across a turn before replying.
       When you CONFIRM a real, exploitable issue, call record_finding to persist it
       to the Findings tab BEFORE you reply — a finding that only lives in your reply
       text is not tracked, reported, or exported. Redact secrets/token values in the
@@ -168,9 +174,26 @@ Communication standard — applies to every reply, not just blocked ones:
 Operational notes:
 - Out-of-scope or new hosts: just call the tool. If the host is not yet authorized
   the operator is asked to approve; a denial comes back as an observation — adapt.
-- Auth walls / captchas: if a response looks like a login/challenge, the operator is
-  offered a browser handoff and any collected session is applied to later requests
-  automatically.
+- Auth walls / captchas: if a response looks like a login/challenge, DO NOT just wait
+  for the operator. Use browser_login as step 0 to authenticate — it handles multi-step
+  login flows (email-first, then password) autonomously, discovers form fields, fills
+  credentials, clicks submit, and exports session + CSRF cookies automatically.
+  browser_login also handles SSO/Auth0/Okta cross-domain flows: it follows redirects
+  to the IdP domain, fills password there, and detects when MFA is required. If it
+  returns mfa_required=true, the operator must complete the MFA challenge manually
+  (browser is visible on their screen). Only fall back to manual
+  browser_navigate/fill/click if browser_login fails for an unusual login form.
+  After browser_login succeeds, use send_request for authenticated API calls — the
+  CSRF token and session cookies are auto-injected. Use send_request (not
+  browser_fetch) for GraphQL/API calls because browser_fetch has a proxy
+  interference issue. Only ask the operator for help if you genuinely cannot log
+  in (captcha, no credentials).
+- Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
+  may need time to render, or the URL may be wrong. Before giving up: (1) check
+  get_history for the same host to find URLs that returned real content — the operator's
+  browser traffic shows which URLs work; (2) try browser_wait_for with a broader
+  selector like "button, input, a" for up to 15s; (3) try a different URL path from
+  history. Never classify an empty snapshot as WAF_BLOCK — it is a rendering issue.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
 - Prefer replying as soon as you have something worth the operator's attention; do
   not pad the turn with tool calls.
@@ -181,19 +204,64 @@ Operational notes:
   both users and compare. Report a finding when a low-privilege session accesses
   resources that should require higher privilege. Tell the operator which session
   you are using for each request so they can follow your reasoning.
+- Authentication testing: for every new endpoint you discover, also test it
+  without authentication using test_unauth. If test_unauth returns status 200 or
+  204, the endpoint may be missing auth controls — investigate what data it
+  exposes and whether it should require a session. Common unauthenticated vulns:
+  CSV/data exports, webhook receivers, admin panels, API endpoints that forgot
+  a before_action authenticate check.
+- Recording findings: when a test CONFIRMS a vulnerability, IMMEDIATELY call
+  record_finding. Do NOT wait for operator confirmation — if the test proves it,
+  record it. A confirmed vuln looks like:
+  * 201/200 when creating a system/global resource as a regular tenant (privilege escalation)
+  * 200 when PATCHing/GETting an object with a foreign tenant's ID (IDOR/BOLA)
+  * 200/204 from an endpoint with NO auth headers (missing authentication)
+  * Response contains data with a different account_id than yours (cross-tenant disclosure)
+  * Write succeeded on a resource you don't own (broken access control)
+  What is NOT a finding: 200 on your own data (normal), 401/403 (control works),
+  422 validation error (input rejected). Call record_finding with title, severity
+  (critical/high/medium/low), description, and steps (evidence request/response pairs).
+- Cleanup after write tests: track every object you CREATE (rule IDs, token IDs, etc).
+  After confirming a vuln, DELETE or revert test data immediately. For PATCH tests:
+  GET the original state BEFORE the test, run the exploit, record the finding, then
+  PATCH back to original values. Never leave artifacts (rules named "Test", "DELETE ME").
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.
-- CSRF-protected / token-bearing forms: raw send_request replay fails when a form
-  carries a single-use token (ComposeToken, __VIEWSTATE, draftId). Drive the real
+- CSRF-protected / token-bearing forms: when a form carries a single-use token
+  (ComposeToken, __VIEWSTATE, draftId), raw send_request replay fails. Drive the real
   browser instead: browser_navigate to the page, browser_snapshot to see the form
   fields, browser_fill the inputs, browser_extract any fresh hidden token if you
   need it in a follow-up request, then browser_click the submit button
   (expect_navigation=true). Use verify_reflection to check whether an injected
   payload survived in the rendered output.
+- Interactive exploration and business-logic testing: do not limit browser tools to
+  CSRF-protected forms. Use them as your PRIMARY exploration workflow for SPAs:
+  browser_navigate to each discovered route, browser_snapshot to read the page structure
+  (forms, buttons, links, visible data), browser_fill to enter test values, browser_click
+  to submit or navigate. This is how you UNDERSTAND the app before testing it — reading
+  the DOM reveals parameter semantics, hidden fields, client-side validation, role-gated
+  UI, and state machines that raw HTTP calls miss.
+- Parameter-level semantic reasoning: for every state-changing endpoint (POST/PUT/PATCH),
+  examine each parameter by name and infer what it represents. Identity-bearing parameters
+  (email, user_id, account_id, org_id, role, is_admin, privilege) are high-value targets:
+  (a) swap the value to another user's id/email and observe ownership enforcement;
+  (b) add or modify role/privilege fields the client does not normally send (mass assignment);
+  (c) omit required authorization fields and observe the response.
+  Test via send_request (change one parameter at a time) and compare to the baseline.
+- Response differential analysis: always establish a BASELINE first (the normal, authorized
+  request from get_history or send_request), then issue the MODIFIED request (swapped id,
+  added field, removed auth), and COMPARE the two. Report the specific difference as
+  evidence — do not just say "it returned 200".
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
+- GraphQL schema-aware testing: use graphql_introspect to discover available queries,
+  mutations, and types on any /graphql endpoint. Use graphql_type_info to inspect field
+  names, argument types, and enum values BEFORE crafting queries — this eliminates
+  guessing and avoids validation errors. Use graphql_find_sensitive to scan the schema
+  for fields that may leak credentials or secrets (otpSecretKey, sharedSecret, etc.).
+  Always introspect before testing a GraphQL target.
 - external retest objective ("retest H1 #XXXX"): (1) read the report with the
   triage tools to understand the vuln and endpoints; (2) you are already logged in
   (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via
@@ -410,7 +478,13 @@ class CopilotSession:
         self.messages: List[Dict[str, str]] = []
         self._seen_calls: set[str] = set()
         self._session_cookies: Dict[str, str] = {}
+        self._last_login: Optional[Dict[str, str]] = None
+        self._relogin_in_progress: bool = False
+        self._last_relogin_ts: float = 0.0
+        self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
+        self._last_bearer_refresh_ts: float = 0.0
         self._auth_prompted_hosts: set[str] = set()
+        self._store: Optional[object] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
         # or hypothesis target) make the brief available from the very first turn;
         # hosts the copilot then touches via tools accumulate for later turns.
@@ -422,6 +496,73 @@ class CopilotSession:
     def get_known_hosts(self) -> List[str]:
         """All hosts this session has targeted (focus + any touched during tool calls)."""
         return sorted(set(self._focus_hosts) | self._context_hosts)
+
+    @staticmethod
+    def _decode_jwt_exp(token: str) -> Optional[float]:
+        """Extract the ``exp`` claim from a JWT without verifying the signature."""
+        try:
+            parts = token.split(".")
+            if len(parts) < 2:
+                return None
+            import base64
+            payload = parts[1]
+            payload += "=" * (4 - len(payload) % 4)
+            import json as _json
+            claims = _json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp")
+            return float(exp) if exp is not None else None
+        except Exception:
+            return None
+
+    def _capture_bearer_tokens(self, store: Any, host: str) -> None:
+        """Scan proxy history for Bearer tokens targeting *host* and cache them."""
+        if store is None:
+            return
+        try:
+            entries = store.all_entries()
+        except Exception:
+            return
+        host_lower = host.lower()
+        parts = host_lower.split(".")
+        domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
+        import time as _time
+        for entry in reversed(entries):
+            try:
+                entry_host = (entry.get("host") or "").lower()
+                if domain_suffix not in entry_host:
+                    continue
+                req_headers = entry.get("request_headers") or {}
+                auth_val = ""
+                for k, v in req_headers.items():
+                    if k.lower() == "authorization":
+                        auth_val = str(v)
+                        break
+                if not auth_val.startswith("Bearer "):
+                    continue
+                token_val = auth_val[7:].strip()
+                exp = self._decode_jwt_exp(token_val)
+                now = _time.time()
+                if exp is not None and exp < now:
+                    continue
+                entry_host_actual = entry.get("host") or host
+                auth_endpoint = entry.get("path") or None
+                source_id = entry.get("id") or ""
+                if entry.get("source") == "copilot":
+                    continue
+            except Exception:
+                continue
+            self._bearer_tokens[entry_host_actual] = {
+                "token": token_val,
+                "captured_at": now,
+                "source_entry_id": source_id,
+                "auth_endpoint": auth_endpoint,
+                "exp": exp,
+            }
+            ttl = int(exp - now) if exp else "unknown"
+            logger.info("Captured Bearer token for host",
+                        host=entry_host_actual, ttl=ttl,
+                        source_entry=source_id[:20])
+            break
 
     def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
         """Preload an authenticated session (e.g. from an activated login profile)
@@ -716,6 +857,16 @@ class CopilotSession:
                         continue
 
                     call_key = f"{tool_name}:{_canonical(tool_args)}"
+                    if tool_name in ("browser_snapshot", "browser_extract",
+                                     "browser_wait_for") and hasattr(tool_ctx, "browser"):
+                        browser = getattr(tool_ctx, "browser", None)
+                        if browser is not None:
+                            try:
+                                page_url = browser.page.url if browser.page else ""
+                            except Exception:
+                                page_url = ""
+                            if page_url:
+                                call_key = f"{tool_name}:{page_url}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
                         reply = await _record_tool_failure(
                             entry, "Repeat of an earlier identical call — suppressed. "
@@ -729,6 +880,7 @@ class CopilotSession:
                     # + borrowed auth headers) on a request-shaped call. Runs after
                     # the anti-repeat key is computed so the injected session never
                     # changes the dedup identity of the model's intended call.
+                    tool_ctx.bearer_tokens = self._bearer_tokens
                     self._apply_session_auth(tool_ctx, tool_args)
 
                     if await self._scope_gate(
@@ -753,6 +905,123 @@ class CopilotSession:
                         continue
 
                     consecutive_tool_failures = 0
+                    if tool_name == "send_request" and result.get("set_cookies"):
+                        from http.cookies import SimpleCookie
+                        for sc_str in result["set_cookies"]:
+                            try:
+                                sc = SimpleCookie()
+                                sc.load(sc_str)
+                                for name, morsel in sc.items():
+                                    self._session_cookies[name] = morsel.value
+                            except Exception:
+                                pass
+                    if (
+                        tool_name in ("send_request", "browser_navigate")
+                        and not self._relogin_in_progress
+                        and self._last_login is not None
+                    ):
+                        import time as _time
+                        status = result.get("status")
+                        request_url = str(tool_args.get("url") or result.get("url") or "")
+                        host = urlparse(request_url).hostname or ""
+                        final_url = str(result.get("final_url") or result.get("url") or "").lower()
+                        login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
+                        session_expired = (
+                            (status == 302 and any(p in final_url for p in login_paths))
+                            or status == 401
+                        )
+                        cooldown_ok = (_time.time() - self._last_relogin_ts) > 60
+                        if session_expired and cooldown_ok:
+                            browser = getattr(tool_ctx, "browser", None)
+                            bearer_refreshed = False
+                            # Fast path: refresh Bearer token via auth endpoint
+                            if (
+                                status == 401
+                                and host in self._bearer_tokens
+                                and browser is not None
+                                and (_time.time() - self._last_bearer_refresh_ts) > 15
+                            ):
+                                cached = self._bearer_tokens[host]
+                                auth_ep = cached.get("auth_endpoint")
+                                if auth_ep:
+                                    logger.info("bearer-refresh: trying fast path",
+                                                host=host, endpoint=auth_ep[:60])
+                                    self._last_bearer_refresh_ts = _time.time()
+                                    try:
+                                        page = await browser._ensure_page()
+                                        resp = await page.request.fetch(
+                                            f"https://{host}{auth_ep}",
+                                            method="GET")
+                                        if resp.status == 200:
+                                            import json as _json
+                                            body = _json.loads(await resp.text())
+                                            new_token = (body.get("token")
+                                                         or body.get("access_token") or "")
+                                            if new_token:
+                                                exp = self._decode_jwt_exp(new_token)
+                                                self._bearer_tokens[host] = {
+                                                    "token": new_token,
+                                                    "captured_at": _time.time(),
+                                                    "source_entry_id": cached.get("source_entry_id", ""),
+                                                    "auth_endpoint": auth_ep,
+                                                    "exp": exp,
+                                                }
+                                                logger.info("bearer-refresh: succeeded",
+                                                            host=host,
+                                                            ttl=int(exp - _time.time()) if exp else -1)
+                                                self._apply_session_auth(tool_ctx, tool_args)
+                                                result = await run_tool(tool_ctx, tool_name, tool_args)
+                                                bearer_refreshed = True
+                                    except Exception as exc:
+                                        logger.debug("bearer-refresh: failed, falling back to login",
+                                                     error=str(exc)[:100])
+
+                            # Slow path: full browser re-login
+                            if not bearer_refreshed and browser is not None:
+                                logger.info("auto-relogin: session expired, re-authenticating",
+                                            request_host=urlparse(str(result.get("url", ""))).hostname,
+                                            login_url=self._last_login["url"][:60])
+                                self._relogin_in_progress = True
+                                self._last_relogin_ts = _time.time()
+                                try:
+                                    login_result = await browser.login(
+                                        self._last_login["url"],
+                                        self._last_login["email"],
+                                        self._last_login["password"],
+                                    )
+                                    if login_result.get("ok") and login_result.get("logged_in"):
+                                        if login_result.get("cookies"):
+                                            self._session_cookies.update(login_result["cookies"])
+                                        logger.info("auto-relogin: succeeded, retrying request")
+                                        self._capture_bearer_tokens(
+                                            getattr(tool_ctx, "store", None), host)
+                                        self._apply_session_auth(tool_ctx, tool_args)
+                                        result = await run_tool(tool_ctx, tool_name, tool_args)
+                                    else:
+                                        logger.warning("auto-relogin: login failed",
+                                                       error=str(login_result.get("error", ""))[:100])
+                                except Exception as exc:
+                                    logger.warning("auto-relogin: exception", error=str(exc)[:200])
+                                finally:
+                                    self._relogin_in_progress = False
+
+                    if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
+                        new_url = str(result.get("url", ""))
+                        if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():
+                            browser = getattr(tool_ctx, "browser", None)
+                            if browser is not None:
+                                try:
+                                    exported = await browser.export_cookies()
+                                    if exported:
+                                        self._session_cookies.update(exported)
+                                        logger.debug("Synced browser cookies to session",
+                                                     count=len(exported))
+                                    nav_host = urlparse(new_url).hostname or ""
+                                    if nav_host:
+                                        self._capture_bearer_tokens(
+                                            getattr(tool_ctx, "store", None), nav_host)
+                                except Exception:
+                                    pass
                     await _observe(entry, _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
                     # dedup keys: the copilot must be able to re-issue a prior read
@@ -760,9 +1029,13 @@ class CopilotSession:
                     # the anti-repeat set so that confirming re-read is not wrongly
                     # suppressed as a duplicate (which previously made it misread a
                     # stale get_history entry as the live post-mutation response).
-                    if tool_name == "send_request" and str(
-                        tool_args.get("method", "")
-                    ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                    if (
+                        (tool_name == "send_request" and str(
+                            tool_args.get("method", "")
+                        ).strip().upper() in ("POST", "PUT", "PATCH", "DELETE"))
+                        or tool_name in ("browser_fill", "browser_click",
+                                         "browser_navigate", "browser_wait_for")
+                    ):
                         self._seen_calls.clear()
                     continue
 
@@ -867,11 +1140,43 @@ class CopilotSession:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
 
+        # CSRF and XHR headers: inject whenever we have cookies, even if the
+        # copilot already set the Cookie header manually.  Previous code nested
+        # these inside the cookie-injection block, so they were silently skipped
+        # when the copilot provided its own Cookie header.
+        if cookies and "x-csrf-token" not in present:
+            csrf = (cookies.get("CSRF-TOKEN")
+                    or cookies.get("csrf-token")
+                    or cookies.get("csrf_token")
+                    or cookies.get("XSRF-TOKEN")
+                    or cookies.get("xsrf-token"))
+            if csrf:
+                headers["X-CSRF-Token"] = csrf
+
+        if cookies and "x-requested-with" not in present:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":
                 continue  # cookies come from the host-scoped jar above
             if name.lower() not in present:
                 headers[name] = value
+
+        if "authorization" not in present and host:
+            cached = self._bearer_tokens.get(host)
+            if cached is None and store is not None:
+                self._capture_bearer_tokens(store, host)
+                cached = self._bearer_tokens.get(host)
+            if cached:
+                import time as _time
+                exp = cached.get("exp")
+                if exp is None or exp > _time.time():
+                    headers["Authorization"] = f"Bearer {cached['token']}"
+                    logger.debug("Injected cached Bearer token",
+                                 host=host, ttl=int(exp - _time.time()) if exp else -1)
+                else:
+                    logger.debug("Cached Bearer token expired, will rely on 401 refresh",
+                                 host=host)
 
         if headers:
             tool_args["headers"] = headers
@@ -913,6 +1218,17 @@ class CopilotSession:
                 return True
         return False
 
+    def _jar_has_cookies_for(self, host: str) -> bool:
+        """Check whether the proxy cookie jar has session cookies for a host."""
+        store = self._store
+        if store is None:
+            return False
+        try:
+            cookies = store.get_cookies_for_host(host)
+            return bool(cookies)
+        except Exception:
+            return False
+
     async def _auth_gate(
         self,
         result: Dict[str, Any],
@@ -926,10 +1242,6 @@ class CopilotSession:
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
         collected and the identical call should be allowed to retry."""
-        # ``status`` is the HTTP code on request-shaped tools, but this gate runs on
-        # every tool result and non-request tools (e.g. run_scan) put a non-numeric
-        # status here ("vulnerable"/"scanning"/"safe"). A non-numeric status is by
-        # definition not an HTTP auth wall, so treat it as 0 rather than crashing.
         try:
             status_code = int(result.get("status", 0) or 0)
         except (TypeError, ValueError):
@@ -945,6 +1257,21 @@ class CopilotSession:
             and looks_like_auth_wall(status_code, final_url, body)
         ):
             return False
+        if self._jar_has_cookies_for(host):
+            try:
+                jar_cookies = {
+                    c.get("name", ""): c.get("value", "")
+                    for c in (self._store.get_cookies_for_host(host) or [])
+                    if c.get("name")
+                }
+                if jar_cookies:
+                    self._session_cookies.update(jar_cookies)
+                    self._seen_calls.discard(call_key)
+                    await observe(entry, f"Auth wall (HTTP {status_code}); auto-injected "
+                                  f"{len(jar_cookies)} cookies from proxy jar. Retrying.")
+                    return True
+            except Exception:
+                pass
         self._auth_prompted_hosts.add(host)
         auth = await wait_for_human("auth", {"url": final_url, "host": host,
                                              "status": status_code})

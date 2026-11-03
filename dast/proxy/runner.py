@@ -394,6 +394,232 @@ class ProxyRunner:
             await self._pool.stop()
             await self._plugin_manager.teardown_all()
 
+    async def _browse_worker(self, browse_queue: asyncio.Queue) -> None:
+        from dast.proxy.browse_session import BrowseSession, login_with_credentials
+        from dast.proxy.plugin_manager import log_event
+
+        # Unnamed session (legacy start/stop flow)
+        _active: Optional[BrowseSession] = None
+        # Named sessions: name → BrowseSession (each isolated context)
+        _named: dict[str, BrowseSession] = {}
+
+        while True:
+            job = await browse_queue.get()
+            action = job.get("action")
+
+            # ── legacy stop (unnamed session) ───────────────────────────────
+            if action == "stop":
+                if _active:
+                    await _active.stop()
+                    self._store.active_browse_session_id = None
+                    _active = None
+                    log_event("browser", "info", "Browse session stopped", source="browser")
+                continue
+
+            # ── legacy start (unnamed session) ──────────────────────────────
+            if action == "start":
+                if _active and _active.running:
+                    await _active.stop()
+
+                def on_stop():
+                    self._store.active_browse_session_id = None
+
+                session = BrowseSession(
+                    proxy_port=self._proxy_port,
+                    on_stop=on_stop,
+                )
+                await session.start(start_url=job.get("url"), headless=False)
+                self._store.active_browse_session_id = session.session_id
+                _active = session
+                log_event("browser", "info", "Browse session started",
+                          url=job.get("url", ""), source="browser")
+                job.get("result_cb", lambda s: None)(session.session_id)
+                continue
+
+            # ── named browser session ────────────────────────────────────────
+            if action == "start_named":
+                name = job.get("name", "")
+                role = job.get("role", "user")
+                if name in _named and _named[name].running:
+                    job.get("result_cb", lambda *_: None)(
+                        False, "session already open", _named[name].session_id
+                    )
+                    continue
+
+                def _make_stop_cb(n: str):
+                    def _on_stop():
+                        _named.pop(n, None)
+                    return _on_stop
+
+                ns = BrowseSession(
+                    proxy_port=self._proxy_port,
+                    on_stop=_make_stop_cb(name),
+                    name=name,
+                )
+                try:
+                    await ns.start(start_url=job.get("url"), headless=False)
+                    _named[name] = ns
+                    log_event("browser", "info", f'Named browse session "{name}" started',
+                              url=job.get("url", ""), source="browser")
+                    job.get("result_cb", lambda *_: None)(True, "", ns.session_id)
+                except Exception as exc:
+                    log_event("browser", "error", f'Failed to open named session "{name}": {exc}',
+                              source="browser")
+                    job.get("result_cb", lambda *_: None)(False, str(exc), "")
+                continue
+
+            if action == "save_named":
+                # Capture cookies from the named browser context and persist as NamedSession
+                name = job.get("name", "")
+                role = job.get("role", "user")
+                ns = _named.get(name)
+                if not ns:
+                    job.get("result_cb", lambda *_: None)(False, "session not open", 0)
+                    continue
+                pw_cookies = await ns.get_playwright_cookies()
+                saved = self._store.save_named_session_from_playwright(name, role, pw_cookies)
+                log_event("browser", "info",
+                          f'Named session "{name}" saved — {len(saved.cookies)} cookie(s)',
+                          source="browser")
+                job.get("result_cb", lambda *_: None)(True, "", len(saved.cookies))
+                continue
+
+            if action == "stop_named":
+                name = job.get("name", "")
+                ns = _named.pop(name, None)
+                if ns:
+                    await ns.stop()
+                    log_event("browser", "info", f'Named browse session "{name}" stopped',
+                              source="browser")
+                job.get("result_cb", lambda *_: None)(True, "")
+                continue
+
+            if action == "list_named":
+                result = [
+                    {"name": n, "session_id": s.session_id, "running": s.running}
+                    for n, s in _named.items()
+                ]
+                job.get("result_cb", lambda r: None)(result)
+                continue
+
+            # ── navigate / refresh existing browse session ───────────────────
+            if action == "navigate":
+                target = _active
+                if job.get("name"):
+                    target = _named.get(job["name"])
+                if not target or not target.running or not target._context:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no active browse session"})
+                    continue
+                pages = target._context.pages
+                if not pages:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no page in browse session"})
+                    continue
+                page = pages[0]
+                try:
+                    await page.goto(job.get("url", ""), wait_until="domcontentloaded",
+                                    timeout=30000)
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": True, "url": page.url, "title": await page.title()})
+                except Exception as exc:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": str(exc)[:200]})
+                continue
+
+            if action == "refresh":
+                target = _active
+                if job.get("name"):
+                    target = _named.get(job["name"])
+                if not target or not target.running or not target._context:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no active browse session"})
+                    continue
+                pages = target._context.pages
+                if not pages:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": "no page in browse session"})
+                    continue
+                page = pages[0]
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=30000)
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": True, "url": page.url})
+                except Exception as exc:
+                    job.get("result_cb", lambda r: None)(
+                        {"ok": False, "error": str(exc)[:200]})
+                continue
+
+            # ── headless credential login ────────────────────────────────────
+            if action == "credentials":
+                name = job.get("name", "")
+                role = job.get("role", "user")
+                try:
+                    result = await login_with_credentials(
+                        proxy_port=self._proxy_port,
+                        login_url=job["login_url"],
+                        username=job["username"],
+                        password=job["password"],
+                        username_selector=job.get("username_selector",
+                            "input[type=email],input[type=text],input[name*=user],input[name*=email],input[id*=user],input[id*=email]"),
+                        password_selector=job.get("password_selector", "input[type=password]"),
+                        submit_selector=job.get("submit_selector",
+                            "button[type=submit],input[type=submit]"),
+                    )
+                    if result["success"]:
+                        saved = self._store.save_named_session_from_playwright(
+                            name, role, result["cookies"], result["auth_headers"]
+                        )
+                        log_event("browser", "info",
+                                  f'Credentials login for "{name}" succeeded — '
+                                  f'{len(saved.cookies)} cookie(s)', source="browser")
+                        job.get("result_cb", lambda *_: None)(True, "", len(saved.cookies))
+                    else:
+                        log_event("browser", "warn",
+                                  f'Credentials login for "{name}" failed: {result["error"]}',
+                                  source="browser")
+                        job.get("result_cb", lambda *_: None)(False, result["error"], 0)
+                except Exception as exc:
+                    log_event("browser", "error",
+                              f'Credentials login for "{name}" error: {exc}', source="browser")
+                    job.get("result_cb", lambda *_: None)(False, str(exc), 0)
+
+    async def _crawl_worker(self, crawl_queue: asyncio.Queue) -> None:
+        from dast.proxy.spa_crawler import SpaCrawler
+        from dast.proxy.plugin_manager import log_event
+
+        _active_stop: Optional[asyncio.Event] = None
+
+        while True:
+            job = await crawl_queue.get()
+
+            if job.get("action") == "stop":
+                if _active_stop:
+                    _active_stop.set()
+                    log_event("crawler", "info", "Crawler stopped", source="crawler")
+                continue
+
+            stop_event = asyncio.Event()
+            _active_stop = stop_event
+            log_cb = job.get("log_cb") or (lambda m: None)
+            target_url = job.get("url", "")
+            log_event("crawler", "info", "Crawl started", url=target_url, source="crawler")
+
+            crawler = SpaCrawler(self._store, log_cb, stop_event, proxy_port=self._proxy_port)
+            try:
+                await crawler.run(
+                    target_url=target_url,
+                    auth_cookies=job.get("cookies"),
+                    max_clicks=job.get("max_clicks", 200),
+                    headless=job.get("headless", True),
+                    extra_seeds=job.get("extra_seeds"),
+                )
+                log_event("crawler", "info", "Crawl finished", url=target_url, source="crawler")
+            except Exception as e:
+                log_cb(f"Crawler error: {e}")
+                logger.error("Crawl failed", url=target_url, error=str(e))
+                log_event("crawler", "error", f"Crawl error: {e}", url=target_url, source="crawler")
+
     async def restart_proxy_listener(self, host: str, port: Optional[int] = None) -> dict:
         """
         Rebind the proxy listener to a new host/port without dropping the

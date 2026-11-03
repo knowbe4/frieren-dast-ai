@@ -216,21 +216,11 @@ function buildRRHtml(d) {
   const respMode = _paneViewMode.resp;
   const head = _dpSummary(d) + noteBanner;
 
-  if (isGQL && _paneViewMode.gql === true) {
-    return `<div class="dp">${head}
-      <div class="pane-hdr">GraphQL
-        <div class="pane-view-toggle">
-          <button onclick="_setPaneView('gql',false)">Raw</button>
-          <button class="on">GraphQL</button>
-        </div>
-      </div>
-      <div id="pane-gql-area" class="dp-gql">${_buildGQLView(d.request_body, d.response_body)}</div>
-    </div>`;
-  }
-
-  const reqContent = reqMode === 'raw'
-    ? `<pre class="dp-raw">${fmtReq(d, 'raw')}</pre>`
-    : _dpRequestSections(d);
+  const reqContent = (isGQL && _paneViewMode.gql === true)
+    ? _buildGQLView(d.request_body, d.response_body)
+    : reqMode === 'raw'
+      ? `<pre class="dp-raw">${fmtReq(d, 'raw')}</pre>`
+      : _dpRequestSections(d);
   const respContent = respMode === 'raw'
     ? `<pre class="dp-raw">${fmtResp(d, 'raw')}</pre>`
     : _dpResponseSections(d);

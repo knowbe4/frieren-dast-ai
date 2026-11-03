@@ -412,7 +412,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
 # Raw callbacks are kept for display; long enough that a typical DNS or HTTP
 # interaction stays valid JSON so the tab can format it.
-_MAX_CALLBACK_RAW_CHARS = 2000
+_MAX_CALLBACK_RAW_CHARS = 8000
+_MAX_FIELD_CHARS = 4000
 
 
 def _callback_from_interaction(interaction: dict, received_at: float) -> dict:
@@ -424,10 +425,18 @@ def _callback_from_interaction(interaction: dict, received_at: float) -> dict:
         interaction_type = "dns"
     else:
         interaction_type = "unknown"
+    trimmed = dict(interaction)
+    for field in ("raw-request", "raw-response", "raw"):
+        val = trimmed.get(field)
+        if isinstance(val, str) and len(val) > _MAX_FIELD_CHARS:
+            trimmed[field] = val[:_MAX_FIELD_CHARS] + "\n... (truncated)"
+    raw_json = json.dumps(trimmed)
+    if len(raw_json) > _MAX_CALLBACK_RAW_CHARS:
+        raw_json = raw_json[:_MAX_CALLBACK_RAW_CHARS - 1] + "}"
     return {
         "received_at": received_at,
         "type": interaction_type,
-        "raw": json.dumps(interaction)[:_MAX_CALLBACK_RAW_CHARS],
+        "raw": raw_json,
     }
 
 

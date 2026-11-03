@@ -251,7 +251,8 @@ function cpConnectWs() {
       if (m.type === 'pause') {
         _cpPaused[m.session_id] = { kind: m.kind, payload: m.payload };
         cpRenderPauseBanner();
-      } else if (m.type === 'resumed') {
+      } else if (m.type === 'resumed'
+                 || (m.type === 'autonomous' && (m.event === 'stopped' || m.event === 'complete'))) {
         delete _cpPaused[m.session_id];
         cpRenderPauseBanner();
       }
@@ -394,11 +395,12 @@ function cpRender(session) {
   // mid-pause (e.g. the "Login done" button enabled by Open Browser, and the
   // auth status message) — which is exactly what left the button greyed out.
   if (pauseEl) {
-    const sig = session.pause
+    const activePause = session.pause && _CP_INPROGRESS.includes(session.status);
+    const sig = activePause
       ? `${session.session_id}:${session.pause.kind}:${JSON.stringify(session.pause.payload || {})}`
       : null;
     if (sig !== _cpPauseSig) {
-      pauseEl.innerHTML = session.pause ? cpRenderPause(session) : '';
+      pauseEl.innerHTML = activePause ? cpRenderPause(session) : '';
       _cpPauseSig = sig;
     }
   }

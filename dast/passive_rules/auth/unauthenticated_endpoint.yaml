@@ -1,0 +1,22 @@
+rules:
+  - id: unauthenticated-endpoint-accessible
+    title: "Endpoint Accessible Without Authentication"
+    severity: medium
+    cwe: CWE-306
+    description: >
+      An endpoint returned a successful response (HTTP 200 or 204) without any
+      session cookies or authorization headers in the request. This may indicate
+      missing authentication controls. Some endpoints are intentionally public
+      (login pages, health checks, static assets) — AI validation confirms
+      whether the response contains sensitive data or functionality that should
+      require authentication.
+    match:
+      response_status_regex: '^(200|204)$'
+      request_header_absent: cookie
+    conditions:
+      one_per_host: true
+      exclude_path_regex: '(?i)(login|signin|sign_up|signup|register|health|status|ping|favicon|robots\.txt|sitemap|\.js$|\.css$|\.png$|\.jpg$|\.svg$|\.woff|\.ico$|/assets/|/static/|/public/)'
+      exclude_content_type_regex: '(?i)(image/|font/|text/css|application/javascript)'
+    evidence_template: >-
+      {method} {path} returned HTTP {status} with no authentication (Content-Type: {content_type})
+    needs_ai_validation: true

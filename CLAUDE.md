@@ -131,6 +131,8 @@ proxy traffic on every entry → plugin.
 | Vuln knowledge | `uv run python -c "from dast.vuln_knowledge import known_attack_types; print(known_attack_types())"` |
 | Triage engine | `uv run pytest tests/unit/test_payload_safety.py` |
 | Tool layer / MCP | `uv run pytest tests/unit/test_tools_registry.py`; `uv run dast-ai mcp --help` |
+| Browser tools | `uv run pytest tests/unit/test_tools_registry.py -k browser` |
+| GraphQL tools | `uv run pytest tests/unit/test_tools_registry.py -k graphql` |
 | Active plugins / OOB | `uv run pytest tests/unit/test_header_oob_scanner.py tests/unit/test_oob_correlator.py tests/unit/test_plugin_dispatch_active.py` |
 
 Run a single test with `uv run pytest tests/unit/test_x.py::test_name`. `tests/evals/` is an
@@ -179,6 +181,10 @@ Secret-scan git hooks run on every commit and push (installed by `make setup`). 
 - `dast/ai/prompt_safety.py` — structural prompt-injection defense
 - `dast/agents/*.py` — vulnerability agents; `payload_filter.py` = tech-aware group selector
 - `dast/tools/` — shared tool registry (one definition drives internal agents AND MCP)
+- `dast/tools/browser_tools.py` — browser_login (autonomous multi-step login), browser_fetch
+  (in-browser fetch with CSRF auto-inject), browser_navigate/snapshot/fill/click/wait_for/extract
+- `dast/tools/graphql_tools.py` — graphql_introspect (schema discovery), graphql_type_info
+  (type inspection), graphql_find_sensitive (credential-leak field scanner)
 - `dast/mcp/server.py` — MCP stdio server bridging the tool registry
 - `dast/profiles/` — named sessions with privilege levels (cross-session IDOR, quick capture)
 - `dast/graphql/`, `dast/chains/`, `dast/discovery/`, `dast/code_analysis/`, `dast/importers/`,
@@ -252,4 +258,4 @@ Tiered helpers: `get_fast_model()` (planning/baseline, default Haiku), `get_vali
 
 ---
 
-**Last Updated:** 2026-09-24 · **Version:** 0.8.2
+**Last Updated:** 2026-10-28 · **Version:** 0.8.2

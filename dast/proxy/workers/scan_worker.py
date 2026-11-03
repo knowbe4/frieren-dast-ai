@@ -331,18 +331,22 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                 runner._store.add_finding(entry_id, {"error": str(e)}, "error")
                 qs.finish(entry_id, 0, "error")
                 return
-
-            # Persist which attack types the coordinator actually evaluated on this
-            # endpoint (side-channel set on the target) for per-dimension coverage.
-            attempted = getattr(target, "attempted_attack_types", None)
-            if attempted:
-                try:
-                    entry.scanned_attack_types = sorted(
-                        set(entry.scanned_attack_types or []) | set(attempted)
-                    )
-                except Exception as exc:
-                    logger.debug("recording scanned attack types failed",
-                                 url=entry.url, error=str(exc))
+            finally:
+                # Persist which attack types the coordinator evaluated on this endpoint
+                # (side-channel set on the target) for per-dimension coverage. In a FINALLY
+                # so it is recorded even when run_active_checks is CANCELLED / times out
+                # mid-run: the coordinator sets attempted_attack_types EARLY (before the LLM
+                # validation phase), so it is valid data even for a cut-short scan. Without
+                # this, long scans (cancelled during validation) left the coverage matrix
+                # empty — the per-dimension coverage was effectively blind.
+                _attempted = getattr(target, "attempted_attack_types", None)
+                if _attempted:
+                    try:
+                        entry.scanned_attack_types = sorted(
+                            set(entry.scanned_attack_types or []) | set(_attempted))
+                    except Exception as _cov_exc:
+                        logger.debug("recording scanned attack types failed",
+                                     url=entry.url, error=str(_cov_exc))
 
             # Update any stub imported findings on this entry to reflect scan outcome
             update_import_stubs(entry, bool(findings))

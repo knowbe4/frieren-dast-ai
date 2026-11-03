@@ -780,3 +780,17 @@ def test_coverage_cross_tenant_na_without_two_sessions():
     assert "cross_tenant" not in cov["dimensions"]
     assert cov["cross_tenant_gap"] is False
     assert cov["complete"] is True
+
+
+def test_coverage_access_control_counts_auth_and_sensitive_data():
+    # Regression: the scan emitted attack types 'auth_bypass' and 'sensitive_data'
+    # which were unmapped, so access_control read as untested. They must map to access_control.
+    from dast.proxy.api.copilot_service import _ATTACK_TYPE_DIMENSION
+    assert _ATTACK_TYPE_DIMENSION.get("auth_bypass") == "access_control"
+    assert _ATTACK_TYPE_DIMENSION.get("sensitive_data") == "access_control"
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["auth_bypass", "sensitive_data"])
+    store = _DimStore([e], named_sessions=1)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["dimensions"]["access_control"]["untested"] == []   # evaluated, not a gap

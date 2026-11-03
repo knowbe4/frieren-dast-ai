@@ -1095,8 +1095,9 @@ class Coordinator:
                 set(candidate_types or [])
                 | {getattr(a, "attack_type", "") for a in agents if getattr(a, "attack_type", "")}
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("recording attempted attack types failed",
+                         url=target.url, error=str(exc))
 
         if not agents:
             _activity_log.appendleft({

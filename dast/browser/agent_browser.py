@@ -28,6 +28,7 @@ _SNAPSHOT_JS = r"""
   const vis = el => { const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
   const forms = [...document.querySelectorAll('form')].slice(0, 10).map(f => ({
+    id: f.id || '', name: f.getAttribute('name') || '',
     action: f.getAttribute('action') || '', method: (f.getAttribute('method') || 'get').toUpperCase(),
     fields: [...f.querySelectorAll('input,select,textarea')].slice(0, 40).map(i => ({
       tag: i.tagName.toLowerCase(), type: (i.getAttribute('type') || '').toLowerCase(),
@@ -35,15 +36,62 @@ _SNAPSHOT_JS = r"""
       hidden: (i.getAttribute('type') || '').toLowerCase() === 'hidden' || !vis(i),
     })),
   }));
-  const buttons = [...document.querySelectorAll('button,input[type=submit],a[role=button]')]
+  const buttons = [...document.querySelectorAll(
+      'button,input[type=submit],input[type=button],[role=button]')]
     .filter(vis).slice(0, 25).map(b => ({
       text: (b.innerText || b.value || '').trim().slice(0, 40), id: b.id || '',
+      name: b.getAttribute('name') || '',
       type: (b.getAttribute('type') || '').toLowerCase(),
     }));
   const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 25).map(a => ({
     text: (a.innerText || '').trim().slice(0, 40), href: a.getAttribute('href') || '', id: a.id || '',
   }));
   return { forms, buttons, links };
+}
+"""
+
+# Pick the best submit control for a login form and tag it with data-dast-submit.
+# Scores candidates: sign-in text wins, search/nav/secondary text loses, and being
+# in the same form as the password/email field is a strong boost. This stops the
+# deterministic engine from clicking a header "Search" button on a noisy page.
+_PICK_SUBMIT_JS = r"""
+() => {
+  // Traverse open shadow roots too (web components): querySelectorAll alone does
+  // not pierce them, so a shadow-DOM login form's submit would be missed.
+  const deepQA = (root, sel, out) => {
+    out.push(...root.querySelectorAll(sel));
+    root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) deepQA(el.shadowRoot, sel, out); });
+    return out;
+  };
+  const deepFirst = (sel) => deepQA(document, sel, [])[0] || null;
+  deepQA(document, '[data-dast-submit]', []).forEach(e => e.removeAttribute('data-dast-submit'));
+  const POS = ['continue','next','sign in','log in','login','log on','sign on','submit','yes','authorize','allow','proceed','done','entrar','acessar','conectar'];
+  const NEG = ['search','buscar','go','subscribe','cancel','back','forgot','reset','create account','sign up','register','skip','no'];
+  const vis = el => { const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.disabled; };
+  const cands = deepQA(document,
+      'button,input[type=submit],input[type=button],[role=button]', []).filter(vis);
+  if (!cands.length) return null;
+  const pwField = deepFirst('input[type=password]');
+  const emField = deepFirst(
+      'input[type=email],input[name=email],input[name=username],input[name=user],'
+      + 'input[name=identifier],input[name=loginfmt],input[name=login],input[name=log]');
+  const pwForm = pwField && pwField.form, emForm = emField && emField.form;
+  const score = el => {
+    const t = (el.innerText || el.value || '').trim().toLowerCase();
+    let s = 0;
+    if (POS.some(p => t.includes(p))) s += 5;
+    if (NEG.some(n => t === n || t.includes(n))) s -= 8;
+    if (pwForm && el.form === pwForm) s += 4;
+    else if (emForm && el.form === emForm) s += 3;
+    if ((el.getAttribute('type') || '').toLowerCase() === 'submit') s += 1;
+    return s;
+  };
+  let best = null, bestScore = -1e9;
+  for (const el of cands) { const s = score(el); if (s > bestScore) { bestScore = s; best = el; } }
+  if (!best || bestScore <= -8) return null;
+  best.setAttribute('data-dast-submit', '1');
+  return { score: bestScore, text: (best.innerText || best.value || '').trim().slice(0, 40) };
 }
 """
 
@@ -221,10 +269,68 @@ class AgentBrowser:
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
 
+    async def _find_submit(self, page: Any) -> Any:
+        """Best submit control for the login form: scored to prefer the sign-in
+        button in the password/email form over a header Search/Go button. Falls
+        back to the static selector list (text-filtered) when scoring finds none."""
+        try:
+            picked = await page.evaluate(_PICK_SUBMIT_JS)
+        except Exception as exc:
+            logger.debug("_find_submit: scoring failed", error=str(exc)[:120])
+            picked = None
+        if picked:
+            loc = page.locator('[data-dast-submit="1"]')
+            try:
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    logger.debug("_find_submit: scored submit",
+                                 text=picked.get("text"), score=picked.get("score"))
+                    return loc.first
+            except Exception:
+                pass
+        for sel in self._SUBMIT_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    return loc.first
+            except Exception:
+                continue
+        return None
+
+    _LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
+                    "/auth/login", "/u/login", "/authorize")
+
+    async def _login_success_result(self, page: Any) -> Dict[str, Any]:
+        """Build the login result dict from the current page: logged_in is true when
+        the URL is no longer a login/SSO page. Shared by the single-page short-circuit
+        and the end of login()."""
+        current_url = page.url.lower()
+        final_path = current_url.split("?")[0]
+        on_login_page = any(final_path.endswith(p) or f"{p}/" in final_path
+                            for p in self._LOGIN_PATHS)
+        on_sso_domain = any(d in current_url for d in self._SSO_DOMAINS)
+        logged_in = not on_login_page and not on_sso_domain
+        cookies = await self.export_cookies()
+        csrf_token = cookies.get("CSRF-TOKEN")
+        return {
+            "ok": logged_in,
+            "url": page.url,
+            "logged_in": logged_in,
+            "cookies_count": len(cookies),
+            "csrf_token": csrf_token[:20] + "..." if csrf_token and len(csrf_token) > 20 else csrf_token,
+            "cookies": cookies,
+        }
+
     _EMAIL_SELECTORS = [
         "#REGISTRATION-EMAIL", "#LOGIN-EMAIL", "#email",
         "input[type=email]", "input[name=email]",
-        "input[name=username]", "input[name=login]",
+        # Real-world username field names across common products:
+        # username (generic), identifier (Okta), loginfmt (Azure AD),
+        # log (WordPress), UserName (ADFS), user/userid, j_username (JEE), login.
+        "input[name=username i]", "input[name=identifier i]",
+        "input[name=loginfmt i]", "input[name=log i]",
+        "input[name=user i]", "input[name=userid i]",
+        "input[name=j_username i]", "input[name=login i]",
+        "input[autocomplete=username]", "input[autocomplete=email]",
     ]
     _SUBMIT_SELECTORS = [
         "#LOGIN-SUBMIT-BTN", "button[type=submit]",
@@ -291,7 +397,21 @@ class AgentBrowser:
         await email_field.fill(email)
         logger.info("browser_login: filled email", url=page.url)
 
-        submit_btn = await _find_visible(self._SUBMIT_SELECTORS)
+        # Single-page forms: if the password field is already visible, fill it
+        # BEFORE submitting. Otherwise a form without HTML5 `required` posts with
+        # an empty password on the first submit and fails. (Two-step forms hide
+        # the password until a Continue/Next click, so this is a no-op there.)
+        early_password = await _find_visible(self._PASSWORD_SELECTORS)
+        if early_password is not None:
+            try:
+                await early_password.fill(password)
+                logger.info("browser_login: single-page form, filled password early",
+                            url=page.url)
+            except Exception as exc:
+                logger.debug("browser_login: early password fill failed",
+                             error=str(exc)[:120])
+
+        submit_btn = await self._find_submit(page)
         if submit_btn is None:
             return {"ok": False, "error": "no submit button found after email",
                     "url": page.url}
@@ -302,6 +422,37 @@ class AgentBrowser:
             await page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
+
+        # Single-page forms are a one-shot: having filled both fields and clicked
+        # submit, the outcome is settled. Classify it and return — do NOT fall into
+        # the two-step password search, which can mis-click interstitials (consent
+        # pages, MFA "Verify") and muddle the result.
+        if early_password is not None:
+            low = page.url.lower()
+            on_mfa = any(ind in low for ind in self._MFA_INDICATORS)
+            if not on_mfa:
+                try:
+                    otp = page.locator(
+                        "input[name=code], input[name=otp], input[type=tel][maxlength='6']")
+                    on_mfa = await otp.count() > 0
+                except Exception:
+                    on_mfa = False
+            if on_mfa:
+                cookies = await self.export_cookies()
+                logger.info("browser_login: single-page submit hit an MFA wall",
+                            url=page.url)
+                return {"ok": False, "url": page.url, "logged_in": False,
+                        "mfa_required": True, "cookies_count": len(cookies),
+                        "cookies": cookies}
+            result = await self._login_success_result(page)
+            if result["logged_in"]:
+                logger.info("browser_login: single-page login succeeded", url=page.url)
+            else:
+                logger.info("browser_login: single-page submit did not authenticate "
+                            "(invalid creds, or a consent/Authorize step the "
+                            "deterministic engine does not handle)", url=page.url)
+                result.setdefault("error", "submitted but not authenticated")
+            return result
 
         # Detect SSO redirect: the page may have navigated to an IdP domain.
         # Federated login often lands on a new email-first form on the IdP
@@ -322,7 +473,7 @@ class AgentBrowser:
                         await idp_email.fill(email)
                 except Exception:
                     await idp_email.fill(email)
-                idp_submit = await _find_visible(self._SUBMIT_SELECTORS)
+                idp_submit = await self._find_submit(page)
                 if idp_submit is not None:
                     await idp_submit.click()
                     await page.wait_for_timeout(3000)
@@ -347,7 +498,7 @@ class AgentBrowser:
             if password_field is not None:
                 break
             if _attempt == 2:
-                retry_btn = await _find_visible(self._SUBMIT_SELECTORS)
+                retry_btn = await self._find_submit(page)
                 if retry_btn is not None:
                     logger.info("browser_login: re-clicking submit (SPA may not have registered first click)")
                     await retry_btn.click()
@@ -390,7 +541,7 @@ class AgentBrowser:
 
         await password_field.fill(password)
 
-        submit_btn2 = await _find_visible(self._SUBMIT_SELECTORS)
+        submit_btn2 = await self._find_submit(page)
         if submit_btn2 is not None:
             try:
                 async with page.expect_navigation(

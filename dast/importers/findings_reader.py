@@ -152,19 +152,25 @@ def _apply_filter(findings: List[Dict], status_filter: str) -> List[Dict]:
 
 
 def _infer_attack_type(finding: dict) -> str:
-    text = " ".join([
-        finding.get("title", ""),
-        finding.get("description", ""),
-        finding.get("cwe", ""),
-    ]).lower()
+    # orchestrator-ai findings can carry explicit nulls (e.g. "cwe": null), and
+    # .get(key, default) returns None for a present-but-null key — so coerce every
+    # part to a string before joining.
+    text = " ".join(
+        str(finding.get(key) or "")
+        for key in ("title", "description", "cwe")
+    ).lower()
     return _infer_attack_type_from_text(text)
 
 
 def _infer_attack_type_from_text(text: str) -> str:
     text = text.lower()
+    # SQLi is checked before XSS: a "SQL Injection via unescaped ..." title contains
+    # the generic XSS keyword "unescaped", so XSS-first would misclassify it.
+    if any(k in text for k in ("sql injection", "sqli", "cwe-89")):
+        return "sqli"
     if any(k in text for k in ("xss", "cross-site script", "sanitize_html", "unescaped")):
         return "xss"
-    if any(k in text for k in ("sql", "sqli", "cwe-89")):
+    if any(k in text for k in ("sql",)):
         return "sqli"
     if any(k in text for k in ("ssrf", "server-side request", "unvalidated url")):
         return "ssrf"

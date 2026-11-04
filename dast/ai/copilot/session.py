@@ -1060,22 +1060,38 @@ class CopilotSession:
                                 self._relogin_in_progress = True
                                 self._last_relogin_ts = _time.time()
                                 try:
-                                    login_result = await browser.login(
+                                    # Re-login through the full cascade (form -> spa_api ->
+                                    # LLM), not raw browser.login: a SPA whose form is in an
+                                    # iframe/shadow root only re-authenticates via the spa_api
+                                    # strategy. The cascade syncs the jar on spa_api success;
+                                    # we also fold the browser's cookies into the handoff below
+                                    # so every engine path updates the session.
+                                    from dast.browser.login_cascade import adaptive_login
+                                    cascade = await adaptive_login(
+                                        browser,
                                         self._last_login["url"],
                                         self._last_login["email"],
                                         self._last_login["password"],
+                                        in_scope=getattr(tool_ctx, "is_in_scope", None),
+                                        store=getattr(tool_ctx, "store", None),
+                                        session=self,
                                     )
-                                    if login_result.get("ok") and login_result.get("logged_in"):
-                                        if login_result.get("cookies"):
-                                            self._session_cookies.update(login_result["cookies"])
-                                        logger.info("auto-relogin: succeeded, retrying request")
+                                    if cascade.ok:
+                                        try:
+                                            self._session_cookies.update(await browser.export_cookies())
+                                        except Exception as exc:
+                                            logger.debug("auto-relogin: cookie sync failed",
+                                                         error=str(exc)[:120])
+                                        logger.info("auto-relogin: succeeded via %s, retrying request",
+                                                    cascade.engine)
                                         self._capture_bearer_tokens(
                                             getattr(tool_ctx, "store", None), host)
                                         self._apply_session_auth(tool_ctx, tool_args)
                                         result = await run_tool(tool_ctx, tool_name, tool_args)
                                     else:
-                                        logger.warning("auto-relogin: login failed",
-                                                       error=str(login_result.get("error", ""))[:100])
+                                        logger.warning("auto-relogin: cascade failed",
+                                                       engine=cascade.engine,
+                                                       error=str(cascade.error)[:100])
                                 except Exception as exc:
                                     logger.warning("auto-relogin: exception", error=str(exc)[:200])
                                 finally:

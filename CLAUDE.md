@@ -32,9 +32,12 @@ more accurate, or easier to use? If not, don't add it.
 4. **Descriptive variable names** — no abbreviations.
 5. **Error handling** — log and continue; never crash the scan on one endpoint. Never swallow
    exceptions silently (`except Exception: pass`) — always log them with `error=str(exc)`.
-6. **Modularity first** — keep modules small and single-responsibility. Never bolt a feature onto
-   an existing module when it belongs in a new one. Complexity stays local; cross-module coupling
-   is explicit and minimal.
+6. **Modularity first, simple always** — keep modules AND functions small and
+   single-responsibility: one function does one thing. Simple is the goal; complexity is
+   expensive to maintain and breeds bugs, so do not add it without a clear, stated reason. Reuse
+   an existing helper before writing new code; factor a shared primitive into one place instead
+   of duplicating it. Never bolt a feature onto an existing module when it belongs in a new one.
+   Complexity stays local; cross-module coupling is explicit and minimal.
 7. **Understand before acting** — agents, plugins, and LLM prompts must read the actual
    request/response context before testing. Never infer a vuln category from the URL path alone;
    use params, body, headers, and response content as evidence. Spamming payloads without

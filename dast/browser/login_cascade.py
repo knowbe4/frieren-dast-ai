@@ -93,6 +93,8 @@ async def adaptive_login(
     success_url_suffix: Optional[str] = None,
     max_llm_steps: int = _MAX_LLM_STEPS,
     in_scope: Optional[Callable[[str], bool]] = None,
+    store: Optional[Any] = None,
+    session: Optional[Any] = None,
 ) -> LoginCascadeResult:
     """Log in, trying the deterministic engine first and the LLM only on failure.
 
@@ -118,6 +120,22 @@ async def adaptive_login(
         logger.info("adaptive_login: MFA required, not escalating to LLM", url=det_url)
         return LoginCascadeResult(ok=False, engine="deterministic", url=det_url,
                                   error="mfa_required")
+
+    # --- Phase 1.5: SPA JSON-API login (DOM-independent) --------------------
+    # The deterministic form-fill failed — often because the form lives in an iframe or a
+    # closed shadow root the DOM path can't reach. Before spending LLM steps, try the app's
+    # JSON auth endpoint directly (this is what works for the the SPAs). It syncs the
+    # resulting session into the jar + copilot session on success.
+    try:
+        from dast.browser.login_strategies import spa_api
+        spa = await spa_api.attempt(browser, url, email, password,
+                                    store=store, session=session, in_scope=in_scope)
+        if spa.get("ok") and spa.get("logged_in"):
+            logger.info("adaptive_login: solved by SPA JSON-API strategy",
+                        endpoint=spa.get("endpoint"))
+            return LoginCascadeResult(ok=True, engine="spa_api", url=spa.get("url") or url)
+    except Exception as exc:
+        logger.warning("adaptive_login: spa_api strategy raised", error=str(exc)[:200])
 
     # --- Phase 2: LLM-driven fallback over the browser primitives -----------
     decider = decide or make_llm_decider()

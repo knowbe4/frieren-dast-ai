@@ -27,26 +27,43 @@ _SNAPSHOT_JS = r"""
 () => {
   const vis = el => { const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
-  const forms = [...document.querySelectorAll('form')].slice(0, 10).map(f => ({
+  // Traverse OPEN shadow roots too: modern SPAs (SvelteKit, web components, the target's
+  // login) render the form inside shadow DOM, which document.querySelectorAll does NOT
+  // pierce — so a plain snapshot reported 0 inputs/buttons on a form that is clearly
+  // there. deepQA walks every shadowRoot so the copilot can see (and then fill/click,
+  // since Playwright CSS selectors pierce open shadow DOM) the real fields.
+  const deepQA = (root, sel, out) => {
+    try { out.push(...root.querySelectorAll(sel)); } catch (e) {}
+    root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) deepQA(el.shadowRoot, sel, out); });
+    return out;
+  };
+  const field = i => ({
+    tag: i.tagName.toLowerCase(), type: (i.getAttribute('type') || '').toLowerCase(),
+    name: i.getAttribute('name') || '', id: i.id || '',
+    placeholder: i.getAttribute('placeholder') || '',
+    label: i.getAttribute('aria-label') || '',
+    autocomplete: i.getAttribute('autocomplete') || '',
+    hidden: (i.getAttribute('type') || '').toLowerCase() === 'hidden' || !vis(i),
+  });
+  const forms = deepQA(document, 'form', []).slice(0, 10).map(f => ({
     id: f.id || '', name: f.getAttribute('name') || '',
     action: f.getAttribute('action') || '', method: (f.getAttribute('method') || 'get').toUpperCase(),
-    fields: [...f.querySelectorAll('input,select,textarea')].slice(0, 40).map(i => ({
-      tag: i.tagName.toLowerCase(), type: (i.getAttribute('type') || '').toLowerCase(),
-      name: i.getAttribute('name') || '', id: i.id || '',
-      hidden: (i.getAttribute('type') || '').toLowerCase() === 'hidden' || !vis(i),
-    })),
+    fields: deepQA(f, 'input,select,textarea', []).slice(0, 40).map(field),
   }));
-  const buttons = [...document.querySelectorAll(
-      'button,input[type=submit],input[type=button],[role=button]')]
+  // All interactive fields across the page (incl. shadow DOM), even when they are NOT
+  // wrapped in a <form> element — SPA login forms frequently are not.
+  const fields = deepQA(document, 'input,select,textarea', []).slice(0, 40).map(field);
+  const buttons = deepQA(document,
+      'button,input[type=submit],input[type=button],[role=button]', [])
     .filter(vis).slice(0, 25).map(b => ({
       text: (b.innerText || b.value || '').trim().slice(0, 40), id: b.id || '',
       name: b.getAttribute('name') || '',
       type: (b.getAttribute('type') || '').toLowerCase(),
     }));
-  const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 25).map(a => ({
+  const links = deepQA(document, 'a[href]', []).filter(vis).slice(0, 25).map(a => ({
     text: (a.innerText || '').trim().slice(0, 40), href: a.getAttribute('href') || '', id: a.id || '',
   }));
-  return { forms, buttons, links };
+  return { forms, fields, buttons, links };
 }
 """
 
@@ -221,11 +238,74 @@ class AgentBrowser:
         if _time.time() - self._last_cookie_sync > 30:
             await self.resync_cookies()
 
+    async def export_cookies_full(self) -> List[dict]:
+        """Export the browser's cookies as Playwright dicts (name/value/domain/path/...),
+        for importing into the proxy jar (which keys by domain). Unlike export_cookies,
+        this preserves the domain so get_cookies_for_host can match."""
+        if self._context is None:
+            return []
+        try:
+            return list(await self._context.cookies())
+        except Exception as exc:
+            logger.debug("AgentBrowser: export_cookies_full failed", error=str(exc))
+            return []
+
+    async def api_post(self, url: str, headers: Optional[Dict[str, str]] = None,
+                       body: Optional[str] = None) -> Dict[str, Any]:
+        """Network-level POST through the browser context (carries its cookies, bypasses
+        CORS). Used by the SPA JSON-API login strategy: it hits the app's JSON auth
+        endpoint without touching the form DOM, so it works regardless of shadow DOM /
+        iframes. Returns {ok, status, text, headers}."""
+        page = await self._ensure_page()
+        fetch_kwargs: Dict[str, Any] = {"method": "POST", "headers": headers or {}}
+        if body is not None:
+            fetch_kwargs["data"] = body
+        try:
+            resp = await page.request.fetch(url, **fetch_kwargs)
+            text = await resp.text()
+            return {"ok": True, "status": resp.status, "text": text[:20000],
+                    "headers": {k: v for k, v in resp.headers.items()}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
+
     async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
         page = await self._ensure_page()
         if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
             await self.clear_cookies()
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        # SPA hydration: domcontentloaded fires BEFORE the JS framework mounts, so for a
+        # single-page app it returns an empty shell (0 forms/buttons) — which makes
+        # snapshot/fill/click/login all fail on an unrendered page. Wait for the network
+        # to settle and for interactive content to actually appear before returning, so
+        # the browser tools operate on the real rendered page. Best-effort: each wait is
+        # guarded so a static page (or a mocked page in tests) still returns promptly.
+        try:
+            await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+        except Exception as exc:
+            logger.debug("AgentBrowser navigate: networkidle wait ended", error=str(exc)[:120])
+        try:
+            # Wait briefly for the SPA to mount any interactive element. Counts across OPEN
+            # shadow roots and same-origin iframes (a SvelteKit / web-component / iframe
+            # login lives there), so a shadow/iframe-only UI is not falsely seen as
+            # content-less. If the page is genuinely empty this times out harmlessly.
+            await page.wait_for_function(
+                """() => {
+                  const SEL = 'input,button,a,form,select,textarea,[role=button]';
+                  const count = (root) => {
+                    let n = 0;
+                    try { n += root.querySelectorAll(SEL).length; } catch (e) {}
+                    try { root.querySelectorAll('*').forEach(el => {
+                      if (el.shadowRoot) n += count(el.shadowRoot); }); } catch (e) {}
+                    try { root.querySelectorAll('iframe,frame').forEach(f => {
+                      try { if (f.contentDocument) n += count(f.contentDocument); } catch (e) {} }); } catch (e) {}
+                    return n;
+                  };
+                  return count(document) > 0;
+                }""",
+                timeout=4000,
+            )
+        except Exception as exc:
+            logger.debug("AgentBrowser navigate: hydration wait ended", error=str(exc)[:120])
         return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
                 "title": await page.title()}
 

@@ -53,12 +53,13 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
     if not ctx.is_in_scope(url):
         return {"ok": False, "error": "url is out of scope", "url": url}
     success_url_suffix = str(args.get("success_url_suffix", "")).strip() or None
+    session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     try:
         from dast.browser.login_cascade import adaptive_login
 
         result = await adaptive_login(
             browser, url, email, password, success_url_suffix=success_url_suffix,
-            in_scope=ctx.is_in_scope,
+            in_scope=ctx.is_in_scope, store=getattr(ctx, "store", None), session=session,
         )
         # On success, sync the browser's session cookies into the copilot session
         # so subsequent authenticated calls carry them (parity with browser_login).
@@ -67,7 +68,6 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
                 cookies = await browser.export_cookies()
             except Exception:
                 cookies = {}
-            session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
             if session is not None and cookies and hasattr(session, "_session_cookies"):
                 session._session_cookies.update(cookies)
                 logger.info("adaptive_login tool: synced cookies to copilot session",

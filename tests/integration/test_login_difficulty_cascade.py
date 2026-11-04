@@ -138,21 +138,19 @@ async def test_t11_authorize_consent_solved_by_llm(agent_browser: AgentBrowser) 
 
 
 @pytest.mark.asyncio
-async def test_t4_iframe_fields_unreachable_even_by_fallback(agent_browser: AgentBrowser) -> None:
-    """Credential fields inside an iframe are not in the main-frame snapshot, so a
-    snapshot-driven decider has nothing to act on and gives up. Documents the limit
-    (fixing it needs frame-aware primitives, not a smarter prompt)."""
+async def test_t4_iframe_fields_solved_by_spa_api(agent_browser: AgentBrowser) -> None:
+    """Credential fields inside an iframe are unreachable to BOTH form-fill and the
+    snapshot-driven LLM decider (the iframe is not in the main-frame snapshot). But the app
+    exposes a JSON auth endpoint, so the DOM-independent spa_api strategy logs in anyway —
+    it never touches the iframe form. This is the capability that fixed the real the target
+    SPA. The LLM decider below would still give up; spa_api wins before it is reached."""
     def decide(snapshot: Dict[str, Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        names = {f.get("name") for form in (snapshot.get("forms") or [])
-                 for f in (form.get("fields") or [])}
-        if "email" in names or "password" in names:
-            return {"action": "fill", "selector": "input[type=email]", "value": context["email"]}
-        return {"action": "stop"}  # nothing usable in the main-frame snapshot
+        raise AssertionError("LLM must not be reached: spa_api solves this before the fallback")
 
     with login_fixture() as server:
         result = await adaptive_login(
             agent_browser, f"{server.base_url}/t4/login", USERNAME, PASSWORD,
-            decide=decide, success_url_suffix="/dashboard",
+            decide=decide, success_url_suffix="/dashboard", in_scope=lambda u: True,
         )
-    assert result.ok is False, result.to_dict()
-    assert not result.url.endswith("/dashboard")
+    assert result.ok is True, result.to_dict()
+    assert result.engine == "spa_api", result.to_dict()

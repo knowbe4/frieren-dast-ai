@@ -122,20 +122,26 @@ async def adaptive_login(
                                   error="mfa_required")
 
     # --- Phase 1.5: SPA JSON-API login (DOM-independent) --------------------
-    # The deterministic form-fill failed — often because the form lives in an iframe or a
-    # closed shadow root the DOM path can't reach. Before spending LLM steps, try the app's
-    # JSON auth endpoint directly (this is what works for the the SPAs). It syncs the
-    # resulting session into the jar + copilot session on success.
-    try:
-        from dast.browser.login_strategies import spa_api
-        spa = await spa_api.attempt(browser, url, email, password,
-                                    store=store, session=session, in_scope=in_scope)
-        if spa.get("ok") and spa.get("logged_in"):
-            logger.info("adaptive_login: solved by SPA JSON-API strategy",
-                        endpoint=spa.get("endpoint"))
-            return LoginCascadeResult(ok=True, engine="spa_api", url=spa.get("url") or url)
-    except Exception as exc:
-        logger.warning("adaptive_login: spa_api strategy raised", error=str(exc)[:200])
+    # Only when the deterministic form-fill could NOT REACH the form (no email/password/
+    # submit field found) — i.e. the form is in an iframe or a closed shadow root. In that
+    # case the app may still expose a JSON auth endpoint we can POST to directly (this is
+    # what works for the the SPAs). We gate on "form unreachable" so a login that DID
+    # reach the form but needs an extra step (consent/MFA/2FA) is left to the LLM, and so a
+    # blind JSON POST is not fired at every ordinary form.
+    _err = str(det.get("error", "")).lower()
+    _form_unreachable = any(s in _err for s in
+                            ("no email field", "no password field", "no submit button"))
+    if _form_unreachable:
+        try:
+            from dast.browser.login_strategies import spa_api
+            spa = await spa_api.attempt(browser, url, email, password,
+                                        store=store, session=session, in_scope=in_scope)
+            if spa.get("ok") and spa.get("logged_in"):
+                logger.info("adaptive_login: solved by SPA JSON-API strategy",
+                            endpoint=spa.get("endpoint"))
+                return LoginCascadeResult(ok=True, engine="spa_api", url=spa.get("url") or url)
+        except Exception as exc:
+            logger.warning("adaptive_login: spa_api strategy raised", error=str(exc)[:200])
 
     # --- Phase 2: LLM-driven fallback over the browser primitives -----------
     decider = decide or make_llm_decider()

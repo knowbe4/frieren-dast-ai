@@ -139,6 +139,10 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         with strict/single-concurrent session management. read_only (production
         targets) sends only GET/HEAD/OPTIONS, refuses probe/attack tools and keeps
         the crawler off action buttons; it also pauses AI mode for the run.
+        validation_only (default false) focuses the run on confirming ONE finding:
+        it forces bounded mode and skips all breadth (no auto GraphQL sweep, no
+        evidence auto-route, no exhaustive recon) so only the finding's endpoint is
+        tested.
         """
         objective = (body.get("objective") or "").strip()
         if not objective:
@@ -162,11 +166,13 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if mode not in ("bounded", "complete"):
             return JSONResponse({"error": "mode must be 'bounded' or 'complete'"}, status_code=400)
         submit_forms = bool(body.get("submit_forms", False))
+        validation_only = bool(body.get("validation_only", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
                 budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
                 read_only=read_only, mode=mode, submit_forms=submit_forms,
+                validation_only=validation_only,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

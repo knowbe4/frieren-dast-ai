@@ -1,0 +1,135 @@
+"""Tests for autonomous-run profile authentication.
+
+Covers the two halves of the credential-only-profile login fix:
+  * ``_activate_profile`` seeds ``engine._last_login`` from a profile that has
+    credentials but no captured session (so 401 auto-relogin is armed), and
+  * ``_ensure_profile_login`` performs a real login at run start using those
+    credentials (never exposing them to the model), syncing cookies on success and
+    degrading gracefully — not deadlocking — otherwise.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
+import dast.browser.login_cascade as login_cascade
+import dast.profiles.store as profiles_store
+from dast.profiles.models import Credential, LoginProfile
+from dast.proxy.api.copilot_service import CopilotService
+
+
+class _FakeStore:
+    ai_mode = False
+
+    def get_cookies_for_host(self, host):
+        return []
+
+    def in_scope_entries(self):
+        return []
+
+
+class _FakeCtx:
+    def __init__(self) -> None:
+        self.proxy_port = 8080
+        self.dashboard_port = 8088
+        self.store = _FakeStore()
+        self.settings = None
+        self.broadcast_copilot = AsyncMock()
+
+
+def test_activate_profile_seeds_last_login_from_credential_only_profile(monkeypatch):
+    service = CopilotService(_FakeCtx())
+    sid = service.new_session()
+    session = service.get(sid)
+    engine = session["engine"]
+    assert engine._last_login is None
+
+    profile = LoginProfile(
+        slug="p", name="P", auth_url="https://app.example.com/login",
+        credentials=[Credential(username="u@example.com", secret="pw")],
+        saved_session=None,  # credential-only: no captured session
+    )
+    monkeypatch.setattr(profiles_store, "load_profile", lambda slug: profile)
+
+    service._activate_profile("p", session)
+
+    assert engine._last_login == {
+        "url": "https://app.example.com/login",
+        "email": "u@example.com",
+        "password": "pw",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ensure_profile_login_noop_without_credentials():
+    service = CopilotService(_FakeCtx())
+    sid = service.new_session()
+    session = service.get(sid)
+    session["autonomous"] = {"profile": None, "hosts": []}
+    session["engine"]._last_login = None
+
+    await service._ensure_profile_login(sid, session)
+
+    assert session["autonomous"].get("_proactive_login_done") is not True
+
+
+@pytest.mark.asyncio
+async def test_ensure_profile_login_logs_in_and_syncs_cookies(monkeypatch):
+    service = CopilotService(_FakeCtx())
+    sid = service.new_session()
+    session = service.get(sid)
+    session["autonomous"] = {"profile": "p", "hosts": []}
+    engine = session["engine"]
+    engine._last_login = {"url": "https://app.example.com/login",
+                          "email": "u@example.com", "password": "pw"}
+    engine._session_cookies = {}
+
+    class _FakeBrowser:
+        async def export_cookies(self):
+            return {"_session": "abc"}
+
+    fake_ctx = SimpleNamespace(browser=_FakeBrowser(), is_in_scope=lambda u: True)
+    monkeypatch.setattr(service, "_build_tool_ctx", lambda s: fake_ctx)
+    service._broadcast_autonomous = AsyncMock()
+    login_mock = AsyncMock(return_value=SimpleNamespace(
+        ok=True, engine="deterministic", error=None))
+    monkeypatch.setattr(login_cascade, "adaptive_login", login_mock)
+
+    await service._ensure_profile_login(sid, session)
+
+    assert login_mock.await_count == 1
+    args, _ = login_mock.await_args
+    assert args[1] == "https://app.example.com/login"
+    assert args[2] == "u@example.com"
+    assert args[3] == "pw"
+    assert engine._session_cookies.get("_session") == "abc"
+    assert session["autonomous"]["_proactive_login_done"] is True
+    assert "authenticated via profile" in session["autonomous"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_profile_login_degrades_on_failure(monkeypatch):
+    service = CopilotService(_FakeCtx())
+    sid = service.new_session()
+    session = service.get(sid)
+    session["autonomous"] = {"profile": "p", "hosts": []}
+    engine = session["engine"]
+    engine._last_login = {"url": "https://app.example.com/login",
+                          "email": "u@example.com", "password": "pw"}
+    engine._session_cookies = {}
+
+    fake_ctx = SimpleNamespace(browser=object(), is_in_scope=lambda u: True)
+    monkeypatch.setattr(service, "_build_tool_ctx", lambda s: fake_ctx)
+    service._broadcast_autonomous = AsyncMock()
+    login_mock = AsyncMock(return_value=SimpleNamespace(
+        ok=False, engine=None, error="no email field"))
+    monkeypatch.setattr(login_cascade, "adaptive_login", login_mock)
+
+    # Must not raise — a failed login reports a blocker, it does not deadlock.
+    await service._ensure_profile_login(sid, session)
+
+    assert session["autonomous"]["_proactive_login_done"] is True
+    assert "failed" in session["autonomous"]["detail"].lower()

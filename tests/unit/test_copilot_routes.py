@@ -95,12 +95,14 @@ class _StubService:
 
     def run_autonomous(self, objective, focus_hosts=None, profile_slug=None,
                        budget=None, auto_ai_mode=True, session_safe=False,
-                       read_only=False, mode="bounded", submit_forms=False) -> str:
+                       read_only=False, mode="bounded", submit_forms=False,
+                       validation_only=False) -> str:
         self.started = {
             "objective": objective, "focus_hosts": focus_hosts,
             "profile_slug": profile_slug, "budget": budget, "auto_ai_mode": auto_ai_mode,
             "session_safe": session_safe, "read_only": read_only,
             "mode": mode, "submit_forms": submit_forms,
+            "validation_only": validation_only,
         }
         return "sid-auto"
 
@@ -152,6 +154,7 @@ def test_autonomous_start_passes_args(auto_client):
         "read_only": True,
         "mode": "complete",
         "submit_forms": True,
+        "validation_only": True,
         "budget": {"max_tool_calls": 50},
     })
     assert resp.status_code == 200
@@ -165,6 +168,7 @@ def test_autonomous_start_passes_args(auto_client):
     assert started["read_only"] is True
     assert started["mode"] == "complete"
     assert started["submit_forms"] is True
+    assert started["validation_only"] is True
     assert started["budget"] == {"max_tool_calls": 50}
 
 
@@ -173,6 +177,7 @@ def test_autonomous_start_defaults_to_bounded_mode(auto_client):
     assert resp.status_code == 200
     assert auto_client.service.started["mode"] == "bounded"
     assert auto_client.service.started["submit_forms"] is False
+    assert auto_client.service.started["validation_only"] is False
 
 
 def test_autonomous_start_rejects_bad_mode(auto_client):

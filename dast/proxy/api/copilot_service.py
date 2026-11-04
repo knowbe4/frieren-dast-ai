@@ -81,6 +81,12 @@ _AUTONOMOUS_DEFAULTS: Dict[str, object] = {
 # How many engine-level errors in a row abort the driver (guards a wedged model).
 _MAX_DRIVER_ERRORS = 3
 
+# Uniform-failure breaker: if a turn adds at least _UNIFORM_FAIL_MIN_NEW in-scope
+# requests and NONE got a 2xx, that is a failing turn; _MAX_UNIFORM_FAIL_TURNS such
+# turns in a row stop the run (403/null floods read as progress otherwise).
+_UNIFORM_FAIL_MIN_NEW = 5
+_MAX_UNIFORM_FAIL_TURNS = 2
+
 # Proactive session keepalive: between turns the browser navigates to a known
 # authenticated URL so the SSO session cookie is refreshed server-side before it
 # expires. 20 minutes is well within typical 1h SSO windows.
@@ -763,6 +769,7 @@ class CopilotService:
         read_only: bool = False,
         mode: str = "bounded",
         submit_forms: bool = False,
+        validation_only: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -782,6 +789,27 @@ class CopilotService:
             raise ValueError("objective is required")
         hosts = [h.strip().lower() for h in (focus_hosts or []) if h and h.strip()]
         mode = mode if mode in ("bounded", "complete") else "bounded"
+        # Validation-only: test ONLY the finding's endpoint — no breadth. Force bounded
+        # so the complete-mode exhaustive sweep never runs; the per-turn auto-graphql /
+        # auto-route breadth is also skipped in _drive_autonomous.
+        if validation_only:
+            mode = "bounded"
+
+        # With a login profile, authentication is handled server-side: _activate_profile
+        # seeds the session cookies and arms credential auto-relogin. The model is NOT
+        # given the password, so the base "authenticate like a human" step would make it
+        # invent a placeholder credential and hammer the login. Tell it to skip that.
+        if profile_slug:
+            objective = (
+                objective
+                + "\n\nAUTHENTICATION (handled for you — overrides any 'authenticate like a human' "
+                f"step): you were logged in at run start via the active profile '{profile_slug}'. A "
+                "session (cookies + CSRF) is loaded and auto-relogins from the profile on 401/expiry, "
+                "so just make your requests. You do NOT have the password: never type or invent one, "
+                "and do not call login tools with made-up credentials. If you still land on a login "
+                "page or stay unauthenticated, the profile login failed — report it as a blocker "
+                "(record_finding or reply to the operator); do not guess credentials."
+            )
 
         sid = self.new_session(focus_hosts=hosts)
         session = self._sessions[sid]
@@ -804,6 +832,7 @@ class CopilotService:
             "session_safe": session_safe,
             "read_only": read_only,
             "mode": mode,
+            "validation_only": bool(validation_only),
             "submit_forms": bool(submit_forms) and not read_only,
             "initial_explore_done": False,
             "stop_event": asyncio.Event(),
@@ -1030,20 +1059,27 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: profile load failed", slug=slug, error=str(exc))
             return
-        if profile is None or not profile.saved_session:
-            logger.warning("autonomous run: login profile has no saved session", slug=slug)
+        if profile is None:
+            logger.warning("autonomous run: login profile not found", slug=slug)
             return
-        try:
-            cookies = list(profile.saved_session.get("cookies", []))
-            auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
-            store.save_named_session_from_playwright(
-                name=profile.slug, role=profile.name,
-                playwright_cookies=cookies, auth_headers=auth_headers,
-            )
-            imported = store.import_playwright_cookies(cookies)
-            logger.info("autonomous run activated login profile", slug=slug, cookies=imported)
-        except Exception as exc:
-            logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
+        # Cookie import only applies to a profile that captured a live session.
+        # A fresh credential-only profile has none — that is NOT a reason to skip
+        # the credential seeding below (which is what arms auto-login).
+        if profile.saved_session:
+            try:
+                cookies = list(profile.saved_session.get("cookies", []))
+                auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
+                store.save_named_session_from_playwright(
+                    name=profile.slug, role=profile.name,
+                    playwright_cookies=cookies, auth_headers=auth_headers,
+                )
+                imported = store.import_playwright_cookies(cookies)
+                logger.info("autonomous run activated login profile", slug=slug, cookies=imported)
+            except Exception as exc:
+                logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
+        else:
+            logger.info("autonomous run: profile has no saved session; relying on "
+                        "credential auto-login", slug=slug)
         # Seed the engine's relogin credentials from the profile so the existing
         # 401/expiry auto-relogin (session.py) can re-authenticate WITHOUT pausing the
         # run. Needs a credential + auth_url on the profile; cookie-only profiles skip this.
@@ -1060,6 +1096,58 @@ class CopilotService:
                 logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
         except Exception as exc:
             logger.warning("autonomous run: relogin-credential seed failed", slug=slug, error=str(exc))
+
+    async def _ensure_profile_login(self, sid: str, session: dict) -> None:
+        """Proactively log in a credential-only profile at run start so the run begins
+        authenticated. The model never receives the password; this uses the credentials
+        seeded onto the engine (``engine._last_login``) by ``_activate_profile`` and the
+        same ``adaptive_login`` cascade as the inline 401 auto-relogin. Best-effort: never
+        raises, never deadlocks the run, never logs secret values."""
+        auto = session.get("autonomous") or {}
+        if auto.get("_proactive_login_done"):
+            return
+        engine = session.get("engine")
+        creds = getattr(engine, "_last_login", None) if engine is not None else None
+        if not creds or not creds.get("url") or not creds.get("email") or not creds.get("password"):
+            return  # no credentials to use — the model will report any auth wall itself
+        auto["_proactive_login_done"] = True
+        try:
+            tool_ctx = self._build_tool_ctx(session)
+            browser = getattr(tool_ctx, "browser", None)
+            if browser is None:
+                logger.warning("autonomous run: no browser for proactive login", session_id=sid)
+                return
+            from dast.browser.login_cascade import adaptive_login
+            result = await adaptive_login(
+                browser, creds["url"], creds["email"], creds["password"],
+                in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
+            )
+            if getattr(result, "ok", False):
+                try:
+                    cookies = await browser.export_cookies()
+                except Exception:
+                    cookies = {}
+                if cookies and hasattr(engine, "_session_cookies"):
+                    engine._session_cookies.update(cookies)
+                self._seed_engine_session(session, auto.get("hosts") or [])
+                auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
+                                  f"({getattr(result, 'engine', '?')})")
+                logger.info("autonomous run: proactive profile login ok", session_id=sid,
+                            engine=getattr(result, "engine", "?"), cookies=len(cookies))
+                await self._broadcast_autonomous(sid, "authenticated", {
+                    "profile": auto.get("profile"), "engine": getattr(result, "engine", None),
+                })
+            else:
+                auto["detail"] = f"profile login failed: {getattr(result, 'error', 'unknown')}"
+                logger.warning("autonomous run: proactive profile login failed",
+                               session_id=sid, error=getattr(result, "error", None))
+                await self._broadcast_autonomous(sid, "auth_failed", {
+                    "profile": auto.get("profile"), "error": getattr(result, "error", None),
+                })
+        except Exception as exc:
+            auto["detail"] = f"profile login error: {str(exc)[:150]}"
+            logger.warning("autonomous run: proactive profile login error",
+                           session_id=sid, error=str(exc)[:200])
 
     def _seed_engine_session(self, session: dict, hosts: List[str]) -> None:
         """Seed the engine's session cookies for the primary focus host so the
@@ -1099,6 +1187,22 @@ class CopilotService:
         ui_stats = graph.stats() if graph is not None else {"visited": 0, "frontier": 0}
         ui_units = ui_stats["visited"] + ui_stats["frontier"]
         return (findings, len(entries), scanned + swept_ops, ui_units)
+
+    def _response_counts(self) -> Tuple[int, int]:
+        """(# in-scope entries, # with a 2xx status) — feeds the uniform-failure breaker.
+        A 403/null still creates an entry, so comparing the 2xx count across turns is
+        what distinguishes real responses from a rejection flood."""
+        store = self._ctx.store
+        if store is None:
+            return (0, 0)
+        try:
+            entries = store.in_scope_entries()
+        except Exception:
+            return (0, 0)
+        ok = sum(1 for entry in entries
+                 if isinstance(getattr(entry, "status", None), int)
+                 and 200 <= entry.status < 300)
+        return (len(entries), ok)
 
     async def _broadcast_autonomous(self, sid: str, event: str,
                                     extra: Optional[dict] = None) -> None:
@@ -1513,11 +1617,18 @@ class CopilotService:
         # the UI-route frontier is seeded and has_surface is True — this closes the
         # path where an early self-declared 'complete' is honored because nothing
         # was mapped yet. Best-effort; never blocks the run on a crawl failure.
-        if mode == "complete" and not auto.get("initial_explore_done"):
+        if mode == "complete" and not auto.get("validation_only") \
+                and not auto.get("initial_explore_done"):
             await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
             auto["breadth_done"] = True
             await self._session_keepalive(sid, session)
+
+        # A credential-only login profile carries no captured session, so nothing is
+        # authenticated yet and the model is never handed the password. Log in for real
+        # now (server-side, same cascade as the inline 401 auto-relogin) so the run
+        # starts authenticated. Best-effort — never deadlocks the run.
+        await self._ensure_profile_login(sid, session)
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
@@ -1540,6 +1651,8 @@ class CopilotService:
 
         last_progress = self._progress_snapshot()
         stuck_turns = 0
+        last_counts = self._response_counts()
+        consec_fail_turns = 0
         last_keepalive = time.time()
         auto["status"] = "running"
         await self._broadcast_autonomous(sid, "started", {
@@ -1636,8 +1749,9 @@ class CopilotService:
                 # it (introspect -> sweep, or fuzz captured ops) without waiting for
                 # the model to decide to. Idempotent; no-op in read-only. Runs in
                 # bounded AND complete mode so "see GraphQL -> test GraphQL" is
-                # guaranteed, not discretionary.
-                if effective_hosts:
+                # guaranteed, not discretionary. Skipped in validation-only mode,
+                # which must test ONLY the finding's endpoint, not sweep breadth.
+                if effective_hosts and not auto.get("validation_only"):
                     turn_ctx = self._build_tool_ctx(session)
                     await self._auto_test_graphql(session, turn_ctx, set(effective_hosts))
                     # Evidence-driven auto-routing of the unambiguous leads (bounded
@@ -1654,6 +1768,27 @@ class CopilotService:
                     last_progress = progress
                 else:
                     stuck_turns += 1
+
+                # ── Uniform-failure breaker ──────────────────────────────────────
+                # 403/null responses still create in-scope entries, so they read as
+                # "progress" and never trip the stuck detector. Track turns whose new
+                # traffic had NO 2xx at all and stop if that persists — otherwise the
+                # run floods a target that is uniformly rejecting it.
+                counts = self._response_counts()
+                new_entries = counts[0] - last_counts[0]
+                new_ok = counts[1] - last_counts[1]
+                last_counts = counts
+                if new_entries >= _UNIFORM_FAIL_MIN_NEW and new_ok <= 0:
+                    consec_fail_turns += 1
+                else:
+                    consec_fail_turns = 0
+                if consec_fail_turns >= _MAX_UNIFORM_FAIL_TURNS:
+                    self._finish_autonomous(
+                        session, "stopped",
+                        f"no successful (2xx) responses for {consec_fail_turns} turns — "
+                        f"stopping instead of flooding the target")
+                    await self._broadcast_autonomous(sid, "finished", {"status": "stopped"})
+                    return
 
                 # ── Interpret the reply's control signal ─────────────────────────
                 # Watchdog: the engine killed a turn whose agent looped on the same

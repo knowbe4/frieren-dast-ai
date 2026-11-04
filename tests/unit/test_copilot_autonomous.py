@@ -794,3 +794,35 @@ def test_coverage_access_control_counts_auth_and_sensitive_data():
     service = CopilotService(_FakeCtx(store))
     cov = service._surface_coverage(["app.example.com"])
     assert cov["dimensions"]["access_control"]["untested"] == []   # evaluated, not a gap
+
+
+# ── validation-only mode: no breadth ───────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_validation_only_skips_graphql_sweep_and_autoroute():
+    # A validate-this-finding run must test ONLY the finding's endpoint — the
+    # per-turn auto GraphQL sweep and evidence auto-route must NOT fire.
+    service = CopilotService(_FakeCtx())
+    service._auto_test_graphql = AsyncMock()
+    service._auto_route = AsyncMock()
+    sid = service.run_autonomous("validate finding X", focus_hosts=["h"],
+                                 validation_only=True)
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    service._auto_test_graphql.assert_not_awaited()
+    service._auto_route.assert_not_awaited()
+    assert session["autonomous"]["validation_only"] is True
+    assert session["autonomous"]["mode"] == "bounded"
+
+
+@pytest.mark.asyncio
+async def test_normal_run_still_does_breadth():
+    # A normal (non-validation) run keeps the auto GraphQL/route breadth.
+    service = CopilotService(_FakeCtx())
+    service._auto_test_graphql = AsyncMock()
+    service._auto_route = AsyncMock()
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    service._auto_test_graphql.assert_awaited()

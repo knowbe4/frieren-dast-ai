@@ -395,7 +395,7 @@ _GET_BEARER_TOKEN_SCHEMA: Dict[str, Any] = {
     "properties": {
         "host": {
             "type": "string",
-            "description": "Target API host (e.g. 'api.phisher.knowbe4.com'). "
+            "description": "Target API host (e.g. 'api.internal.example.com'). "
                            "If omitted, returns tokens for all hosts.",
         },
     },

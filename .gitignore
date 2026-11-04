@@ -42,3 +42,8 @@ sessions/
 
 # Local presentation artifacts (screenshots may show target data)
 presentation/
+# Engagement scratch notes & ad-hoc PoC scripts — never commit (may carry
+# internal hostnames / target data). Keep these local only.
+TODO.md
+poc_*.sh
+*_poc.sh

@@ -986,6 +986,16 @@ class CopilotService:
         task = session.get("_task")
         if task is not None and not task.done():
             task.cancel()
+        # Close this session's own browser now: a cancelled task may not run its
+        # cleanup, which otherwise leaves an orphan (logged-out) Chromium window
+        # open per stopped run. pop() makes this idempotent with _cleanup_session.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                from dast.utils.tasks import spawn_tracked
+                spawn_tracked(browser.close(), name="close-session-browser-on-stop")
+            except Exception as exc:
+                logger.debug("could not schedule session browser close on stop", error=str(exc))
         logger.info("autonomous run stop requested", session_id=sid)
         return True
 

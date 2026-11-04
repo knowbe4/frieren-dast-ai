@@ -523,7 +523,10 @@ async def test_session_auth_injects_jar_cookies_and_borrowed_headers():
 
     headers = captured["args"]["headers"]
     assert headers["Cookie"] == "session=abc"  # from the host-scoped jar
-    assert headers["Authorization"] == "Bearer XYZ"  # borrowed from history
+    # Authorization is NOT borrowed from the global history directly (that would
+    # leak a token across concurrent sessions); it is captured into this engine's
+    # own per-session _bearer_tokens cache and applied from there.
+    assert headers["Authorization"] == "Bearer XYZ"
 
 
 @pytest.mark.asyncio

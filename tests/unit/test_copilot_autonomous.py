@@ -277,6 +277,40 @@ async def test_stop_autonomous_kills_the_run():
 
 
 @pytest.mark.asyncio
+async def test_stop_autonomous_closes_the_session_browser():
+    # A cancelled driver task may not run its cleanup, so stop() must close the
+    # session's own browser itself — otherwise each stopped run leaves an orphan
+    # (logged-out) Chromium window open.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+
+    closed = asyncio.Event()
+
+    class _FakeBrowser:
+        async def close(self) -> None:
+            closed.set()
+
+    # The driver rebuilds the tool ctx every turn (which would replace the
+    # browser with a real AgentBrowser); keep our fake attached so we can assert
+    # stop() closes whatever browser the session holds.
+    import types
+    service._build_tool_ctx = lambda s: types.SimpleNamespace()  # type: ignore[assignment]
+
+    async def slow_send(text: str, tool_ctx: Any, *, on_event, wait_for_human) -> _Reply:
+        await asyncio.sleep(0.05)
+        return _Reply("working")
+
+    session["engine"].send = slow_send
+    assert await _wait_for(lambda: session["autonomous"]["turns"] >= 1)
+    session["_agent_browser"] = _FakeBrowser()
+    assert service.stop_autonomous(sid) is True
+    await asyncio.gather(session["_task"], return_exceptions=True)
+    assert await _wait_for(closed.is_set)                # browser.close() was scheduled
+    assert session.get("_agent_browser") is None         # detached from the session
+
+
+@pytest.mark.asyncio
 async def test_pause_and_resume_toggle_the_gate():
     service = CopilotService(_FakeCtx())
     sid = service.run_autonomous("obj", focus_hosts=["h"])

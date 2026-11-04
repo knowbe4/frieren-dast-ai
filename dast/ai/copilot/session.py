@@ -578,12 +578,20 @@ class CopilotSession:
         parts = host_lower.split(".")
         domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
         import time as _time
+
+        def _field(entry: Any, name: str) -> Any:
+            # Entries are ProxyEntry dataclasses in production and dicts in some
+            # tests/imports; read either shape without assuming .get() exists.
+            if isinstance(entry, dict):
+                return entry.get(name)
+            return getattr(entry, name, None)
+
         for entry in reversed(entries):
             try:
-                entry_host = (entry.get("host") or "").lower()
+                entry_host = (_field(entry, "host") or "").lower()
                 if domain_suffix not in entry_host:
                     continue
-                req_headers = entry.get("request_headers") or {}
+                req_headers = _field(entry, "request_headers") or {}
                 auth_val = ""
                 for k, v in req_headers.items():
                     if k.lower() == "authorization":
@@ -596,10 +604,10 @@ class CopilotSession:
                 now = _time.time()
                 if exp is not None and exp < now:
                     continue
-                entry_host_actual = entry.get("host") or host
-                auth_endpoint = entry.get("path") or None
-                source_id = entry.get("id") or ""
-                if entry.get("source") == "copilot":
+                entry_host_actual = _field(entry, "host") or host
+                auth_endpoint = _field(entry, "path") or None
+                source_id = _field(entry, "id") or ""
+                if _field(entry, "source") == "copilot":
                     continue
             except Exception:
                 continue
@@ -1285,6 +1293,13 @@ class CopilotSession:
         for name, value in borrowed_headers.items():
             if name.lower() == "cookie":
                 continue  # cookies come from the host-scoped jar above
+            if name.lower() == "authorization":
+                # Authorization is per-session (a Bearer belongs to ONE account): never
+                # borrow it from the GLOBAL proxy history — a concurrent/earlier run's
+                # token would leak across sessions. It comes only from this engine's own
+                # _bearer_tokens cache below (populated by get_app_token / this session's
+                # own captured traffic).
+                continue
             if name.lower() not in present:
                 headers[name] = value
 

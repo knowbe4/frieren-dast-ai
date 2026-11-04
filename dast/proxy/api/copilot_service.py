@@ -691,6 +691,10 @@ class CopilotService:
         # successful login on it. Without this the engine's auto-relogin on 401/expiry
         # (session.py) stays dormant because `_last_login` is never populated.
         tool_ctx._session = session.get("engine")
+        # Validation-only runs hide breadth/recon tools from the model (enforced in
+        # the engine's tool-menu build) so it tests only the finding's endpoint.
+        tool_ctx.validation_only = bool(
+            (session.get("autonomous") or {}).get("validation_only", False))
         return tool_ctx
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,
@@ -1822,6 +1826,15 @@ class CopilotService:
                     continue
 
                 if blocked_reason == "complete":
+                    # A validation-only run cares about ONE finding, not surface
+                    # coverage — accept the verdict immediately instead of bouncing
+                    # 'complete' through the coverage gate (which would push breadth).
+                    if auto.get("validation_only"):
+                        self._finish_autonomous(session, "complete",
+                                                 reply.message or "validation concluded")
+                        await self._broadcast_autonomous(sid, "finished",
+                                                         {"status": "complete"})
+                        return
                     coverage = self._surface_coverage(effective_hosts)
                     budget_left = (time.time() < deadline
                                    and auto["tool_calls"] < cfg["max_tool_calls"])

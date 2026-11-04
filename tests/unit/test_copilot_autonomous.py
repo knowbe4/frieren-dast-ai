@@ -826,3 +826,21 @@ async def test_normal_run_still_does_breadth():
     session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
     await session["_task"]
     service._auto_test_graphql.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validation_only_accepts_complete_without_coverage_gate():
+    # A validation-only run cares about one finding, not surface coverage. Even with a
+    # mapped-but-untested surface (which would bounce 'complete' in a normal run), the
+    # model's verdict must end the run immediately — not get pushed into breadth.
+    e = _CovEntry("POST", "/app/backend/x", "h", scanned_attack_types=["sqli"])
+    store = _DimStore([e])
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("validate finding Y", focus_hosts=["h"],
+                                 validation_only=True)
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(
+        side_effect=[_Reply("NOT CONFIRMED: no differential", "complete")])
+    await session["_task"]
+    assert session["autonomous"]["status"] == "complete"
+    assert session["autonomous"]["complete_rejections"] == 0   # gate skipped, not bounced

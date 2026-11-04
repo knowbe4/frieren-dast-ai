@@ -323,6 +323,14 @@ def _canonical(args: Dict[str, Any]) -> str:
         return str(args)
 
 
+# Breadth/recon tools hidden in validation-only mode: a "confirm this one finding"
+# run must test only the finding's endpoint, not fan out across the surface.
+_BREADTH_TOOLS = frozenset({
+    "content_discovery", "crawl", "graphql_fuzz", "graphql_sweep",
+    "param_mining", "run_scan", "scan_surface",
+})
+
+
 def _candidate_urls(args: Dict[str, Any]) -> List[str]:
     """URL-bearing argument values a scope gate should check before dispatch."""
     urls: List[str] = []
@@ -634,10 +642,14 @@ class CopilotSession:
 
         # Exclude copilot-tagged tools (e.g. copilot_ask) so the copilot can never
         # call itself — those exist only to let OTHER agents/MCP clients drive it.
+        # In validation-only runs also hide breadth/recon tools so the model tests
+        # only the finding's endpoint instead of fanning out across the surface.
+        hide_breadth = bool(getattr(tool_ctx, "validation_only", False))
         tool_defs = [
             {"name": t.name, "description": t.description, "input_schema": t.input_schema}
             for t in all_tools()
             if "copilot" not in (t.tags or [])
+            and not (hide_breadth and t.name in _BREADTH_TOOLS)
         ]
         tool_names = {t["name"] for t in tool_defs}
         # Required args per tool (from each schema) so a malformed call with a

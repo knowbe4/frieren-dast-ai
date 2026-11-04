@@ -180,6 +180,28 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "could not start autonomous run"}, status_code=503)
         return {"session_id": sid, "status": "running"}
 
+    @router.post("/api/copilot/validate-batch")
+    async def validate_batch(body: dict):
+        """Launch one focused finding-validation run per item, in parallel.
+
+        Body: {items: [{objective (required), focus_hosts?: [str], profile_slug?: str,
+        budget?: {...}}], max_concurrency?: int}. Every run is forced validation_only +
+        session_safe so they test only their finding and can run concurrently with
+        per-session browser/cookie isolation. Returns the launched session ids + errors.
+        """
+        items = body.get("items")
+        if not isinstance(items, list) or not items:
+            return JSONResponse({"error": "items (non-empty list) required"}, status_code=400)
+        try:
+            max_concurrency = int(body.get("max_concurrency", 3))
+        except (TypeError, ValueError):
+            max_concurrency = 3
+        try:
+            result = service.run_validation_batch(items, max_concurrency=max_concurrency)
+        except RuntimeError:
+            return JSONResponse({"error": "could not start validation batch"}, status_code=503)
+        return result
+
     @router.post("/api/copilot/autonomous/{sid}/stop")
     async def autonomous_stop(sid: str):
         if not service.stop_autonomous(sid):

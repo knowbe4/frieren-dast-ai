@@ -844,3 +844,77 @@ async def test_validation_only_accepts_complete_without_coverage_gate():
     await session["_task"]
     assert session["autonomous"]["status"] == "complete"
     assert session["autonomous"]["complete_rejections"] == 0   # gate skipped, not bounced
+
+
+# ── Phase 1: parallel multi-agent isolation ────────────────────────────────────
+class _HostStatusEntry:
+    def __init__(self, host, status):
+        self.host = host
+        self.status = status
+        self.findings = []
+        self.scan_result = None
+
+
+def test_scope_entries_filters_by_host_exact_and_subdomain():
+    es = [_HostStatusEntry("training.knowbe4.com", 200),
+          _HostStatusEntry("api.training.knowbe4.com", 403),
+          _HostStatusEntry("other.knowbe4.com", 200)]
+    scoped = CopilotService._scope_entries(es, {"training.knowbe4.com"})
+    hosts = {e.host for e in scoped}
+    assert hosts == {"training.knowbe4.com", "api.training.knowbe4.com"}  # subdomain in, sibling out
+    assert CopilotService._scope_entries(es, None) == es                   # no filter = all
+
+
+def test_response_counts_scoped_to_focus_hosts():
+    es = [_HostStatusEntry("training.knowbe4.com", 200),
+          _HostStatusEntry("training.knowbe4.com", 403),
+          _HostStatusEntry("noise.example.com", 200)]
+    service = CopilotService(_FakeCtx(_DimStore(es)))
+    total, ok = service._response_counts({"training.knowbe4.com"})
+    assert (total, ok) == (2, 1)                 # the noise host is excluded
+
+
+def test_gc_never_evicts_a_live_run(monkeypatch):
+    import dast.proxy.api.copilot_service as cs
+    monkeypatch.setattr(cs, "_MAX_SESSIONS", 1)
+    service = CopilotService(_FakeCtx())
+    live = service.new_session()
+
+    class _T:
+        def done(self):
+            return False
+    service._sessions[live]["_task"] = _T()           # live task
+    service.new_session()                              # second session triggers _gc
+    assert live in service._sessions                   # live run was not evicted
+
+
+@pytest.mark.asyncio
+async def test_run_validation_batch_forces_validation_only_and_session_safe():
+    service = CopilotService(_FakeCtx())
+    result = service.run_validation_batch([
+        {"objective": "validate finding A", "focus_hosts": ["h"]},
+        {"objective": "   ", "focus_hosts": ["h"]},     # invalid → error, not launched
+    ])
+    assert result["count"] == 1
+    assert len(result["errors"]) == 1
+    sid = result["launched"][0]["session_id"]
+    auto = service.get(sid)["autonomous"]
+    assert auto["validation_only"] is True
+    assert auto["session_safe"] is True
+    assert auto["mode"] == "bounded"
+    service.get(sid)["_task"].cancel()
+    await asyncio.gather(service.get(sid)["_task"], return_exceptions=True)
+
+
+def test_each_session_gets_its_own_browser():
+    # Per-session isolation: two sessions must not share one AgentBrowser (that was the
+    # parallel-run blocker — shared page/cookies clobbered each other).
+    service = CopilotService(_FakeCtx())
+    a = service.new_session()
+    b = service.new_session()
+    ctx_a = service._build_tool_ctx(service.get(a))
+    ctx_b = service._build_tool_ctx(service.get(b))
+    ba = service.get(a)["_agent_browser"]
+    bb = service.get(b)["_agent_browser"]
+    assert ba is not None and bb is not None and ba is not bb
+    assert ctx_a.browser is ba and ctx_b.browser is bb

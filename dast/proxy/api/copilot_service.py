@@ -355,13 +355,23 @@ class CopilotService:
         # Hypothesis key -> session id, so re-exploring the same hypothesis
         # (e.g. a double-click) reuses the live session instead of duplicating it.
         self._hypothesis_sessions: Dict[str, str] = {}
-        # Shared AgentBrowser across all copilot sessions — login state, cookies,
-        # and page context persist between messages. One browser window, never
-        # recreated unless closed or crashed.
+        # Browsers are per-session now (session["_agent_browser"]); this legacy handle
+        # is kept only so an older caller setting it still gets closed on shutdown.
         self._shared_browser: Any = None
 
+    async def _close_session_browser(self, session: dict) -> None:
+        """Close and detach this session's own AgentBrowser, if any."""
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("session AgentBrowser close error", error=str(exc))
+
     async def close_browser(self) -> None:
-        """Close the shared AgentBrowser (e.g. on proxy shutdown)."""
+        """Close every live session's AgentBrowser (e.g. on proxy shutdown)."""
+        for session in list(self._sessions.values()):
+            await self._close_session_browser(session)
         if self._shared_browser is not None:
             try:
                 await self._shared_browser.close()
@@ -381,6 +391,10 @@ class CopilotService:
             oldest = sorted(self._sessions.keys(),
                             key=lambda k: self._sessions[k].get("created_at", 0))
             for k in oldest[:len(self._sessions) - _MAX_SESSIONS]:
+                sess = self._sessions.get(k) or {}
+                task = sess.get("_task")
+                if task is not None and not task.done():
+                    continue  # never evict a session whose run is still live
                 self._sessions.pop(k, None)
 
     def _init_engine(self, sid: str, focus_hosts: Optional[List[str]] = None):
@@ -657,10 +671,11 @@ class CopilotService:
         run_scan) reach the live queues through the extra fields; they are present
         only for the in-process copilot, so the tools degrade gracefully elsewhere."""
         ctx = self._ctx
-        # Shared AgentBrowser across ALL copilot sessions — login state, cookies,
-        # and page context persist between messages. Created lazily on first use;
-        # recreated if closed or crashed.
-        browser = self._shared_browser
+        # Per-session AgentBrowser: each copilot session gets its OWN browser (own
+        # Playwright context+page = isolated cookies/login), so multiple runs can
+        # execute concurrently without clobbering each other's page or auth. Created
+        # lazily, recreated if closed/crashed, and closed when the session is cleaned up.
+        browser = session.get("_agent_browser")
         if browser is None or getattr(browser, "_browser", None) is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
@@ -668,7 +683,6 @@ class CopilotService:
                     proxy_port=ctx.proxy_port, store=ctx.store,
                     read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
                 )
-                self._shared_browser = browser
             except Exception as exc:
                 logger.warning("could not create AgentBrowser", error=str(exc))
                 browser = None
@@ -888,7 +902,10 @@ class CopilotService:
         # Defer identity-provider hosts for the main run: the ambient auto-scan and
         # scan_surface skip them so probing the IdP cannot log the run out mid-scan.
         # The driver lifts this for a final phase that tests the IdP last.
-        if self._ctx.store is not None:
+        # Skipped for validation_only: it does no ambient scan / IdP phase, and this
+        # is a GLOBAL store flag — leaving it untouched lets parallel validation runs
+        # coexist without clobbering each other's deferral.
+        if self._ctx.store is not None and not validation_only:
             self._ctx.store.defer_identity_hosts = True
 
         # Preseed auth so the run carries a logged-in session from the first call
@@ -907,6 +924,46 @@ class CopilotService:
         logger.info("autonomous copilot run started", session_id=sid,
                     hosts=hosts, profile=profile_slug or None, config=cfg)
         return sid
+
+    def run_validation_batch(self, items: List[dict],
+                             max_concurrency: int = 3) -> Dict[str, Any]:
+        """Launch one focused finding-validation run per item, concurrently.
+
+        Each item is {objective (required), focus_hosts?, profile_slug?, budget?}. Every
+        run is forced ``validation_only=True`` + ``session_safe=True`` so it tests only
+        its finding (no breadth) and avoids the global ambient-scan/defer races — which,
+        together with the per-session browser + per-session cookie seeding, lets the runs
+        execute in parallel without clobbering each other. Returns the launched session
+        ids (plus any per-item errors). Runs beyond ``max_concurrency`` are launched too
+        but flagged, since each spins up its own browser (resource cost scales with N)."""
+        launched: List[dict] = []
+        errors: List[dict] = []
+        for i, item in enumerate(items or []):
+            objective = (item.get("objective") or "").strip()
+            if not objective:
+                errors.append({"index": i, "error": "objective required"})
+                continue
+            try:
+                sid = self.run_autonomous(
+                    objective,
+                    focus_hosts=item.get("focus_hosts"),
+                    profile_slug=item.get("profile_slug"),
+                    budget=item.get("budget"),
+                    session_safe=True, read_only=False,
+                    mode="bounded", validation_only=True,
+                )
+                launched.append({"index": i, "session_id": sid,
+                                 "focus_hosts": item.get("focus_hosts"),
+                                 "profile_slug": item.get("profile_slug")})
+            except (ValueError, RuntimeError) as exc:
+                errors.append({"index": i, "error": str(exc)})
+        over = max(0, len(launched) - max_concurrency)
+        if over:
+            logger.warning("validation batch exceeds suggested concurrency",
+                           launched=len(launched), max_concurrency=max_concurrency)
+        return {"launched": launched, "errors": errors,
+                "count": len(launched),
+                "over_concurrency": over}
 
     # ── Autonomous run controls ──────────────────────────────────────────────────
     def stop_autonomous(self, sid: str) -> bool:
@@ -1078,7 +1135,15 @@ class CopilotService:
                     playwright_cookies=cookies, auth_headers=auth_headers,
                 )
                 imported = store.import_playwright_cookies(cookies)
-                logger.info("autonomous run activated login profile", slug=slug, cookies=imported)
+                # Also seed the cookies onto THIS engine session (per-session, wins on
+                # collision) so a concurrent run with a different profile is not
+                # clobbered by the shared global jar.
+                engine = session.get("engine")
+                seeded = {c["name"]: c.get("value", "") for c in cookies if c.get("name")}
+                if engine is not None and seeded and hasattr(engine, "seed_session_cookies"):
+                    engine.seed_session_cookies(seeded)
+                logger.info("autonomous run activated login profile", slug=slug,
+                            cookies=imported, session_scoped=len(seeded))
             except Exception as exc:
                 logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
         else:
@@ -1167,18 +1232,34 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: engine session seed failed", error=str(exc))
 
-    def _progress_snapshot(self) -> Tuple[int, int, int, int]:
+    @staticmethod
+    def _scope_entries(entries: list, hosts: Optional[set]) -> list:
+        """Filter proxy entries to a run's focus hosts (exact or subdomain). With no
+        hosts, returns them all. Keeps concurrent runs' traffic from polluting each
+        other's stuck/uniform-failure/coverage signals."""
+        if not hosts:
+            return entries
+        hs = {h.lower() for h in hosts if h}
+        out = []
+        for e in entries:
+            host = (getattr(e, "host", "") or "").lower()
+            if host in hs or any(host.endswith("." + h) for h in hs):
+                out.append(e)
+        return out
+
+    def _progress_snapshot(self, hosts: Optional[set] = None) -> Tuple[int, int, int, int]:
         """A monotonic (findings, in-scope endpoints, coverage units, ui units) tuple
         used by the stuck detector: no change across ``max_stuck_turns`` turns means no
         progress. Coverage units count scanned endpoints + swept GraphQL operations so
         breadth work (scan_surface / graphql_sweep) registers as progress; ui units count
         discovered + visited UI routes so SPA exploration (discovering or visiting a
-        route) also counts and never trips the stuck detector."""
+        route) also counts and never trips the stuck detector. ``hosts`` scopes the
+        entry-derived counts to a run's focus hosts for safe concurrent runs."""
         store = self._ctx.store
         if store is None:
             return (0, 0, 0, 0)
         try:
-            entries = store.in_scope_entries()
+            entries = self._scope_entries(store.in_scope_entries(), hosts)
         except Exception:
             return (0, 0, 0, 0)
         findings = sum(len(getattr(entry, "findings", None) or []) for entry in entries)
@@ -1192,15 +1273,16 @@ class CopilotService:
         ui_units = ui_stats["visited"] + ui_stats["frontier"]
         return (findings, len(entries), scanned + swept_ops, ui_units)
 
-    def _response_counts(self) -> Tuple[int, int]:
+    def _response_counts(self, hosts: Optional[set] = None) -> Tuple[int, int]:
         """(# in-scope entries, # with a 2xx status) — feeds the uniform-failure breaker.
         A 403/null still creates an entry, so comparing the 2xx count across turns is
-        what distinguishes real responses from a rejection flood."""
+        what distinguishes real responses from a rejection flood. ``hosts`` scopes it to
+        the run's focus hosts so a concurrent run's traffic can't mask this run's flood."""
         store = self._ctx.store
         if store is None:
             return (0, 0)
         try:
-            entries = store.in_scope_entries()
+            entries = self._scope_entries(store.in_scope_entries(), hosts)
         except Exception:
             return (0, 0)
         ok = sum(1 for entry in entries
@@ -1232,7 +1314,9 @@ class CopilotService:
                     logger.warning("autonomous run could not restore AI mode",
                                    error=str(exc))
             # Lift the identity-host deferral so it never leaks into manual use.
-            if self._ctx.store is not None:
+            # A validation_only run never set this GLOBAL flag, so it must NOT clear
+            # it either — that would clobber a concurrent non-validation run.
+            if self._ctx.store is not None and not auto.get("validation_only"):
                 self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
         session["pause"] = None
@@ -1244,9 +1328,15 @@ class CopilotService:
     def _cleanup_session(self, session: dict) -> None:
         """Release per-session resources: close the agent browser and remove any
         match/replace rules the copilot added (tagged with [copilot_session])."""
-        # Detach the shared browser from this session but do NOT close it —
-        # it persists across sessions so login state survives.
-        session.pop("_agent_browser", None)
+        # Close this session's OWN browser (per-session isolation). Cleanup is sync
+        # and browser.close() is async, so schedule it as a tracked task.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                from dast.utils.tasks import spawn_tracked
+                spawn_tracked(browser.close(), name="close-session-browser")
+            except Exception as exc:
+                logger.debug("could not schedule session browser close", error=str(exc))
         # Remove copilot-scoped match/replace rules so the operator's browsing
         # is not affected after the copilot finishes.
         settings = getattr(self._ctx, "settings", None)
@@ -1653,9 +1743,12 @@ class CopilotService:
             read_only=read_only_note,
         )
 
-        last_progress = self._progress_snapshot()
+        # Validation runs scope their progress/breaker signals to their own focus
+        # hosts so concurrent runs don't pollute each other's stuck/failure detection.
+        scope_hosts = set(auto.get("hosts") or []) if auto.get("validation_only") else None
+        last_progress = self._progress_snapshot(scope_hosts)
         stuck_turns = 0
-        last_counts = self._response_counts()
+        last_counts = self._response_counts(scope_hosts)
         consec_fail_turns = 0
         last_keepalive = time.time()
         auto["status"] = "running"
@@ -1763,7 +1856,7 @@ class CopilotService:
                     await self._auto_route(session, turn_ctx, set(effective_hosts))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
-                progress = self._progress_snapshot()
+                progress = self._progress_snapshot(scope_hosts)
                 if progress != last_progress:
                     stuck_turns = 0
                     # Real work happened — refresh the soft-escalation nudge budget so a
@@ -1778,7 +1871,7 @@ class CopilotService:
                 # "progress" and never trip the stuck detector. Track turns whose new
                 # traffic had NO 2xx at all and stop if that persists — otherwise the
                 # run floods a target that is uniformly rejecting it.
-                counts = self._response_counts()
+                counts = self._response_counts(scope_hosts)
                 new_entries = counts[0] - last_counts[0]
                 new_ok = counts[1] - last_counts[1]
                 last_counts = counts

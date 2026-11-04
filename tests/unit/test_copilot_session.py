@@ -217,7 +217,7 @@ async def test_out_of_scope_denied_records_observation_not_call():
 
     run_tool.assert_not_awaited()  # denied before dispatch
     assert reply.blocked_reason == "out_of_scope"
-    assert "Denied by operator" in reply.transcript[0]["observation"]
+    assert "Denied" in reply.transcript[0]["observation"]
 
 
 @pytest.mark.asyncio

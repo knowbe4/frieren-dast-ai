@@ -333,6 +333,16 @@ def _candidate_urls(args: Dict[str, Any]) -> List[str]:
     return urls
 
 
+def _host_in_focus(host: str, focus_hosts: Any) -> bool:
+    """True if ``host`` equals a focus host or is a subdomain of one."""
+    h = (host or "").lower()
+    for focus in (focus_hosts or ()):
+        f = (focus or "").lower()
+        if f and (h == f or h.endswith("." + f)):
+            return True
+    return False
+
+
 def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
     """Compact one-line argument hint from a tool's JSON Schema: ``name:type`` per
     property, required ones marked ``*``. Without this the copilot menu shows a
@@ -1295,18 +1305,28 @@ class CopilotSession:
         wait_for_human: WaitForHuman,
         observe: Callable[[Dict[str, Any], str], Awaitable[None]],
     ) -> bool:
-        """Authorize any out-of-scope host via an operator approve-pause. Returns
-        True when the call was DENIED (caller should skip the tool)."""
+        """Authorize an out-of-scope OR off-focus host via an operator approve-pause.
+        Returns True when the call was DENIED (caller should skip the tool).
+
+        When the run has focus hosts, a host must be in focus (exact or subdomain) to
+        pass silently even if the broad scope preset would admit it — this stops a
+        fabricated sibling host (e.g. a hostname invented from a profile slug) from
+        being reached just because the preset allows ``*.example.com``."""
         temp_allowed: List[str] = []
         for candidate in _candidate_urls(tool_args):
             host = (urlparse(candidate).hostname or "").lower()
             if not host or host in approved_hosts:
                 continue
-            if tool_ctx.is_in_scope(candidate):
+            in_focus = _host_in_focus(host, self._focus_hosts)
+            # Silent pass only when in scope AND (no focus set OR within focus).
+            if tool_ctx.is_in_scope(candidate) and (not self._focus_hosts or in_focus):
                 continue
             verdict = await wait_for_human("approve", {
                 "url": candidate, "host": host,
                 "method": str(tool_args.get("method", "GET")).upper(), "tool": tool_name,
+                "reason": ("off-focus host" if (self._focus_hosts and not in_focus
+                                                and tool_ctx.is_in_scope(candidate))
+                           else "out of scope"),
             })
             choice = str((verdict or {}).get("decision", "deny")).strip().lower()
             if choice == "always_host":
@@ -1317,8 +1337,9 @@ class CopilotSession:
             else:
                 for allowed in temp_allowed:
                     approved_hosts.discard(allowed)
-                await observe(entry, "Denied by operator (out of scope). Try an "
-                              "in-scope target or reply.")
+                await observe(entry, "Denied: host is not in the run's focus or is out of "
+                              "scope. Use the exact target host from the objective (do not "
+                              "invent hostnames), or reply.")
                 return True
         return False
 

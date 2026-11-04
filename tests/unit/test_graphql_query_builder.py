@@ -82,9 +82,10 @@ class TestBuildArgumentValue:
         schema = _schema(enum_types={"Role": {"values": ["ADMIN", "USER"]}})
         assert build_argument_value(schema, "Role", None) == "ADMIN"
 
-    def test_enum_with_no_values_falls_back(self):
+    def test_enum_with_no_values_falls_back_to_null(self):
+        # A valueless enum has no valid value; emit null, not a fake "UNKNOWN" literal.
         schema = _schema(enum_types={"Empty": {"values": []}})
-        assert build_argument_value(schema, "Empty", None) == "UNKNOWN"
+        assert build_argument_value(schema, "Empty", None) is None
 
     def test_list_wrapper_wraps_value_in_list(self):
         schema = _schema()

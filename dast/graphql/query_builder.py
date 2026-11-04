@@ -139,7 +139,9 @@ def build_argument_value(
 
     if arg_type in schema.get("enum_types", {}):
         values = schema["enum_types"][arg_type].get("values") or []
-        value: Any = values[0] if values else "UNKNOWN"
+        # A valueless enum (degenerate/incomplete introspection) has no valid value;
+        # send null rather than a fake "UNKNOWN" literal that looks like real data.
+        value: Any = values[0] if values else None
     elif arg_type in schema.get("input_types", {}):
         value = _build_input_object(schema, arg_type, _depth=_depth, _seen_input_types=_seen_input_types)
     else:

@@ -18,6 +18,7 @@ from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils import read_only
 from dast.utils.logger import get_logger
+from dast.utils.placeholders import looks_like_placeholder
 
 logger = get_logger(__name__)
 
@@ -140,6 +141,18 @@ def _destructive_reason(text: str) -> Dict[str, str] | None:
     return None
 
 
+def _first_placeholder_field(url: str, headers: Dict[str, str], body: str) -> str | None:
+    """Name of the first field carrying a model placeholder (e.g. ``<UNKNOWN>``), else None."""
+    if looks_like_placeholder(url):
+        return "url"
+    for name, value in headers.items():
+        if looks_like_placeholder(value):
+            return f"header '{name}'"
+    if looks_like_placeholder(body):
+        return "body"
+    return None
+
+
 async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -194,6 +207,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     source_label = getattr(ctx, "source_label", None)
     if source_label and "x-dast-source" not in {k.lower() for k in headers}:
         headers["x-dast-source"] = str(source_label)
+
+    # Placeholder gate: refuse model stand-in values (e.g. "<UNKNOWN>", "<jwt>") in
+    # the url, a header, or the body before sending — they are noise and can lock
+    # accounts. The real value must come from history/an earlier response.
+    placeholder_field = _first_placeholder_field(url, headers, body)
+    if placeholder_field:
+        logger.warning("send_request refused placeholder value", field=placeholder_field)
+        return {"ok": False, "error": (
+            f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
+            "have the real value — read it from get_history or an earlier response, or ask the "
+            "operator; do not invent one.")}
 
     # Payload-safety gate: refuse destructive URL/body, surfacing the safe variant.
     for where, text in (("url", url), ("body", body)):

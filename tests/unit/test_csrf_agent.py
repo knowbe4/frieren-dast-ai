@@ -146,3 +146,45 @@ async def test_get_method_is_skipped():
     )
     findings = await CsrfAgent().run(target, MagicMock())
     assert findings == []
+
+
+# ── Check 2: random-token swap targets the HEADER, and body swap is guarded ───
+
+def _hdr_target():
+    # SPA double-submit: the CSRF token lives in a header; a body field also matches
+    # the csrf name regex (authenticity_token) — the old code falsely swapped that.
+    return CheckTarget(
+        method="POST",
+        url="https://app.example.com/app/backend/x",
+        headers={"cookie": "_knowbe4_session_new=abc", "x-csrf-token": "REALTOKEN123"},
+        body="authenticity_token=REALTOKEN123&data=1",
+        params=[{"name": "authenticity_token", "location": "body", "value": "REALTOKEN123"}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_random_token_swaps_the_header_and_fires_when_any_value_accepted():
+    # Vulnerable app: accepts ANY token value → the HEADER swap must flag it.
+    async def _send(client, method, url, headers, body):
+        return _resp(201, "created")
+    with patch("dast.agents.csrf_agent._send", new=_send):
+        findings = await CsrfAgent().run(_hdr_target(), MagicMock())
+    rt = [f for f in findings if f.title == "CSRF — Random Token Accepted"]
+    assert rt, "expected a Random Token Accepted finding from the header swap"
+    f = rt[0]
+    assert f.parameter.lower() == "x-csrf-token"          # swapped the HEADER, not the body
+    assert "x-csrf-token" in f.payload.lower()
+    assert "..." not in f.payload                          # full value, so the UI can highlight it
+
+
+@pytest.mark.asyncio
+async def test_body_param_swap_not_a_false_positive_when_header_token_validated():
+    # Correctly-protected app: accepts ONLY when the real header token is present.
+    async def _send(client, method, url, headers, body):
+        hv = {k.lower(): v for k, v in (headers or {}).items()}
+        return _resp(201, "created") if hv.get("x-csrf-token") == "REALTOKEN123" else _resp(403, "forbidden")
+    with patch("dast.agents.csrf_agent._send", new=_send):
+        findings = await CsrfAgent().run(_hdr_target(), MagicMock())
+    # Header swap → 403 (rejected), body swap guarded off → NO Random/Removal false positive.
+    assert not [f for f in findings if "Random Token" in f.title], findings
+    assert not [f for f in findings if "Removal" in f.title], findings

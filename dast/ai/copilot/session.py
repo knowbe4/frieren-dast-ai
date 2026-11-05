@@ -370,6 +370,63 @@ def _subapp_for_path(path: str) -> Optional[str]:
     return None
 
 
+def scan_history_bearer(store: Any, host: str, path: str) -> Optional[Dict[str, Any]]:
+    """Freshest non-expired Bearer in proxy history for a (host, request path).
+
+    Standalone twin of ``CopilotSession._capture_bearer_tokens`` for callers without
+    a copilot session (e.g. the ``send_request`` tool driven directly or over MCP).
+    Prefers a token whose auth endpoint matches the request path's sub-app (modstore
+    and ccm share a host); otherwise falls back to the freshest host-level token.
+    Returns a record ``{token, exp, auth_endpoint}`` or None. Never raises."""
+    if store is None or not host:
+        return None
+    try:
+        entries = store.all_entries()
+    except Exception:
+        return None
+    import time as _time
+    now = _time.time()
+    want_app = _subapp_for_path(path)
+    host_lower = host.lower()
+    parts = host_lower.split(".")
+    domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
+
+    def _field(entry: Any, name: str) -> Any:
+        if isinstance(entry, dict):
+            return entry.get(name)
+        return getattr(entry, name, None)
+
+    host_level: Optional[Dict[str, Any]] = None
+    for entry in reversed(entries):
+        try:
+            entry_host = (_field(entry, "host") or "").lower()
+            if domain_suffix not in entry_host:
+                continue
+            req_headers = _field(entry, "request_headers") or {}
+            auth_val = ""
+            for key, value in req_headers.items():
+                if key.lower() == "authorization":
+                    auth_val = str(value)
+                    break
+            if not auth_val.startswith("Bearer "):
+                continue
+            token_val = auth_val[7:].strip()
+            exp = CopilotSession._decode_jwt_exp(token_val)
+            if exp is not None and exp < now:
+                continue
+            auth_endpoint = _field(entry, "path") or ""
+            record = {"token": token_val, "exp": exp, "auth_endpoint": auth_endpoint}
+            if want_app and _subapp_for_path(auth_endpoint) == want_app:
+                return record  # best match: a token minted for the same sub-app
+            if host_level is None:
+                host_level = record  # freshest host-level token, as a fallback
+            if not want_app:
+                return host_level  # non-sub-app request: freshest host token wins
+        except Exception:
+            continue
+    return host_level
+
+
 def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
     """Compact one-line argument hint from a tool's JSON Schema: ``name:type`` per
     property, required ones marked ``*``. Without this the copilot menu shows a

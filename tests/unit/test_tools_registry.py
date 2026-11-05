@@ -163,6 +163,87 @@ async def test_send_request_injects_csrf_from_jar(monkeypatch):
     assert "csrf-token=tok123" in sent.get("cookie", "").lower()
 
 
+class _CaptureClient:
+    """httpx.AsyncClient stub that records the outgoing headers."""
+    captured: dict = {}
+
+    def __init__(self, **kw): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def request(self, method, url, headers=None, content=None):
+        _CaptureClient.captured = dict(headers or {})
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+            headers = {"Content-Type": "application/json"}
+        _Resp.url = url
+        return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
+    # The copilot engine's per-sub-app Bearer selection is reused by the tool: a
+    # /modstore request gets modstore's token, /customercontent gets ccm's.
+    class _Session:
+        def _capture_bearer_tokens(self, store, host): pass
+        def _select_bearer(self, host, path):
+            return {"token": "MOD" if "/modstore" in path else "CCM", "exp": None}
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+
+    r1 = await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "body": '{"query":"{me}"}'})
+    assert r1["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"
+    assert "MOD" not in str(r1)  # token never surfaced in the tool result
+
+    await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/customercontent/graphql", "method": "POST",
+        "body": '{"query":"{me}"}'})
+    assert _CaptureClient.captured.get("Authorization") == "Bearer CCM"
+
+
+@pytest.mark.asyncio
+async def test_send_request_attaches_bearer_from_history(monkeypatch):
+    # No copilot session attached: resolve the Bearer from proxy history.
+    class _Store:
+        def get_cookies_for_host(self, host): return []
+        def all_entries(self):
+            return [{"host": "api.acme-corp.com", "path": "/graphql",
+                     "request_headers": {"Authorization": "Bearer HIST"}}]
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/graphql", "method": "POST", "body": "{}"})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer HIST"
+
+
+@pytest.mark.asyncio
+async def test_send_request_preserves_caller_authorization(monkeypatch):
+    # A caller-supplied Authorization is never overridden (and resolution is skipped).
+    class _Session:
+        def _capture_bearer_tokens(self, store, host):
+            raise AssertionError("must not resolve when the caller set Authorization")
+        def _select_bearer(self, host, path):
+            raise AssertionError("must not resolve when the caller set Authorization")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "body": "{}", "headers": {"Authorization": "Bearer CALLER"}})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer CALLER"
+
+
 @pytest.mark.asyncio
 async def test_send_request_surfaces_all_set_cookies(monkeypatch):
     # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced

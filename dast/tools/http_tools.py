@@ -203,6 +203,39 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
 
+    # Auto-attach a sub-app Bearer when the caller supplied no Authorization and one
+    # is known for this (host, path). Mirrors the copilot engine's _apply_session_auth
+    # so a direct / MCP caller can reach a Bearer-authed sub-app (modstore/ccm) instead
+    # of a 403. The token is attached server-side and never returned to the caller.
+    # (In a separate `dast-ai mcp` process ctx.store is None -> this no-ops; use
+    # browser_fetch there, which carries the SPA's Bearer + sub-session.)
+    if not any(k.lower() == "authorization" for k in headers):
+        from dast.ai.copilot.session import scan_history_bearer, _subapp_for_path
+        parsed = urlparse(url)
+        bearer_host = parsed.hostname or ""
+        bearer_path = parsed.path or "/"
+        rec = None
+        session = getattr(ctx, "_session", None)
+        try:
+            if session is not None and hasattr(session, "_select_bearer"):
+                if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
+                    session._capture_bearer_tokens(ctx.store, bearer_host)
+                rec = session._select_bearer(bearer_host, bearer_path)
+            elif ctx.store is not None:
+                rec = scan_history_bearer(ctx.store, bearer_host, bearer_path)
+        except Exception as exc:
+            logger.debug("send_request: bearer resolution failed",
+                         host=bearer_host, error=str(exc))
+            rec = None
+        if isinstance(rec, dict) and rec.get("token"):
+            import time as _time
+            exp = rec.get("exp")
+            if exp is None or exp > _time.time():
+                headers["Authorization"] = f"Bearer {rec['token']}"
+                logger.debug("send_request: attached cached Bearer", host=bearer_host,
+                             app=_subapp_for_path(bearer_path),
+                             ttl=int(exp - _time.time()) if exp else -1)
+
     body = args.get("body") or ""
 
     # Tag the proxy-history entry with the caller's source (e.g. "copilot") so the
@@ -404,6 +437,11 @@ register(Tool(
         "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
+        "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
+        "headers from the jar, and a cached sub-app Bearer (modstore/ccm) selected by request "
+        "path when one is known. If a sub-app returns 403 for a missing Bearer and none is "
+        "cached, drive it with browser_fetch instead (it runs in the SPA context and carries the "
+        "Bearer + sub-session).\n"
         "Use this when: reproducing or probing a specific endpoint, testing whether a "
         "payload reflects/changes behavior, replaying a captured request with a tweak, or "
         "delivering an SSRF/XXE payload that embeds an OOB URL from oob_generate.\n"

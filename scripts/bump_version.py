@@ -1,8 +1,8 @@
 """
 Bump the project version across every file that hardcodes it, atomically.
 
-The version is duplicated in 4 places (pyproject.toml, desktop/package.json,
-CLAUDE.md, docs/ARCHITECTURE.md) with no single source of truth and no automation,
+The version is duplicated in 3 places (pyproject.toml, desktop/package.json,
+docs/ARCHITECTURE.md) with no single source of truth and no automation,
 so they drift apart over time — this repo sat at 0.8.0 in all of them for
 months while everything else moved on. This script is the fix: it never
 decides *when* to bump (that stays a human/product judgement call — major vs
@@ -58,11 +58,6 @@ def _sites(new_version: str) -> list[VersionSite]:
             path=_REPO_ROOT / "desktop" / "package.json",
             pattern=re.compile(r'"version":\s*"[^"]+"'),
             replacement_template=f'"version": "{new_version}"',
-        ),
-        VersionSite(
-            path=_REPO_ROOT / "CLAUDE.md",
-            pattern=re.compile(r"\*\*Version:\*\*\s*[\d.]+"),
-            replacement_template=f"**Version:** {new_version}",
         ),
         VersionSite(
             path=_REPO_ROOT / "docs" / "ARCHITECTURE.md",

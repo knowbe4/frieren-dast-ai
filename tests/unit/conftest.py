@@ -1,16 +1,27 @@
-"""Unit-test safety net: no outbound network.
+"""Unit-test safety net: no outbound network + no developer .env.
 
 Unit tests must never reach a real LLM provider or target (cost, flakiness, and
 real credentials on a developer machine). Outbound socket connects to anything
 other than loopback raise, so a code path that would silently call Bedrock /
 Anthropic / OpenAI fails loudly instead. Mocked transports (respx, ASGI test
 clients, monkeypatched clients) never open a socket and are unaffected.
+
+They must also be deterministic regardless of the developer's local `.env`: a
+machine configured for the gateway provider (AI_PROVIDER=gateway,
+ai_validation_models=...) would otherwise leak into `dast.config.settings` and
+break provider/tier tests (and route LLM calls into the no-network guard). Set
+the opt-out BEFORE importing anything from `dast`, so the settings singleton is
+built without the `.env` file.
 """
 
-import ipaddress
-import socket
+import os
 
-import pytest
+os.environ.setdefault("DAST_DISABLE_DOTENV", "1")
+
+import ipaddress  # noqa: E402
+import socket  # noqa: E402
+
+import pytest  # noqa: E402
 
 _real_connect = socket.socket.connect
 _real_connect_ex = socket.socket.connect_ex

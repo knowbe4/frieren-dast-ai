@@ -47,7 +47,19 @@ EXPIRY_SKEW_SECONDS = 120
 
 
 class GatewayError(RuntimeError):
-    """Raised when the gateway is unreachable or authentication fails."""
+    """Raised when the gateway is unreachable or authentication fails.
+
+    ``status_code`` is the HTTP status when the failure was an HTTP error (None
+    for connection errors), and ``detail`` is the (truncated) response body, so
+    callers can tell a safety-classifier refusal (a content-based 4xx) apart from
+    a transient/transport failure instead of seeing one opaque message.
+    """
+
+    def __init__(self, message: str, *, status_code: Optional[int] = None,
+                 detail: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
 
 
 def _keychain_service() -> str:
@@ -228,7 +240,8 @@ class GatewayTransport:
                     time.sleep(retry_delay)
                     retry_delay *= 2
                     continue
-                raise GatewayError(f"Gateway HTTP {exc.code}: {detail}") from exc
+                raise GatewayError(f"Gateway HTTP {exc.code}: {detail}",
+                                   status_code=exc.code, detail=detail) from exc
             except urllib.error.URLError as exc:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)

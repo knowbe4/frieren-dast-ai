@@ -859,12 +859,16 @@ def _invoke_raw(
     for index, candidate in enumerate(candidates):
         try:
             return _invoke_one(provider, body, candidate)
-        except (AiUnavailableError, AiContentBlockedError):
-            # Credential/SSO exhaustion and safety-classifier refusals are not
-            # model-specific — every model fails the same way, so do not burn the
-            # rest of the chain on them.
+        except AiUnavailableError:
+            # Credential/SSO exhaustion is not model-specific — every model fails
+            # the same way, so do not burn the rest of the chain on it.
             raise
         except Exception as exc:
+            # A safety-classifier refusal (AiContentBlockedError) is NOT short-
+            # circuited: a different model in the chain may not be refused (an
+            # operator may configure e.g. a stricter model first and a permissive
+            # one as the last fallback), so try the next candidate. Only when the
+            # whole chain is exhausted does the block surface (as safety_blocked).
             last_exc = exc
             if index < len(candidates) - 1:
                 logger.warning(

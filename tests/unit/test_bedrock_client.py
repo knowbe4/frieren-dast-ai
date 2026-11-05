@@ -183,9 +183,10 @@ def test_safety_classifier_block_raises_distinct_error_without_retry(monkeypatch
     assert calls["dispatch"] == 1
 
 
-def test_safety_classifier_block_does_not_burn_fallback_chain(monkeypatch):
-    # Every model refuses identical content, so a safety block must stop the chain
-    # after the first model rather than trying each tier.
+def test_safety_classifier_block_falls_through_chain_then_surfaces(monkeypatch):
+    # A block is NOT short-circuited: a later model in the configured chain may not
+    # be refused, so every candidate is tried. When all are blocked, the block
+    # surfaces (AiContentBlockedError -> safety_blocked downstream).
     calls = {"invoke_one": 0}
 
     def fake_invoke_one(provider, body, model):
@@ -200,7 +201,29 @@ def test_safety_classifier_block_does_not_burn_fallback_chain(monkeypatch):
 
     with pytest.raises(bedrock_client.AiContentBlockedError):
         bedrock_client._invoke_raw("sys", "user", None, 1024, 0.0, False, None)
-    assert calls["invoke_one"] == 1  # chain not burned
+    assert calls["invoke_one"] == 3  # full chain tried before surfacing the block
+
+
+def test_safety_classifier_block_recovers_if_later_model_passes(monkeypatch):
+    # The operator's fallback chain exists precisely so a block on the first model
+    # falls through to a permissive one — that result is returned, no error.
+    seen = []
+
+    def fake_invoke_one(provider, body, model):
+        seen.append(model)
+        if model != "model-c":
+            raise bedrock_client.AiContentBlockedError("blocked")
+        return _text_response('{"ok": true}')
+
+    monkeypatch.setattr(bedrock_client, "_invoke_one", fake_invoke_one)
+    monkeypatch.setattr(bedrock_client, "_resolve_model", lambda m: "model-a")
+    monkeypatch.setattr(bedrock_client, "get_active_provider", lambda: "gateway")
+    monkeypatch.setattr(bedrock_client, "_fallback_models",
+                        lambda m: ["model-a", "model-b", "model-c"])
+
+    result = bedrock_client._invoke_raw("sys", "user", None, 1024, 0.0, False, None)
+    assert result == _text_response('{"ok": true}')
+    assert seen == ["model-a", "model-b", "model-c"]  # fell through to the passing model
 
 
 def test_structured_path_reraises_unrelated_400(monkeypatch):

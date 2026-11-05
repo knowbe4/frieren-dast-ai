@@ -47,3 +47,6 @@ presentation/
 TODO.md
 poc_*.sh
 *_poc.sh
+# CLAUDE.md (AI guidance) kept local-only at any level — not published to the
+# remote. Matches the root file and every nested per-directory CLAUDE.md.
+CLAUDE.md

@@ -318,17 +318,32 @@ class AgentBrowser:
             return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
 
     async def _wait_for_hydration(self, page: Any, timeout_ms: int = 6000,
-                                  min_elements: int = 3) -> bool:
+                                  min_elements: int = 3, attempts: int = 2) -> bool:
         """Wait for the SPA to mount real interactive content (``>= min_elements`` across
-        the document + open shadow roots + same-origin iframes). Returns True when content
-        appeared, False on timeout. Best-effort: a genuinely sparse page returns False
-        without raising, so callers never block on it."""
-        try:
-            await page.wait_for_function(_HYDRATION_JS, arg=min_elements, timeout=timeout_ms)
-            return True
-        except Exception as exc:
-            logger.debug("AgentBrowser hydration wait ended", error=str(exc)[:120])
-            return False
+        the document + open shadow roots + same-origin iframes).
+
+        Retries up to ``attempts`` times with a bounded settle between tries: a heavy
+        client-rendered app (modstore3 / CCM studio) can still be fetching on the first
+        wait, so a single short wait caught the pre-hydration shell. Returns True as soon
+        as content appears, False if it never does. Best-effort: a genuinely sparse page
+        returns False without raising, so callers never block on it."""
+        attempts = max(1, attempts)
+        per_attempt = max(1000, timeout_ms // attempts)
+        for attempt in range(attempts):
+            try:
+                await page.wait_for_function(_HYDRATION_JS, arg=min_elements, timeout=per_attempt)
+                return True
+            except Exception as exc:
+                logger.debug("AgentBrowser hydration wait ended", attempt=attempt + 1,
+                             error=str(exc)[:120])
+            if attempt < attempts - 1:
+                # Let in-flight XHR / rendering catch up before retrying. Bounded and
+                # best-effort so a never-idle SPA cannot stall the whole budget.
+                try:
+                    await page.wait_for_load_state("load", timeout=min(per_attempt, 3000))
+                except Exception:
+                    pass
+        return False
 
     async def navigate(self, url: str, timeout_ms: int = 20000,
                        wait_selector: Optional[str] = None) -> Dict[str, Any]:
@@ -348,7 +363,7 @@ class AgentBrowser:
             except Exception as exc:
                 logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
         else:
-            await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 6000))
+            await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
         return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
                 "title": await page.title()}
 
@@ -400,8 +415,9 @@ class AgentBrowser:
     async def snapshot(self) -> Dict[str, Any]:
         page = await self._ensure_page()
         # A snapshot taken right after navigate can catch the pre-hydration shell. Settle
-        # for real content first (best-effort; a sparse page still snapshots promptly).
-        await self._wait_for_hydration(page, timeout_ms=3000)
+        # for real content first with a retry + longer budget (best-effort; a sparse page
+        # still snapshots promptly once both attempts time out).
+        await self._wait_for_hydration(page, timeout_ms=8000)
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
 

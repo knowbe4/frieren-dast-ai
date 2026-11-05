@@ -125,6 +125,45 @@ async def test_send_request_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_injects_csrf_from_jar(monkeypatch):
+    # A cookie-authed Rails/SPA endpoint 403s without X-CSRF-Token + X-Requested-With.
+    # The raw send_request tool path must inject them from the jar's CSRF cookie
+    # (parity with the copilot engine's _apply_session_auth).
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+        url = "https://api.acme-corp.com/graphql"
+        headers = {"Content-Type": "application/json"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            captured["headers"] = headers
+            return _Resp()
+
+    class _Store:
+        def get_cookies_for_host(self, host):
+            return [{"name": "CSRF-TOKEN", "value": "tok123"},
+                    {"name": "_session", "value": "s"}]
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/graphql", "method": "POST",
+        "body": '{"query": "query { me { id } }"}',
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in captured["headers"].items()}
+    assert sent.get("x-csrf-token") == "tok123"
+    assert sent.get("x-requested-with") == "XMLHttpRequest"
+    assert "csrf-token=tok123" in sent.get("cookie", "").lower()
+
+
+@pytest.mark.asyncio
 async def test_send_request_surfaces_all_set_cookies(monkeypatch):
     # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced
     # as a list, not collapsed by dict(resp.headers). A cookie set on a redirect hop
@@ -683,6 +722,24 @@ async def test_validate_chain_requires_input():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_spec", [
+    {"name": "c", "steps": ["https://api.acme-corp.com/x"]},
+    {"name": "c", "steps": [{"name": "s", "url": "https://api.acme-corp.com/x",
+                             "extract": ["token"]}]},
+    {"name": "c", "steps": [{"name": "s", "url": "https://api.acme-corp.com/x",
+                             "assertions": ["status_eq 200"]}]},
+])
+async def test_validate_chain_rejects_bare_string_elements(bad_spec):
+    # A bare string where an object is expected must degrade to a readable
+    # "invalid chain spec" error, not a Python AttributeError.
+    ctx = ToolContext(store=object(), settings=_Scope(True))
+    result = await run_tool(ctx, "validate_chain", {"chain": bad_spec})
+    assert result["ok"] is False
+    assert "invalid chain spec" in result["error"]
+    assert "must be an object" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_validate_chain_out_of_scope_blocked():
     # store set (in-process) so no interactive approval is attempted.
     ctx = ToolContext(store=object(), settings=_Scope(False))
@@ -804,6 +861,42 @@ async def test_graphql_introspect_http_fallback(monkeypatch):
     assert result["queries"] == ["me"]
     assert posted["url"].endswith("/api/graphql/introspect")
     assert posted["json"]["endpoint"] == "https://api.acme-corp.com/graphql"
+
+
+@pytest.mark.asyncio
+async def test_graphql_type_info_reads_root_query_args():
+    # The root Query type must resolve (fields + arg signatures), not 404 as
+    # "type 'Query' not found" with total_fields=0.
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {
+                "https://api.acme-corp.com/graphql": {
+                    "introspected": True,
+                    "queries": {"account": {"args": [{"name": "id", "type": "ID"}],
+                                            "return_type": "Account"}},
+                    "mutations": {},
+                    "input_types": {}, "object_types": {}, "union_types": {},
+                    "enum_types": {},
+                    "root_types": {
+                        "Query": {
+                            "kind": "OBJECT", "role": "query",
+                            "fields": [{"name": "account",
+                                        "args": [{"name": "id", "type": "ID"}],
+                                        "return_type": "Account"}],
+                        },
+                    },
+                }
+            }
+
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "graphql_type_info",
+                            {"url": "https://api.acme-corp.com/graphql", "type_name": "Query"})
+    assert result["ok"] is True
+    assert result["role"] == "query"
+    assert result["total_fields"] == 1
+    assert result["fields"][0]["name"] == "account"
+    assert result["fields"][0]["args"][0]["name"] == "id"
+    assert result["fields"][0]["return_type"] == "Account"
 
 
 # ── MCP conversion (pure, no mcp import) ────────────────────────────────────────

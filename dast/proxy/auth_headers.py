@@ -85,6 +85,34 @@ def _cookie_value_map(cookies) -> Dict[str, str]:
     return out
 
 
+def build_cookie_header(cookies) -> str:
+    """Join *cookies* into a ``Cookie`` header value.
+
+    Accepts the same shapes as :func:`inject_csrf` (a ``{name: value}`` map, a
+    ``{name: playwright-dict}`` map, or an iterable of playwright cookie dicts).
+    """
+    cookie_map = _cookie_value_map(cookies)
+    return "; ".join(f"{name}={value}" for name, value in cookie_map.items() if name)
+
+
+def apply_cookies(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:
+    """Set the ``Cookie`` header from *cookies* and inject the matching CSRF/XHR
+    headers, mutating and returning ``headers``.
+
+    Shared by the ``send_request`` tool and the repeater route so cookie + CSRF
+    handling lives in one place (the copilot engine does the equivalent inline in
+    ``_apply_session_auth``). Overwrites any existing ``Cookie`` header — the jar
+    or named session is the source of truth; CSRF overwrite is governed by
+    ``refresh`` (see :func:`inject_csrf`).
+    """
+    if not cookies:
+        return headers
+    cookie_header = build_cookie_header(cookies)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return inject_csrf(headers, cookies, refresh=refresh)
+
+
 def inject_csrf(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:
     """Add the CSRF + XHR headers a cookie-authenticated SPA requires on a
     state-changing request, mutating and returning ``headers``.

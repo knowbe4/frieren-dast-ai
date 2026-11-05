@@ -209,6 +209,33 @@ class TestCompactSchema:
         # RootQueryType itself must not leak into object_types (it's the query root)
         assert "RootQueryType" not in result["object_types"]
 
+    def test_root_types_preserve_root_query_fields_and_args(self):
+        # The root Query type is kept out of object_types but recorded in
+        # root_types so graphql_type_info can read its fields + arg signatures.
+        raw = _raw_schema(
+            [
+                {
+                    "name": "Query", "kind": "OBJECT",
+                    "fields": [
+                        {
+                            "name": "account",
+                            "type": _scalar("Account"),
+                            "args": [{"name": "id", "type": _non_null(_scalar("ID"))}],
+                        },
+                    ],
+                },
+            ],
+        )
+        result = _compact_schema(raw)
+        assert "Query" in result["root_types"]
+        root = result["root_types"]["Query"]
+        assert root["role"] == "query"
+        assert root["fields"][0]["name"] == "account"
+        assert root["fields"][0]["args"][0]["name"] == "id"
+        assert root["fields"][0]["return_type"] == "Account"
+        # Still excluded from object_types.
+        assert "Query" not in result["object_types"]
+
 
 class TestIsGraphqlEndpoint:
     class _FakeEntry:

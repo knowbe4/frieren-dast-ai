@@ -161,8 +161,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
         return {"ok": False, "error": f"unsupported method: {method}"}
     if getattr(ctx, "read_only", False) and not read_only.is_safe_method(method):
-        return {"ok": False, "read_only": True,
-                "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS are sent"}
+        # Carve-out: GraphQL (incl. introspection) must POST, but a read-only
+        # query/introspection changes nothing — allow it; still block mutations.
+        if not (method == "POST" and read_only.is_read_only_graphql(url, args.get("body") or "")):
+            return {"ok": False, "read_only": True,
+                    "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS "
+                             "(and read-only GraphQL POST) are sent"}
 
     # Scope gate BEFORE anything is sent. Out-of-scope is denied by default, but an
     # MCP caller (no in-process store) can ask the dashboard operator for an
@@ -189,12 +193,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             try:
                 jar_cookies = ctx.store.get_cookies_for_host(_host) or []
                 if jar_cookies:
-                    cookie_header = "; ".join(
-                        f"{c['name']}={c.get('value', '')}"
-                        for c in jar_cookies if c.get("name")
-                    )
-                    if cookie_header:
-                        headers["Cookie"] = cookie_header
+                    from dast.proxy.auth_headers import apply_cookies
+                    # Inject jar cookies AND the CSRF/XHR headers a cookie-authed
+                    # SPA (Rails, etc.) requires. The copilot engine path does this
+                    # via _apply_session_auth; the raw tool path must match it or
+                    # every Rails /graphql POST 403s.
+                    apply_cookies(headers, jar_cookies, refresh=True)
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))

@@ -154,6 +154,11 @@ def _compact_schema(raw: dict) -> dict:
     object_types: dict = {}
     union_types: dict = {}
     enum_types: dict = {}
+    # The root Query/Mutation OBJECT types are intentionally kept out of
+    # object_types (their fields are flattened into queries/mutations above).
+    # root_types preserves their names + full field signatures so a caller can
+    # introspect the root type itself (e.g. graphql_type_info on "Query").
+    root_types: dict = {}
 
     def _args(field: dict) -> list:
         return [
@@ -171,17 +176,25 @@ def _compact_schema(raw: dict) -> dict:
 
         # Collect mutation and query fields
         if name == mutation_root and kind == "OBJECT":
+            root_fields = []
             for field in (t.get("fields") or []):
-                mutations[field["name"]] = {
+                signature = {
                     "args": _args(field),
                     "return_type": _unwrap_type(field.get("type")),
                 }
+                mutations[field["name"]] = signature
+                root_fields.append({"name": field["name"], **signature})
+            root_types[name] = {"kind": "OBJECT", "role": "mutation", "fields": root_fields}
         elif name == query_root and kind == "OBJECT":
+            root_fields = []
             for field in (t.get("fields") or []):
-                queries[field["name"]] = {
+                signature = {
                     "args": _args(field),
                     "return_type": _unwrap_type(field.get("type")),
                 }
+                queries[field["name"]] = signature
+                root_fields.append({"name": field["name"], **signature})
+            root_types[name] = {"kind": "OBJECT", "role": "query", "fields": root_fields}
         elif kind == "INPUT_OBJECT":
             input_types[name] = {
                 "fields": [
@@ -227,6 +240,7 @@ def _compact_schema(raw: dict) -> dict:
         "object_types": object_types,
         "union_types": union_types,
         "enum_types": enum_types,
+        "root_types": root_types,
         "ts": time.time(),
     }
 

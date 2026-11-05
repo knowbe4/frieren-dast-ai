@@ -67,6 +67,26 @@ _SNAPSHOT_JS = r"""
 }
 """
 
+# True once the page has mounted at least `min` interactive elements, counted across
+# the document, open shadow roots, and same-origin iframes. Used to tell a hydrated SPA
+# from its pre-render shell: a single "Home" link (count 1) must NOT pass, so the wait
+# requires a real threshold rather than "any element".
+_HYDRATION_JS = r"""
+(min) => {
+  const SEL = 'input,button,a,form,select,textarea,[role=button]';
+  const count = (root) => {
+    let n = 0;
+    try { n += root.querySelectorAll(SEL).length; } catch (e) {}
+    try { root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) n += count(el.shadowRoot); }); } catch (e) {}
+    try { root.querySelectorAll('iframe,frame').forEach(f => {
+      try { if (f.contentDocument) n += count(f.contentDocument); } catch (e) {} }); } catch (e) {}
+    return n;
+  };
+  return count(document) >= min;
+}
+"""
+
 # Pick the best submit control for a login form and tag it with data-dast-submit.
 # Scores candidates: sign-in text wins, search/nav/secondary text loses, and being
 # in the same form as the password/email field is a strong boost. This stops the
@@ -124,10 +144,16 @@ class AgentBrowser:
     """
 
     def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None,
-                 read_only: bool = False, headless: Optional[bool] = None) -> None:
+                 read_only: bool = False, headless: Optional[bool] = None,
+                 session_name: Optional[str] = None) -> None:
         self._proxy_port = proxy_port
         self._store = store
         self._read_only = read_only
+        # When set, seed/resync cookies from this named session's isolated jar instead
+        # of the shared global jar, so a per-session browser stays isolated from other
+        # concurrent copilot runs. Settable after construction (the session name is
+        # known only once a login profile is activated).
+        self.session_name = session_name
         if headless is not None:
             self._headless = headless
         else:
@@ -168,11 +194,15 @@ class AgentBrowser:
             return self._page
 
     async def _seed_cookies(self) -> None:
-        """Seed the context with the proxy jar so it starts authenticated."""
+        """Seed the context so it starts authenticated. For a session-scoped browser,
+        seed ONLY this run's named-session cookies (isolated); otherwise the global jar."""
         if self._store is None:
             return
         try:
-            jar = self._store.get_all_cookies() or []
+            if self.session_name is not None:
+                jar = self._store.get_named_session_cookies(self.session_name) or []
+            else:
+                jar = self._store.get_all_cookies() or []
         except Exception as exc:
             logger.warning("AgentBrowser: cookie seed read failed", error=str(exc))
             return
@@ -224,7 +254,12 @@ class AgentBrowser:
         if self._context is None or self._store is None:
             return 0
         try:
-            await self._context.clear_cookies()
+            # Unscoped: replace all context cookies with the current global jar.
+            # Scoped: do NOT clear — the context already holds THIS session's own login;
+            # only (re)layer the saved named-session cookies so we never wipe the fresh
+            # login of a credential-only profile whose named jar is still empty.
+            if self.session_name is None:
+                await self._context.clear_cookies()
             await self._seed_cookies()
             cookies = await self._context.cookies()
             logger.info("AgentBrowser cookies re-synced from jar", count=len(cookies))
@@ -268,44 +303,38 @@ class AgentBrowser:
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
 
-    async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
+    async def _wait_for_hydration(self, page: Any, timeout_ms: int = 6000,
+                                  min_elements: int = 3) -> bool:
+        """Wait for the SPA to mount real interactive content (``>= min_elements`` across
+        the document + open shadow roots + same-origin iframes). Returns True when content
+        appeared, False on timeout. Best-effort: a genuinely sparse page returns False
+        without raising, so callers never block on it."""
+        try:
+            await page.wait_for_function(_HYDRATION_JS, arg=min_elements, timeout=timeout_ms)
+            return True
+        except Exception as exc:
+            logger.debug("AgentBrowser hydration wait ended", error=str(exc)[:120])
+            return False
+
+    async def navigate(self, url: str, timeout_ms: int = 20000,
+                       wait_selector: Optional[str] = None) -> Dict[str, Any]:
         page = await self._ensure_page()
         if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
             await self.clear_cookies()
         resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # SPA hydration: domcontentloaded fires BEFORE the JS framework mounts, so for a
-        # single-page app it returns an empty shell (0 forms/buttons) — which makes
-        # snapshot/fill/click/login all fail on an unrendered page. Wait for the network
-        # to settle and for interactive content to actually appear before returning, so
-        # the browser tools operate on the real rendered page. Best-effort: each wait is
-        # guarded so a static page (or a mocked page in tests) still returns promptly.
-        try:
-            await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
-        except Exception as exc:
-            logger.debug("AgentBrowser navigate: networkidle wait ended", error=str(exc)[:120])
-        try:
-            # Wait briefly for the SPA to mount any interactive element. Counts across OPEN
-            # shadow roots and same-origin iframes (a SvelteKit / web-component / iframe
-            # login lives there), so a shadow/iframe-only UI is not falsely seen as
-            # content-less. If the page is genuinely empty this times out harmlessly.
-            await page.wait_for_function(
-                """() => {
-                  const SEL = 'input,button,a,form,select,textarea,[role=button]';
-                  const count = (root) => {
-                    let n = 0;
-                    try { n += root.querySelectorAll(SEL).length; } catch (e) {}
-                    try { root.querySelectorAll('*').forEach(el => {
-                      if (el.shadowRoot) n += count(el.shadowRoot); }); } catch (e) {}
-                    try { root.querySelectorAll('iframe,frame').forEach(f => {
-                      try { if (f.contentDocument) n += count(f.contentDocument); } catch (e) {} }); } catch (e) {}
-                    return n;
-                  };
-                  return count(document) > 0;
-                }""",
-                timeout=4000,
-            )
-        except Exception as exc:
-            logger.debug("AgentBrowser navigate: hydration wait ended", error=str(exc)[:120])
+        # domcontentloaded fires BEFORE the JS framework mounts, so a single-page app
+        # returns an empty shell — snapshot/fill/click would all act on an unrendered
+        # page. networkidle is intentionally NOT used: a continuous WebSocket/polling SPA
+        # (e.g. modstore3) never reaches it, so it only burns the whole timeout budget.
+        # Instead wait for real interactive content (a one-link shell does not count), or
+        # for an explicit caller-supplied selector when the target control is known.
+        if wait_selector:
+            try:
+                await page.wait_for_selector(wait_selector, timeout=min(timeout_ms, 10000))
+            except Exception as exc:
+                logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
+        else:
+            await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 6000))
         return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
                 "title": await page.title()}
 
@@ -333,6 +362,16 @@ class AgentBrowser:
         await page.wait_for_selector(selector, timeout=timeout_ms, state=state)
         return {"ok": True, "selector": selector}
 
+    async def wait_for_text(self, text: str, timeout_ms: int = 10000) -> Dict[str, Any]:
+        """Wait until *text* appears anywhere in the page body — for client-rendered SPAs
+        where content arrives without a stable selector to target."""
+        page = await self._ensure_page()
+        await page.wait_for_function(
+            "(t) => ((document.body && document.body.innerText) || '').includes(t)",
+            arg=text, timeout=timeout_ms,
+        )
+        return {"ok": True, "text": text}
+
     async def extract(self, selector: str, attribute: str = "value") -> Dict[str, Any]:
         page = await self._ensure_page()
         loc = page.locator(selector).first
@@ -346,6 +385,9 @@ class AgentBrowser:
 
     async def snapshot(self) -> Dict[str, Any]:
         page = await self._ensure_page()
+        # A snapshot taken right after navigate can catch the pre-hydration shell. Settle
+        # for real content first (best-effort; a sparse page still snapshots promptly).
+        await self._wait_for_hydration(page, timeout_ms=3000)
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
 

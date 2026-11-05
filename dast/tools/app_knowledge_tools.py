@@ -44,17 +44,27 @@ def _host_of(value: str) -> str:
 
 
 def _cookie_header(ctx: ToolContext, host: str) -> str:
-    """Build a Cookie header for host from the jar + the engine session's cookies."""
+    """Build a Cookie header for host from the jar + the engine session's cookies. For a
+    scoped run, read ONLY this session's isolated named jar (never the shared global jar,
+    which concurrent runs' passive traffic also populates), then overlay the engine's
+    per-session cookies."""
     pairs: Dict[str, str] = {}
     store = getattr(ctx, "store", None)
+    sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+    scoped = bool(getattr(sess, "_is_scoped", lambda: False)())
+    session_name = getattr(sess, "session_name", None)
     if store is not None:
         try:
-            for c in store.get_cookies_for_host(host) or []:
+            if scoped:
+                jar = (store.get_named_session_cookies_for_host(session_name, host)
+                       if session_name else [])
+            else:
+                jar = store.get_cookies_for_host(host) or []
+            for c in jar:
                 if c.get("name"):
                     pairs[c["name"]] = c.get("value", "")
         except Exception:
             pass
-    sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     sc = getattr(sess, "_session_cookies", None)
     if isinstance(sc, dict):
         pairs.update(sc)
@@ -116,12 +126,19 @@ async def _get_app_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
 
     claims = _decode_jwt_account(token)
 
-    # Cache onto the engine so the inline bearer-refresh path can use it.
+    # Cache onto the engine so the inline bearer-refresh path can use it. Index under
+    # the sub-app (by_app) so modstore and ccm — which share one host — do not overwrite
+    # each other; _apply_session_auth selects the right one by request path.
     sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     cache = getattr(sess, "_bearer_tokens", None)
     if isinstance(cache, dict):
-        cache[host] = {"token": token, "source_entry_id": "app_token_resolver",
-                       "auth_endpoint": probe_path or None, "exp": claims.get("exp")}
+        record = {"token": token, "source_entry_id": "app_token_resolver",
+                  "auth_endpoint": probe_path or None, "exp": claims.get("exp")}
+        existing = cache.get(host)
+        by_app = dict(existing.get("by_app", {})) if isinstance(existing, dict) else {}
+        by_app[app] = dict(record)
+        record["by_app"] = by_app
+        cache[host] = record
 
     # Prime: one authed probe so the token lands in proxy history → the engine's
     # _apply_session_auth borrows the Authorization header on later copilot calls.

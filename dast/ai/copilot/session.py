@@ -351,6 +351,25 @@ def _host_in_focus(host: str, focus_hosts: Any) -> bool:
     return False
 
 
+# Sub-app path prefixes -> app name, for selecting the correct Bearer per request
+# path. modstore and ccm share one host, so a single host-keyed token would let one
+# sub-app's token overwrite the other's; selection is by path instead. Keep in sync
+# with dast/tools/app_knowledge_tools.py::_APP_MAP probe paths.
+_SUBAPP_PATH_PREFIXES: tuple = (
+    ("/modstore", "modstore"),
+    ("/customercontent", "ccm"),
+)
+
+
+def _subapp_for_path(path: str) -> Optional[str]:
+    """Map a request path to its sub-app name, or None for a non-sub-app path."""
+    p = (path or "").lower()
+    for prefix, app in _SUBAPP_PATH_PREFIXES:
+        if p.startswith(prefix):
+            return app
+    return None
+
+
 def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
     """Compact one-line argument hint from a tool's JSON Schema: ``name:type`` per
     property, required ones marked ``*``. Without this the copilot menu shows a
@@ -536,7 +555,15 @@ class CopilotSession:
         self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
         self._last_bearer_refresh_ts: float = 0.0
         self._auth_prompted_hosts: set[str] = set()
+        # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
+        # fabricated host escalate and trip the failure breaker instead of looping.
+        self._denied_hosts: Dict[str, int] = {}
         self._store: Optional[object] = None
+        # Name of this run's isolated named session (set when a login profile is
+        # activated). When set, auth (cookies + Bearer) is sourced ONLY from this
+        # session's own jar, never the shared global jar/history — so parallel
+        # validation runs on different accounts cannot cross-contaminate.
+        self.session_name: Optional[str] = None
         # Hosts to ground the project-context brief on. Seeded ones (an escalation
         # or hypothesis target) make the brief available from the very first turn;
         # hosts the copilot then touches via tools accumulate for later turns.
@@ -548,6 +575,25 @@ class CopilotSession:
     def get_known_hosts(self) -> List[str]:
         """All hosts this session has targeted (focus + any touched during tool calls)."""
         return sorted(set(self._focus_hosts) | self._context_hosts)
+
+    def _is_scoped(self) -> bool:
+        """A scoped run (focus hosts or an activated named session) isolates its auth:
+        cookies + Bearer come ONLY from this session, never the shared global jar or
+        proxy history, so concurrent validation runs on different accounts stay apart."""
+        return bool(self._focus_hosts) or bool(self.session_name)
+
+    def _select_bearer(self, host: str, path: str) -> Optional[Dict[str, Any]]:
+        """Pick the cached Bearer record for a (host, request path). modstore and ccm
+        share a host, so prefer the per-sub-app token selected by path; fall back to
+        the host-level default for non-sub-app paths."""
+        record = self._bearer_tokens.get(host)
+        if not isinstance(record, dict):
+            return None
+        app = _subapp_for_path(path)
+        by_app = record.get("by_app")
+        if app and isinstance(by_app, dict) and app in by_app:
+            return by_app[app]
+        return record
 
     @staticmethod
     def _decode_jwt_exp(token: str) -> Optional[float]:
@@ -611,13 +657,24 @@ class CopilotSession:
                     continue
             except Exception:
                 continue
-            self._bearer_tokens[entry_host_actual] = {
+            record = {
                 "token": token_val,
                 "captured_at": now,
                 "source_entry_id": source_id,
                 "auth_endpoint": auth_endpoint,
                 "exp": exp,
             }
+            # Preserve any per-sub-app tokens already resolved for this host, and index
+            # this one under its sub-app (by path) so modstore and ccm don't overwrite
+            # each other on the shared host.
+            existing = self._bearer_tokens.get(entry_host_actual)
+            by_app = dict(existing.get("by_app", {})) if isinstance(existing, dict) else {}
+            app = _subapp_for_path(auth_endpoint or "")
+            if app:
+                by_app[app] = dict(record)
+            if by_app:
+                record["by_app"] = by_app
+            self._bearer_tokens[entry_host_actual] = record
             ttl = int(exp - now) if exp else "unknown"
             logger.info("Captured Bearer token for host",
                         host=entry_host_actual, ttl=ttl,
@@ -989,11 +1046,17 @@ class CopilotSession:
                                 "automatically. Stop setting them and switch endpoint, parameter, "
                                 "or tool.", blocked_reason="stuck_loop")
 
-                    if await self._scope_gate(
+                    denial = await self._scope_gate(
                         tool_name, tool_args, tool_ctx, approved_hosts,
                         entry, wait_for_human, _observe,
-                    ):
-                        continue  # denied — observation already recorded
+                    )
+                    if denial is not None:
+                        # Count the denial as a failure so repeated fabricated hosts trip
+                        # the breaker and end the turn instead of looping unbounded.
+                        reply = await _record_tool_failure(entry, denial)
+                        if reply is not None:
+                            return reply
+                        continue
 
                     result = await run_tool(tool_ctx, tool_name, tool_args)
 
@@ -1223,17 +1286,27 @@ class CopilotSession:
         urls = _candidate_urls(tool_args)
         if not urls:
             return
-        host = (urlparse(urls[0]).hostname or "").lower()
+        parsed = urlparse(urls[0])
+        host = (parsed.hostname or "").lower()
+        request_path = parsed.path or ""
         if not host:
             return
 
         store = getattr(tool_ctx, "store", None)
+        scoped = self._is_scoped()
 
-        # Cookies: passive proxy jar for the host, overlaid with fresh handoff cookies.
+        # Cookies: for a scoped run, source ONLY this session's isolated named jar (never
+        # the shared global jar — that is the cross-session leak). An unscoped interactive
+        # run keeps the passive global jar. Either base is overlaid with handoff cookies.
         cookies: Dict[str, str] = {}
         if store is not None:
             try:
-                for cookie in store.get_cookies_for_host(host):
+                if scoped:
+                    jar_cookies = (store.get_named_session_cookies_for_host(
+                        self.session_name, host) if self.session_name else [])
+                else:
+                    jar_cookies = store.get_cookies_for_host(host)
+                for cookie in jar_cookies:
                     name = cookie.get("name")
                     if name:
                         cookies[name] = cookie.get("value", "")
@@ -1242,9 +1315,12 @@ class CopilotSession:
                                host=host, error=str(exc))
         cookies.update(self._session_cookies)  # handoff cookies win
 
-        # Auth headers: the freshest real request to this host.
+        # Auth headers: the freshest real request to this host. Skipped for a scoped
+        # run — borrowing non-cookie auth headers (X-Auth-Token/X-Api-Key) from the
+        # GLOBAL history would leak another run's session; scoped runs get their auth
+        # from get_app_token / their own captured traffic only.
         borrowed_headers: Dict[str, str] = {}
-        if store is not None:
+        if store is not None and not scoped:
             try:
                 from dast.proxy.auth_headers import extract_auth_headers
                 recent_first = list(reversed(store.all_entries()))
@@ -1304,17 +1380,21 @@ class CopilotSession:
                 headers[name] = value
 
         if "authorization" not in present and host:
-            cached = self._bearer_tokens.get(host)
-            if cached is None and store is not None:
+            cached = self._select_bearer(host, request_path)
+            # Only an UNSCOPED interactive run may borrow a Bearer from the shared proxy
+            # history; a scoped run relies solely on its own cache (get_app_token / its
+            # own captured traffic) so a concurrent run's token cannot leak in.
+            if cached is None and store is not None and not scoped:
                 self._capture_bearer_tokens(store, host)
-                cached = self._bearer_tokens.get(host)
+                cached = self._select_bearer(host, request_path)
             if cached:
                 import time as _time
                 exp = cached.get("exp")
                 if exp is None or exp > _time.time():
                     headers["Authorization"] = f"Bearer {cached['token']}"
-                    logger.debug("Injected cached Bearer token",
-                                 host=host, ttl=int(exp - _time.time()) if exp else -1)
+                    logger.debug("Injected cached Bearer token", host=host,
+                                 app=_subapp_for_path(request_path),
+                                 ttl=int(exp - _time.time()) if exp else -1)
                 else:
                     logger.debug("Cached Bearer token expired, will rely on 401 refresh",
                                  host=host)
@@ -1331,14 +1411,18 @@ class CopilotSession:
         entry: Dict[str, Any],
         wait_for_human: WaitForHuman,
         observe: Callable[[Dict[str, Any], str], Awaitable[None]],
-    ) -> bool:
+    ) -> Optional[str]:
         """Authorize an out-of-scope OR off-focus host via an operator approve-pause.
-        Returns True when the call was DENIED (caller should skip the tool).
+        Returns a denial observation (str) when the call was DENIED (the caller skips
+        the tool AND counts it as a failure), or None when the call may proceed.
 
         When the run has focus hosts, a host must be in focus (exact or subdomain) to
         pass silently even if the broad scope preset would admit it — this stops a
         fabricated sibling host (e.g. a hostname invented from a profile slug) from
-        being reached just because the preset allows ``*.example.com``."""
+        being reached just because the preset allows ``*.example.com``. A host denied
+        once is remembered: a repeat is denied immediately (no second operator pause)
+        with an escalating message, and every denial is counted by the caller so a
+        model that keeps inventing hosts trips the failure breaker instead of looping."""
         temp_allowed: List[str] = []
         for candidate in _candidate_urls(tool_args):
             host = (urlparse(candidate).hostname or "").lower()
@@ -1348,6 +1432,10 @@ class CopilotSession:
             # Silent pass only when in scope AND (no focus set OR within focus).
             if tool_ctx.is_in_scope(candidate) and (not self._focus_hosts or in_focus):
                 continue
+            # Already denied this host: deny again without re-pausing the operator.
+            if host in self._denied_hosts:
+                self._denied_hosts[host] += 1
+                return self._denial_message(host)
             verdict = await wait_for_human("approve", {
                 "url": candidate, "host": host,
                 "method": str(tool_args.get("method", "GET")).upper(), "tool": tool_name,
@@ -1364,22 +1452,39 @@ class CopilotSession:
             else:
                 for allowed in temp_allowed:
                     approved_hosts.discard(allowed)
-                await observe(entry, "Denied: host is not in the run's focus or is out of "
-                              "scope. Use the exact target host from the objective (do not "
-                              "invent hostnames), or reply.")
-                return True
-        return False
+                self._denied_hosts[host] = self._denied_hosts.get(host, 0) + 1
+                return self._denial_message(host)
+        return None
 
-    def _jar_has_cookies_for(self, host: str) -> bool:
-        """Check whether the proxy cookie jar has session cookies for a host."""
+    def _denial_message(self, host: str) -> str:
+        """Operator-facing denial that names the real focus host(s) and escalates on
+        repeat, so the model redirects to the in-scope target instead of looping."""
+        focus = (", ".join(self._focus_hosts) if self._focus_hosts
+                 else "the exact target host from the objective")
+        msg = (f"Denied: '{host}' is not in scope for this run. In scope: {focus}. "
+               f"Do not invent hostnames — reissue against {focus}, or reply to the operator.")
+        if self._denied_hosts.get(host, 0) >= 2:
+            msg = ("STOP inventing hostnames. " + msg +
+                   " Continuing to invent hosts will end this turn.")
+        return msg
+
+    def _scoped_cookies_for_host(self, host: str) -> List[dict]:
+        """Cookie list for host from the correct jar: this session's isolated named jar
+        when the run is scoped (so parallel runs don't cross-read), else the global jar."""
         store = self._store
         if store is None:
-            return False
+            return []
         try:
-            cookies = store.get_cookies_for_host(host)
-            return bool(cookies)
+            if self._is_scoped():
+                return (store.get_named_session_cookies_for_host(self.session_name, host)
+                        if self.session_name else [])
+            return store.get_cookies_for_host(host) or []
         except Exception:
-            return False
+            return []
+
+    def _jar_has_cookies_for(self, host: str) -> bool:
+        """Check whether the (session-scoped) cookie jar has cookies for a host."""
+        return bool(self._scoped_cookies_for_host(host))
 
     async def _auth_gate(
         self,
@@ -1413,7 +1518,7 @@ class CopilotSession:
             try:
                 jar_cookies = {
                     c.get("name", ""): c.get("value", "")
-                    for c in (self._store.get_cookies_for_host(host) or [])
+                    for c in self._scoped_cookies_for_host(host)
                     if c.get("name")
                 }
                 if jar_cookies:

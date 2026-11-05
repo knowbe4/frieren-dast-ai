@@ -687,6 +687,12 @@ class CopilotService:
                 logger.warning("could not create AgentBrowser", error=str(exc))
                 browser = None
         session["_agent_browser"] = browser
+        # Scope the browser to this run's named session (set when a profile is
+        # activated) so it seeds/resyncs cookies from THIS session's jar, not the
+        # shared global jar — keeping concurrent runs' browser auth isolated. Refreshed
+        # each turn so a session_name set after browser creation still propagates.
+        if browser is not None:
+            browser.session_name = getattr(session.get("engine"), "session_name", None)
         tool_ctx = AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
@@ -1133,6 +1139,13 @@ class CopilotService:
         if profile is None:
             logger.warning("autonomous run: login profile not found", slug=slug)
             return
+        # Scope this run's auth to its OWN named session jar (never the shared global
+        # jar) so concurrent validation runs on different accounts can't cross-read each
+        # other's cookies/token. `session_name` drives that isolation in the engine and
+        # its per-session browser.
+        engine = session.get("engine")
+        if engine is not None:
+            engine.session_name = profile.slug
         # Cookie import only applies to a profile that captured a live session.
         # A fresh credential-only profile has none — that is NOT a reason to skip
         # the credential seeding below (which is what arms auto-login).
@@ -1140,20 +1153,20 @@ class CopilotService:
             try:
                 cookies = list(profile.saved_session.get("cookies", []))
                 auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
+                # Save into the per-name isolated jar only — do NOT write the global jar
+                # (import_playwright_cookies), which is last-writer-wins and leaks across
+                # concurrent profile activations.
                 store.save_named_session_from_playwright(
                     name=profile.slug, role=profile.name,
                     playwright_cookies=cookies, auth_headers=auth_headers,
                 )
-                imported = store.import_playwright_cookies(cookies)
-                # Also seed the cookies onto THIS engine session (per-session, wins on
-                # collision) so a concurrent run with a different profile is not
-                # clobbered by the shared global jar.
-                engine = session.get("engine")
+                # Also seed the cookies onto THIS engine session (per-session) so the very
+                # first request is authenticated without touching the global jar.
                 seeded = {c["name"]: c.get("value", "") for c in cookies if c.get("name")}
                 if engine is not None and seeded and hasattr(engine, "seed_session_cookies"):
                     engine.seed_session_cookies(seeded)
                 logger.info("autonomous run activated login profile", slug=slug,
-                            cookies=imported, session_scoped=len(seeded))
+                            session_scoped=len(seeded))
             except Exception as exc:
                 logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
         else:
@@ -1208,7 +1221,23 @@ class CopilotService:
                     cookies = {}
                 if cookies and hasattr(engine, "_session_cookies"):
                     engine._session_cookies.update(cookies)
-                self._seed_engine_session(session, auto.get("hosts") or [])
+                # Persist the freshly-logged-in cookies into THIS run's isolated named
+                # jar (a credential-only profile has no saved_session), so the engine's
+                # scoped cookie source and the per-session browser resync read this run's
+                # own session instead of the shared global jar.
+                name = getattr(engine, "session_name", None)
+                if name:
+                    try:
+                        full = await browser.export_cookies_full()
+                        if full:
+                            self._ctx.store.save_named_session_from_playwright(
+                                name=name, role=name, playwright_cookies=full,
+                            )
+                    except Exception as exc:
+                        logger.debug("autonomous run: named-session save failed",
+                                     session_id=sid, error=str(exc)[:160])
+                else:
+                    self._seed_engine_session(session, auto.get("hosts") or [])
                 auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
                                   f"({getattr(result, 'engine', '?')})")
                 logger.info("autonomous run: proactive profile login ok", session_id=sid,

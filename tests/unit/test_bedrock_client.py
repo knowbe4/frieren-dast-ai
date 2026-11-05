@@ -146,7 +146,12 @@ def test_structured_path_falls_back_when_tool_use_unsupported(monkeypatch):
 
 
 def test_is_safety_classifier_block_detects_refusal():
-    # A content-based 4xx with a safety marker is a classifier block...
+    # The real gateway policy rejection (observed live): HTTP 400 with
+    # "upstream rejected the request" in an invalid_request_error body.
+    assert bedrock_client._is_safety_classifier_block(
+        400, 'Gateway: Gateway HTTP 400: {"type":"error","error":'
+             '{"type":"invalid_request_error","message":"upstream rejected the request"}}')
+    # Other provider wordings are covered defensively...
     assert bedrock_client._is_safety_classifier_block(
         403, "Gateway HTTP 403: output blocked by content policy")
     assert bedrock_client._is_safety_classifier_block(
@@ -166,8 +171,9 @@ def test_safety_classifier_block_raises_distinct_error_without_retry(monkeypatch
     def fake_dispatch(provider, body, model):
         calls["dispatch"] += 1
         raise providers.ProviderError(
-            "Gateway: Gateway HTTP 403: output blocked by content policy",
-            status_code=403,
+            'Gateway: Gateway HTTP 400: {"type":"error","error":'
+            '{"type":"invalid_request_error","message":"upstream rejected the request"}}',
+            status_code=400,
         )
 
     monkeypatch.setattr(bedrock_client, "_dispatch_external", fake_dispatch)

@@ -92,8 +92,12 @@ class AiContentBlockedError(RuntimeError):
 
 # Markers in a provider error body that indicate an upstream safety/content
 # classifier refusal (as opposed to a malformed-request 400). Kept narrow so a
-# genuine bad-request 400 still surfaces normally.
+# genuine bad-request 400 still surfaces normally. The gateway's policy layer
+# rejects security-testing content with HTTP 400 + "upstream rejected the request"
+# (observed live) — that distinctive phrase is the primary signal; the rest are
+# defensive for other providers/wordings.
 _SAFETY_BLOCK_MARKERS = (
+    "upstream rejected",
     "safety", "content filtering", "content policy", "content_policy",
     "blocked by", "usage policy", "flagged", "output blocked", "input blocked",
 )

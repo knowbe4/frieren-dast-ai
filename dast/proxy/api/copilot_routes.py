@@ -37,6 +37,30 @@ logger = get_logger(__name__)
 
 _MAX_MESSAGE_CHARS = 20_000
 
+# Known body keys for the autonomous + validate-batch endpoints. An unrecognized
+# key (e.g. a mistyped "profile" instead of "profile_slug") must fail loudly, not
+# be silently dropped — a dropped profile_slug launches an UNAUTHENTICATED run.
+_AUTONOMOUS_KEYS = frozenset({
+    "objective", "focus_hosts", "budget", "profile_slug", "profile",
+    "auto_ai_mode", "session_safe", "read_only", "mode", "submit_forms",
+    "validation_only",
+})
+_VALIDATE_BATCH_KEYS = frozenset({"items", "max_concurrency"})
+_VALIDATE_ITEM_KEYS = frozenset({
+    "objective", "focus_hosts", "profile_slug", "profile", "budget",
+})
+
+
+def _unknown_keys(body: dict, allowed: frozenset) -> list:
+    """Return body keys not in *allowed*, sorted (empty when all are known)."""
+    return sorted(key for key in body if key not in allowed)
+
+
+def _resolve_profile_slug(body: dict) -> Optional[str]:
+    """Read profile_slug, accepting 'profile' as an alias (common misspelling)."""
+    value = (body.get("profile_slug") or body.get("profile") or "").strip()
+    return value or None
+
 
 def _collect_jar_cookies(ctx: DashboardContext, pause: dict) -> dict:
     """Collect the proxy jar's session cookies for a paused auth wall's host.
@@ -144,6 +168,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         evidence auto-route, no exhaustive recon) so only the finding's endpoint is
         tested.
         """
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        unknown = _unknown_keys(body, _AUTONOMOUS_KEYS)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unexpected field(s): {', '.join(unknown)} "
+                          f"(use 'profile_slug' for the login profile)"},
+                status_code=400,
+            )
         objective = (body.get("objective") or "").strip()
         if not objective:
             return JSONResponse({"error": "objective required"}, status_code=400)
@@ -158,7 +191,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         budget = body.get("budget")
         if budget is not None and not isinstance(budget, dict):
             return JSONResponse({"error": "budget must be an object"}, status_code=400)
-        profile_slug = (body.get("profile_slug") or "").strip() or None
+        profile_slug = _resolve_profile_slug(body)
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
         session_safe = bool(body.get("session_safe", False))
         read_only = bool(body.get("read_only", False))
@@ -189,9 +222,33 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         session_safe so they test only their finding and can run concurrently with
         per-session browser/cookie isolation. Returns the launched session ids + errors.
         """
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        unknown = _unknown_keys(body, _VALIDATE_BATCH_KEYS)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unexpected field(s): {', '.join(unknown)}"}, status_code=400)
         items = body.get("items")
         if not isinstance(items, list) or not items:
             return JSONResponse({"error": "items (non-empty list) required"}, status_code=400)
+        # Validate each item's keys and normalize the 'profile' alias so a mistyped
+        # key fails loudly instead of launching an unauthenticated validation run.
+        normalized_items = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                return JSONResponse(
+                    {"error": f"items[{index}] must be an object"}, status_code=400)
+            item_unknown = _unknown_keys(item, _VALIDATE_ITEM_KEYS)
+            if item_unknown:
+                return JSONResponse(
+                    {"error": f"items[{index}] unexpected field(s): {', '.join(item_unknown)} "
+                              f"(use 'profile_slug' for the login profile)"},
+                    status_code=400,
+                )
+            normalized = {k: v for k, v in item.items() if k != "profile"}
+            normalized["profile_slug"] = _resolve_profile_slug(item)
+            normalized_items.append(normalized)
+        items = normalized_items
         try:
             max_concurrency = int(body.get("max_concurrency", 3))
         except (TypeError, ValueError):

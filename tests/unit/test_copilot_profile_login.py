@@ -91,6 +91,14 @@ async def test_ensure_profile_login_logs_in_and_syncs_cookies(monkeypatch):
         async def export_cookies(self):
             return {"_session": "abc"}
 
+        async def export_cookies_full(self):
+            return []
+
+        async def api_get(self, url, headers=None):
+            # Gate-check sees a real, provisioned account.
+            return {"ok": True, "status": 200,
+                    "text": '{"user": {"id": 5}, "account": {"id": 42}}', "headers": {}}
+
     fake_ctx = SimpleNamespace(browser=_FakeBrowser(), is_in_scope=lambda u: True)
     monkeypatch.setattr(service, "_build_tool_ctx", lambda s: fake_ctx)
     service._broadcast_autonomous = AsyncMock()
@@ -108,6 +116,58 @@ async def test_ensure_profile_login_logs_in_and_syncs_cookies(monkeypatch):
     assert engine._session_cookies.get("_session") == "abc"
     assert session["autonomous"]["_proactive_login_done"] is True
     assert "authenticated via profile" in session["autonomous"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_profile_login_flags_guest_session_as_not_provisioned(monkeypatch):
+    # Login "succeeds" but the account endpoint reports a guest account (id -1):
+    # the run must NOT declare authenticated — it surfaces a not-provisioned status.
+    service = CopilotService(_FakeCtx())
+    sid = service.new_session()
+    session = service.get(sid)
+    session["autonomous"] = {"profile": "p", "hosts": []}
+    engine = session["engine"]
+    engine._last_login = {"url": "https://app.example.com/login",
+                          "email": "u@example.com", "password": "pw"}
+    engine._session_cookies = {}
+
+    class _GuestBrowser:
+        async def export_cookies(self):
+            return {"_session": "abc"}
+
+        async def api_get(self, url, headers=None):
+            return {"ok": True, "status": 200,
+                    "text": '{"account": {"id": -1}, "user": null}', "headers": {}}
+
+    fake_ctx = SimpleNamespace(browser=_GuestBrowser(), is_in_scope=lambda u: True)
+    monkeypatch.setattr(service, "_build_tool_ctx", lambda s: fake_ctx)
+    broadcasts = []
+    async def _record(sid_, event, payload=None):
+        broadcasts.append((event, payload))
+    service._broadcast_autonomous = _record  # type: ignore[assignment]
+    login_mock = AsyncMock(return_value=SimpleNamespace(
+        ok=True, engine="deterministic", error=None))
+    monkeypatch.setattr(login_cascade, "adaptive_login", login_mock)
+
+    await service._ensure_profile_login(sid, session)
+
+    detail = session["autonomous"]["detail"].lower()
+    assert "not provisioned" in detail or "guest" in detail
+    assert "authenticated via profile" not in session["autonomous"]["detail"]
+    assert any(event == "auth_failed" for event, _ in broadcasts)
+    assert not any(event == "authenticated" for event, _ in broadcasts)
+
+
+def test_session_is_provisioned_classification():
+    from dast.proxy.api.copilot_service import _session_is_provisioned
+
+    assert _session_is_provisioned({"account": {"id": 42}, "user": {"id": 5}}) is True
+    assert _session_is_provisioned({"account": {"id": -1}, "user": None}) is False
+    assert _session_is_provisioned({"guest": True}) is False
+    assert _session_is_provisioned({"user": {"account_id": 7}}) is True
+    # Unknown shape -> None (fail open).
+    assert _session_is_provisioned({"something": "else"}) is None
+    assert _session_is_provisioned([]) is None
 
 
 @pytest.mark.asyncio

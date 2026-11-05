@@ -303,6 +303,20 @@ class AgentBrowser:
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
 
+    async def api_get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Network-level GET through the browser context (carries its cookies/bearer,
+        bypasses CORS). Used for post-login session gate-checks (e.g. fetching an
+        app's session endpoint to confirm a real account). Returns {ok, status,
+        text, headers}. Never raises."""
+        page = await self._ensure_page()
+        try:
+            resp = await page.request.fetch(url, method="GET", headers=headers or {})
+            text = await resp.text()
+            return {"ok": True, "status": resp.status, "text": text[:20000],
+                    "headers": {k: v for k, v in resp.headers.items()}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
+
     async def _wait_for_hydration(self, page: Any, timeout_ms: int = 6000,
                                   min_elements: int = 3) -> bool:
         """Wait for the SPA to mount real interactive content (``>= min_elements`` across

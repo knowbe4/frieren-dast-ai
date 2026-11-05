@@ -153,6 +153,39 @@ _SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
 # Soft escalations auto-nudged before a real human pause, per no-progress streak.
 _MAX_AUTO_GUIDANCE_NUDGES = 3
 
+
+def _session_is_provisioned(data: dict) -> Optional[bool]:
+    """Classify an app session-endpoint JSON body (e.g. KMSAT ``/spa/session``).
+
+    Returns False only when it positively reports a guest/unprovisioned account
+    (account id ``-1``/``<=0`` or an explicit guest marker), True when it reports a
+    real account, and None when it can't tell — so the caller fails open on an
+    unknown app rather than blocking a legitimate login.
+    """
+    if not isinstance(data, dict):
+        return None
+    account_id: Any = None
+    account = data.get("account")
+    if isinstance(account, dict):
+        account_id = account.get("id")
+    if account_id is None:
+        user = data.get("user")
+        if isinstance(user, dict):
+            account_id = user.get("account_id") or user.get("accountId")
+    if account_id is None:
+        account_id = data.get("account_id") or data.get("accountId")
+    if account_id is not None:
+        try:
+            return int(account_id) > 0
+        except (TypeError, ValueError):
+            return None
+    user = data.get("user")
+    if isinstance(user, dict) and user:
+        return True
+    if data.get("guest") is True:
+        return False
+    return None
+
 _AUTONOMOUS_START = (
     "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
@@ -1215,6 +1248,21 @@ class CopilotService:
                 in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
             )
             if getattr(result, "ok", False):
+                # Gate-check: a login that "succeeds" can still land on an
+                # onboarding/guest session (a freshly-created, unprovisioned
+                # account). Confirm a real account before declaring the run
+                # authenticated; fail open on unknown apps.
+                provisioned = await self._gate_check_account_state(browser, creds["url"])
+                if provisioned is False:
+                    auto["detail"] = ("account not provisioned / onboarding incomplete — "
+                                      "login succeeded but the session is a guest account")
+                    logger.warning("autonomous run: profile login reached a guest/"
+                                   "unprovisioned session", session_id=sid)
+                    await self._broadcast_autonomous(sid, "auth_failed", {
+                        "profile": auto.get("profile"),
+                        "error": "account not provisioned (guest session)",
+                    })
+                    return
                 try:
                     cookies = await browser.export_cookies()
                 except Exception:
@@ -1256,6 +1304,33 @@ class CopilotService:
             auto["detail"] = f"profile login error: {str(exc)[:150]}"
             logger.warning("autonomous run: proactive profile login error",
                            session_id=sid, error=str(exc)[:200])
+
+    async def _gate_check_account_state(self, browser: Any, base_url: str) -> Optional[bool]:
+        """Best-effort post-login check that the session is a real provisioned account.
+
+        Fetches ``<origin>/spa/session`` in-browser (carrying the session's cookies)
+        and classifies the body with :func:`_session_is_provisioned`. Returns False
+        only on a positively guest/unprovisioned session, True on a real account, and
+        None when it can't tell (non-KMSAT app, non-JSON, non-200, or error) so the
+        caller treats the login as authenticated. Never raises."""
+        import json as _json
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(base_url)
+            if not parsed.scheme or not parsed.netloc:
+                return None
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            resp = await browser.api_get(f"{origin}/spa/session",
+                                         headers={"X-Requested-With": "XMLHttpRequest"})
+            if not resp.get("ok") or resp.get("status") != 200:
+                return None
+            data = _json.loads(resp.get("text") or "")
+            return _session_is_provisioned(data)
+        except (ValueError, TypeError):
+            return None
+        except Exception as exc:
+            logger.debug("autonomous run: account gate-check skipped", error=str(exc)[:160])
+            return None
 
     def _seed_engine_session(self, session: dict, hosts: List[str]) -> None:
         """Seed the engine's session cookies for the primary focus host so the
@@ -1879,6 +1954,21 @@ class CopilotService:
                     "blocked_reason": reply.blocked_reason,
                 }
                 blocked_reason = (reply.blocked_reason or "").strip().lower()
+
+                # ── Safety-classifier block is terminal ──────────────────────────
+                # The decision model's content was refused upstream; every retry and
+                # every model in the chain refuses identically, so end the run with a
+                # distinct status instead of looping until the budget runs out.
+                if blocked_reason == "safety_blocked":
+                    logger.warning("autonomous run: decision model blocked by safety classifier",
+                                   session_id=sid)
+                    self._finish_autonomous(
+                        session, "error",
+                        "the AI safety classifier blocked the decision model on this run "
+                        "(try a different AI provider)")
+                    await self._broadcast_autonomous(sid, "finished",
+                                                     {"status": "safety_blocked"})
+                    return
 
                 # ── Auto-test any GraphQL endpoint seen so far ───────────────────
                 # The moment the copilot's traffic surfaces a GraphQL endpoint, test

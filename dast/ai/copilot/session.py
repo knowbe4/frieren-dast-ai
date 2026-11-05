@@ -484,6 +484,10 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
                 cache_system=True,
             ),
         )
+    except bedrock_client.AiContentBlockedError:
+        # Content-based refusal — re-raise so the turn loop can surface a distinct
+        # message instead of counting it as a generic decision-model failure.
+        raise
     except Exception as exc:
         logger.warning("Copilot: step LLM call failed", error=str(exc))
         return None
@@ -859,7 +863,19 @@ class CopilotSession:
                 user = _build_user_prompt(
                     self.messages, tool_menu, turn_transcript, context_brief
                 )
-                decision = await _llm_step(_system_prompt(), user)
+                try:
+                    decision = await _llm_step(_system_prompt(), user)
+                except bedrock_client.AiContentBlockedError:
+                    logger.warning("Copilot: decision model blocked by safety classifier")
+                    reply = _finalize(
+                        "The safety classifier blocked this request, so I can't plan "
+                        "the next step this turn. Try rephrasing the objective, or "
+                        "switch the AI provider for this run.",
+                        blocked_reason="safety_blocked",
+                    )
+                    await on_event({"type": "reply", "message": reply.message,
+                                    "blocked_reason": reply.blocked_reason})
+                    return reply
 
                 if decision is None:
                     consecutive_failures += 1

@@ -1840,6 +1840,22 @@ class CopilotService:
 
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        # When the run already logged itself in (proactive profile login), tell the model
+        # so it does NOT waste turns calling activate_login_profile / browser_login or
+        # asking for a password (a credential-only profile shows session_set=false, which
+        # otherwise makes the model think it still needs to log in). Recomputed each turn.
+        def _auth_note() -> str:
+            detail = str(auto.get("detail", ""))
+            if not detail.startswith("authenticated via profile"):
+                return ""
+            return (
+                f"[AUTH STATE] You are ALREADY authenticated: {detail}. Session cookies/token "
+                "are live and auto-injected on your requests (the engine auto-relogins on a 401). "
+                "Do NOT call activate_login_profile, browser_login or save_login_session, do NOT "
+                "treat session_set=false as a blocker, and never ask for a password — just proceed "
+                "with the objective.\n\n"
+            )
+        read_only_note = _auth_note() + read_only_note
         breadth_note = (
             "[BREADTH PHASE COMPLETE] The automated scan arsenal has already covered every "
             "discovered REST endpoint and GraphQL operation. Your job now is DEPTH: examine "

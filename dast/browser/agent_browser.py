@@ -568,7 +568,17 @@ class AgentBrowser:
             return {"ok": False, "error": "no submit button found after email",
                     "url": page.url}
         pre_submit_url = page.url
-        await submit_btn.click()
+        try:
+            await submit_btn.click(timeout=10000)
+        except Exception as exc:
+            # A disabled / non-actionable submit button never becomes clickable, so
+            # Playwright's actionability wait would raise and abort the whole login.
+            # Return a clean "no submit button" failure so the cascade falls through
+            # to the SPA JSON-API strategy instead of dying here.
+            logger.debug("browser_login: submit button not actionable",
+                         error=str(exc)[:120], url=page.url)
+            return {"ok": False, "error": "no submit button actionable after email",
+                    "url": page.url}
         await page.wait_for_timeout(3000)
         try:
             await page.wait_for_load_state("networkidle", timeout=10000)

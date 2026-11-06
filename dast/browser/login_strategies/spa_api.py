@@ -93,6 +93,13 @@ async def attempt(
     origin = f"{parsed.scheme}://{parsed.netloc}"
     candidates = endpoints or [origin + path for path in _DEFAULT_ENDPOINTS]
 
+    # Reuse what worked last time: if the login journal has a known-good endpoint for this
+    # host (same origin), try it FIRST so a learned login is fast and deterministic.
+    from dast.session import login_journal
+    known = login_journal.last_success(url)
+    if known and known.get("endpoint", "").startswith(origin):
+        candidates = [known["endpoint"]] + [c for c in candidates if c != known["endpoint"]]
+
     headers = await _csrf_headers(browser)
     for endpoint in candidates:
         if in_scope is not None and not in_scope(endpoint):
@@ -105,6 +112,9 @@ async def attempt(
                 synced = await _sync_session(browser, store, session, url, email, password)
                 logger.info("spa_api: login succeeded", endpoint=endpoint,
                             status=resp.get("status"), cookies=synced)
+                # Journal the reproducible shape (endpoint + body keys), never secrets.
+                login_journal.record(url, "success", strategy="spa_api", endpoint=endpoint,
+                                     body_shape=",".join(sorted(body.keys())), success_url=url)
                 return {
                     "ok": True, "logged_in": True, "engine": "spa_api",
                     "endpoint": endpoint, "url": url, "cookies": synced,
@@ -112,6 +122,8 @@ async def attempt(
                 }
     logger.info("spa_api: no JSON auth endpoint accepted the credentials",
                 tried=len(candidates))
+    login_journal.record(url, "error", strategy="spa_api",
+                         reason="no SPA JSON auth endpoint accepted the credentials")
     return {"ok": False, "logged_in": False, "engine": "spa_api",
             "error": "no SPA JSON auth endpoint accepted the credentials"}
 

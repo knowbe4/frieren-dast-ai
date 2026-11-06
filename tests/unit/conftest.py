@@ -55,3 +55,12 @@ def _guarded_connect_ex(self, address):
 def _block_outbound_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_login_journal(tmp_path, monkeypatch):
+    """Redirect the login journal to a per-test tmp dir so the SPA login strategy
+    never reads/writes the developer's real ~/.dast-ai/login_journal (which made the
+    'first candidate wins' assertion non-deterministic and leaked test host files)."""
+    from dast.session import login_journal  # noqa: PLC0415
+    monkeypatch.setattr(login_journal, "_JOURNAL_DIR", tmp_path / "login_journal")

@@ -38,8 +38,15 @@ async def _navigate(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "url is required"}
     if not ctx.is_in_scope(url):
         return {"ok": False, "error": "url is out of scope", "url": url}
+    kwargs: Dict[str, Any] = {}
+    wait_selector = str(args.get("wait_for", "")).strip()
+    if wait_selector:
+        kwargs["wait_selector"] = wait_selector
+    timeout_ms = args.get("timeout_ms")
+    if isinstance(timeout_ms, (int, float)) and timeout_ms > 0:
+        kwargs["timeout_ms"] = int(timeout_ms)
     try:
-        return await browser.navigate(url)
+        return await browser.navigate(url, **kwargs)
     except Exception as exc:
         return {"ok": False, "error": f"navigate failed: {str(exc)[:200]}", "url": url}
 
@@ -87,13 +94,19 @@ async def _wait_for(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if browser is None:
         return _unavailable()
     selector = str(args.get("selector", "")).strip()
-    if not selector:
-        return {"ok": False, "error": "selector is required"}
-    state = str(args.get("state", "visible")).strip() or "visible"
+    text = str(args.get("text", "")).strip()
+    if not selector and not text:
+        return {"ok": False, "error": "selector or text is required"}
+    timeout_ms = args.get("timeout_ms")
+    tm = int(timeout_ms) if isinstance(timeout_ms, (int, float)) and timeout_ms > 0 else 10000
     try:
-        return await browser.wait_for(selector, state=state)
+        if text and not selector:
+            return await browser.wait_for_text(text, timeout_ms=tm)
+        state = str(args.get("state", "visible")).strip() or "visible"
+        return await browser.wait_for(selector, timeout_ms=tm, state=state)
     except Exception as exc:
-        return {"ok": False, "error": f"wait_for failed: {str(exc)[:200]}", "selector": selector}
+        return {"ok": False, "error": f"wait_for failed: {str(exc)[:200]}",
+                "selector": selector or text}
 
 
 async def _extract(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,8 +123,12 @@ async def _extract(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": f"extract failed: {str(exc)[:200]}", "selector": selector}
 
 
-_URL_SCHEMA = {"type": "object", "properties": {
-    "url": {"type": "string", "description": "In-scope URL to navigate the browser to."}}, "required": ["url"]}
+_NAV_SCHEMA = {"type": "object", "properties": {
+    "url": {"type": "string", "description": "In-scope URL to navigate the browser to."},
+    "wait_for": {"type": "string", "description": "Optional CSS selector to wait for after load before returning — "
+                 "use on a client-rendered SPA to wait for a known control instead of guessing when it has hydrated."},
+    "timeout_ms": {"type": "integer", "description": "Optional navigation timeout in milliseconds (default 20000)."},
+}, "required": ["url"]}
 _SEL_SCHEMA = {"type": "object", "properties": {
     "selector": {"type": "string", "description": "CSS selector of the target element."},
     "value": {"type": "string", "description": "Value to fill (fill only)."},
@@ -119,11 +136,19 @@ _SEL_SCHEMA = {"type": "object", "properties": {
     "state": {"type": "string", "description": "Wait state: visible (default), attached, hidden (wait_for only)."},
     "expect_navigation": {"type": "boolean", "description": "Set true if the click triggers a page navigation (click only)."},
 }, "required": ["selector"]}
+_WAIT_SCHEMA = {"type": "object", "properties": {
+    "selector": {"type": "string", "description": "CSS selector of the element to wait for."},
+    "text": {"type": "string", "description": "Alternatively, wait until this text appears anywhere in the page body "
+             "(for SPAs that render content without a stable selector). Give selector OR text."},
+    "state": {"type": "string", "description": "Wait state for a selector: visible (default), attached, hidden."},
+    "timeout_ms": {"type": "integer", "description": "Optional wait timeout in milliseconds (default 10000)."},
+}, "required": []}
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
 
-register(Tool(name="browser_navigate", input_schema=_URL_SCHEMA, handler=_navigate, tags=["browser", "active"],
+register(Tool(name="browser_navigate", input_schema=_NAV_SCHEMA, handler=_navigate, tags=["browser", "active"],
     description="Navigate the agent browser to an in-scope URL. Returns the final url, status, and page title. "
-                "Use before snapshot/fill/click to load a page (e.g. a form you must submit with a fresh CSRF token)."))
+                "Use before snapshot/fill/click to load a page (e.g. a form you must submit with a fresh CSRF token). "
+                "For a client-rendered SPA, pass wait_for=<selector> so it returns only once the real UI has mounted."))
 register(Tool(name="browser_snapshot", input_schema=_EMPTY_SCHEMA, handler=_snapshot, tags=["browser", "read"],
     description="Read the current page: its url, title, forms (with field name/type/hidden), visible buttons, and links. "
                 "Use this to discover what selectors to fill/click — do not guess the DOM."))
@@ -131,8 +156,10 @@ register(Tool(name="browser_fill", input_schema=_SEL_SCHEMA, handler=_fill, tags
     description="Fill a form field in the agent browser (selector + value). Use for inputs/textareas before submitting a form."))
 register(Tool(name="browser_click", input_schema=_SEL_SCHEMA, handler=_click, tags=["browser", "active"],
     description="Click an element in the agent browser (e.g. a submit button). Set expect_navigation=true when the click loads a new page."))
-register(Tool(name="browser_wait_for", input_schema=_SEL_SCHEMA, handler=_wait_for, tags=["browser", "read"],
-    description="Wait for an element to reach a state (visible/attached/hidden) in the agent browser — e.g. a password field revealed after a Continue click."))
+register(Tool(name="browser_wait_for", input_schema=_WAIT_SCHEMA, handler=_wait_for, tags=["browser", "read"],
+    description="Wait for an element to reach a state (visible/attached/hidden), or for text to appear in the page body, "
+                "in the agent browser — e.g. a password field revealed after a Continue click, or an SPA tab's content "
+                "finishing render before you snapshot it. Give selector (+state) OR text; optional timeout_ms."))
 register(Tool(name="browser_extract", input_schema=_SEL_SCHEMA, handler=_extract, tags=["browser", "read"],
     description="Read a value from the current page: an input's value (default), an element's text, or any HTML attribute. "
                 "Use to pull a fresh CSRF/hidden token out of a form before building a request."))
@@ -183,7 +210,7 @@ async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 register(Tool(name="browser_login", input_schema=_LOGIN_SCHEMA, handler=_login,
     tags=["browser", "active"],
     description="Autonomous login via the agent browser. Handles multi-step flows "
-                "(email-first, then password on a second page) like KMSAT, Okta, and "
+                "(email-first, then password on a second page) like Okta and "
                 "other SSO-style login pages. Clears stale cookies, discovers form "
                 "fields automatically, fills credentials, clicks submit, waits for "
                 "redirect, and exports the resulting session cookies (including CSRF "
@@ -257,6 +284,30 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     # conflict with context cookies and cause "Invalid token" / "Access denied".
     fetch_headers = {k: v for k, v in headers.items()
                      if k.lower() not in ("cookie", "authorization")}
+
+    # Ride the SPA's live Bearer. An SPA like PhishER injects a short-lived
+    # Authorization from in-memory JS state onto its OWN native XHR; page.request.fetch
+    # does not carry that, so a tool fetch 401s while the app's native calls 200. The
+    # MITM proxy captured that Bearer from the SPA's own requests — attach the freshest
+    # non-expired one for this host (only when the caller did not supply Authorization
+    # and the app actually uses Bearer auth, i.e. a token was captured).
+    if not any(k.lower() == "authorization" for k in headers) and getattr(ctx, "store", None):
+        try:
+            import time as _time
+            from urllib.parse import urlparse as _urlparse
+            from dast.ai.copilot.session import scan_history_bearer
+            _parsed = _urlparse(url)
+            rec = scan_history_bearer(ctx.store, _parsed.hostname or "", _parsed.path or "/")
+            if rec and rec.get("token"):
+                exp = rec.get("exp")
+                if exp is None or exp > _time.time():
+                    fetch_headers["Authorization"] = f"Bearer {rec['token']}"
+                    headers["Authorization"] = f"Bearer {rec['token']}"  # in-page fallback too
+                    logger.debug("browser_fetch: attached captured Bearer",
+                                 host=_parsed.hostname)
+        except Exception as exc:
+            logger.debug("browser_fetch: bearer attach failed", error=str(exc)[:120])
+
     primary_error = ""
     try:
         fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}

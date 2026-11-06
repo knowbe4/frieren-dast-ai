@@ -49,6 +49,12 @@ _CONCURRENCY = 6
 _REQUEST_TIMEOUT = 10.0
 _MAX_FLAGGED_RETURNED = 40
 _CANARY_SIZE = 5
+# Accumulating-failure breaker: fire the batch in chunks and stop once enough probes
+# have run and the overwhelming majority were auth-blocked/errored — a mostly-403
+# schema should not be swept to the end.
+_BREAKER_CHUNK = 10
+_BREAKER_MIN_PROBES = 15
+_BREAKER_BLOCKED_RATIO = 0.8
 
 _AUTH_ERROR_MARKERS = (
     "unauthor", "forbidden", "not authenticated", "authentication required",
@@ -284,13 +290,27 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
             "operations_remaining": len(pending) - canary_size,
         }
 
+    # Fire the rest in chunks so an accumulating-failure breaker can stop a doomed
+    # sweep partway instead of blasting every remaining operation.
     remaining_batch = batch[canary_size:]
-    remaining_results = await asyncio.gather(*[
-        _probe_operation(ctx, url, schema, kind, field_name, semaphore)
-        for kind, field_name in remaining_batch
-    ]) if remaining_batch else []
-    results = list(canary_results) + list(remaining_results)
+    results = list(canary_results)
+    stopped_early = False
+    for start in range(0, len(remaining_batch), _BREAKER_CHUNK):
+        chunk = remaining_batch[start:start + _BREAKER_CHUNK]
+        results.extend(await asyncio.gather(*[
+            _probe_operation(ctx, url, schema, kind, field_name, semaphore)
+            for kind, field_name in chunk
+        ]))
+        blocked = sum(1 for r in results
+                      if r.get("classification") in ("auth_blocked", "request_error"))
+        if len(results) >= _BREAKER_MIN_PROBES and blocked / len(results) >= _BREAKER_BLOCKED_RATIO:
+            stopped_early = True
+            logger.warning("graphql_sweep: stopping early on uniform failures",
+                           url=url, probed=len(results), blocked=blocked)
+            break
 
+    # Only the operations actually probed are recorded as tested (zip truncates to
+    # the shorter of batch/results when the breaker stopped early).
     by_classification: Dict[str, int] = {}
     flagged: List[Dict[str, Any]] = []
     for (kind, field_name), result in zip(batch, results):
@@ -300,24 +320,32 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
         if result.get("flagged"):
             flagged.append({k: v for k, v in result.items() if k != "flagged"})
 
-    remaining = len(pending) - len(batch)
+    tested_now = len(results)
+    remaining = len(pending) - tested_now
     summary: Dict[str, Any] = {
         "ok": True,
         "url": url,
         "kinds": kinds,
         "operations_total": total_ops,
-        "operations_tested_now": len(batch),
+        "operations_tested_now": tested_now,
         "operations_tested_cumulative": len(tested),
         "operations_remaining": remaining,
         "by_classification": by_classification,
         "flagged": flagged[:_MAX_FLAGGED_RETURNED],
         "flagged_count": len(flagged),
     }
-    if remaining > 0:
+    if stopped_early:
+        blocked = by_classification.get("auth_blocked", 0) + by_classification.get("request_error", 0)
+        summary["stopped_early"] = True
+        summary["note"] = (f"stopped early: {blocked}/{tested_now} probed operations were "
+                           f"auth-blocked/errored — the session likely lacks access to this "
+                           f"endpoint. Authenticate differently or skip it instead of re-sweeping.")
+    elif remaining > 0:
         summary["note"] = (f"{remaining} operations still untested — call graphql_sweep again "
                            f"on this endpoint to cover them")
-    logger.info("graphql_sweep: batch complete", url=url, tested_now=len(batch),
-                cumulative=len(tested), remaining=remaining, flagged=len(flagged))
+    logger.info("graphql_sweep: batch complete", url=url, tested_now=tested_now,
+                cumulative=len(tested), remaining=remaining, flagged=len(flagged),
+                stopped_early=stopped_early)
     return summary
 
 

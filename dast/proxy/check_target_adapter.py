@@ -423,10 +423,24 @@ def _entry_to_check_target(entry: "ProxyEntry", store=None):
 
     named_sessions = store.get_named_sessions() if store is not None else []
 
+    target_headers = dict(entry.request_headers)
+    # Refresh the CSRF token on state-changing probes from the live cookie jar. A
+    # CSRF-protected SPA 403s every POST/PUT/PATCH/DELETE without a current X-CSRF-Token,
+    # and the captured header (if any) is usually stale or absent (e.g. a GET entry probed
+    # as a write), so active write-endpoint testing is dead on arrival without this.
+    if store is not None and entry.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            from urllib.parse import urlparse as _urlparse_csrf
+            from dast.proxy.auth_headers import inject_csrf
+            _jar = store.get_cookies_for_host(_urlparse_csrf(entry.url).hostname or "") or []
+            inject_csrf(target_headers, _jar, refresh=True)
+        except Exception as exc:
+            logger.debug("CSRF refresh for target headers failed", url=entry.url, error=str(exc))
+
     return CheckTarget(
         method=entry.method,
         url=entry.url,
-        headers=dict(entry.request_headers),
+        headers=target_headers,
         body=body_str or None,
         params=params,
         raw_body=raw_body,

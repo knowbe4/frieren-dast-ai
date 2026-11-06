@@ -16,6 +16,9 @@ from typing import Any, Dict
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils.logger import get_logger
+# A credential that is clearly a model stand-in (``<UNKNOWN>`` ...) must never be
+# posted to a live login. Detection lives in one shared place; this is a thin alias.
+from dast.utils.placeholders import looks_like_placeholder as _looks_like_placeholder
 
 logger = get_logger(__name__)
 
@@ -50,15 +53,23 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
         return {"ok": False, "error": "email is required"}
     if not password:
         return {"ok": False, "error": "password is required"}
+    if _looks_like_placeholder(email) or _looks_like_placeholder(password):
+        return {"ok": False, "error": (
+            "refusing to log in with a placeholder credential (e.g. '<UNKNOWN>') — you do not "
+            "have the real password and must not invent one. Authentication is handled by the "
+            "active login profile/session: just make your request directly (the session "
+            "auto-relogins from the profile on 401/expiry). Do not call login tools with "
+            "made-up credentials.")}
     if not ctx.is_in_scope(url):
         return {"ok": False, "error": "url is out of scope", "url": url}
     success_url_suffix = str(args.get("success_url_suffix", "")).strip() or None
+    session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     try:
         from dast.browser.login_cascade import adaptive_login
 
         result = await adaptive_login(
             browser, url, email, password, success_url_suffix=success_url_suffix,
-            in_scope=ctx.is_in_scope,
+            in_scope=ctx.is_in_scope, store=getattr(ctx, "store", None), session=session,
         )
         # On success, sync the browser's session cookies into the copilot session
         # so subsequent authenticated calls carry them (parity with browser_login).
@@ -67,7 +78,6 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
                 cookies = await browser.export_cookies()
             except Exception:
                 cookies = {}
-            session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
             if session is not None and cookies and hasattr(session, "_session_cookies"):
                 session._session_cookies.update(cookies)
                 logger.info("adaptive_login tool: synced cookies to copilot session",

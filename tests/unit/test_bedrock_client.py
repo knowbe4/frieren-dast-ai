@@ -145,6 +145,87 @@ def test_structured_path_falls_back_when_tool_use_unsupported(monkeypatch):
     assert calls == {"schema": 1, "text": 1}  # forced tool-use rejected, then text
 
 
+def test_is_safety_classifier_block_detects_refusal():
+    # The real gateway policy rejection (observed live): HTTP 400 with
+    # "upstream rejected the request" in an invalid_request_error body.
+    assert bedrock_client._is_safety_classifier_block(
+        400, 'Gateway: Gateway HTTP 400: {"type":"error","error":'
+             '{"type":"invalid_request_error","message":"upstream rejected the request"}}')
+    # Other provider wordings are covered defensively...
+    assert bedrock_client._is_safety_classifier_block(
+        403, "Gateway HTTP 403: output blocked by content policy")
+    assert bedrock_client._is_safety_classifier_block(
+        400, "request flagged by the safety system")
+    # ...but a generic bad-request 400 is not, and neither is a 5xx/429.
+    assert not bedrock_client._is_safety_classifier_block(400, "invalid request body")
+    assert not bedrock_client._is_safety_classifier_block(503, "content policy")
+
+
+def test_safety_classifier_block_raises_distinct_error_without_retry(monkeypatch):
+    # A gateway safety 4xx becomes AiContentBlockedError and is NOT retried
+    # (not transient) — the dispatch must be attempted exactly once.
+    from dast.ai import providers
+
+    calls = {"dispatch": 0}
+
+    def fake_dispatch(provider, body, model):
+        calls["dispatch"] += 1
+        raise providers.ProviderError(
+            'Gateway: Gateway HTTP 400: {"type":"error","error":'
+            '{"type":"invalid_request_error","message":"upstream rejected the request"}}',
+            status_code=400,
+        )
+
+    monkeypatch.setattr(bedrock_client, "_dispatch_external", fake_dispatch)
+
+    with pytest.raises(bedrock_client.AiContentBlockedError):
+        bedrock_client._invoke_external("gateway", {}, "some-model")
+    assert calls["dispatch"] == 1
+
+
+def test_safety_classifier_block_falls_through_chain_then_surfaces(monkeypatch):
+    # A block is NOT short-circuited: a later model in the configured chain may not
+    # be refused, so every candidate is tried. When all are blocked, the block
+    # surfaces (AiContentBlockedError -> safety_blocked downstream).
+    calls = {"invoke_one": 0}
+
+    def fake_invoke_one(provider, body, model):
+        calls["invoke_one"] += 1
+        raise bedrock_client.AiContentBlockedError("blocked")
+
+    monkeypatch.setattr(bedrock_client, "_invoke_one", fake_invoke_one)
+    monkeypatch.setattr(bedrock_client, "_resolve_model", lambda m: "model-a")
+    monkeypatch.setattr(bedrock_client, "get_active_provider", lambda: "gateway")
+    monkeypatch.setattr(bedrock_client, "_fallback_models",
+                        lambda m: ["model-a", "model-b", "model-c"])
+
+    with pytest.raises(bedrock_client.AiContentBlockedError):
+        bedrock_client._invoke_raw("sys", "user", None, 1024, 0.0, False, None)
+    assert calls["invoke_one"] == 3  # full chain tried before surfacing the block
+
+
+def test_safety_classifier_block_recovers_if_later_model_passes(monkeypatch):
+    # The operator's fallback chain exists precisely so a block on the first model
+    # falls through to a permissive one — that result is returned, no error.
+    seen = []
+
+    def fake_invoke_one(provider, body, model):
+        seen.append(model)
+        if model != "model-c":
+            raise bedrock_client.AiContentBlockedError("blocked")
+        return _text_response('{"ok": true}')
+
+    monkeypatch.setattr(bedrock_client, "_invoke_one", fake_invoke_one)
+    monkeypatch.setattr(bedrock_client, "_resolve_model", lambda m: "model-a")
+    monkeypatch.setattr(bedrock_client, "get_active_provider", lambda: "gateway")
+    monkeypatch.setattr(bedrock_client, "_fallback_models",
+                        lambda m: ["model-a", "model-b", "model-c"])
+
+    result = bedrock_client._invoke_raw("sys", "user", None, 1024, 0.0, False, None)
+    assert result == _text_response('{"ok": true}')
+    assert seen == ["model-a", "model-b", "model-c"]  # fell through to the passing model
+
+
 def test_structured_path_reraises_unrelated_400(monkeypatch):
     # A 400 that is NOT about tools/functions is a genuine bad request and must
     # surface, not be silently retried as text.
@@ -339,6 +420,39 @@ def test_string_that_is_not_the_declared_container_is_left_alone(install_fake_cl
     result = bedrock_client.invoke_json("sys", "user", schema=_PAYLOADS_SCHEMA)
 
     assert result == {"payloads": '{"value": "a"}'}
+
+
+def test_union_typed_property_does_not_crash_decoder(install_fake_client):
+    # A union type ("object"/"null") makes schema["type"] a list; the decoder
+    # must not raise "unhashable type: 'list'" (regression: endpoint_inferrer).
+    schema = {
+        "type": "object",
+        "properties": {
+            "endpoint": {"type": ["object", "null"]},
+            "not_inferable": {"type": "boolean"},
+        },
+        "required": ["not_inferable"],
+    }
+    install_fake_client([_tool_response({"endpoint": {"path": "/x"}, "not_inferable": False})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"endpoint": {"path": "/x"}, "not_inferable": False}
+
+
+def test_union_typed_property_decodes_stringified_object(install_fake_client):
+    # The container member of a union type is still honored: a JSON-string object
+    # for an ["object", "null"] field is decoded.
+    schema = {
+        "type": "object",
+        "properties": {"endpoint": {"type": ["object", "null"]}},
+        "required": [],
+    }
+    install_fake_client([_tool_response({"endpoint": '{"path": "/x"}'})])
+
+    result = bedrock_client.invoke_json("sys", "user", schema=schema)
+
+    assert result == {"endpoint": {"path": "/x"}}
 
 
 def test_string_typed_field_holding_json_is_not_decoded(install_fake_client):

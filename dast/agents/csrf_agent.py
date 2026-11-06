@@ -189,8 +189,16 @@ class CsrfAgent(VulnAgent):
         baseline_status = baseline_resp.status_code
         baseline_len = len(baseline_resp.content)
 
-        # ── Check 1: CSRF token removal from params ────────────────────────
-        csrf_params = _find_csrf_params(target)
+        # Real CSRF token headers (x-requested-with is a marker, not a token). When the
+        # token lives in a header, mutating a BODY param is a false positive — the valid
+        # header token still rides along — so the body-param checks below are skipped.
+        token_headers = [h for h in _find_csrf_headers(target)
+                         if h.lower() != "x-requested-with"]
+
+        # ── Check 1: CSRF token removal from BODY params ───────────────────
+        # Only meaningful when the token is NOT in a header (else removing a body field
+        # while the valid header token remains proves nothing).
+        csrf_params = _find_csrf_params(target) if not token_headers else []
         for param_name in csrf_params:
             stripped_body = _remove_param_from_body(target.body or "", param_name)
             probe_resp = await _send(
@@ -224,8 +232,56 @@ class CsrfAgent(VulnAgent):
                 ))
                 break  # one finding per endpoint is enough
 
-        # ── Check 2: CSRF token replacement with random value ──────────────
+        # ── Check 2: CSRF token replacement with a RANDOM value ────────────
+        # The token the server validates may live in a HEADER (SPA double-submit, e.g.
+        # x-csrf-token) OR in a BODY param. Swap it WHERE IT ACTUALLY IS: swapping a body
+        # field while the valid header token still rides along proves nothing and was a
+        # false positive (the probe kept sending the real token). ``token_headers`` was
+        # computed above (x-requested-with excluded).
+
+        # 2a: swap the CSRF HEADER value to random (header-based double-submit apps).
         if not findings:
+            for header_name in token_headers:
+                fake_token = secrets.token_hex(16)
+                real_key = next((k for k in target.headers
+                                 if k.lower() == header_name.lower()), header_name)
+                swapped_headers = {**target.headers, real_key: fake_token}
+                probe_resp = await _send(
+                    client, target.method, target.url, swapped_headers, target.body
+                )
+                if probe_resp is None:
+                    continue
+                if _responses_similar(baseline_status, baseline_len,
+                                       probe_resp.status_code, len(probe_resp.content)):
+                    baseline_req, baseline_resp_text = _fmt_http_pair(baseline_resp)
+                    probe_req, probe_resp_text = _fmt_http_pair(probe_resp)
+                    findings.append(AgentFinding(
+                        title="CSRF — Random Token Accepted",
+                        severity="high",
+                        cwe="CWE-352",
+                        attack_type="csrf",
+                        evidence=(
+                            f"Replacing the CSRF header '{real_key}' value with a random token "
+                            f"still returned {probe_resp.status_code}. The server does not validate "
+                            f"the CSRF token value (it accepts any value)."
+                        ),
+                        # Full injected value so the UI highlights it in the probe request.
+                        payload=f"{real_key}: {fake_token}",
+                        parameter=real_key,
+                        url=target.url,
+                        request_method=target.method,
+                        bypass_validation=False,
+                        raw_request=baseline_req,
+                        raw_response=baseline_resp_text,
+                        probe_request=probe_req,
+                        probe_response=probe_resp_text,
+                    ))
+                    break
+
+        # 2b: swap a BODY-param token to random — ONLY when there is NO CSRF token header,
+        # otherwise the server may still be validating the header token and a body swap is a
+        # false positive (this is the bug the operator caught on the app SPA).
+        if not findings and not token_headers:
             for param_name in csrf_params:
                 fake_token = secrets.token_hex(16)
                 swapped_body = _replace_param_in_body(target.body or "", param_name, fake_token)
@@ -244,11 +300,11 @@ class CsrfAgent(VulnAgent):
                         cwe="CWE-352",
                         attack_type="csrf",
                         evidence=(
-                            f"Replacing CSRF parameter '{param_name}' with a random value "
-                            f"'{fake_token[:16]}...' still returned {probe_resp.status_code}. "
-                            f"The server does not validate the CSRF token value."
+                            f"Replacing CSRF body parameter '{param_name}' with a random value "
+                            f"still returned {probe_resp.status_code}. The server does not validate "
+                            f"the CSRF token value."
                         ),
-                        payload=f"{param_name}={fake_token[:16]}...",
+                        payload=f"{param_name}={fake_token}",
                         parameter=param_name,
                         url=target.url,
                         request_method=target.method,

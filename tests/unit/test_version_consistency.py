@@ -1,8 +1,8 @@
 """
 Version consistency check.
 
-The project version is duplicated in 4 places with no single source of
-truth: pyproject.toml, desktop/package.json, CLAUDE.md, docs/ARCHITECTURE.md.
+The project version is duplicated in 3 places with no single source of
+truth: pyproject.toml, desktop/package.json, docs/ARCHITECTURE.md.
 Nothing enforced they stay in sync, and they drifted apart (all sat at
 0.8.0 for months while unrelated work shipped). This test is the guard —
 any future bump that misses a site (instead of going through
@@ -41,10 +41,6 @@ def test_desktop_package_json_matches_pyproject():
     assert _package_json_version() == _pyproject_version()
 
 
-def test_claude_md_matches_pyproject():
-    assert _markdown_version("CLAUDE.md") == _pyproject_version()
-
-
 def test_architecture_md_matches_pyproject():
     assert _markdown_version("docs/ARCHITECTURE.md") == _pyproject_version()
 
@@ -67,19 +63,17 @@ def test_bump_version_script_updates_all_sites(tmp_path, monkeypatch):
     (fake_root / "docs").mkdir(parents=True)
     shutil.copy(_REPO_ROOT / "pyproject.toml", fake_root / "pyproject.toml")
     shutil.copy(_REPO_ROOT / "desktop" / "package.json", fake_root / "desktop" / "package.json")
-    shutil.copy(_REPO_ROOT / "CLAUDE.md", fake_root / "CLAUDE.md")
     shutil.copy(_REPO_ROOT / "docs" / "ARCHITECTURE.md", fake_root / "docs" / "ARCHITECTURE.md")
 
     monkeypatch.setattr(bv, "_REPO_ROOT", fake_root)
 
     touched = bv.bump_version("9.9.9", today="2026-01-01")
 
-    assert len(touched) == 4
+    assert len(touched) == 3
     assert 'version = "9.9.9"' in (fake_root / "pyproject.toml").read_text()
     assert json.loads((fake_root / "desktop" / "package.json").read_text())["version"] == "9.9.9"
-    assert "**Version:** 9.9.9" in (fake_root / "CLAUDE.md").read_text()
-    assert "**Last Updated:** 2026-01-01" in (fake_root / "CLAUDE.md").read_text()
     assert "**Version:** 9.9.9" in (fake_root / "docs" / "ARCHITECTURE.md").read_text()
+    assert "**Last Updated:** 2026-01-01" in (fake_root / "docs" / "ARCHITECTURE.md").read_text()
 
 
 def test_bump_version_rejects_non_semver(tmp_path, monkeypatch):
@@ -109,7 +103,6 @@ def test_bump_version_is_idempotent_noop_when_already_at_target(tmp_path, monkey
     (fake_root / "docs").mkdir(parents=True)
     shutil.copy(_REPO_ROOT / "pyproject.toml", fake_root / "pyproject.toml")
     shutil.copy(_REPO_ROOT / "desktop" / "package.json", fake_root / "desktop" / "package.json")
-    shutil.copy(_REPO_ROOT / "CLAUDE.md", fake_root / "CLAUDE.md")
     shutil.copy(_REPO_ROOT / "docs" / "ARCHITECTURE.md", fake_root / "docs" / "ARCHITECTURE.md")
 
     monkeypatch.setattr(bv, "_REPO_ROOT", fake_root)

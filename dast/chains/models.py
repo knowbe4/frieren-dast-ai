@@ -35,6 +35,8 @@ class Extractor:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Extractor":
+        if not isinstance(data, dict):
+            raise ValueError(f"extractor must be an object, got {type(data).__name__}")
         return Extractor(
             kind=str(data.get("kind", "")).strip(),
             var=str(data.get("var", "")).strip(),
@@ -65,6 +67,8 @@ class Assertion:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Assertion":
+        if not isinstance(data, dict):
+            raise ValueError(f"assertion must be an object, got {type(data).__name__}")
         return Assertion(
             kind=str(data.get("kind", "")).strip(),
             value=data.get("value"),
@@ -103,6 +107,8 @@ class ChainStep:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "ChainStep":
+        if not isinstance(data, dict):
+            raise ValueError(f"step must be an object, got {type(data).__name__}")
         send_cookies = data.get("send_cookies")
         if send_cookies is not None:
             send_cookies = [str(c) for c in send_cookies]
@@ -131,6 +137,8 @@ class Chain:
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Chain":
+        if not isinstance(data, dict):
+            raise ValueError(f"chain must be an object, got {type(data).__name__}")
         return Chain(
             name=str(data.get("name", "")).strip() or "attack_chain",
             steps=[ChainStep.from_dict(s) for s in (data.get("steps") or [])],

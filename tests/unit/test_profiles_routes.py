@@ -37,8 +37,8 @@ def client(tmp_path, monkeypatch):
 
 def test_create_list_get_delete(client):
     r = client.post("/api/profiles", json={
-        "name": "Training", "host_pattern": "*.knowbe4.com",
-        "auth_url": "https://training.knowbe4.com/login",
+        "name": "Training", "host_pattern": "*.example.com",
+        "auth_url": "https://app.example.com/login",
         "credentials": [{"label": "admin", "username": "a@b.com", "secret": "pw"}],
     })
     assert r.status_code == 200

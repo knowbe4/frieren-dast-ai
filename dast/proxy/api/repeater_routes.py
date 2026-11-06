@@ -4,10 +4,16 @@ Repeater routes: /api/repeater/send.
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Request
 
 from dast.proxy.api.http_utils import strip_recomputed_headers
 from dast.proxy.api.context import DashboardContext
+from dast.proxy.auth_headers import apply_cookies
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def make_router(ctx: DashboardContext) -> APIRouter:
@@ -24,8 +30,25 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         headers = dict(data.get("headers") or {})
         body    = data.get("body") or None
         follow_redirects = bool(data.get("follow_redirects", False))
+        session_name = str(data.get("session_name", "")).strip()
 
         headers = strip_recomputed_headers(headers)
+
+        # Opt-in: when a named session is given, inject that session's cookies
+        # (host-scoped) plus the CSRF/XHR headers a cookie-authed SPA needs. Not
+        # applied without session_name so a hand-pasted request (with its own
+        # Cookie header) is sent verbatim.
+        if session_name:
+            store = getattr(ctx, "store", None)
+            host = urlparse(url).hostname or ""
+            if store is not None and host:
+                try:
+                    cookies = store.get_named_session_cookies_for_host(session_name, host) or []
+                    if cookies:
+                        apply_cookies(headers, cookies, refresh=True)
+                except Exception as exc:
+                    logger.warning("repeater: session cookie injection failed",
+                                   session=session_name, host=host, error=str(exc))
 
         t0 = _time.monotonic()
         try:

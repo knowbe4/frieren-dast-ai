@@ -81,6 +81,12 @@ _AUTONOMOUS_DEFAULTS: Dict[str, object] = {
 # How many engine-level errors in a row abort the driver (guards a wedged model).
 _MAX_DRIVER_ERRORS = 3
 
+# Uniform-failure breaker: if a turn adds at least _UNIFORM_FAIL_MIN_NEW in-scope
+# requests and NONE got a 2xx, that is a failing turn; _MAX_UNIFORM_FAIL_TURNS such
+# turns in a row stop the run (403/null floods read as progress otherwise).
+_UNIFORM_FAIL_MIN_NEW = 5
+_MAX_UNIFORM_FAIL_TURNS = 2
+
 # Proactive session keepalive: between turns the browser navigates to a known
 # authenticated URL so the SSO session cookie is refreshed server-side before it
 # expires. 20 minutes is well within typical 1h SSO windows.
@@ -90,9 +96,38 @@ _SESSION_KEEPALIVE_INTERVAL = 1200.0
 # run end anyway (with an honest "coverage incomplete" report). Guards against a loop
 # where the copilot cannot make coverage progress; the stuck detector is the other bound.
 _MAX_COMPLETE_REJECTIONS = 8
+# How many times the engine may report a stuck_loop (an agent repeating the same
+# normalized call) before the coordinator KILLS the run instead of re-prompting it.
+_MAX_STUCK_LOOPS = 2
 
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
+
+# Per-dimension coverage: map Frieren's agent attack_type vocabulary onto the pentest
+# test dimensions an operator reasons about, so coverage can report "injection tested,
+# access-control not" per endpoint instead of a single tested/untested bit.
+_ATTACK_TYPE_DIMENSION = {
+    # injection family
+    "xss": "injection", "sqli": "injection", "cmdi": "injection", "ssti": "injection",
+    "nosql": "injection", "xxe": "injection", "lfi": "injection", "file_read": "injection",
+    "ssrf": "injection", "prototype_pollution": "injection", "host_header": "injection",
+    "open_redirect": "injection", "cache_poisoning": "injection", "blazor": "injection",
+    "graphql": "injection", "oob_headers": "injection",
+    # access control / authz / token / info-disclosure
+    "idor": "access_control", "auth": "access_control", "auth_bypass": "access_control",
+    "mfa_bypass": "access_control", "jwt": "access_control", "sensitive_data": "access_control",
+    # cross-tenant (multi-user replay) — only applicable with >=2 named sessions
+    "cross_session_idor": "cross_tenant",
+    # business logic (incl. mass assignment + race conditions)
+    "business_logic": "business_logic", "race_condition": "business_logic",
+    # prompt / LLM injection
+    "llm_injection": "llm_injection",
+    # csrf
+    "csrf": "csrf",
+}
+# Order shown to the operator / model.
+_COVERAGE_DIMENSIONS = ("injection", "access_control", "cross_tenant",
+                        "business_logic", "llm_injection", "csrf")
 
 def _order_hosts(hosts) -> List[str]:
     """Sorted host list with identity-provider hosts pushed to the end.
@@ -118,6 +153,39 @@ _SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
 # Soft escalations auto-nudged before a real human pause, per no-progress streak.
 _MAX_AUTO_GUIDANCE_NUDGES = 3
 
+
+def _session_is_provisioned(data: dict) -> Optional[bool]:
+    """Classify an app session-endpoint JSON body (e.g. KMSAT ``/spa/session``).
+
+    Returns False only when it positively reports a guest/unprovisioned account
+    (account id ``-1``/``<=0`` or an explicit guest marker), True when it reports a
+    real account, and None when it can't tell — so the caller fails open on an
+    unknown app rather than blocking a legitimate login.
+    """
+    if not isinstance(data, dict):
+        return None
+    account_id: Any = None
+    account = data.get("account")
+    if isinstance(account, dict):
+        account_id = account.get("id")
+    if account_id is None:
+        user = data.get("user")
+        if isinstance(user, dict):
+            account_id = user.get("account_id") or user.get("accountId")
+    if account_id is None:
+        account_id = data.get("account_id") or data.get("accountId")
+    if account_id is not None:
+        try:
+            return int(account_id) > 0
+        except (TypeError, ValueError):
+            return None
+    user = data.get("user")
+    if isinstance(user, dict) and user:
+        return True
+    if data.get("guest") is True:
+        return False
+    return None
+
 _AUTONOMOUS_START = (
     "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
@@ -140,6 +208,10 @@ _AUTONOMOUS_START = (
     "It uses the browser's own cookies (session, CSRF) automatically — more reliable than "
     "send_request for SPAs. Use after logging in via browser tools.\n"
     "- send_request / validate_chain ONLY for a targeted check no dedicated tool covers.\n"
+    "- code_list / code_lookup_path / code_search / code_file — IF the target's source is loaded "
+    "(call code_list; non-empty means it is), read the handler for an endpoint (code_lookup_path on "
+    "its URL path) to learn its real parameters, auth checks, and sinks BEFORE testing it, instead "
+    "of guessing. Do not assume source is loaded; skip these if code_list is empty.\n"
     "BE A PENTESTER, NOT A SCANNER. Your edge over the automated agents is UNDERSTANDING the app:\n"
     "0. AUTHENTICATE like a human: if you have credentials, use browser_navigate to the login "
     "page, browser_snapshot to see the form, browser_fill to enter email/password, browser_click "
@@ -204,7 +276,8 @@ _AUTONOMOUS_START = (
 _AUTONOMOUS_CONTINUE = (
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
     "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding, "
-    "browser_navigate, browser_snapshot, send_request), and actively TEST leads "
+    "browser_navigate, browser_snapshot, send_request, and code_lookup_path/code_search when "
+    "source is loaded), and actively TEST leads "
     "(IDOR/BOLA/XSS/privilege/mass-assignment/param-tampering) with parameter-level reasoning, "
     "don't just map them.\n"
     "{read_only}"
@@ -218,6 +291,18 @@ _AUTONOMOUS_CONTINUE = (
     "Set blocked_reason='complete' ONLY once the objective is covered, the high-value leads "
     "have been actively tested, AND no coverage gaps remain; or 'need_human' if you are truly "
     "blocked (say what a vulnerable vs. normal response would look like)."
+)
+
+_AUTONOMOUS_STUCK_LOOP = (
+    "LOOP BROKEN BY THE COORDINATOR. You repeated the same request over and over with no "
+    "new result:\n{detail}\n\n"
+    "Root cause: do NOT paste Cookie or X-CSRF-Token headers into send_request — the tool "
+    "manages the session for the active identity (activate_login_profile / the named session). "
+    "Pasting a header literal pins a stale session and changes nothing.\n"
+    "Do something DIFFERENT now: a different endpoint, a different parameter, or a different "
+    "tool (scan_surface, run_scan, run_multiuser_idor, idor_probe). If you have genuinely "
+    "exhausted this endpoint, move to the next one or conclude. Budget: {budget}.\n\n"
+    "{coverage}"
 )
 
 _AUTONOMOUS_SELF_PROCEED = (
@@ -303,13 +388,23 @@ class CopilotService:
         # Hypothesis key -> session id, so re-exploring the same hypothesis
         # (e.g. a double-click) reuses the live session instead of duplicating it.
         self._hypothesis_sessions: Dict[str, str] = {}
-        # Shared AgentBrowser across all copilot sessions — login state, cookies,
-        # and page context persist between messages. One browser window, never
-        # recreated unless closed or crashed.
+        # Browsers are per-session now (session["_agent_browser"]); this legacy handle
+        # is kept only so an older caller setting it still gets closed on shutdown.
         self._shared_browser: Any = None
 
+    async def _close_session_browser(self, session: dict) -> None:
+        """Close and detach this session's own AgentBrowser, if any."""
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception as exc:
+                logger.debug("session AgentBrowser close error", error=str(exc))
+
     async def close_browser(self) -> None:
-        """Close the shared AgentBrowser (e.g. on proxy shutdown)."""
+        """Close every live session's AgentBrowser (e.g. on proxy shutdown)."""
+        for session in list(self._sessions.values()):
+            await self._close_session_browser(session)
         if self._shared_browser is not None:
             try:
                 await self._shared_browser.close()
@@ -329,6 +424,10 @@ class CopilotService:
             oldest = sorted(self._sessions.keys(),
                             key=lambda k: self._sessions[k].get("created_at", 0))
             for k in oldest[:len(self._sessions) - _MAX_SESSIONS]:
+                sess = self._sessions.get(k) or {}
+                task = sess.get("_task")
+                if task is not None and not task.done():
+                    continue  # never evict a session whose run is still live
                 self._sessions.pop(k, None)
 
     def _init_engine(self, sid: str, focus_hosts: Optional[List[str]] = None):
@@ -605,10 +704,11 @@ class CopilotService:
         run_scan) reach the live queues through the extra fields; they are present
         only for the in-process copilot, so the tools degrade gracefully elsewhere."""
         ctx = self._ctx
-        # Shared AgentBrowser across ALL copilot sessions — login state, cookies,
-        # and page context persist between messages. Created lazily on first use;
-        # recreated if closed or crashed.
-        browser = self._shared_browser
+        # Per-session AgentBrowser: each copilot session gets its OWN browser (own
+        # Playwright context+page = isolated cookies/login), so multiple runs can
+        # execute concurrently without clobbering each other's page or auth. Created
+        # lazily, recreated if closed/crashed, and closed when the session is cleaned up.
+        browser = session.get("_agent_browser")
         if browser is None or getattr(browser, "_browser", None) is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
@@ -616,12 +716,17 @@ class CopilotService:
                     proxy_port=ctx.proxy_port, store=ctx.store,
                     read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
                 )
-                self._shared_browser = browser
             except Exception as exc:
                 logger.warning("could not create AgentBrowser", error=str(exc))
                 browser = None
         session["_agent_browser"] = browser
-        return AgentToolContext(
+        # Scope the browser to this run's named session (set when a profile is
+        # activated) so it seeds/resyncs cookies from THIS session's jar, not the
+        # shared global jar — keeping concurrent runs' browser auth isolated. Refreshed
+        # each turn so a session_name set after browser creation still propagates.
+        if browser is not None:
+            browser.session_name = getattr(session.get("engine"), "session_name", None)
+        tool_ctx = AgentToolContext(
             proxy_port=ctx.proxy_port,
             dashboard_port=getattr(ctx, "dashboard_port", 8088),
             store=ctx.store,
@@ -635,6 +740,15 @@ class CopilotService:
             read_only=bool((session.get("autonomous") or {}).get("read_only", False)),
             browser=browser,
         )
+        # Attach the engine session so tools (e.g. browser_login) can record the last
+        # successful login on it. Without this the engine's auto-relogin on 401/expiry
+        # (session.py) stays dormant because `_last_login` is never populated.
+        tool_ctx._session = session.get("engine")
+        # Validation-only runs hide breadth/recon tools from the model (enforced in
+        # the engine's tool-menu build) so it tests only the finding's endpoint.
+        tool_ctx.validation_only = bool(
+            (session.get("autonomous") or {}).get("validation_only", False))
+        return tool_ctx
 
     async def _operator_wait(self, sid: str, session: dict, kind: str, payload: dict,
                              timeout: float, defaults: dict) -> dict:
@@ -712,6 +826,7 @@ class CopilotService:
         read_only: bool = False,
         mode: str = "bounded",
         submit_forms: bool = False,
+        validation_only: bool = False,
     ) -> str:
         """Start a fully autonomous copilot run against ``focus_hosts``.
 
@@ -731,6 +846,27 @@ class CopilotService:
             raise ValueError("objective is required")
         hosts = [h.strip().lower() for h in (focus_hosts or []) if h and h.strip()]
         mode = mode if mode in ("bounded", "complete") else "bounded"
+        # Validation-only: test ONLY the finding's endpoint — no breadth. Force bounded
+        # so the complete-mode exhaustive sweep never runs; the per-turn auto-graphql /
+        # auto-route breadth is also skipped in _drive_autonomous.
+        if validation_only:
+            mode = "bounded"
+
+        # With a login profile, authentication is handled server-side: _activate_profile
+        # seeds the session cookies and arms credential auto-relogin. The model is NOT
+        # given the password, so the base "authenticate like a human" step would make it
+        # invent a placeholder credential and hammer the login. Tell it to skip that.
+        if profile_slug:
+            objective = (
+                objective
+                + "\n\nAUTHENTICATION (handled for you — overrides any 'authenticate like a human' "
+                f"step): you were logged in at run start via the active profile '{profile_slug}'. A "
+                "session (cookies + CSRF) is loaded and auto-relogins from the profile on 401/expiry, "
+                "so just make your requests. You do NOT have the password: never type or invent one, "
+                "and do not call login tools with made-up credentials. If you still land on a login "
+                "page or stay unauthenticated, the profile login failed — report it as a blocker "
+                "(record_finding or reply to the operator); do not guess credentials."
+            )
 
         sid = self.new_session(focus_hosts=hosts)
         session = self._sessions[sid]
@@ -753,6 +889,7 @@ class CopilotService:
             "session_safe": session_safe,
             "read_only": read_only,
             "mode": mode,
+            "validation_only": bool(validation_only),
             "submit_forms": bool(submit_forms) and not read_only,
             "initial_explore_done": False,
             "stop_event": asyncio.Event(),
@@ -804,7 +941,10 @@ class CopilotService:
         # Defer identity-provider hosts for the main run: the ambient auto-scan and
         # scan_surface skip them so probing the IdP cannot log the run out mid-scan.
         # The driver lifts this for a final phase that tests the IdP last.
-        if self._ctx.store is not None:
+        # Skipped for validation_only: it does no ambient scan / IdP phase, and this
+        # is a GLOBAL store flag — leaving it untouched lets parallel validation runs
+        # coexist without clobbering each other's deferral.
+        if self._ctx.store is not None and not validation_only:
             self._ctx.store.defer_identity_hosts = True
 
         # Preseed auth so the run carries a logged-in session from the first call
@@ -823,6 +963,46 @@ class CopilotService:
         logger.info("autonomous copilot run started", session_id=sid,
                     hosts=hosts, profile=profile_slug or None, config=cfg)
         return sid
+
+    def run_validation_batch(self, items: List[dict],
+                             max_concurrency: int = 3) -> Dict[str, Any]:
+        """Launch one focused finding-validation run per item, concurrently.
+
+        Each item is {objective (required), focus_hosts?, profile_slug?, budget?}. Every
+        run is forced ``validation_only=True`` + ``session_safe=True`` so it tests only
+        its finding (no breadth) and avoids the global ambient-scan/defer races — which,
+        together with the per-session browser + per-session cookie seeding, lets the runs
+        execute in parallel without clobbering each other. Returns the launched session
+        ids (plus any per-item errors). Runs beyond ``max_concurrency`` are launched too
+        but flagged, since each spins up its own browser (resource cost scales with N)."""
+        launched: List[dict] = []
+        errors: List[dict] = []
+        for i, item in enumerate(items or []):
+            objective = (item.get("objective") or "").strip()
+            if not objective:
+                errors.append({"index": i, "error": "objective required"})
+                continue
+            try:
+                sid = self.run_autonomous(
+                    objective,
+                    focus_hosts=item.get("focus_hosts"),
+                    profile_slug=item.get("profile_slug"),
+                    budget=item.get("budget"),
+                    session_safe=True, read_only=False,
+                    mode="bounded", validation_only=True,
+                )
+                launched.append({"index": i, "session_id": sid,
+                                 "focus_hosts": item.get("focus_hosts"),
+                                 "profile_slug": item.get("profile_slug")})
+            except (ValueError, RuntimeError) as exc:
+                errors.append({"index": i, "error": str(exc)})
+        over = max(0, len(launched) - max_concurrency)
+        if over:
+            logger.warning("validation batch exceeds suggested concurrency",
+                           launched=len(launched), max_concurrency=max_concurrency)
+        return {"launched": launched, "errors": errors,
+                "count": len(launched),
+                "over_concurrency": over}
 
     # ── Autonomous run controls ──────────────────────────────────────────────────
     def stop_autonomous(self, sid: str) -> bool:
@@ -845,6 +1025,16 @@ class CopilotService:
         task = session.get("_task")
         if task is not None and not task.done():
             task.cancel()
+        # Close this session's own browser now: a cancelled task may not run its
+        # cleanup, which otherwise leaves an orphan (logged-out) Chromium window
+        # open per stopped run. pop() makes this idempotent with _cleanup_session.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                from dast.utils.tasks import spawn_tracked
+                spawn_tracked(browser.close(), name="close-session-browser-on-stop")
+            except Exception as exc:
+                logger.debug("could not schedule session browser close on stop", error=str(exc))
         logger.info("autonomous run stop requested", session_id=sid)
         return True
 
@@ -979,20 +1169,168 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: profile load failed", slug=slug, error=str(exc))
             return
-        if profile is None or not profile.saved_session:
-            logger.warning("autonomous run: login profile has no saved session", slug=slug)
+        if profile is None:
+            logger.warning("autonomous run: login profile not found", slug=slug)
             return
+        # Scope this run's auth to its OWN named session jar (never the shared global
+        # jar) so concurrent validation runs on different accounts can't cross-read each
+        # other's cookies/token. `session_name` drives that isolation in the engine and
+        # its per-session browser.
+        engine = session.get("engine")
+        if engine is not None:
+            engine.session_name = profile.slug
+        # Cookie import only applies to a profile that captured a live session.
+        # A fresh credential-only profile has none — that is NOT a reason to skip
+        # the credential seeding below (which is what arms auto-login).
+        if profile.saved_session:
+            try:
+                cookies = list(profile.saved_session.get("cookies", []))
+                auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
+                # Save into the per-name isolated jar only — do NOT write the global jar
+                # (import_playwright_cookies), which is last-writer-wins and leaks across
+                # concurrent profile activations.
+                store.save_named_session_from_playwright(
+                    name=profile.slug, role=profile.name,
+                    playwright_cookies=cookies, auth_headers=auth_headers,
+                )
+                # Also seed the cookies onto THIS engine session (per-session) so the very
+                # first request is authenticated without touching the global jar.
+                seeded = {c["name"]: c.get("value", "") for c in cookies if c.get("name")}
+                if engine is not None and seeded and hasattr(engine, "seed_session_cookies"):
+                    engine.seed_session_cookies(seeded)
+                logger.info("autonomous run activated login profile", slug=slug,
+                            session_scoped=len(seeded))
+            except Exception as exc:
+                logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
+        else:
+            logger.info("autonomous run: profile has no saved session; relying on "
+                        "credential auto-login", slug=slug)
+        # Seed the engine's relogin credentials from the profile so the existing
+        # 401/expiry auto-relogin (session.py) can re-authenticate WITHOUT pausing the
+        # run. Needs a credential + auth_url on the profile; cookie-only profiles skip this.
         try:
-            cookies = list(profile.saved_session.get("cookies", []))
-            auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
-            store.save_named_session_from_playwright(
-                name=profile.slug, role=profile.name,
-                playwright_cookies=cookies, auth_headers=auth_headers,
-            )
-            imported = store.import_playwright_cookies(cookies)
-            logger.info("autonomous run activated login profile", slug=slug, cookies=imported)
+            creds = getattr(profile, "credentials", None) or []
+            auth_url = (getattr(profile, "auth_url", "") or "").strip()
+            engine = session.get("engine")
+            if engine is not None and auth_url and creds and creds[0].username and creds[0].secret:
+                engine._last_login = {
+                    "url": auth_url, "email": creds[0].username, "password": creds[0].secret,
+                }
+                logger.info("autonomous run seeded relogin credentials from profile", slug=slug)
+            elif engine is not None:
+                logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
         except Exception as exc:
-            logger.warning("autonomous run: profile activation failed", slug=slug, error=str(exc))
+            logger.warning("autonomous run: relogin-credential seed failed", slug=slug, error=str(exc))
+
+    async def _ensure_profile_login(self, sid: str, session: dict) -> None:
+        """Proactively log in a credential-only profile at run start so the run begins
+        authenticated. The model never receives the password; this uses the credentials
+        seeded onto the engine (``engine._last_login``) by ``_activate_profile`` and the
+        same ``adaptive_login`` cascade as the inline 401 auto-relogin. Best-effort: never
+        raises, never deadlocks the run, never logs secret values."""
+        auto = session.get("autonomous") or {}
+        if auto.get("_proactive_login_done"):
+            return
+        engine = session.get("engine")
+        creds = getattr(engine, "_last_login", None) if engine is not None else None
+        if not creds or not creds.get("url") or not creds.get("email") or not creds.get("password"):
+            return  # no credentials to use — the model will report any auth wall itself
+        auto["_proactive_login_done"] = True
+        try:
+            tool_ctx = self._build_tool_ctx(session)
+            browser = getattr(tool_ctx, "browser", None)
+            if browser is None:
+                logger.warning("autonomous run: no browser for proactive login", session_id=sid)
+                return
+            from dast.browser.login_cascade import adaptive_login
+            result = await adaptive_login(
+                browser, creds["url"], creds["email"], creds["password"],
+                in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
+            )
+            if getattr(result, "ok", False):
+                # Gate-check: a login that "succeeds" can still land on an
+                # onboarding/guest session (a freshly-created, unprovisioned
+                # account). Confirm a real account before declaring the run
+                # authenticated; fail open on unknown apps.
+                provisioned = await self._gate_check_account_state(browser, creds["url"])
+                if provisioned is False:
+                    auto["detail"] = ("account not provisioned / onboarding incomplete — "
+                                      "login succeeded but the session is a guest account")
+                    logger.warning("autonomous run: profile login reached a guest/"
+                                   "unprovisioned session", session_id=sid)
+                    await self._broadcast_autonomous(sid, "auth_failed", {
+                        "profile": auto.get("profile"),
+                        "error": "account not provisioned (guest session)",
+                    })
+                    return
+                try:
+                    cookies = await browser.export_cookies()
+                except Exception:
+                    cookies = {}
+                if cookies and hasattr(engine, "_session_cookies"):
+                    engine._session_cookies.update(cookies)
+                # Persist the freshly-logged-in cookies into THIS run's isolated named
+                # jar (a credential-only profile has no saved_session), so the engine's
+                # scoped cookie source and the per-session browser resync read this run's
+                # own session instead of the shared global jar.
+                name = getattr(engine, "session_name", None)
+                if name:
+                    try:
+                        full = await browser.export_cookies_full()
+                        if full:
+                            self._ctx.store.save_named_session_from_playwright(
+                                name=name, role=name, playwright_cookies=full,
+                            )
+                    except Exception as exc:
+                        logger.debug("autonomous run: named-session save failed",
+                                     session_id=sid, error=str(exc)[:160])
+                else:
+                    self._seed_engine_session(session, auto.get("hosts") or [])
+                auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
+                                  f"({getattr(result, 'engine', '?')})")
+                logger.info("autonomous run: proactive profile login ok", session_id=sid,
+                            engine=getattr(result, "engine", "?"), cookies=len(cookies))
+                await self._broadcast_autonomous(sid, "authenticated", {
+                    "profile": auto.get("profile"), "engine": getattr(result, "engine", None),
+                })
+            else:
+                auto["detail"] = f"profile login failed: {getattr(result, 'error', 'unknown')}"
+                logger.warning("autonomous run: proactive profile login failed",
+                               session_id=sid, error=getattr(result, "error", None))
+                await self._broadcast_autonomous(sid, "auth_failed", {
+                    "profile": auto.get("profile"), "error": getattr(result, "error", None),
+                })
+        except Exception as exc:
+            auto["detail"] = f"profile login error: {str(exc)[:150]}"
+            logger.warning("autonomous run: proactive profile login error",
+                           session_id=sid, error=str(exc)[:200])
+
+    async def _gate_check_account_state(self, browser: Any, base_url: str) -> Optional[bool]:
+        """Best-effort post-login check that the session is a real provisioned account.
+
+        Fetches ``<origin>/spa/session`` in-browser (carrying the session's cookies)
+        and classifies the body with :func:`_session_is_provisioned`. Returns False
+        only on a positively guest/unprovisioned session, True on a real account, and
+        None when it can't tell (non-KMSAT app, non-JSON, non-200, or error) so the
+        caller treats the login as authenticated. Never raises."""
+        import json as _json
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(base_url)
+            if not parsed.scheme or not parsed.netloc:
+                return None
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            resp = await browser.api_get(f"{origin}/spa/session",
+                                         headers={"X-Requested-With": "XMLHttpRequest"})
+            if not resp.get("ok") or resp.get("status") != 200:
+                return None
+            data = _json.loads(resp.get("text") or "")
+            return _session_is_provisioned(data)
+        except (ValueError, TypeError):
+            return None
+        except Exception as exc:
+            logger.debug("autonomous run: account gate-check skipped", error=str(exc)[:160])
+            return None
 
     def _seed_engine_session(self, session: dict, hosts: List[str]) -> None:
         """Seed the engine's session cookies for the primary focus host so the
@@ -1008,18 +1346,34 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous run: engine session seed failed", error=str(exc))
 
-    def _progress_snapshot(self) -> Tuple[int, int, int, int]:
+    @staticmethod
+    def _scope_entries(entries: list, hosts: Optional[set]) -> list:
+        """Filter proxy entries to a run's focus hosts (exact or subdomain). With no
+        hosts, returns them all. Keeps concurrent runs' traffic from polluting each
+        other's stuck/uniform-failure/coverage signals."""
+        if not hosts:
+            return entries
+        hs = {h.lower() for h in hosts if h}
+        out = []
+        for e in entries:
+            host = (getattr(e, "host", "") or "").lower()
+            if host in hs or any(host.endswith("." + h) for h in hs):
+                out.append(e)
+        return out
+
+    def _progress_snapshot(self, hosts: Optional[set] = None) -> Tuple[int, int, int, int]:
         """A monotonic (findings, in-scope endpoints, coverage units, ui units) tuple
         used by the stuck detector: no change across ``max_stuck_turns`` turns means no
         progress. Coverage units count scanned endpoints + swept GraphQL operations so
         breadth work (scan_surface / graphql_sweep) registers as progress; ui units count
         discovered + visited UI routes so SPA exploration (discovering or visiting a
-        route) also counts and never trips the stuck detector."""
+        route) also counts and never trips the stuck detector. ``hosts`` scopes the
+        entry-derived counts to a run's focus hosts for safe concurrent runs."""
         store = self._ctx.store
         if store is None:
             return (0, 0, 0, 0)
         try:
-            entries = store.in_scope_entries()
+            entries = self._scope_entries(store.in_scope_entries(), hosts)
         except Exception:
             return (0, 0, 0, 0)
         findings = sum(len(getattr(entry, "findings", None) or []) for entry in entries)
@@ -1032,6 +1386,23 @@ class CopilotService:
         ui_stats = graph.stats() if graph is not None else {"visited": 0, "frontier": 0}
         ui_units = ui_stats["visited"] + ui_stats["frontier"]
         return (findings, len(entries), scanned + swept_ops, ui_units)
+
+    def _response_counts(self, hosts: Optional[set] = None) -> Tuple[int, int]:
+        """(# in-scope entries, # with a 2xx status) — feeds the uniform-failure breaker.
+        A 403/null still creates an entry, so comparing the 2xx count across turns is
+        what distinguishes real responses from a rejection flood. ``hosts`` scopes it to
+        the run's focus hosts so a concurrent run's traffic can't mask this run's flood."""
+        store = self._ctx.store
+        if store is None:
+            return (0, 0)
+        try:
+            entries = self._scope_entries(store.in_scope_entries(), hosts)
+        except Exception:
+            return (0, 0)
+        ok = sum(1 for entry in entries
+                 if isinstance(getattr(entry, "status", None), int)
+                 and 200 <= entry.status < 300)
+        return (len(entries), ok)
 
     async def _broadcast_autonomous(self, sid: str, event: str,
                                     extra: Optional[dict] = None) -> None:
@@ -1057,7 +1428,9 @@ class CopilotService:
                     logger.warning("autonomous run could not restore AI mode",
                                    error=str(exc))
             # Lift the identity-host deferral so it never leaks into manual use.
-            if self._ctx.store is not None:
+            # A validation_only run never set this GLOBAL flag, so it must NOT clear
+            # it either — that would clobber a concurrent non-validation run.
+            if self._ctx.store is not None and not auto.get("validation_only"):
                 self._ctx.store.defer_identity_hosts = False
         session["status"] = "idle" if status == "complete" else status
         session["pause"] = None
@@ -1069,9 +1442,15 @@ class CopilotService:
     def _cleanup_session(self, session: dict) -> None:
         """Release per-session resources: close the agent browser and remove any
         match/replace rules the copilot added (tagged with [copilot_session])."""
-        # Detach the shared browser from this session but do NOT close it —
-        # it persists across sessions so login state survives.
-        session.pop("_agent_browser", None)
+        # Close this session's OWN browser (per-session isolation). Cleanup is sync
+        # and browser.close() is async, so schedule it as a tracked task.
+        browser = session.pop("_agent_browser", None)
+        if browser is not None:
+            try:
+                from dast.utils.tasks import spawn_tracked
+                spawn_tracked(browser.close(), name="close-session-browser")
+            except Exception as exc:
+                logger.debug("could not schedule session browser close", error=str(exc))
         # Remove copilot-scoped match/replace rules so the operator's browsing
         # is not affected after the copilot finishes.
         settings = getattr(self._ctx, "settings", None)
@@ -1446,14 +1825,37 @@ class CopilotService:
         # the UI-route frontier is seeded and has_surface is True — this closes the
         # path where an early self-declared 'complete' is honored because nothing
         # was mapped yet. Best-effort; never blocks the run on a crawl failure.
-        if mode == "complete" and not auto.get("initial_explore_done"):
+        if mode == "complete" and not auto.get("validation_only") \
+                and not auto.get("initial_explore_done"):
             await self._deterministic_recon_scan_sweep(sid, session)
             auto["initial_explore_done"] = True
             auto["breadth_done"] = True
             await self._session_keepalive(sid, session)
 
+        # A credential-only login profile carries no captured session, so nothing is
+        # authenticated yet and the model is never handed the password. Log in for real
+        # now (server-side, same cascade as the inline 401 auto-relogin) so the run
+        # starts authenticated. Best-effort — never deadlocks the run.
+        await self._ensure_profile_login(sid, session)
+
         hosts_label = ", ".join(auto["hosts"]) or "the in-scope target(s)"
         read_only_note = _READ_ONLY_DIRECTIVE + "\n\n" if auto.get("read_only") else ""
+        # When the run already logged itself in (proactive profile login), tell the model
+        # so it does NOT waste turns calling activate_login_profile / browser_login or
+        # asking for a password (a credential-only profile shows session_set=false, which
+        # otherwise makes the model think it still needs to log in). Recomputed each turn.
+        def _auth_note() -> str:
+            detail = str(auto.get("detail", ""))
+            if not detail.startswith("authenticated via profile"):
+                return ""
+            return (
+                f"[AUTH STATE] You are ALREADY authenticated: {detail}. Session cookies/token "
+                "are live and auto-injected on your requests (the engine auto-relogins on a 401). "
+                "Do NOT call activate_login_profile, browser_login or save_login_session, do NOT "
+                "treat session_set=false as a blocker, and never ask for a password — just proceed "
+                "with the objective.\n\n"
+            )
+        read_only_note = _auth_note() + read_only_note
         breadth_note = (
             "[BREADTH PHASE COMPLETE] The automated scan arsenal has already covered every "
             "discovered REST endpoint and GraphQL operation. Your job now is DEPTH: examine "
@@ -1471,8 +1873,13 @@ class CopilotService:
             read_only=read_only_note,
         )
 
-        last_progress = self._progress_snapshot()
+        # Validation runs scope their progress/breaker signals to their own focus
+        # hosts so concurrent runs don't pollute each other's stuck/failure detection.
+        scope_hosts = set(auto.get("hosts") or []) if auto.get("validation_only") else None
+        last_progress = self._progress_snapshot(scope_hosts)
         stuck_turns = 0
+        last_counts = self._response_counts(scope_hosts)
+        consec_fail_turns = 0
         last_keepalive = time.time()
         auto["status"] = "running"
         await self._broadcast_autonomous(sid, "started", {
@@ -1564,13 +1971,29 @@ class CopilotService:
                 }
                 blocked_reason = (reply.blocked_reason or "").strip().lower()
 
+                # ── Safety-classifier block is terminal ──────────────────────────
+                # The decision model's content was refused upstream; every retry and
+                # every model in the chain refuses identically, so end the run with a
+                # distinct status instead of looping until the budget runs out.
+                if blocked_reason == "safety_blocked":
+                    logger.warning("autonomous run: decision model blocked by safety classifier",
+                                   session_id=sid)
+                    self._finish_autonomous(
+                        session, "error",
+                        "the AI safety classifier blocked the decision model on this run "
+                        "(try a different AI provider)")
+                    await self._broadcast_autonomous(sid, "finished",
+                                                     {"status": "safety_blocked"})
+                    return
+
                 # ── Auto-test any GraphQL endpoint seen so far ───────────────────
                 # The moment the copilot's traffic surfaces a GraphQL endpoint, test
                 # it (introspect -> sweep, or fuzz captured ops) without waiting for
                 # the model to decide to. Idempotent; no-op in read-only. Runs in
                 # bounded AND complete mode so "see GraphQL -> test GraphQL" is
-                # guaranteed, not discretionary.
-                if effective_hosts:
+                # guaranteed, not discretionary. Skipped in validation-only mode,
+                # which must test ONLY the finding's endpoint, not sweep breadth.
+                if effective_hosts and not auto.get("validation_only"):
                     turn_ctx = self._build_tool_ctx(session)
                     await self._auto_test_graphql(session, turn_ctx, set(effective_hosts))
                     # Evidence-driven auto-routing of the unambiguous leads (bounded
@@ -1578,7 +2001,7 @@ class CopilotService:
                     await self._auto_route(session, turn_ctx, set(effective_hosts))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
-                progress = self._progress_snapshot()
+                progress = self._progress_snapshot(scope_hosts)
                 if progress != last_progress:
                     stuck_turns = 0
                     # Real work happened — refresh the soft-escalation nudge budget so a
@@ -1588,8 +2011,68 @@ class CopilotService:
                 else:
                     stuck_turns += 1
 
+                # ── Uniform-failure breaker ──────────────────────────────────────
+                # 403/null responses still create in-scope entries, so they read as
+                # "progress" and never trip the stuck detector. Track turns whose new
+                # traffic had NO 2xx at all and stop if that persists — otherwise the
+                # run floods a target that is uniformly rejecting it.
+                counts = self._response_counts(scope_hosts)
+                new_entries = counts[0] - last_counts[0]
+                new_ok = counts[1] - last_counts[1]
+                last_counts = counts
+                if new_entries >= _UNIFORM_FAIL_MIN_NEW and new_ok <= 0:
+                    consec_fail_turns += 1
+                else:
+                    consec_fail_turns = 0
+                if consec_fail_turns >= _MAX_UNIFORM_FAIL_TURNS:
+                    self._finish_autonomous(
+                        session, "stopped",
+                        f"no successful (2xx) responses for {consec_fail_turns} turns — "
+                        f"stopping instead of flooding the target")
+                    await self._broadcast_autonomous(sid, "finished", {"status": "stopped"})
+                    return
+
                 # ── Interpret the reply's control signal ─────────────────────────
+                # Watchdog: the engine killed a turn whose agent looped on the same
+                # normalized call. The coordinator breaks it — re-prompt once with a hard
+                # corrective, and KILL the run if it keeps happening (the agent cannot
+                # self-correct; the supervisor must stop it rather than burn the budget).
+                if blocked_reason == "stuck_loop":
+                    auto["stuck_loops"] = auto.get("stuck_loops", 0) + 1
+                    await self._broadcast_autonomous(sid, "stuck_loop",
+                                                     {"count": auto["stuck_loops"]})
+                    logger.warning("autonomous run: agent stuck in a loop",
+                                   session_id=sid, count=auto["stuck_loops"])
+                    if auto["stuck_loops"] >= _MAX_STUCK_LOOPS:
+                        self._finish_autonomous(
+                            session, "stuck",
+                            "agent repeatedly looped on the same call and could not self-correct")
+                        await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
+                        return
+                    # Clear the engine's dedup + repeat counters so the corrected strategy
+                    # is not itself suppressed, then re-prompt with a hard constraint.
+                    try:
+                        session["engine"]._seen_calls.clear()
+                        session["engine"]._repeat_sigs.clear()
+                    except Exception as exc:
+                        logger.debug("stuck_loop: could not clear engine dedup", error=str(exc))
+                    prompt = _AUTONOMOUS_STUCK_LOOP.format(
+                        detail=(reply.message or "")[:400],
+                        budget=self._budget_label(auto, cfg, deadline),
+                        coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    )
+                    continue
+
                 if blocked_reason == "complete":
+                    # A validation-only run cares about ONE finding, not surface
+                    # coverage — accept the verdict immediately instead of bouncing
+                    # 'complete' through the coverage gate (which would push breadth).
+                    if auto.get("validation_only"):
+                        self._finish_autonomous(session, "complete",
+                                                 reply.message or "validation concluded")
+                        await self._broadcast_autonomous(sid, "finished",
+                                                         {"status": "complete"})
+                        return
                     coverage = self._surface_coverage(effective_hosts)
                     budget_left = (time.time() < deadline
                                    and auto["tool_calls"] < cfg["max_tool_calls"])
@@ -1627,6 +2110,13 @@ class CopilotService:
                             "rest_untested": len(coverage["rest_untested"]),
                             "gql_untested": len(coverage["gql_untested"]),
                             "ui_frontier": len(coverage["ui_frontier"]),
+                            # Per-dimension gaps on scanned endpoints, so the dashboard can
+                            # render the coverage checklist (endpoint x dimension).
+                            "dimensions": {
+                                dim: len(info.get("untested") or [])
+                                for dim, info in (coverage.get("dimensions") or {}).items()
+                            },
+                            "cross_tenant_gap": coverage.get("cross_tenant_gap", False),
                             "rejection": auto["complete_rejections"],
                         })
                         # Complete mode closes gaps deterministically rather than
@@ -1802,6 +2292,7 @@ class CopilotService:
             logger.debug("coverage: rest enumeration failed", error=str(exc))
             entries = []
         rest_status: Dict[Tuple[str, str, str], bool] = {}
+        rest_dims: Dict[Tuple[str, str, str], set] = {}  # key -> dimensions evaluated
         for entry in entries:
             method = (getattr(entry, "method", "") or "").upper()
             path = getattr(entry, "path", "") or ""
@@ -1821,10 +2312,53 @@ class CopilotService:
             key = (host, method, normalise_endpoint_path(path))
             tested = bool(getattr(entry, "scan_result", None))
             rest_status[key] = rest_status.get(key, False) or tested
+            # Which test dimensions were evaluated on this endpoint — from the attack
+            # types the scan ran plus any finding's attack type.
+            dims = rest_dims.setdefault(key, set())
+            for at in (getattr(entry, "scanned_attack_types", None) or []):
+                dim = _ATTACK_TYPE_DIMENSION.get(at)
+                if dim:
+                    dims.add(dim)
+            for finding in (getattr(entry, "findings", None) or []):
+                dim = _ATTACK_TYPE_DIMENSION.get((finding or {}).get("attack_type", ""))
+                if dim:
+                    dims.add(dim)
         cov["rest_total"] = len(rest_status)
         cov["rest_tested"] = sum(1 for tested in rest_status.values() if tested)
         cov["rest_untested"] = sorted(
             f"{method} {path}" for (_h, method, path), tested in rest_status.items() if not tested
+        )
+
+        # ── Per-dimension coverage matrix over the scanned REST endpoints ─────────
+        # cross_tenant is only applicable (expected) when >=2 named sessions exist to
+        # replay across; otherwise it is N/A and must not count as a gap.
+        try:
+            named_count = len(store.get_named_sessions() or [])
+        except Exception:
+            named_count = 0
+        cross_tenant_applicable = named_count >= 2
+        dim_summary: Dict[str, Dict[str, object]] = {}
+        for dim in _COVERAGE_DIMENSIONS:
+            if dim == "cross_tenant" and not cross_tenant_applicable:
+                continue
+            evaluated = [k for k, dims in rest_dims.items() if dim in dims]
+            # Only endpoints that were scanned at all are candidates for a dimension gap
+            # (an unscanned endpoint is already reported under rest_untested).
+            scanned_keys = [k for k, t in rest_status.items() if t]
+            missing = [k for k in scanned_keys if dim not in rest_dims.get(k, set())]
+            dim_summary[dim] = {
+                "tested": len(evaluated),
+                "scanned_endpoints": len(scanned_keys),
+                "untested": sorted(f"{m} {p}" for (_h, m, p) in missing),
+            }
+        cov["dimensions"] = dim_summary
+        cov["cross_tenant_applicable"] = cross_tenant_applicable
+        # The one hard per-dimension gate: with >=2 identities saved, cross-tenant MUST be
+        # exercised on the scanned endpoints — not testing it is the exact gap that made the
+        # run miss every cross-account check.
+        cov["cross_tenant_gap"] = bool(
+            cross_tenant_applicable
+            and dim_summary.get("cross_tenant", {}).get("untested")
         )
 
         # ── GraphQL surface ─────────────────────────────────────────────────────
@@ -1902,6 +2436,7 @@ class CopilotService:
         cov["complete"] = bool(
             cov["has_surface"] and not cov["rest_untested"] and not cov["gql_untested"]
             and not cov["gql_captured_untested"] and not cov["ui_frontier"]
+            and not cov["cross_tenant_gap"]
         )
         return cov
 
@@ -1955,5 +2490,29 @@ class CopilotService:
                 f"- {len(ui_frontier)} UI route(s) discovered but not yet explored. Run `explore` "
                 f"on the app until frontier_remaining is 0 to reach every section. Examples: "
                 + wrap_untrusted(", ".join(ui_frontier[:8]), "unexplored_ui_routes")
+            )
+        # Per-dimension gaps on the ALREADY-scanned endpoints — so the copilot does not
+        # stop after a shallow injection-only pass and call the surface "covered".
+        dims = cov.get("dimensions") or {}
+        _DIM_HINT = {
+            "injection": "injection probes (scan_surface / run_scan reach these)",
+            "access_control": "authz / IDOR — reason about id/owner params and run idor_probe or run_scan",
+            "cross_tenant": "cross-account replay — run run_multiuser_idor across the saved named sessions",
+            "business_logic": "business-logic / mass-assignment — add fields the client does not send",
+            "llm_injection": "prompt / LLM injection on any field that reaches an AI classifier",
+            "csrf": "CSRF protection checks on state-changing endpoints",
+        }
+        for dim in _COVERAGE_DIMENSIONS:
+            info = dims.get(dim)
+            if not info:
+                continue
+            missing = info.get("untested") or []
+            if not missing:
+                continue
+            hard = " (REQUIRED: you have >=2 identities saved)" if dim == "cross_tenant" else ""
+            lines.append(
+                f"- {len(missing)} scanned endpoint(s) NOT yet tested for {dim}{hard} — "
+                f"{_DIM_HINT.get(dim, dim)}. Examples: "
+                + wrap_untrusted(", ".join(missing[:6]), f"untested_{dim}")
             )
         return "\n".join(lines)

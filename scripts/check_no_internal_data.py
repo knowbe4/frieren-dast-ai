@@ -40,6 +40,7 @@ CONTENT_ALLOWLIST: tuple[str, ...] = (
     ".env.example",
     "dast/scope_presets/example.json.example",
     "tests/unit/test_secrets_agent.py",
+    "tests/unit/test_internal_data_guard.py",
     "tests/unit/test_passive_scanner.py",
     "tests/unit/test_passive_rules_extended.py",
     "tests/unit/test_agent_logic.py",
@@ -70,11 +71,20 @@ AWS_ACCESS_KEY_RE = re.compile(r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b")
 AWS_SECRET_ASSIGN_RE = re.compile(
     r"AWS_SECRET_ACCESS_KEY\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{20,})"
 )
-# Internal-only hostnames (e.g. the Claude apps gateway) must stay in .env, never
-# in a tracked file. Matches company internal/corp/private subdomains; does NOT
-# match public references like "github.com/knowbe4" or "*.example.com" placeholders.
+# Internal-only hostnames (e.g. the Claude apps gateway, on-demand demo infra)
+# must stay in .env / local scripts, never in a tracked file. Covers internal
+# env/product subdomains of the corp domain and any on-demand run host. Public
+# references like "github.com/knowbe4", a bare "*.knowbe4.com" / "kb4od.run"
+# mention, or "*.example.com" placeholders are NOT matched (they carry no
+# host-qualified internal subdomain).
+_INTERNAL_HOST_PATTERNS: tuple[str, ...] = (
+    # <host>.<internal-env-or-product>.knowbe4.com
+    r"[a-z0-9][a-z0-9.-]*\.(?:internal|corp|private|kmsat|phisher|eai)\.knowbe4\.com",
+    # on-demand / demo infra run hosts under the kb4od.run run domain
+    r"[a-z0-9][a-z0-9.-]*\.kb4od\.[a-z]{2,}",
+)
 INTERNAL_HOSTNAME_RE = re.compile(
-    r"\b[a-z0-9][a-z0-9.-]*\.(?:internal|corp|private)\.knowbe4\.com\b",
+    r"\b(?:" + "|".join(_INTERNAL_HOST_PATTERNS) + r")\b",
     re.IGNORECASE,
 )
 

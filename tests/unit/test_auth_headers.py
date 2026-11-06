@@ -101,3 +101,69 @@ def test_stops_at_first_matching_entry_with_headers():
     ]
     result = extract_auth_headers(entries, host="example.com")
     assert result == {"Authorization": "Bearer newest"}
+
+
+# ── inject_csrf (shared CSRF injector used by copilot + active scan) ───────────
+
+from dast.proxy.auth_headers import inject_csrf  # noqa: E402
+
+
+def test_inject_csrf_from_dict_map():
+    h = {}
+    inject_csrf(h, {"CSRF-TOKEN": "abc"})
+    assert h["X-CSRF-Token"] == "abc"
+    assert h["X-Requested-With"] == "XMLHttpRequest"
+
+
+def test_inject_csrf_from_playwright_cookie_list():
+    h = {}
+    inject_csrf(h, [{"name": "XSRF-TOKEN", "value": "xyz", "domain": "x"}])
+    assert h["X-CSRF-Token"] == "xyz"
+
+
+def test_inject_csrf_from_named_session_cookie_map():
+    # NamedSession.cookies shape: {name: {"value": ...}}
+    h = {}
+    inject_csrf(h, {"csrf_token": {"value": "pw", "domain": "x"}})
+    assert h["X-CSRF-Token"] == "pw"
+
+
+def test_inject_csrf_refresh_overwrites_stale():
+    h = {"X-CSRF-Token": "STALE"}
+    inject_csrf(h, {"CSRF-TOKEN": "fresh"}, refresh=True)
+    assert h["X-CSRF-Token"] == "fresh"
+
+
+def test_inject_csrf_without_refresh_keeps_existing():
+    h = {"X-CSRF-Token": "KEEP"}
+    inject_csrf(h, {"CSRF-TOKEN": "fresh"}, refresh=False)
+    assert h["X-CSRF-Token"] == "KEEP"
+
+
+def test_inject_csrf_no_csrf_cookie_sets_only_xhr():
+    h = {}
+    inject_csrf(h, {"session": "s"})
+    assert "X-CSRF-Token" not in h
+    assert h["X-Requested-With"] == "XMLHttpRequest"
+
+
+def test_inject_csrf_empty_cookies_is_noop():
+    h = {}
+    inject_csrf(h, [])
+    assert h == {}
+
+
+def test_cross_session_headers_inject_fresh_csrf():
+    """cross_session_idor replay drops the owner's CSRF and mirrors the target
+    identity's own CSRF cookie so a cross-tenant write probe is not 403'd."""
+    from dast.agents.cross_session_idor_agent import _build_session_headers
+
+    class _Sess:
+        auth_headers = {}
+        cookies = {"_session": {"value": "s2"}, "CSRF-TOKEN": {"value": "tok2"}}
+
+    original = {"cookie": "_session=s1", "x-csrf-token": "tok1", "accept": "application/json"}
+    out = _build_session_headers(original, _Sess())
+    assert out["X-CSRF-Token"] == "tok2"       # refreshed to identity 2's token
+    assert "s2" in out["cookie"] and "s1" not in out["cookie"]
+    assert out["accept"] == "application/json"  # non-auth headers preserved

@@ -1085,6 +1085,20 @@ class Coordinator:
             if t in cls._registry
         ]
 
+        # Side-channel OUT for per-dimension coverage: record which attack types this
+        # endpoint was actually EVALUATED for — canary-probed candidates (a probe is a
+        # test, even with no signal) plus the dispatched agents. The scan worker persists
+        # this onto the ProxyEntry so the autonomous coverage gate can tell e.g. "injection
+        # tested, access-control not" instead of a single tested/untested bit.
+        try:
+            target.attempted_attack_types = sorted(
+                set(candidate_types or [])
+                | {getattr(a, "attack_type", "") for a in agents if getattr(a, "attack_type", "")}
+            )
+        except Exception as exc:
+            logger.debug("recording attempted attack types failed",
+                         url=target.url, error=str(exc))
+
         if not agents:
             _activity_log.appendleft({
                 "ts": time.time(),

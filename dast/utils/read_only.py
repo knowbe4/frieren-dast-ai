@@ -51,6 +51,59 @@ def is_safe_method(method: str) -> bool:
     return (method or "").upper() in SAFE_METHODS
 
 
+_GRAPHQL_PATH = re.compile(r"/graphql\b", re.IGNORECASE)
+_GRAPHQL_MUTATING = re.compile(r"\b(?:mutation|subscription)\b", re.IGNORECASE)
+_GRAPHQL_QUERY_OP = re.compile(r"^\s*query\b", re.IGNORECASE)
+
+
+def _extract_graphql_query(body: Any) -> str:
+    """Pull the GraphQL document string out of a request body (dict or JSON str)."""
+    import json
+
+    candidate = body
+    if isinstance(candidate, (bytes, bytearray)):
+        try:
+            candidate = candidate.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if text.startswith("{"):
+            try:
+                candidate = json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text  # treat the raw string as the query document
+        else:
+            return text
+    if isinstance(candidate, dict):
+        query = candidate.get("query")
+        return query if isinstance(query, str) else ""
+    return ""
+
+
+def is_read_only_graphql(url: str, body: Any) -> bool:
+    """True when a POST to *url* with *body* is a non-mutating GraphQL request.
+
+    GraphQL (even introspection) must use POST, so a blanket GET/HEAD/OPTIONS
+    allowlist blocks read-only recon. This carve-out permits introspection and
+    ``query`` operations while still refusing ``mutation``/``subscription``.
+    Fails closed: anything not positively classified as a read-only query is
+    rejected.
+    """
+    if not url or not _GRAPHQL_PATH.search(url):
+        return False
+    query = _extract_graphql_query(body)
+    if not query:
+        return False
+    stripped = query.strip()
+    if _GRAPHQL_MUTATING.search(stripped):
+        return False
+    lowered = stripped.lower()
+    if "__schema" in lowered or "__type" in lowered:
+        return True
+    return stripped.startswith("{") or bool(_GRAPHQL_QUERY_OP.match(stripped))
+
+
 def is_action_label(label: str) -> bool:
     """True when a clickable element's visible text/aria-label names an action."""
     return bool(_ACTION_LABEL.search(label or ""))

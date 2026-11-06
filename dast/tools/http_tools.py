@@ -18,6 +18,7 @@ from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils import read_only
 from dast.utils.logger import get_logger
+from dast.utils.placeholders import looks_like_placeholder
 
 logger = get_logger(__name__)
 
@@ -140,6 +141,18 @@ def _destructive_reason(text: str) -> Dict[str, str] | None:
     return None
 
 
+def _first_placeholder_field(url: str, headers: Dict[str, str], body: str) -> str | None:
+    """Name of the first field carrying a model placeholder (e.g. ``<UNKNOWN>``), else None."""
+    if looks_like_placeholder(url):
+        return "url"
+    for name, value in headers.items():
+        if looks_like_placeholder(value):
+            return f"header '{name}'"
+    if looks_like_placeholder(body):
+        return "body"
+    return None
+
+
 async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -148,8 +161,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
         return {"ok": False, "error": f"unsupported method: {method}"}
     if getattr(ctx, "read_only", False) and not read_only.is_safe_method(method):
-        return {"ok": False, "read_only": True,
-                "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS are sent"}
+        # Carve-out: GraphQL (incl. introspection) must POST, but a read-only
+        # query/introspection changes nothing — allow it; still block mutations.
+        if not (method == "POST" and read_only.is_read_only_graphql(url, args.get("body") or "")):
+            return {"ok": False, "read_only": True,
+                    "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS "
+                             "(and read-only GraphQL POST) are sent"}
 
     # Scope gate BEFORE anything is sent. Out-of-scope is denied by default, but an
     # MCP caller (no in-process store) can ask the dashboard operator for an
@@ -176,15 +193,48 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             try:
                 jar_cookies = ctx.store.get_cookies_for_host(_host) or []
                 if jar_cookies:
-                    cookie_header = "; ".join(
-                        f"{c['name']}={c.get('value', '')}"
-                        for c in jar_cookies if c.get("name")
-                    )
-                    if cookie_header:
-                        headers["Cookie"] = cookie_header
+                    from dast.proxy.auth_headers import apply_cookies
+                    # Inject jar cookies AND the CSRF/XHR headers a cookie-authed
+                    # SPA (Rails, etc.) requires. The copilot engine path does this
+                    # via _apply_session_auth; the raw tool path must match it or
+                    # every Rails /graphql POST 403s.
+                    apply_cookies(headers, jar_cookies, refresh=True)
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
+
+    # Auto-attach a sub-app Bearer when the caller supplied no Authorization and one
+    # is known for this (host, path). Mirrors the copilot engine's _apply_session_auth
+    # so a direct / MCP caller can reach a Bearer-authed sub-app (modstore/ccm) instead
+    # of a 403. The token is attached server-side and never returned to the caller.
+    # (In a separate `dast-ai mcp` process ctx.store is None -> this no-ops; use
+    # browser_fetch there, which carries the SPA's Bearer + sub-session.)
+    if not any(k.lower() == "authorization" for k in headers):
+        from dast.ai.copilot.session import scan_history_bearer, _subapp_for_path
+        parsed = urlparse(url)
+        bearer_host = parsed.hostname or ""
+        bearer_path = parsed.path or "/"
+        rec = None
+        session = getattr(ctx, "_session", None)
+        try:
+            if session is not None and hasattr(session, "_select_bearer"):
+                if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
+                    session._capture_bearer_tokens(ctx.store, bearer_host)
+                rec = session._select_bearer(bearer_host, bearer_path)
+            elif ctx.store is not None:
+                rec = scan_history_bearer(ctx.store, bearer_host, bearer_path)
+        except Exception as exc:
+            logger.debug("send_request: bearer resolution failed",
+                         host=bearer_host, error=str(exc))
+            rec = None
+        if isinstance(rec, dict) and rec.get("token"):
+            import time as _time
+            exp = rec.get("exp")
+            if exp is None or exp > _time.time():
+                headers["Authorization"] = f"Bearer {rec['token']}"
+                logger.debug("send_request: attached cached Bearer", host=bearer_host,
+                             app=_subapp_for_path(bearer_path),
+                             ttl=int(exp - _time.time()) if exp else -1)
 
     body = args.get("body") or ""
 
@@ -194,6 +244,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     source_label = getattr(ctx, "source_label", None)
     if source_label and "x-dast-source" not in {k.lower() for k in headers}:
         headers["x-dast-source"] = str(source_label)
+
+    # Placeholder gate: refuse model stand-in values (e.g. "<UNKNOWN>", "<jwt>") in
+    # the url, a header, or the body before sending — they are noise and can lock
+    # accounts. The real value must come from history/an earlier response.
+    placeholder_field = _first_placeholder_field(url, headers, body)
+    if placeholder_field:
+        logger.warning("send_request refused placeholder value", field=placeholder_field)
+        return {"ok": False, "error": (
+            f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
+            "have the real value — read it from get_history or an earlier response, or ask the "
+            "operator; do not invent one.")}
 
     # Payload-safety gate: refuse destructive URL/body, surfacing the safe variant.
     for where, text in (("url", url), ("body", body)):
@@ -376,6 +437,11 @@ register(Tool(
         "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
+        "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
+        "headers from the jar, and a cached sub-app Bearer (modstore/ccm) selected by request "
+        "path when one is known. If a sub-app returns 403 for a missing Bearer and none is "
+        "cached, drive it with browser_fetch instead (it runs in the SPA context and carries the "
+        "Bearer + sub-session).\n"
         "Use this when: reproducing or probing a specific endpoint, testing whether a "
         "payload reflects/changes behavior, replaying a captured request with a tweak, or "
         "delivering an SSRF/XXE payload that embeds an OOB URL from oob_generate.\n"
@@ -395,7 +461,7 @@ _GET_BEARER_TOKEN_SCHEMA: Dict[str, Any] = {
     "properties": {
         "host": {
             "type": "string",
-            "description": "Target API host (e.g. 'api.phisher.knowbe4.com'). "
+            "description": "Target API host (e.g. 'api.internal.example.com'). "
                            "If omitted, returns tokens for all hosts.",
         },
     },

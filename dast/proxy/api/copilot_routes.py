@@ -37,6 +37,30 @@ logger = get_logger(__name__)
 
 _MAX_MESSAGE_CHARS = 20_000
 
+# Known body keys for the autonomous + validate-batch endpoints. An unrecognized
+# key (e.g. a mistyped "profile" instead of "profile_slug") must fail loudly, not
+# be silently dropped — a dropped profile_slug launches an UNAUTHENTICATED run.
+_AUTONOMOUS_KEYS = frozenset({
+    "objective", "focus_hosts", "budget", "profile_slug", "profile",
+    "auto_ai_mode", "session_safe", "read_only", "mode", "submit_forms",
+    "validation_only",
+})
+_VALIDATE_BATCH_KEYS = frozenset({"items", "max_concurrency"})
+_VALIDATE_ITEM_KEYS = frozenset({
+    "objective", "focus_hosts", "profile_slug", "profile", "budget",
+})
+
+
+def _unknown_keys(body: dict, allowed: frozenset) -> list:
+    """Return body keys not in *allowed*, sorted (empty when all are known)."""
+    return sorted(key for key in body if key not in allowed)
+
+
+def _resolve_profile_slug(body: dict) -> Optional[str]:
+    """Read profile_slug, accepting 'profile' as an alias (common misspelling)."""
+    value = (body.get("profile_slug") or body.get("profile") or "").strip()
+    return value or None
+
 
 def _collect_jar_cookies(ctx: DashboardContext, pause: dict) -> dict:
     """Collect the proxy jar's session cookies for a paused auth wall's host.
@@ -139,7 +163,20 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         with strict/single-concurrent session management. read_only (production
         targets) sends only GET/HEAD/OPTIONS, refuses probe/attack tools and keeps
         the crawler off action buttons; it also pauses AI mode for the run.
+        validation_only (default false) focuses the run on confirming ONE finding:
+        it forces bounded mode and skips all breadth (no auto GraphQL sweep, no
+        evidence auto-route, no exhaustive recon) so only the finding's endpoint is
+        tested.
         """
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        unknown = _unknown_keys(body, _AUTONOMOUS_KEYS)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unexpected field(s): {', '.join(unknown)} "
+                          f"(use 'profile_slug' for the login profile)"},
+                status_code=400,
+            )
         objective = (body.get("objective") or "").strip()
         if not objective:
             return JSONResponse({"error": "objective required"}, status_code=400)
@@ -154,7 +191,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         budget = body.get("budget")
         if budget is not None and not isinstance(budget, dict):
             return JSONResponse({"error": "budget must be an object"}, status_code=400)
-        profile_slug = (body.get("profile_slug") or "").strip() or None
+        profile_slug = _resolve_profile_slug(body)
         auto_ai_mode = bool(body.get("auto_ai_mode", True))
         session_safe = bool(body.get("session_safe", False))
         read_only = bool(body.get("read_only", False))
@@ -162,17 +199,65 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if mode not in ("bounded", "complete"):
             return JSONResponse({"error": "mode must be 'bounded' or 'complete'"}, status_code=400)
         submit_forms = bool(body.get("submit_forms", False))
+        validation_only = bool(body.get("validation_only", False))
         try:
             sid = service.run_autonomous(
                 objective, focus_hosts=focus_hosts, profile_slug=profile_slug,
                 budget=budget, auto_ai_mode=auto_ai_mode, session_safe=session_safe,
                 read_only=read_only, mode=mode, submit_forms=submit_forms,
+                validation_only=validation_only,
             )
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         except RuntimeError:
             return JSONResponse({"error": "could not start autonomous run"}, status_code=503)
         return {"session_id": sid, "status": "running"}
+
+    @router.post("/api/copilot/validate-batch")
+    async def validate_batch(body: dict):
+        """Launch one focused finding-validation run per item, in parallel.
+
+        Body: {items: [{objective (required), focus_hosts?: [str], profile_slug?: str,
+        budget?: {...}}], max_concurrency?: int}. Every run is forced validation_only +
+        session_safe so they test only their finding and can run concurrently with
+        per-session browser/cookie isolation. Returns the launched session ids + errors.
+        """
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        unknown = _unknown_keys(body, _VALIDATE_BATCH_KEYS)
+        if unknown:
+            return JSONResponse(
+                {"error": f"unexpected field(s): {', '.join(unknown)}"}, status_code=400)
+        items = body.get("items")
+        if not isinstance(items, list) or not items:
+            return JSONResponse({"error": "items (non-empty list) required"}, status_code=400)
+        # Validate each item's keys and normalize the 'profile' alias so a mistyped
+        # key fails loudly instead of launching an unauthenticated validation run.
+        normalized_items = []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                return JSONResponse(
+                    {"error": f"items[{index}] must be an object"}, status_code=400)
+            item_unknown = _unknown_keys(item, _VALIDATE_ITEM_KEYS)
+            if item_unknown:
+                return JSONResponse(
+                    {"error": f"items[{index}] unexpected field(s): {', '.join(item_unknown)} "
+                              f"(use 'profile_slug' for the login profile)"},
+                    status_code=400,
+                )
+            normalized = {k: v for k, v in item.items() if k != "profile"}
+            normalized["profile_slug"] = _resolve_profile_slug(item)
+            normalized_items.append(normalized)
+        items = normalized_items
+        try:
+            max_concurrency = int(body.get("max_concurrency", 3))
+        except (TypeError, ValueError):
+            max_concurrency = 3
+        try:
+            result = service.run_validation_batch(items, max_concurrency=max_concurrency)
+        except RuntimeError:
+            return JSONResponse({"error": "could not start validation batch"}, status_code=503)
+        return result
 
     @router.post("/api/copilot/autonomous/{sid}/stop")
     async def autonomous_stop(sid: str):

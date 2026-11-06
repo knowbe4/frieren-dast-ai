@@ -37,6 +37,16 @@ _SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
 _MAX_LLM_STEPS = 8
 
 
+def _journal(url: str, outcome: str, **fields: str) -> None:
+    """Record a login outcome to the per-host journal (~/.dast-ai). Best-effort: a
+    journal error must never break a login."""
+    try:
+        from dast.session import login_journal
+        login_journal.record(url, outcome, **fields)
+    except Exception as exc:  # noqa: BLE001 — journaling is non-critical
+        logger.debug("adaptive_login: journal write failed", error=str(exc)[:120])
+
+
 @dataclass
 class LoginCascadeResult:
     """Outcome of an adaptive login attempt."""
@@ -93,6 +103,8 @@ async def adaptive_login(
     success_url_suffix: Optional[str] = None,
     max_llm_steps: int = _MAX_LLM_STEPS,
     in_scope: Optional[Callable[[str], bool]] = None,
+    store: Optional[Any] = None,
+    session: Optional[Any] = None,
 ) -> LoginCascadeResult:
     """Log in, trying the deterministic engine first and the LLM only on failure.
 
@@ -105,19 +117,52 @@ async def adaptive_login(
     except Exception as exc:
         logger.warning("adaptive_login: deterministic engine raised",
                        error=str(exc)[:200])
-        det = {"logged_in": False, "url": url}
+        # Preserve the failure reason (do NOT wipe it to {}): a raised form-fill
+        # (e.g. a disabled submit button that never becomes actionable) must still
+        # fall through to the SPA JSON-API strategy below, not be mistaken for a
+        # reachable, succeeding form.
+        det = {"logged_in": False, "url": url, "error": f"form login raised: {str(exc)[:200]}"}
 
     det_url = str(det.get("url") or url)
     if det.get("logged_in") and _looks_authenticated(det_url, success_url_suffix):
         logger.info("adaptive_login: solved by deterministic engine", url=det_url)
+        _journal(url, "success", strategy="deterministic", success_url=det_url)
         return LoginCascadeResult(ok=True, engine="deterministic", url=det_url)
 
     # MFA/CAPTCHA are human-in-the-loop walls, not selector problems - do not burn
     # LLM steps trying to brute them. Surface the signal and stop.
     if det.get("mfa_required"):
         logger.info("adaptive_login: MFA required, not escalating to LLM", url=det_url)
+        _journal(url, "error", strategy="deterministic", reason="mfa_required")
         return LoginCascadeResult(ok=False, engine="deterministic", url=det_url,
                                   error="mfa_required")
+
+    # --- Phase 1.5: SPA JSON-API login (DOM-independent) --------------------
+    # Fire when the deterministic form-fill could not REACH a usable form — the form is
+    # in an iframe/closed shadow root ("no email/password/submit field"), OR the submit
+    # button is disabled/non-actionable (now surfaced as "no submit button actionable"),
+    # OR the form-fill RAISED (preserved as "form login raised"). In those cases the app
+    # may still expose a JSON auth endpoint we can POST to directly — what reliably works
+    # for these SPAs, and the ONLY path that works under read_only (api_post bypasses the
+    # route guard that aborts a form-submit POST). A form that WAS reached but needs an
+    # extra step (consent/2FA) is deliberately left to the LLM (it does not match below),
+    # so a blind JSON POST is not fired at every ordinary form.
+    _err = str(det.get("error", "")).lower()
+    _form_unreachable = (
+        any(s in _err for s in ("no email field", "no password field", "no submit button"))
+        or "form login raised" in _err
+    )
+    if _form_unreachable:
+        try:
+            from dast.browser.login_strategies import spa_api
+            spa = await spa_api.attempt(browser, url, email, password,
+                                        store=store, session=session, in_scope=in_scope)
+            if spa.get("ok") and spa.get("logged_in"):
+                logger.info("adaptive_login: solved by SPA JSON-API strategy",
+                            endpoint=spa.get("endpoint"))
+                return LoginCascadeResult(ok=True, engine="spa_api", url=spa.get("url") or url)
+        except Exception as exc:
+            logger.warning("adaptive_login: spa_api strategy raised", error=str(exc)[:200])
 
     # --- Phase 2: LLM-driven fallback over the browser primitives -----------
     decider = decide or make_llm_decider()
@@ -135,6 +180,7 @@ async def adaptive_login(
         if _looks_authenticated(current, success_url_suffix) and current != url:
             logger.info("adaptive_login: solved by LLM fallback",
                         url=current, steps=step)
+            _journal(url, "success", strategy="llm", success_url=current)
             return LoginCascadeResult(ok=True, engine="llm", url=current,
                                       llm_steps=step, actions=history)
         try:
@@ -165,6 +211,10 @@ async def adaptive_login(
     engine = "llm" if history else "none"
     logger.info("adaptive_login: finished", ok=authenticated, engine=engine,
                 url=final, llm_steps=len(history))
+    if authenticated:
+        _journal(url, "success", strategy=engine, success_url=final)
+    else:
+        _journal(url, "error", strategy=engine, reason="login not completed")
     return LoginCascadeResult(
         ok=authenticated, engine=engine, url=final,
         llm_steps=len(history), actions=history,

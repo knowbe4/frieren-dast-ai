@@ -80,6 +80,37 @@ class AiUnavailableError(RuntimeError):
     """Raised when AWS credentials are expired and cannot be refreshed."""
 
 
+class AiContentBlockedError(RuntimeError):
+    """Raised when an upstream safety classifier refused the request content.
+
+    This is content-based, not model-based: every model in the fallback chain
+    refuses identical content, so the chain must not be burned, and the caller
+    should surface a distinct "blocked by safety classifier" message rather than
+    a generic "repeated errors" bail.
+    """
+
+
+# Markers in a provider error body that indicate an upstream safety/content
+# classifier refusal (as opposed to a malformed-request 400). Kept narrow so a
+# genuine bad-request 400 still surfaces normally. The gateway's policy layer
+# rejects security-testing content with HTTP 400 + "upstream rejected the request"
+# (observed live) — that distinctive phrase is the primary signal; the rest are
+# defensive for other providers/wordings.
+_SAFETY_BLOCK_MARKERS = (
+    "upstream rejected",
+    "safety", "content filtering", "content policy", "content_policy",
+    "blocked by", "usage policy", "flagged", "output blocked", "input blocked",
+)
+
+
+def _is_safety_classifier_block(status: Optional[int], text: str) -> bool:
+    """True when a provider 4xx looks like an upstream safety-classifier refusal."""
+    if status not in (400, 403):
+        return False
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _SAFETY_BLOCK_MARKERS)
+
+
 def is_ai_available() -> bool:
     return not _ai_unavailable
 
@@ -732,6 +763,14 @@ def _invoke_external(
             # worth retrying with backoff, matching the Bedrock throttling path.
             # Other 4xx and config errors are permanent — surface immediately.
             status = getattr(exc, "status_code", None)
+            # A safety-classifier refusal (content-based 4xx) is neither transient
+            # nor model-specific: surface a distinct error so the caller does not
+            # retry it, burn the fallback chain, or report a generic failure.
+            if _is_safety_classifier_block(status, str(exc)):
+                logger.warning("AI request blocked by upstream safety classifier",
+                               provider=provider, status=status)
+                raise AiContentBlockedError(
+                    "the upstream safety classifier blocked this request") from exc
             transient = status == 429 or (status is not None and 500 <= status < 600)
             if transient and attempt < 2:
                 logger.warning("Provider transient error, backing off",
@@ -825,6 +864,11 @@ def _invoke_raw(
             # the same way, so do not burn the rest of the chain on it.
             raise
         except Exception as exc:
+            # A safety-classifier refusal (AiContentBlockedError) is NOT short-
+            # circuited: a different model in the chain may not be refused (an
+            # operator may configure e.g. a stricter model first and a permissive
+            # one as the last fallback), so try the next candidate. Only when the
+            # whole chain is exhausted does the block surface (as safety_blocked).
             last_exc = exc
             if index < len(candidates) - 1:
                 logger.warning(
@@ -954,6 +998,20 @@ def _require_fields(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[
 _JSON_CONTAINER_TYPES: Dict[str, type] = {"array": list, "object": dict}
 
 
+def _container_type(schema_type: Any) -> Optional[type]:
+    """Resolve the Python container type for a JSON Schema ``type``.
+
+    ``type`` may be a plain string (``"array"``) or a union list
+    (``["object", "null"]``); return the matching container type or ``None``.
+    """
+    candidates = schema_type if isinstance(schema_type, list) else [schema_type]
+    for candidate in candidates:
+        container = _JSON_CONTAINER_TYPES.get(candidate)
+        if container is not None:
+            return container
+    return None
+
+
 def _decode_stringified_containers(structured: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
     """Decode top-level array/object properties the model sent as a JSON string.
 
@@ -964,7 +1022,7 @@ def _decode_stringified_containers(structured: Dict[str, Any], schema: Dict[str,
     """
     for key, property_schema in (schema.get("properties") or {}).items():
         value = structured.get(key)
-        expected_type = _JSON_CONTAINER_TYPES.get((property_schema or {}).get("type", ""))
+        expected_type = _container_type((property_schema or {}).get("type", ""))
         if expected_type is None or not isinstance(value, str):
             continue
         try:

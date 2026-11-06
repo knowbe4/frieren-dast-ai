@@ -99,7 +99,9 @@ def _build_session_headers(
     session: "NamedSession",
 ) -> Dict[str, str]:
     """Replace auth headers and cookie header with the named session's credentials."""
-    _AUTH_KEYS = {"authorization", "x-auth-token", "x-api-key", "cookie"}
+    # Drop the owner/attacker CSRF token too: a stale token from the original request
+    # would 403 the replayed probe, so we refresh it from THIS identity's own cookies below.
+    _AUTH_KEYS = {"authorization", "x-auth-token", "x-api-key", "cookie", "x-csrf-token"}
     headers = {k: v for k, v in original_headers.items() if k.lower() not in _AUTH_KEYS}
     headers.update(session.auth_headers)
     if session.cookies:
@@ -108,6 +110,13 @@ def _build_session_headers(
         )
         if cookie_str:
             headers["cookie"] = cookie_str
+        # Mirror this identity's CSRF cookie into X-CSRF-Token so cross-tenant WRITE
+        # probes are not blanket-403'd by a CSRF-protected SPA (shared injector).
+        try:
+            from dast.proxy.auth_headers import inject_csrf
+            inject_csrf(headers, session.cookies, refresh=True)
+        except Exception:
+            pass
     return headers
 
 

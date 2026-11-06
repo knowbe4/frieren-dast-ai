@@ -89,18 +89,25 @@ class _StubService:
 
     def __init__(self) -> None:
         self.started = None
+        self.batch = None
         self.controls: list = []
         self.control_result = True
         self.sessions: dict = {}
 
+    def run_validation_batch(self, items, max_concurrency=3):
+        self.batch = {"items": items, "max_concurrency": max_concurrency}
+        return {"sessions": [], "errors": []}
+
     def run_autonomous(self, objective, focus_hosts=None, profile_slug=None,
                        budget=None, auto_ai_mode=True, session_safe=False,
-                       read_only=False, mode="bounded", submit_forms=False) -> str:
+                       read_only=False, mode="bounded", submit_forms=False,
+                       validation_only=False) -> str:
         self.started = {
             "objective": objective, "focus_hosts": focus_hosts,
             "profile_slug": profile_slug, "budget": budget, "auto_ai_mode": auto_ai_mode,
             "session_safe": session_safe, "read_only": read_only,
             "mode": mode, "submit_forms": submit_forms,
+            "validation_only": validation_only,
         }
         return "sid-auto"
 
@@ -152,6 +159,7 @@ def test_autonomous_start_passes_args(auto_client):
         "read_only": True,
         "mode": "complete",
         "submit_forms": True,
+        "validation_only": True,
         "budget": {"max_tool_calls": 50},
     })
     assert resp.status_code == 200
@@ -165,6 +173,7 @@ def test_autonomous_start_passes_args(auto_client):
     assert started["read_only"] is True
     assert started["mode"] == "complete"
     assert started["submit_forms"] is True
+    assert started["validation_only"] is True
     assert started["budget"] == {"max_tool_calls": 50}
 
 
@@ -173,6 +182,7 @@ def test_autonomous_start_defaults_to_bounded_mode(auto_client):
     assert resp.status_code == 200
     assert auto_client.service.started["mode"] == "bounded"
     assert auto_client.service.started["submit_forms"] is False
+    assert auto_client.service.started["validation_only"] is False
 
 
 def test_autonomous_start_rejects_bad_mode(auto_client):
@@ -191,6 +201,46 @@ def test_autonomous_start_rejects_bad_types(auto_client):
                             json={"objective": "x", "focus_hosts": "nope"}).status_code == 400
     assert auto_client.post("/api/copilot/autonomous",
                             json={"objective": "x", "budget": "nope"}).status_code == 400
+
+
+def test_autonomous_start_rejects_unknown_field(auto_client):
+    # A mistyped key (e.g. "profilee") must fail loudly, not be dropped silently —
+    # a dropped profile_slug launches an UNAUTHENTICATED run.
+    resp = auto_client.post("/api/copilot/autonomous",
+                            json={"objective": "x", "profilee": "admin"})
+    assert resp.status_code == 400
+    assert "unexpected field" in resp.json()["error"]
+    assert "profilee" in resp.json()["error"]
+
+
+def test_autonomous_start_accepts_profile_alias(auto_client):
+    resp = auto_client.post("/api/copilot/autonomous",
+                            json={"objective": "x", "profile": "admin"})
+    assert resp.status_code == 200
+    assert auto_client.service.started["profile_slug"] == "admin"
+
+
+def test_validate_batch_rejects_unknown_top_level_field(auto_client):
+    resp = auto_client.post("/api/copilot/validate-batch",
+                            json={"items": [{"objective": "x"}], "bogus": 1})
+    assert resp.status_code == 400
+    assert "unexpected field" in resp.json()["error"]
+
+
+def test_validate_batch_rejects_unknown_item_field(auto_client):
+    resp = auto_client.post("/api/copilot/validate-batch",
+                            json={"items": [{"objective": "x", "profil": "admin"}]})
+    assert resp.status_code == 400
+    assert "items[0]" in resp.json()["error"]
+
+
+def test_validate_batch_normalizes_profile_alias(auto_client):
+    resp = auto_client.post("/api/copilot/validate-batch",
+                            json={"items": [{"objective": "x", "profile": "admin"}]})
+    assert resp.status_code == 200
+    item = auto_client.service.batch["items"][0]
+    assert item["profile_slug"] == "admin"
+    assert "profile" not in item
 
 
 @pytest.mark.parametrize("action", ["stop", "pause", "resume"])

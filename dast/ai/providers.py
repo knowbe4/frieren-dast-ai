@@ -280,7 +280,10 @@ def invoke_gateway(
         transport = gateway_auth.get_shared_transport(base_url=base_url)
         return transport.send(payload)
     except gateway_auth.GatewayError as exc:
-        raise ProviderError(f"Gateway: {exc}") from exc
+        # Preserve the HTTP status (as the other providers do) so a safety-classifier
+        # refusal (a content-based 4xx) is distinguishable downstream from a
+        # transient/transport failure.
+        raise ProviderError(f"Gateway: {exc}", status_code=exc.status_code) from exc
 
 
 # ── OpenAI (and OpenAI-compatible) chat completions ──────────────────────────

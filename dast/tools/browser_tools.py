@@ -284,6 +284,30 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     # conflict with context cookies and cause "Invalid token" / "Access denied".
     fetch_headers = {k: v for k, v in headers.items()
                      if k.lower() not in ("cookie", "authorization")}
+
+    # Ride the SPA's live Bearer. An SPA like PhishER injects a short-lived
+    # Authorization from in-memory JS state onto its OWN native XHR; page.request.fetch
+    # does not carry that, so a tool fetch 401s while the app's native calls 200. The
+    # MITM proxy captured that Bearer from the SPA's own requests — attach the freshest
+    # non-expired one for this host (only when the caller did not supply Authorization
+    # and the app actually uses Bearer auth, i.e. a token was captured).
+    if not any(k.lower() == "authorization" for k in headers) and getattr(ctx, "store", None):
+        try:
+            import time as _time
+            from urllib.parse import urlparse as _urlparse
+            from dast.ai.copilot.session import scan_history_bearer
+            _parsed = _urlparse(url)
+            rec = scan_history_bearer(ctx.store, _parsed.hostname or "", _parsed.path or "/")
+            if rec and rec.get("token"):
+                exp = rec.get("exp")
+                if exp is None or exp > _time.time():
+                    fetch_headers["Authorization"] = f"Bearer {rec['token']}"
+                    headers["Authorization"] = f"Bearer {rec['token']}"  # in-page fallback too
+                    logger.debug("browser_fetch: attached captured Bearer",
+                                 host=_parsed.hostname)
+        except Exception as exc:
+            logger.debug("browser_fetch: bearer attach failed", error=str(exc)[:120])
+
     primary_error = ""
     try:
         fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}

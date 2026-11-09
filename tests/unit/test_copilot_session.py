@@ -838,3 +838,78 @@ async def test_watchdog_kills_model_repeatedly_pasting_session_headers_across_en
 
     assert reply.blocked_reason == "stuck_loop"
     assert "cookie" in reply.message.lower()
+
+
+# ── _ensure_fresh_bearer: wait for the SPA to mint a Bearer after navigate-commit ──
+
+def _unexpired_jwt() -> str:
+    """A structurally valid JWT with NO exp claim (so _decode_jwt_exp -> None -> treated
+    fresh). Built at runtime so no eyJ... literal sits in the source (gitleaks)."""
+    import base64 as _b64, json as _json
+
+    def seg(obj):
+        return _b64.urlsafe_b64encode(_json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{seg({'alg': 'HS512'})}.{seg({'sub': '1', 'account_id': 999})}.{seg('sig1234567890')}"
+
+
+@dataclass
+class _BearerEntry:
+    host: str
+    request_headers: Dict[str, str]
+    path: str = "/v1/dashboard"
+    source: str = "proxy"
+    id: str = "e1"
+
+
+class _DelayedStore:
+    """all_entries() returns the Bearer entry only from the Nth call onward — simulating
+    the SPA's authenticated call landing shortly after navigate resolved on 'commit'."""
+
+    def __init__(self, appears_on_call: int, entry):
+        self._n = 0
+        self._appears = appears_on_call
+        self._entry = entry
+
+    def all_entries(self):
+        self._n += 1
+        return [self._entry] if self._n >= self._appears else []
+
+
+class _BrowserOnHost:
+    class _Page:
+        url = "https://phisher.example/"
+    page = _Page()
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_bearer_waits_for_spa_token():
+    session = CopilotSession("s-bearer")
+    entry = _BearerEntry(host="api.phisher.example",
+                         request_headers={"Authorization": f"Bearer {_unexpired_jwt()}"})
+    store = _DelayedStore(appears_on_call=2, entry=entry)  # absent on the fast path, appears after a poll
+    rec = await session._ensure_fresh_bearer(
+        store, "api.phisher.example", "/queries_api/v2/x",
+        browser=_BrowserOnHost(), timeout_s=3.0)
+    assert rec and rec.get("token")
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_bearer_no_wait_when_browser_elsewhere():
+    import time as _time
+    session = CopilotSession("s-bearer2")
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    class _Elsewhere:
+        class _Page:
+            url = "https://unrelated.example.com/"
+        page = _Page()
+
+    t0 = _time.monotonic()
+    rec = await session._ensure_fresh_bearer(
+        _Empty(), "api.phisher.example", "/queries_api/v2/x",
+        browser=_Elsewhere(), timeout_s=5.0)
+    assert rec is None
+    assert _time.monotonic() - t0 < 1.0   # did NOT burn the timeout — browser not on this host

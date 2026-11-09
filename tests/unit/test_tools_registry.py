@@ -339,6 +339,25 @@ async def test_send_request_overrides_caller_authorization(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_uses_ensure_fresh_bearer(monkeypatch):
+    # send_request prefers the session's _ensure_fresh_bearer (waits for the live SPA to mint
+    # a token when none is cached yet) over the plain capture+select pair, and attaches it.
+    class _Session:
+        async def _ensure_fresh_bearer(self, store, host, path, browser=None):
+            return {"token": "FRESH", "exp": None}
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.phisher.example/queries_api/v2/accounts/1/mailservers/x",
+        "method": "GET"})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer FRESH"
+    assert "FRESH" not in str(result)   # token never surfaced in the tool result
+
+
+@pytest.mark.asyncio
 async def test_send_request_surfaces_all_set_cookies(monkeypatch):
     # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced
     # as a list, not collapsed by dict(resp.headers). A cookie set on a redirect hop

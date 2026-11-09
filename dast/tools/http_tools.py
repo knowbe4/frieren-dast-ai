@@ -251,7 +251,14 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         rec = None
         session = getattr(ctx, "_session", None)
         try:
-            if session is not None and hasattr(session, "_select_bearer"):
+            if (session is not None and ctx.store is not None
+                    and hasattr(session, "_ensure_fresh_bearer")):
+                # Wait briefly for the live SPA to mint a Bearer when none is cached yet
+                # (navigate resolves on "commit", before the SPA's authenticated calls).
+                rec = await session._ensure_fresh_bearer(
+                    ctx.store, bearer_host, bearer_path,
+                    browser=getattr(ctx, "browser", None))
+            elif session is not None and hasattr(session, "_select_bearer"):
                 if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
                     session._capture_bearer_tokens(ctx.store, bearer_host)
                 rec = session._select_bearer(bearer_host, bearer_path)

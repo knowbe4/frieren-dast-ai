@@ -765,6 +765,65 @@ class CopilotSession:
                         source_entry=source_id[:20])
             break
 
+    @staticmethod
+    def _rec_is_fresh(rec: Optional[Dict[str, Any]]) -> bool:
+        """A Bearer record is usable when it has a token and is not past its exp."""
+        if not isinstance(rec, dict) or not rec.get("token"):
+            return False
+        import time as _time
+        exp = rec.get("exp")
+        return exp is None or exp > _time.time()
+
+    @staticmethod
+    def _browser_on_host(browser: Any, host: str) -> bool:
+        """True when the live agent browser is currently on *host*'s app (same
+        registrable domain), so waiting for the SPA to mint a Bearer is worthwhile."""
+        if browser is None or not host:
+            return False
+        try:
+            page = getattr(browser, "page", None)
+            current = (page.url if page else "") or ""
+        except Exception:
+            return False
+        from urllib.parse import urlparse
+        cur_host = (urlparse(current).hostname or "").lower()
+        if not cur_host:
+            return False
+        want = host.lower().split(".")
+        want_suffix = ".".join(want[-2:]) if len(want) >= 2 else host.lower()
+        return want_suffix in cur_host
+
+    async def _ensure_fresh_bearer(self, store: Any, host: str, path: str,
+                                   browser: Any = None,
+                                   timeout_s: float = 8.0) -> Optional[Dict[str, Any]]:
+        """Return a NON-expired Bearer record for (host, path), waiting briefly for the
+        live SPA to mint one when needed.
+
+        ``navigate`` resolves on ``commit`` (before the SPA makes its authenticated calls),
+        so right after entering a sub-app the proxy may not have captured a Bearer yet. When
+        the browser is on this host's app, poll history for up to ``timeout_s`` so the token
+        the SPA is about to emit is captured and attached — otherwise a tool request to the
+        sub-app 401s with the token sitting one network round-trip away."""
+        import asyncio
+        import time as _time
+        self._capture_bearer_tokens(store, host)
+        rec = self._select_bearer(host, path)
+        if self._rec_is_fresh(rec):
+            return rec
+        # Only wait when the SPA for this host is live — otherwise the host simply has no
+        # Bearer and waiting is pointless latency.
+        if not self._browser_on_host(browser, host):
+            return rec
+        deadline = _time.monotonic() + max(0.0, timeout_s)
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            self._capture_bearer_tokens(store, host)
+            rec = self._select_bearer(host, path)
+            if self._rec_is_fresh(rec):
+                logger.info("Fresh sub-app Bearer captured after wait", host=host)
+                return rec
+        return rec
+
     def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
         """Preload an authenticated session (e.g. from an activated login profile)
         so requests carry it from the first tool call and the auth-wall gate stays

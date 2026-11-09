@@ -233,6 +233,74 @@ async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_drops_non_secret_authorization(monkeypatch):
+    # The schema promises Authorization is ALWAYS stripped. A non-secret-looking garbage
+    # Authorization (a forged alg-confusion token / raw hash) must NOT survive to the wire —
+    # it otherwise blocks the auto-inject and hits the upstream (an AWS SigV4 parse error that
+    # reads like a finding). "Token abc123" is not flagged by the secret detector, so a clean
+    # outgoing request proves the UNCONDITIONAL drop, not strip_pasted_secret_headers.
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store/session -> nothing re-attached
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/x", "method": "GET",
+        "headers": {"Authorization": "Token abc123", "Accept": "application/json"},
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert "authorization" not in sent              # dropped, not forwarded upstream
+    assert sent.get("accept") == "application/json"  # non-auth header preserved
+    assert "note" in result and "authorization" in result["note"].lower()
+
+
+# ── record_finding deterministic FP guard ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_record_finding_refuses_success_claim_on_403():
+    # The copilot once recorded a CRITICAL "alg:none Accepted" whose evidence said 403.
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "record_finding", {
+        "title": "JWT Algorithm Confusion — alg:none Accepted", "severity": "critical",
+        "url": "https://api.acme-corp.com/x",
+        "evidence": "Server accepted unsigned token (alg:none). Response: 403 (176 chars)",
+    })
+    assert result["ok"] is False
+    assert "rejection is not acceptance" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_record_finding_refuses_infra_sigv4_error():
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Auth bypass", "severity": "high", "url": "https://api.acme-corp.com/x",
+        "evidence": ('Response: {"message":"Invalid key=value pair (missing equal-sign) in '
+                     'Authorization header (hashed with SHA-256 and encoded with Base64)"}'),
+    })
+    assert result["ok"] is False
+    assert "infrastructure error" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_record_finding_records_clean_finding():
+    class _Store:
+        def __init__(self): self.recorded = None
+        def record_manual_finding(self, finding, url, method):
+            self.recorded = (finding, url, method)
+            return "entry-1"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Cross-tenant record disclosure", "severity": "high",
+        "url": "https://api.acme-corp.com/users/42",
+        "evidence": "200 OK — returned another tenant's user record {id: 42, account_id: 999}",
+        "attack_type": "idor",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "entry-1"
+    assert store.recorded is not None
+
+
+@pytest.mark.asyncio
 async def test_send_request_attaches_bearer_from_history(monkeypatch):
     # No copilot session attached: resolve the Bearer from proxy history.
     class _Store:
@@ -250,13 +318,15 @@ async def test_send_request_attaches_bearer_from_history(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_request_preserves_caller_authorization(monkeypatch):
-    # A caller-supplied Authorization is never overridden (and resolution is skipped).
+async def test_send_request_overrides_caller_authorization(monkeypatch):
+    # A caller-supplied Authorization is ALWAYS dropped (schema contract: auth is auto-injected,
+    # never caller-set) and the session's own Bearer is resolved and attached instead. Previously
+    # a non-secret caller token was honored, which let a forged alg-confusion header reach the
+    # upstream and read like a finding (AWS SigV4 parse error).
     class _Session:
-        def _capture_bearer_tokens(self, store, host):
-            raise AssertionError("must not resolve when the caller set Authorization")
+        def _capture_bearer_tokens(self, store, host): pass
         def _select_bearer(self, host, path):
-            raise AssertionError("must not resolve when the caller set Authorization")
+            return {"token": "MOD", "exp": None}
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
     ctx = ToolContext(settings=_Scope(True), store=object())
@@ -265,7 +335,7 @@ async def test_send_request_preserves_caller_authorization(monkeypatch):
         "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
         "body": "{}", "headers": {"Authorization": "Bearer CALLER"}})
     assert result["ok"] is True
-    assert _CaptureClient.captured.get("Authorization") == "Bearer CALLER"
+    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"  # caller's ignored
 
 
 @pytest.mark.asyncio

@@ -182,6 +182,19 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
 
     headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
 
+    # Placeholder gate: refuse model stand-in values (e.g. "<UNKNOWN>", "<jwt>") in the url,
+    # a header, or the body — they are noise and can lock accounts. Run this BEFORE the auth
+    # strip below so a placeholder Authorization is refused with explicit guidance, not
+    # silently dropped by the always-strip step. The real value must come from
+    # history/an earlier response.
+    placeholder_field = _first_placeholder_field(url, headers, args.get("body") or "")
+    if placeholder_field:
+        logger.warning("send_request refused placeholder value", field=placeholder_field)
+        return {"ok": False, "error": (
+            f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
+            "have the real value — read it from get_history or an earlier response, or ask the "
+            "operator; do not invent one.")}
+
     # Guardrail: refuse a hand-pasted raw secret (bearer/JWT) in Authorization/Cookie.
     # Auth is injected automatically below (jar cookies + CSRF + a cached sub-app
     # Bearer), so a pasted raw token is a secret-handling violation and usually stale.
@@ -191,6 +204,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     if _stripped_secret:
         logger.warning("send_request stripped hand-pasted secret header(s)",
                        headers=",".join(_stripped_secret))
+    # Schema contract: Authorization is ALWAYS stripped from caller-supplied headers —
+    # auth is auto-injected below. strip_pasted_secret_headers only removes secret-LOOKING
+    # values; a non-secret garbage Authorization (e.g. a model's forged alg-confusion token
+    # or a raw hash) would otherwise survive, block the auto-inject (which only fires when no
+    # Authorization is present), and hit the upstream as a bogus header — e.g. an AWS SigV4
+    # parse error that reads like a finding. Drop any remainder unconditionally.
+    _dropped_auth = [k for k in list(headers) if k.lower() == "authorization"]
+    for _k in _dropped_auth:
+        del headers[_k]
+    if _dropped_auth:
+        logger.warning("send_request dropped caller-supplied Authorization (auth auto-injects)")
 
     # Copilot's _apply_session_auth injects jar+handoff cookies and marks them
     # trusted via x-dast-cookies-injected. Otherwise strip LLM-supplied cookies
@@ -255,17 +279,6 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     if source_label and "x-dast-source" not in {k.lower() for k in headers}:
         headers["x-dast-source"] = str(source_label)
 
-    # Placeholder gate: refuse model stand-in values (e.g. "<UNKNOWN>", "<jwt>") in
-    # the url, a header, or the body before sending — they are noise and can lock
-    # accounts. The real value must come from history/an earlier response.
-    placeholder_field = _first_placeholder_field(url, headers, body)
-    if placeholder_field:
-        logger.warning("send_request refused placeholder value", field=placeholder_field)
-        return {"ok": False, "error": (
-            f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
-            "have the real value — read it from get_history or an earlier response, or ask the "
-            "operator; do not invent one.")}
-
     # Payload-safety gate: refuse destructive URL/body, surfacing the safe variant.
     for where, text in (("url", url), ("body", body)):
         destructive = _destructive_reason(text)
@@ -308,10 +321,11 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
-        if _stripped_secret:
+        _flagged = list(dict.fromkeys(_stripped_secret + _dropped_auth))
+        if _flagged:
             result["note"] = (
-                f"stripped a hand-pasted secret header ({', '.join(_stripped_secret)}) — do not "
-                "paste raw bearer/JWT tokens or cookies; auth is injected automatically "
+                f"stripped caller-supplied auth header(s) ({', '.join(_flagged)}) — do not set "
+                "Authorization/Cookie; auth is injected automatically "
                 "(use get_bearer_token to confirm a token is cached)."
             )
         if set_cookies:

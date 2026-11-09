@@ -177,45 +177,28 @@ _LOGIN_SCHEMA = {
 
 
 async def _login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    browser = _browser(ctx)
-    if browser is None:
-        return _unavailable()
-    url = str(args.get("url", "")).strip()
-    email = str(args.get("email", "")).strip()
-    password = str(args.get("password", ""))
-    if not url:
-        return {"ok": False, "error": "url is required"}
-    if not email:
-        return {"ok": False, "error": "email is required"}
-    if not password:
-        return {"ok": False, "error": "password is required"}
-    if not ctx.is_in_scope(url):
-        return {"ok": False, "error": "url is out of scope", "url": url}
-    try:
-        result = await browser.login(url, email, password)
-        if result.get("ok") and result.get("cookies"):
-            session = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
-            if session is not None and hasattr(session, "_session_cookies"):
-                session._session_cookies.update(result["cookies"])
-                logger.info("browser_login: synced cookies to copilot session",
-                            count=len(result["cookies"]))
-            if session is not None and result.get("logged_in"):
-                session._last_login = {"url": url, "email": email, "password": password}
-        safe_result = {k: v for k, v in result.items() if k != "cookies"}
-        return safe_result
-    except Exception as exc:
-        return {"ok": False, "error": f"login failed: {str(exc)[:200]}", "url": url}
+    # browser_login is the simple 3-arg front door, but it must NOT be a bare
+    # form-fill: many SPAs (e.g. the training app) render no reachable email field,
+    # so the deterministic engine returns "no email field found" and only the SPA
+    # JSON-API strategy authenticates. Delegate to the full adaptive cascade
+    # (deterministic form-fill -> SPA JSON-API fall-through -> LLM) — the exact same
+    # backend as browser_login_adaptive, so the default and explicit tools can never
+    # drift and the obvious tool the model reaches for just works.
+    from dast.tools.login_tools import _adaptive_login
+    return await _adaptive_login(ctx, args)
 
 
 register(Tool(name="browser_login", input_schema=_LOGIN_SCHEMA, handler=_login,
     tags=["browser", "active"],
-    description="Autonomous login via the agent browser. Handles multi-step flows "
-                "(email-first, then password on a second page) like Okta and "
-                "other SSO-style login pages. Clears stale cookies, discovers form "
-                "fields automatically, fills credentials, clicks submit, waits for "
-                "redirect, and exports the resulting session cookies (including CSRF "
-                "tokens set on page load). Use this as step 0 before any authenticated "
-                "testing. Returns logged_in status, final URL, and cookie count."))
+    description="Autonomous login via the agent browser (full adaptive cascade). Handles "
+                "multi-step flows (email-first, then password on a second page) like Okta and "
+                "other SSO-style login pages, AND SPAs that render no reachable form field by "
+                "POSTing credentials to the JSON auth endpoint (e.g. /spa/auth/login), then "
+                "escalates to the LLM only if both fail. Clears stale cookies, discovers form "
+                "fields automatically, fills credentials, clicks submit, waits for redirect, and "
+                "syncs the resulting session cookies (including CSRF tokens). Does NOT brute "
+                "CAPTCHA/MFA (those are reported). Use this as step 0 before any authenticated "
+                "testing. Returns which engine succeeded, logged_in status, and final URL."))
 
 
 _FETCH_SCHEMA = {

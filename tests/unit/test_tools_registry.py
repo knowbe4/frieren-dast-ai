@@ -1593,6 +1593,42 @@ async def test_adaptive_login_deterministic_success():
     assert result["llm_steps"] == 0
 
 
+class _FakeSpaBrowser:
+    """AgentBrowser stand-in where the deterministic form-fill finds no reachable
+    field but the SPA JSON auth endpoint accepts credentials (training-app shape)."""
+
+    async def login(self, url: str, email: str, password: str) -> dict:
+        return {"logged_in": False, "url": url, "error": "no email field found on the page"}
+
+    async def navigate(self, url: str) -> dict:
+        return {"ok": True, "url": url}
+
+    async def export_cookies(self) -> dict:
+        return {"CSRF-TOKEN": "tok", "session": "abc"}
+
+    async def export_cookies_full(self) -> list:
+        return [{"name": "session", "value": "abc", "domain": "app.acme-corp.com"}]
+
+    async def api_post(self, endpoint: str, headers: dict, body: str) -> dict:
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/dashboard"}'}
+
+
+@pytest.mark.asyncio
+async def test_browser_login_falls_through_to_spa_api():
+    """The plain browser_login tool must NOT be a bare form-fill: when no reachable
+    form field exists, it delegates to the cascade and authenticates via spa_api."""
+    browser = _FakeSpaBrowser()
+    store = _FakeSessionStore()
+    store.import_playwright_cookies = lambda full: len(full)
+    ctx = ToolContext(settings=_Scope(True), browser=browser, store=store)
+    result = await run_tool(ctx, "browser_login", {
+        "url": "https://app.acme-corp.com/login", "email": "a@b.com", "password": "x"})
+    assert result["ok"] is True
+    assert result["engine"] == "spa_api"
+    # Never leak cookie values back out of the tool result.
+    assert "cookies" not in result
+
+
 # ── session tools: save/list/activate + run_multiuser_idor ─────────────────────
 
 class _FakeNamedSession:

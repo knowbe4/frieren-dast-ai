@@ -350,13 +350,25 @@ class AgentBrowser:
         page = await self._ensure_page()
         if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
             await self.clear_cookies()
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        # domcontentloaded fires BEFORE the JS framework mounts, so a single-page app
-        # returns an empty shell — snapshot/fill/click would all act on an unrendered
-        # page. networkidle is intentionally NOT used: a continuous WebSocket/polling SPA
-        # (e.g. modstore3) never reaches it, so it only burns the whole timeout budget.
-        # Instead wait for real interactive content (a one-link shell does not count), or
-        # for an explicit caller-supplied selector when the target control is known.
+        # wait_until="commit" resolves as soon as the final navigation response (after all
+        # 3xx hops) is received and the document starts loading. A redirect chain or a
+        # continuously-streaming SPA (modstore3 / CCM, or the PhishER handoff via
+        # /users/goto_phisher) never cleanly fires domcontentloaded through the MITM proxy,
+        # so blocking on it hangs goto for the whole budget. networkidle is likewise avoided.
+        resp = None
+        timed_out = False
+        try:
+            resp = await page.goto(url, wait_until="commit", timeout=timeout_ms)
+        except Exception as exc:
+            # Never hard-fail the goto: a stalled hop would otherwise raise and make the
+            # agent loop on the error. The navigation has usually committed, so continue
+            # with the current page — the caller can inspect what loaded and what traffic
+            # the proxy captured, instead of being stuck.
+            timed_out = True
+            logger.debug("AgentBrowser navigate: goto did not settle, continuing",
+                         url=url, error=str(exc)[:160])
+        # Settle on real interactive content (a one-link shell does not count), or an
+        # explicit caller-supplied selector. Both are best-effort and never raise.
         if wait_selector:
             try:
                 await page.wait_for_selector(wait_selector, timeout=min(timeout_ms, 10000))
@@ -364,8 +376,17 @@ class AgentBrowser:
                 logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
         else:
             await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
-        return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
-                "title": await page.title()}
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        result: Dict[str, Any] = {"ok": True, "url": page.url,
+                                  "status": (resp.status if resp else None),
+                                  "title": title, "timed_out": timed_out}
+        if timed_out:
+            result["note"] = ("navigation did not fully settle; showing the current page — "
+                              "check get_history for captured traffic, then snapshot/retry")
+        return result
 
     async def fill(self, selector: str, value: str, timeout_ms: int = 10000) -> Dict[str, Any]:
         page = await self._ensure_page()

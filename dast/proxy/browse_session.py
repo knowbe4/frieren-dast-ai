@@ -175,7 +175,7 @@ class BrowseSession:
     def _on_context_or_page_close(self, *_) -> None:
         """Fired when a page or context closes. If all pages are gone, force-close
         the browser so the ``disconnected`` event fires and cleanup runs."""
-        import asyncio
+        from dast.utils.tasks import spawn_tracked
         if not self._browser or not self.running:
             return
         try:
@@ -184,7 +184,9 @@ class BrowseSession:
             if not all_pages:
                 logger.info("Last browser page closed, shutting down browse session",
                             session_id=self.session_id)
-                asyncio.ensure_future(self._force_close())
+                # spawn_tracked (not bare ensure_future): keep a strong ref so this
+                # force-close is not GC'd while pending ("Task was destroyed ...").
+                spawn_tracked(self._force_close(), name="browse-force-close")
         except Exception as exc:
             logger.warning("Failed to handle browser page/context close",
                            session_id=self.session_id, error=str(exc))

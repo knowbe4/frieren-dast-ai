@@ -113,6 +113,58 @@ def apply_cookies(headers: Dict[str, str], cookies, *, refresh: bool = False) ->
     return inject_csrf(headers, cookies, refresh=refresh)
 
 
+def is_raw_secret_value(value: str) -> bool:
+    """True when a header value is (or wraps) a raw JWT / long-opaque bearer token.
+
+    A ``<placeholder>`` (e.g. ``<jwt>``) is NOT a secret (left for the placeholder
+    gate). Reuses the existing credential detectors — no new heuristic."""
+    from dast.plugins.sensitive_param_tracker import (
+        _JWT_RE, _BEARER_RE, _shannon_entropy, _MIN_ENTROPY_BITS_PER_CHAR,
+    )
+    from dast.utils.placeholders import looks_like_placeholder
+
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    candidates = [raw]
+    low = raw.lower()
+    for scheme in ("bearer ", "token ", "jwt "):
+        if low.startswith(scheme):
+            candidates.append(raw[len(scheme):].strip())
+    for candidate in candidates:
+        if not candidate or looks_like_placeholder(candidate):
+            continue
+        if _JWT_RE.match(candidate):
+            return True
+        if _BEARER_RE.match(candidate) and _shannon_entropy(candidate) >= _MIN_ENTROPY_BITS_PER_CHAR:
+            return True
+    return False
+
+
+def strip_pasted_secret_headers(headers: Dict[str, str]) -> list:
+    """Remove caller-pasted ``Authorization``/``Cookie`` headers whose value is a raw
+    secret (JWT or long-opaque bearer), mutating ``headers``; return the stripped
+    header NAMES.
+
+    The tool layer injects the active session automatically (jar cookies + CSRF + a
+    cached sub-app Bearer), so a hand-pasted raw token must never leave the machine —
+    it is a secret-handling violation and usually stale/wrong anyway. A ``<placeholder>``
+    value and ordinary (non-secret) header values are left untouched."""
+    stripped = []
+    for name in list(headers.keys()):
+        if name.lower() not in ("authorization", "cookie"):
+            continue
+        value = str(headers.get(name, ""))
+        if name.lower() == "cookie":
+            parts = [seg.split("=", 1)[1] if "=" in seg else seg for seg in value.split(";")]
+        else:
+            parts = [value]
+        if any(is_raw_secret_value(part) for part in parts):
+            headers.pop(name, None)
+            stripped.append(name)
+    return stripped
+
+
 def inject_csrf(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:
     """Add the CSRF + XHR headers a cookie-authenticated SPA requires on a
     state-changing request, mutating and returning ``headers``.

@@ -193,3 +193,34 @@ async def test_ensure_profile_login_degrades_on_failure(monkeypatch):
 
     assert session["autonomous"]["_proactive_login_done"] is True
     assert "failed" in session["autonomous"]["detail"].lower()
+
+
+# ── autonomous start race + validation methodology/guardrail prompt presence ─────
+
+@pytest.mark.asyncio
+async def test_run_autonomous_sets_top_level_status_synchronously(monkeypatch):
+    # Regression: the top-level session["status"] was left "idle" at launch (only the
+    # nested autonomous.status was set), so a poll saw a false "idle/turns=0" terminal.
+    service = CopilotService(_FakeCtx())
+
+    async def _noop(sid):  # keep the driver from doing real work in the test
+        return None
+    monkeypatch.setattr(service, "_drive_autonomous", _noop)
+
+    sid = service.run_autonomous("map the api", focus_hosts=["app.example.com"])
+    session = service.get(sid)
+    assert session["status"] == "running"                       # top-level, synchronous
+    assert (session.get("autonomous") or {}).get("turns") == 0
+
+
+def test_system_prompt_has_validation_and_secret_rules():
+    from dast.ai.copilot.session import _SYSTEM_COPILOT
+    assert "GROUND THE REAL ROUTE" in _SYSTEM_COPILOT
+    assert "BASELINE ON YOUR OWN ID" in _SYSTEM_COPILOT
+    assert "NEVER paste a raw secret" in _SYSTEM_COPILOT
+
+
+def test_validation_playbook_constant_present():
+    from dast.proxy.api.copilot_service import _AUTONOMOUS_VALIDATION_PLAYBOOK
+    assert "GROUND THE REAL ROUTE" in _AUTONOMOUS_VALIDATION_PLAYBOOK
+    assert "BASELINE on your OWN id" in _AUTONOMOUS_VALIDATION_PLAYBOOK

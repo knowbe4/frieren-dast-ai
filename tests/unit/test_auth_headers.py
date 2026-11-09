@@ -167,3 +167,55 @@ def test_cross_session_headers_inject_fresh_csrf():
     assert out["X-CSRF-Token"] == "tok2"       # refreshed to identity 2's token
     assert "s2" in out["cookie"] and "s1" not in out["cookie"]
     assert out["accept"] == "application/json"  # non-auth headers preserved
+
+
+# ── strip_pasted_secret_headers (secret-handling guardrail) ──────────────────────
+
+from dast.proxy.auth_headers import is_raw_secret_value, strip_pasted_secret_headers  # noqa: E402
+
+def _fake_jwt() -> str:
+    """Build a structurally valid (unsigned) JWT at runtime so no eyJ... literal sits
+    in the source (gitleaks flags a static JWT)."""
+    import base64
+    import json as _json
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(_json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{seg({'alg': 'HS256', 'typ': 'JWT'})}.{seg({'sub': '1', 'account_id': 99})}.{seg('sigvalue123')}"
+
+
+_FAKE_JWT = _fake_jwt()
+
+
+def test_is_raw_secret_value_detects_jwt_and_bearer():
+    assert is_raw_secret_value(_FAKE_JWT)
+    assert is_raw_secret_value("Bearer " + _FAKE_JWT)
+    # long high-entropy opaque token (random mix of chars)
+    assert is_raw_secret_value("Bearer aB3xK9mQ7pL2wR8tZ5cV1nY6dF4gH0jS7kP3qW9eU2iO1bX")
+    # NOT secrets: placeholders and ordinary values
+    assert not is_raw_secret_value("<jwt>")
+    assert not is_raw_secret_value("<TOKEN>")
+    assert not is_raw_secret_value("application/json")
+    assert not is_raw_secret_value("")
+
+
+def test_strip_pasted_secret_headers_removes_raw_token_authorization():
+    headers = {"Authorization": "Bearer " + _FAKE_JWT, "Accept": "application/json"}
+    stripped = strip_pasted_secret_headers(headers)
+    assert stripped == ["Authorization"]
+    assert "Authorization" not in headers
+    assert headers["Accept"] == "application/json"  # non-auth header untouched
+
+
+def test_strip_pasted_secret_headers_leaves_placeholder_and_nonsecret():
+    headers = {"Authorization": "Bearer <jwt>", "X-Api-Version": "3"}
+    stripped = strip_pasted_secret_headers(headers)
+    assert stripped == []
+    assert headers["Authorization"] == "Bearer <jwt>"  # placeholder left for the placeholder gate
+
+
+def test_strip_pasted_secret_headers_cookie_with_jwt_value():
+    headers = {"Cookie": f"phisher_access_token={_FAKE_JWT}; other=1"}
+    stripped = strip_pasted_secret_headers(headers)
+    assert stripped == ["Cookie"]
+    assert "Cookie" not in headers

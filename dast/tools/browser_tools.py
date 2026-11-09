@@ -302,7 +302,6 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                 exp = rec.get("exp")
                 if exp is None or exp > _time.time():
                     fetch_headers["Authorization"] = f"Bearer {rec['token']}"
-                    headers["Authorization"] = f"Bearer {rec['token']}"  # in-page fallback too
                     logger.debug("browser_fetch: attached captured Bearer",
                                  host=_parsed.hostname)
         except Exception as exc:
@@ -349,7 +348,7 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             } catch (e) {
                 return { ok: false, error: e.message };
             }
-        }""", {"url": url, "method": method, "headers": headers, "body": body})
+        }""", {"url": url, "method": method, "headers": fetch_headers, "body": body})
         return result
     except Exception as fallback_exc:
         return {"ok": False, "error": f"fetch failed: {primary_error}; "

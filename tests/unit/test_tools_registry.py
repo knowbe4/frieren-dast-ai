@@ -183,6 +183,30 @@ class _CaptureClient:
 
 
 @pytest.mark.asyncio
+async def test_send_request_strips_hand_pasted_token(monkeypatch):
+    # A raw bearer/JWT pasted into Authorization must be stripped (not forwarded) and
+    # flagged — auth is auto-injected; the model must not hand-paste secrets. Built at
+    # runtime so no static eyJ... literal sits in the source (gitleaks flags that).
+    import base64 as _b64, json as _json
+    def _seg(o):
+        return _b64.urlsafe_b64encode(_json.dumps(o).encode()).rstrip(b"=").decode()
+    _jwt = f"{_seg({'alg': 'HS256'})}.{_seg({'sub': '1', 'account_id': 7})}.{_seg('sigvalue1234567890')}"
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store/session -> nothing re-attached
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/x", "method": "GET",
+        "headers": {"Authorization": f"Bearer {_jwt}", "Accept": "application/json"},
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert "authorization" not in sent          # stripped, not forwarded upstream
+    assert sent.get("accept") == "application/json"
+    assert "note" in result and "stripped" in result["note"].lower()
+    assert _jwt not in str(result)              # the token value never echoed back
+
+
+@pytest.mark.asyncio
 async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
     # The copilot engine's per-sub-app Bearer selection is reused by the tool: a
     # /modstore request gets modstore's token, /customercontent gets ccm's.

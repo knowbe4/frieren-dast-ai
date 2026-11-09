@@ -243,7 +243,11 @@ Operational notes:
   * Response contains data with a different account_id than yours (cross-tenant disclosure)
   * Write succeeded on a resource you don't own (broken access control)
   What is NOT a finding: 200 on your own data (normal), 401/403 (control works),
-  422 validation error (input rejected). Call record_finding with title, severity
+  422 validation error (input rejected). BUT read the BODY, never judge by status alone:
+  a 403 may be an infrastructure/API-gateway auth-format error (e.g. "Invalid key=value
+  pair in Authorization header" = SigV4), and a 404 with an app body (e.g. `{}` /
+  "not found") means your request REACHED the handler and found nothing — neither proves
+  a control works; both are commonly misread. Call record_finding with title, severity
   (critical/high/medium/low), description, and steps (evidence request/response pairs).
 - Cleanup after write tests: track every object you CREATE (rule IDs, token IDs, etc).
   After confirming a vuln, DELETE or revert test data immediately. For PATCH tests:
@@ -280,6 +284,22 @@ Operational notes:
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
+- Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
+  1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
+     testing, confirm the actual route, its parameters and its authz with code_lookup_path
+     (reads the real source/controller) or get_history (the app's OWN authenticated
+     traffic). Never probe a guessed path — a wrong path yields 403/404 that prove nothing.
+  2. BASELINE ON YOUR OWN ID. Issue the request as yourself and confirm a 200 WITH real
+     data. If your own id returns empty/404, you CANNOT demonstrate the finding on this
+     account — say so; do not infer a vuln from a foreign-id response alone.
+  3. SWAP, then COMPARE BODIES. Only after a working baseline, change the id to another
+     tenant and compare the response BODIES. A cross-tenant read is confirmed when you get
+     the OTHER tenant's actual data back, not merely a non-403 status.
+- NEVER paste a raw secret (bearer/JWT/access token, Cookie, API key) into a tool argument,
+  including the `headers` of send_request/browser_fetch. Auth is injected automatically
+  (jar cookies + CSRF + a cached sub-app Bearer selected by request path); a pasted raw
+  token is stripped and ignored (and is usually stale/wrong). To check a token exists call
+  get_bearer_token (it returns only a redacted preview).
 - GraphQL schema-aware testing: use graphql_introspect to discover available queries,
   mutations, and types on any /graphql endpoint. Use graphql_type_info to inspect field
   names, argument types, and enum values BEFORE crafting queries — this eliminates
@@ -1428,6 +1448,17 @@ class CopilotSession:
                 self._stripped_header_count += 1
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
             headers["x-dast-cookies-injected"] = "1"
+
+        # Guardrail: a model-pasted raw Authorization bearer/JWT must never be sent.
+        # Authorization comes ONLY from this engine's own per-session Bearer cache
+        # (injected below) — never from the model (stale/wrong, and a cross-session
+        # leak risk). Strip a pasted raw-token Authorization; a <placeholder> is left
+        # for the placeholder gate. (Cookie is already handled above.)
+        from dast.proxy.auth_headers import is_raw_secret_value
+        for key in [k for k in list(headers) if k.lower() == "authorization"]:
+            if is_raw_secret_value(str(headers.get(key, ""))):
+                del headers[key]
+                self._stripped_header_count += 1
 
         present = {key.lower() for key in headers}
 

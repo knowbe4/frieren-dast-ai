@@ -182,6 +182,16 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
 
     headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
 
+    # Guardrail: refuse a hand-pasted raw secret (bearer/JWT) in Authorization/Cookie.
+    # Auth is injected automatically below (jar cookies + CSRF + a cached sub-app
+    # Bearer), so a pasted raw token is a secret-handling violation and usually stale.
+    # Strip it and tell the caller; the auto-injection then runs normally.
+    from dast.proxy.auth_headers import strip_pasted_secret_headers
+    _stripped_secret = strip_pasted_secret_headers(headers)
+    if _stripped_secret:
+        logger.warning("send_request stripped hand-pasted secret header(s)",
+                       headers=",".join(_stripped_secret))
+
     # Copilot's _apply_session_auth injects jar+handoff cookies and marks them
     # trusted via x-dast-cookies-injected. Otherwise strip LLM-supplied cookies
     # (often stale) and inject fresh ones from the proxy jar.
@@ -298,6 +308,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
+        if _stripped_secret:
+            result["note"] = (
+                f"stripped a hand-pasted secret header ({', '.join(_stripped_secret)}) — do not "
+                "paste raw bearer/JWT tokens or cookies; auth is injected automatically "
+                "(use get_bearer_token to confirm a token is cached)."
+            )
         if set_cookies:
             result["set_cookies"] = set_cookies
         if history:

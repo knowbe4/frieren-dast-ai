@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from dast.ai.prompt_safety import wrap_untrusted
 from dast.tools.context import AgentToolContext
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 if TYPE_CHECKING:
     from dast.proxy.api.context import DashboardContext
@@ -347,6 +348,20 @@ _READ_ONLY_DIRECTIVE = (
     "once you have mapped and observed the surface for the objective."
 )
 
+_AUTONOMOUS_VALIDATION_PLAYBOOK = (
+    "[VALIDATION RUN] You are confirming ONE reported finding. The reported endpoint path may "
+    "be INFERRED and wrong, so follow this order and do not skip steps:\n"
+    "1. GROUND THE REAL ROUTE first with code_lookup_path (reads the real controller/route) or "
+    "get_history (the app's own authenticated traffic). Never probe a guessed path — a wrong "
+    "path returns 403/404 that prove nothing.\n"
+    "2. BASELINE on your OWN id: issue the request as yourself and confirm a 200 WITH real data. "
+    "If your own id returns empty/404, you CANNOT demonstrate the finding on this account — report "
+    "that; do not infer a vuln from a foreign-id response alone.\n"
+    "3. SWAP the id to another tenant and COMPARE RESPONSE BODIES. Confirmed only when you get the "
+    "OTHER tenant's actual data, not merely a non-403 status. Read the body, never judge by status "
+    "alone (a 403 can be infra/SigV4; a 404 {} is the app's not-found = request reached the handler).\n\n"
+)
+
 _AUTONOMOUS_GUIDANCE = (
     "Operator response to your request: {answer}\n\n"
     "Continue with your plan autonomously."
@@ -590,7 +605,8 @@ class CopilotService:
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
-        session["_task"] = asyncio.create_task(self._run_turn(sid, text))
+        # spawn_tracked: strong ref + logs a silent driver death (vs bare create_task).
+        session["_task"] = spawn_tracked(self._run_turn(sid, text), name=f"copilot-turn-{sid}")
 
     # ── Block escalation (in-process entry point) ────────────────────────────────
     def escalate_block(self, host: str, attack_type: str, host_intel: object) -> Optional[str]:
@@ -953,8 +969,14 @@ class CopilotService:
             self._activate_profile(profile_slug, session)
         self._seed_engine_session(session, hosts)
 
+        # Flip the TOP-LEVEL status synchronously (before returning sid) so a poll in
+        # the window before the driver's first tick never sees a false "idle/turns=0"
+        # terminal state (only the nested autonomous.status was set to "starting").
+        session["status"] = "running"
+
         try:
-            session["_task"] = asyncio.create_task(self._drive_autonomous(sid))
+            session["_task"] = spawn_tracked(self._drive_autonomous(sid),
+                                             name=f"copilot-driver-{sid}")
         except RuntimeError as exc:
             logger.warning("autonomous run could not schedule driver",
                            session_id=sid, error=str(exc))
@@ -1864,8 +1886,11 @@ class CopilotService:
             "send_request to test parameter manipulation hypotheses, and idor_probe for stored-"
             "object BOLA. Focus on state-changing endpoints with identity-bearing parameters.\n\n"
         ) if auto.get("breadth_done") else ""
+        validation_note = (
+            _AUTONOMOUS_VALIDATION_PLAYBOOK if auto.get("validation_only") else ""
+        )
         start_hosts = self._effective_hosts(auto["hosts"])
-        prompt = breadth_note + _AUTONOMOUS_START.format(
+        prompt = validation_note + breadth_note + _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(start_hosts),
             router=self._router_block(start_hosts),

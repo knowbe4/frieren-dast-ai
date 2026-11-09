@@ -71,8 +71,11 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
         },
         "attack_type": {
             "type": "string",
-            "description": "Optional machine-readable class, e.g. broken-access-control, "
-                           "sqli, xss, ssrf, sensitive-param.",
+            "description": "Optional machine-readable class, e.g. sqli, xss, ssrf, "
+                           "sensitive-param. For access control, pick precisely: 'idor' "
+                           "(object-level/BOLA — reaching ANOTHER tenant's/user's object, "
+                           "CWE-639) vs 'bfla' (function-level — a SAME-tenant action your "
+                           "role should not allow / vertical privilege escalation, CWE-862).",
         },
         "cwe": {"type": "string", "description": "Optional CWE id, e.g. CWE-284."},
         "method": {"type": "string", "description": "HTTP method of the request (default GET)."},

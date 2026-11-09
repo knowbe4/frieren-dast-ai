@@ -24,3 +24,10 @@ negative_examples:
     reasoning: >
       An indistinguishable 404 leaks nothing about other objects and returns no
       cross-tenant data — no unauthorized object was disclosed.
+  - payload: "PATCH /api/courses/<uuid owned by an admin of MY OWN account> as a learner-role user"
+    response_snippet: '200 OK the admin''s course was modified'
+    reasoning: >
+      The object is in the caller's OWN account (not another tenant), reached without any
+      id manipulation across tenants — the server scopes to the account but ignores the
+      caller's role. That is function-level authz (BFLA, CWE-862, see bfla.yaml), NOT an
+      IDOR. A role bypass on your own tenant's object is not an object-level reference bug.

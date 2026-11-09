@@ -237,11 +237,14 @@ Operational notes:
 - Recording findings: when a test CONFIRMS a vulnerability, IMMEDIATELY call
   record_finding. Do NOT wait for operator confirmation — if the test proves it,
   record it. A confirmed vuln looks like:
-  * 201/200 when creating a system/global resource as a regular tenant (privilege escalation)
-  * 200 when PATCHing/GETting an object with a foreign tenant's ID (IDOR/BOLA)
+  * 200 when PATCHing/GETting an object with a FOREIGN tenant's/user's id = IDOR/BOLA
+    (attack_type idor, CWE-639): object-level, cross-tenant
+  * An action your role should NOT allow, authorized on the account/tenant claim alone
+    (SAME tenant, wrong role) = BFLA / function-level (attack_type bfla, CWE-862): e.g. a
+    low-privilege session creating/editing/archiving an admin-only or system/global resource
+    in its OWN account. Classify as bfla, NOT idor — a role bypass is not an IDOR.
   * 200/204 from an endpoint with NO auth headers (missing authentication)
   * Response contains data with a different account_id than yours (cross-tenant disclosure)
-  * Write succeeded on a resource you don't own (broken access control)
   What is NOT a finding: 200 on your own data (normal), 401/403 (control works),
   422 validation error (input rejected). BUT read the BODY, never judge by status alone:
   a 403 may be an infrastructure/API-gateway auth-format error (e.g. "Invalid key=value

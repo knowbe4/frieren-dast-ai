@@ -115,7 +115,8 @@ _ATTACK_TYPE_DIMENSION = {
     "open_redirect": "injection", "cache_poisoning": "injection", "blazor": "injection",
     "graphql": "injection", "oob_headers": "injection",
     # access control / authz / token / info-disclosure
-    "idor": "access_control", "auth": "access_control", "auth_bypass": "access_control",
+    "idor": "access_control", "bfla": "access_control", "auth": "access_control",
+    "auth_bypass": "access_control",
     "mfa_bypass": "access_control", "jwt": "access_control", "sensitive_data": "access_control",
     # cross-tenant (multi-user replay) — only applicable with >=2 named sessions
     "cross_session_idor": "cross_tenant",
@@ -236,9 +237,14 @@ _AUTONOMOUS_START = (
     "Write requests (POST/PUT/PATCH/DELETE) are expected and authorized for testing — you "
     "cannot test access controls without them. 'Destructive' means mass deletion, DoS, or "
     "irreversible corruption — not normal CRUD for testing. Always clean up after write tests.\n\n"
-    "RECORDING FINDINGS — when a test confirms a vuln, call record_finding IMMEDIATELY:\n"
-    "- 201/200 creating a system/global resource as regular tenant = privilege escalation (record it)\n"
-    "- 200 PATCHing/GETting with a foreign tenant ID = IDOR (record it)\n"
+    "RECORDING FINDINGS — when a test confirms a vuln, call record_finding IMMEDIATELY. "
+    "Classify access-control bugs precisely (do NOT call a role bypass an IDOR):\n"
+    "- 200 PATCHing/GETting ANOTHER tenant's/user's object by changing an id = IDOR/BOLA "
+    "(attack_type idor, CWE-639) — object-level, cross-tenant (record it)\n"
+    "- An action your role should NOT allow, authorized on the account/tenant claim alone "
+    "(SAME tenant, wrong role) = BFLA / function-level (attack_type bfla, CWE-862) — e.g. a "
+    "low-privilege session creating/editing/archiving an admin-only or system/global resource in "
+    "its OWN account (record it as bfla, not idor)\n"
     "- 200/204 from endpoint with no auth = missing authentication (record it)\n"
     "- Response has different account_id = cross-tenant disclosure (record it)\n"
     "Do NOT say 'this is an authorized test, not a finding' — the TEST RESULT IS the finding.\n"

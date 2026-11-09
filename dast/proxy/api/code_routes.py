@@ -698,9 +698,19 @@ def _vuln_type_to_attack(vuln_type: str) -> str:
         return "ssrf"
     if any(x in vl for x in ("lfi", "path traversal", "file read", "directory traversal")):
         return "file_read"
+    # Function-level authz (BFLA, vertical privilege escalation) — check BEFORE the
+    # generic auth_bypass/idor branches so "privilege escalation" / "function level" /
+    # "missing authorization" are not swallowed as auth_bypass or mislabelled idor.
+    if any(x in vl for x in ("bfla", "function level", "function-level", "broken function",
+                             "missing authorization", "missing authorisation",
+                             "vertical privilege", "privilege escalation", "privesc",
+                             "role check", "cwe-862", "cwe-863")):
+        return "bfla"
     if any(x in vl for x in ("auth", "bypass", "unauthori", "privilege")):
         return "auth_bypass"
-    if any(x in vl for x in ("idor", "object reference", "access control")):
+    # Object-level authz (IDOR/BOLA) — horizontal, cross-tenant object reference.
+    if any(x in vl for x in ("idor", "bola", "object reference", "object-level",
+                             "horizontal", "access control", "cwe-639")):
         return "idor"
     if any(x in vl for x in ("csrf",)):
         return "csrf"

@@ -174,7 +174,15 @@ def _infer_attack_type_from_text(text: str) -> str:
         return "sqli"
     if any(k in text for k in ("ssrf", "server-side request", "unvalidated url")):
         return "ssrf"
-    if any(k in text for k in ("idor", "insecure direct object", "cwe-639")):
+    # Function-level authz (BFLA / vertical privilege escalation) BEFORE idor so a role
+    # bypass on one's own tenant is not mislabelled as an object-level reference bug.
+    if any(k in text for k in ("broken function level", "function-level authoriz",
+                               "function level authoriz", "bfla", "missing authorization",
+                               "vertical privilege", "privilege escalation",
+                               "cwe-862", "cwe-863")):
+        return "bfla"
+    if any(k in text for k in ("idor", "insecure direct object", "bola",
+                               "broken object level", "cwe-639")):
         return "idor"
     if any(k in text for k in ("mass assignment", "strong param", "unfiltered input")):
         return "mass_assignment"

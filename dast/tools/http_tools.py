@@ -244,7 +244,8 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     # (In a separate `dast-ai mcp` process ctx.store is None -> this no-ops; use
     # browser_fetch there, which carries the SPA's Bearer + sub-session.)
     if not any(k.lower() == "authorization" for k in headers):
-        from dast.ai.copilot.session import scan_history_bearer, _subapp_for_path
+        from dast.session.auth_provider import scan_history_bearer
+        from dast.session.auth_provider import subapp_for_path as _subapp_for_path
         parsed = urlparse(url)
         bearer_host = parsed.hostname or ""
         bearer_path = parsed.path or "/"

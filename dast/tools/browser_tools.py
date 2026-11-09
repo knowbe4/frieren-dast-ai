@@ -278,7 +278,7 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
             import time as _time
             from urllib.parse import urlparse as _urlparse
-            from dast.ai.copilot.session import scan_history_bearer
+            from dast.session.auth_provider import scan_history_bearer
             _parsed = _urlparse(url)
             rec = scan_history_bearer(ctx.store, _parsed.hostname or "", _parsed.path or "/")
             if rec and rec.get("token"):

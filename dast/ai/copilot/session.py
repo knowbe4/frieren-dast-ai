@@ -25,6 +25,13 @@ from dast.ai.copilot.context_brief import build_context_brief
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.authorization import AUTHORIZED_ENGAGEMENT_DIRECTIVE, is_full_authorization
 from dast.ai.schemas import COPILOT_STEP_SCHEMA
+from dast.session.auth_provider import (
+    collect_host_bearer,
+    decode_jwt_exp,
+    rec_is_fresh,
+    select_bearer,
+    subapp_for_path as _subapp_for_path,
+)
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -374,80 +381,9 @@ def _host_in_focus(host: str, focus_hosts: Any) -> bool:
     return False
 
 
-# Sub-app path prefixes -> app name, for selecting the correct Bearer per request
-# path. modstore and ccm share one host, so a single host-keyed token would let one
-# sub-app's token overwrite the other's; selection is by path instead. Keep in sync
-# with dast/tools/app_knowledge_tools.py::_APP_MAP probe paths.
-_SUBAPP_PATH_PREFIXES: tuple = (
-    ("/modstore", "modstore"),
-    ("/customercontent", "ccm"),
-)
-
-
-def _subapp_for_path(path: str) -> Optional[str]:
-    """Map a request path to its sub-app name, or None for a non-sub-app path."""
-    p = (path or "").lower()
-    for prefix, app in _SUBAPP_PATH_PREFIXES:
-        if p.startswith(prefix):
-            return app
-    return None
-
-
-def scan_history_bearer(store: Any, host: str, path: str) -> Optional[Dict[str, Any]]:
-    """Freshest non-expired Bearer in proxy history for a (host, request path).
-
-    Standalone twin of ``CopilotSession._capture_bearer_tokens`` for callers without
-    a copilot session (e.g. the ``send_request`` tool driven directly or over MCP).
-    Prefers a token whose auth endpoint matches the request path's sub-app (modstore
-    and ccm share a host); otherwise falls back to the freshest host-level token.
-    Returns a record ``{token, exp, auth_endpoint}`` or None. Never raises."""
-    if store is None or not host:
-        return None
-    try:
-        entries = store.all_entries()
-    except Exception:
-        return None
-    import time as _time
-    now = _time.time()
-    want_app = _subapp_for_path(path)
-    host_lower = host.lower()
-    parts = host_lower.split(".")
-    domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
-
-    def _field(entry: Any, name: str) -> Any:
-        if isinstance(entry, dict):
-            return entry.get(name)
-        return getattr(entry, name, None)
-
-    host_level: Optional[Dict[str, Any]] = None
-    for entry in reversed(entries):
-        try:
-            entry_host = (_field(entry, "host") or "").lower()
-            if domain_suffix not in entry_host:
-                continue
-            req_headers = _field(entry, "request_headers") or {}
-            auth_val = ""
-            for key, value in req_headers.items():
-                if key.lower() == "authorization":
-                    auth_val = str(value)
-                    break
-            if not auth_val.startswith("Bearer "):
-                continue
-            token_val = auth_val[7:].strip()
-            exp = CopilotSession._decode_jwt_exp(token_val)
-            if exp is not None and exp < now:
-                continue
-            auth_endpoint = _field(entry, "path") or ""
-            record = {"token": token_val, "exp": exp, "auth_endpoint": auth_endpoint}
-            if want_app and _subapp_for_path(auth_endpoint) == want_app:
-                return record  # best match: a token minted for the same sub-app
-            if host_level is None:
-                host_level = record  # freshest host-level token, as a fallback
-            if not want_app:
-                return host_level  # non-sub-app request: freshest host token wins
-        except Exception:
-            continue
-    return host_level
+# Sub-app Bearer selection + the history scan now live in dast/session/auth_provider.py
+# (single source of truth). The raw tool paths (http_tools/browser_tools) import
+# scan_history_bearer / subapp_for_path from there directly.
 
 
 def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
@@ -667,112 +603,29 @@ class CopilotSession:
         return bool(self._focus_hosts) or bool(self.session_name)
 
     def _select_bearer(self, host: str, path: str) -> Optional[Dict[str, Any]]:
-        """Pick the cached Bearer record for a (host, request path). modstore and ccm
-        share a host, so prefer the per-sub-app token selected by path; fall back to
-        the host-level default for non-sub-app paths."""
-        record = self._bearer_tokens.get(host)
-        if not isinstance(record, dict):
-            return None
-        app = _subapp_for_path(path)
-        by_app = record.get("by_app")
-        if app and isinstance(by_app, dict) and app in by_app:
-            return by_app[app]
-        return record
+        """Pick the cached Bearer record for a (host, request path) — per-sub-app token
+        when the path maps to one, else the host-level default. See auth_provider."""
+        return select_bearer(self._bearer_tokens.get(host), path)
 
     @staticmethod
     def _decode_jwt_exp(token: str) -> Optional[float]:
-        """Extract the ``exp`` claim from a JWT without verifying the signature."""
-        try:
-            parts = token.split(".")
-            if len(parts) < 2:
-                return None
-            import base64
-            payload = parts[1]
-            payload += "=" * (4 - len(payload) % 4)
-            import json as _json
-            claims = _json.loads(base64.urlsafe_b64decode(payload))
-            exp = claims.get("exp")
-            return float(exp) if exp is not None else None
-        except Exception:
-            return None
+        """Extract the ``exp`` claim from a JWT (unverified). Delegates to auth_provider."""
+        return decode_jwt_exp(token)
 
     def _capture_bearer_tokens(self, store: Any, host: str) -> None:
-        """Scan proxy history for Bearer tokens targeting *host* and cache them."""
-        if store is None:
-            return
-        try:
-            entries = store.all_entries()
-        except Exception:
-            return
-        host_lower = host.lower()
-        parts = host_lower.split(".")
-        domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host_lower
-        import time as _time
-
-        def _field(entry: Any, name: str) -> Any:
-            # Entries are ProxyEntry dataclasses in production and dicts in some
-            # tests/imports; read either shape without assuming .get() exists.
-            if isinstance(entry, dict):
-                return entry.get(name)
-            return getattr(entry, name, None)
-
-        for entry in reversed(entries):
-            try:
-                entry_host = (_field(entry, "host") or "").lower()
-                if domain_suffix not in entry_host:
-                    continue
-                req_headers = _field(entry, "request_headers") or {}
-                auth_val = ""
-                for k, v in req_headers.items():
-                    if k.lower() == "authorization":
-                        auth_val = str(v)
-                        break
-                if not auth_val.startswith("Bearer "):
-                    continue
-                token_val = auth_val[7:].strip()
-                exp = self._decode_jwt_exp(token_val)
-                now = _time.time()
-                if exp is not None and exp < now:
-                    continue
-                entry_host_actual = _field(entry, "host") or host
-                auth_endpoint = _field(entry, "path") or None
-                source_id = _field(entry, "id") or ""
-                if _field(entry, "source") == "copilot":
-                    continue
-            except Exception:
-                continue
-            record = {
-                "token": token_val,
-                "captured_at": now,
-                "source_entry_id": source_id,
-                "auth_endpoint": auth_endpoint,
-                "exp": exp,
-            }
-            # Preserve any per-sub-app tokens already resolved for this host, and index
-            # this one under its sub-app (by path) so modstore and ccm don't overwrite
-            # each other on the shared host.
-            existing = self._bearer_tokens.get(entry_host_actual)
-            by_app = dict(existing.get("by_app", {})) if isinstance(existing, dict) else {}
-            app = _subapp_for_path(auth_endpoint or "")
-            if app:
-                by_app[app] = dict(record)
-            if by_app:
-                record["by_app"] = by_app
-            self._bearer_tokens[entry_host_actual] = record
-            ttl = int(exp - now) if exp else "unknown"
-            logger.info("Captured Bearer token for host",
-                        host=entry_host_actual, ttl=ttl,
-                        source_entry=source_id[:20])
-            break
+        """Scan proxy history for the freshest non-expired Bearer(s) for *host* and cache
+        the record (with a per-sub-app ``by_app`` index). Skips the copilot's own replayed
+        requests. One shared scan — see dast/session/auth_provider.collect_host_bearer."""
+        record = collect_host_bearer(store, host, exclude_source="copilot")
+        if record:
+            # Key by the actual matched entry host (a request to a family host like
+            # "app.example" can match an entry on "api.app.example").
+            self._bearer_tokens[record.get("matched_host") or host] = record
 
     @staticmethod
     def _rec_is_fresh(rec: Optional[Dict[str, Any]]) -> bool:
         """A Bearer record is usable when it has a token and is not past its exp."""
-        if not isinstance(rec, dict) or not rec.get("token"):
-            return False
-        import time as _time
-        exp = rec.get("exp")
-        return exp is None or exp > _time.time()
+        return rec_is_fresh(rec)
 
     @staticmethod
     def _browser_on_host(browser: Any, host: str) -> bool:

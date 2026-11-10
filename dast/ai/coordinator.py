@@ -1028,10 +1028,15 @@ class Coordinator:
                 return []
 
         baseline_response_summary = ""
-        _run_baseline = (
-            target.method in ("GET", "POST", "PUT", "PATCH", "DELETE")
-            and (bool(target.body) or bool(target.params))
-        )
+        # Run the baseline for any request we might scan — not only injectable ones.
+        # Even with no params/body to inject, the baseline's deterministic checks catch
+        # an auth wall (401/403 -> run auth_bypass only + signal needs=auth-refresh) and
+        # structural dead-ends (404/405). A no-param GET to a protected endpoint would
+        # otherwise skip the baseline and let the non-injection agents (sensitive_data,
+        # cache_poisoning, header probes) flood it blindly without recognizing the wall.
+        # Cost is one request (the agents hit the endpoint anyway) and _baseline_check
+        # still gates the LLM call behind should_ask_llm, so a clear 200/401 costs no tokens.
+        _run_baseline = target.method in ("GET", "POST", "PUT", "PATCH", "DELETE")
         auth_wall = False
         if _run_baseline:
             from dast.ai.bedrock_client import get_fast_model as _get_fast

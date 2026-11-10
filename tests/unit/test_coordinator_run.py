@@ -267,7 +267,10 @@ async def test_run_aborts_when_baseline_returns_404():
 
 
 @pytest.mark.asyncio
-async def test_run_skips_baseline_probe_when_no_params_and_no_body():
+async def test_run_runs_baseline_probe_even_without_params_or_body():
+    # The baseline runs for any scannable method, not only injectable ones: it is
+    # the only place an auth wall (401/403) or structural dead-end (404) on a
+    # no-param GET is detected. A clean 200 does not abort and does not call the LLM.
     class _AnyAgent(VulnAgent):
         name = "Any"
         attack_type = "_no_params_test"
@@ -289,7 +292,37 @@ async def test_run_skips_baseline_probe_when_no_params_and_no_body():
             client = MagicMock()
             await Coordinator.run(target, client, budget_seconds=5.0)
 
-    send_mock.assert_not_called()
+    send_mock.assert_called()  # baseline ran despite no params/body
+
+
+@pytest.mark.asyncio
+async def test_run_no_param_get_detects_auth_wall_via_baseline():
+    # Regression guard for the fixed edge: a protected no-param GET (401) must be
+    # recognized as an auth wall -> run auth_bypass only + signal needs=auth-refresh,
+    # instead of silently skipping the baseline and flooding the endpoint.
+    class _AuthBypassAgent(VulnAgent):
+        name = "AuthBypass"
+        attack_type = "auth_bypass"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    send_mock = AsyncMock(return_value=_resp(
+        status=401, text='{"message":"Missing authorization token"}'))
+    target = CheckTarget(
+        method="GET", url="https://example.com/protected",
+        headers={}, body=None, params=[],
+    )
+    with _Registry():
+        Coordinator.register(_AuthBypassAgent)
+        with patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=send_mock):
+            out = await Coordinator.run(target, MagicMock(), use_llm_planner=False,
+                                        budget_seconds=5.0, return_outcome=True)
+
+    send_mock.assert_called()  # baseline ran despite no params
+    assert "auth-refresh" in out.needs
+    assert out.agents_ran == ["auth_bypass"]
 
 
 # ── structural-error short-circuit via session intelligence ──────────────

@@ -671,8 +671,7 @@ class CopilotSession:
         if browser is None or not host:
             return False
         try:
-            page = getattr(browser, "page", None)
-            current = (page.url if page else "") or ""
+            current = getattr(browser, "current_url", "") or ""
         except Exception:
             return False
         from urllib.parse import urlparse
@@ -1194,10 +1193,7 @@ class CopilotSession:
                                      "browser_wait_for") and hasattr(tool_ctx, "browser"):
                         browser = getattr(tool_ctx, "browser", None)
                         if browser is not None:
-                            try:
-                                page_url = browser.page.url if browser.page else ""
-                            except Exception:
-                                page_url = ""
+                            page_url = getattr(browser, "current_url", "") or ""
                             if page_url:
                                 call_key = f"{tool_name}:{page_url}:{_canonical(tool_args)}"
                     if call_key in self._seen_calls:
@@ -1328,8 +1324,8 @@ class CopilotSession:
 
                     # Transport fallback: an API request that STILL 401s after the Bearer
                     # refresh is re-issued via the browser session, which rides the SPA's live
-                    # in-memory token the API path cannot carry (the api.phisher case). Fires
-                    # independently of auto-relogin — it only needs the live browser.
+                    # in-memory token the API path cannot carry (the short-TTL in-memory-token
+                    # case). Fires independently of auto-relogin — it only needs the live browser.
                     if (
                         tool_name == "send_request"
                         and result.get("status") == 401

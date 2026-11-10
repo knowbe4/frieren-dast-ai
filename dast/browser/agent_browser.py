@@ -166,6 +166,22 @@ class AgentBrowser:
         self._lock = asyncio.Lock()
         self._last_cookie_sync: float = 0.0
 
+    @property
+    def current_url(self) -> str:
+        """The URL the live page is currently on, or "" when the browser has not launched.
+
+        This is the STABLE CONTRACT the auth/refresh modules depend on to read the browser's
+        location — the Bearer-refresh ladder's ``_browser_on_host`` gate and the snapshot
+        dedup key. They read this instead of reaching into the Playwright page object, so a
+        future change to how the page is stored cannot silently break those gates (the bug
+        where ``_browser_on_host`` read a non-existent ``.page`` and always returned False,
+        disabling the short-TTL token re-mint tiers). Never raises."""
+        page = self._page
+        try:
+            return (page.url if page is not None else "") or ""
+        except Exception:
+            return ""
+
     async def _ensure_page(self) -> Any:
         if self._page is not None:
             return self._page
@@ -352,8 +368,8 @@ class AgentBrowser:
             await self.clear_cookies()
         # wait_until="commit" resolves as soon as the final navigation response (after all
         # 3xx hops) is received and the document starts loading. A redirect chain or a
-        # continuously-streaming SPA (modstore3 / CCM, or the PhishER handoff via
-        # /users/goto_phisher) never cleanly fires domcontentloaded through the MITM proxy,
+        # continuously-streaming SPA, or a cross-domain SSO/app handoff, never cleanly
+        # fires domcontentloaded through the MITM proxy,
         # so blocking on it hangs goto for the whole budget. networkidle is likewise avoided.
         resp = None
         timed_out = False

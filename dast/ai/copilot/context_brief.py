@@ -119,6 +119,26 @@ def _app_knowledge_block(host: str) -> str:
     return f"## App knowledge — {host}\n{note}" if note else ""
 
 
+def _transport_capability_block(host: str) -> str:
+    """The transport (API vs browser session) Frieren has learned works for this host/sub-apps,
+    from the local ~/.dast-ai/transport_capability store. A hint only — the copilot's auto
+    API->browser fallback is the guarantee; this just lets it pick the right transport up front.
+    Returns "" when nothing is learned for the host."""
+    try:
+        from dast.session.transport_capability import capability_for
+        rec = capability_for(host)
+    except Exception as exc:
+        logger.warning("context brief: transport-capability load failed",
+                       host=host, error=str(exc))
+        return ""
+    if not rec:
+        return ""
+    sub_app = rec.get("sub_app") or "(host)"
+    reason = f" ({rec.get('reason')})" if rec.get("reason") else ""
+    return (f"## Transport capability — {host}\n"
+            f"- {sub_app}: prefer {rec.get('prefer')} (works: {rec.get('auth')}){reason}")
+
+
 def build_context_brief(
     store: Any,
     hosts: Sequence[str],
@@ -154,6 +174,10 @@ def build_context_brief(
     # Locally-learned per-host app knowledge (auth model, token locations, entitlements).
     knowledge_blocks = [b for b in (_app_knowledge_block(host) for host in ordered) if b]
     blocks.extend(knowledge_blocks)
+
+    # Locally-learned per-host transport preference (API vs browser session).
+    transport_blocks = [b for b in (_transport_capability_block(host) for host in ordered) if b]
+    blocks.extend(transport_blocks)
 
     sessions_block = _named_sessions_block()
     if sessions_block:

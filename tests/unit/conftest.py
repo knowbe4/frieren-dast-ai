@@ -64,3 +64,11 @@ def _isolate_login_journal(tmp_path, monkeypatch):
     'first candidate wins' assertion non-deterministic and leaked test host files)."""
     from dast.session import login_journal  # noqa: PLC0415
     monkeypatch.setattr(login_journal, "_JOURNAL_DIR", tmp_path / "login_journal")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_transport_capability(tmp_path, monkeypatch):
+    """Redirect the learned transport-capability store to a per-test tmp dir so tests never
+    read/write the developer's real ~/.dast-ai/transport_capability."""
+    from dast.session import transport_capability  # noqa: PLC0415
+    monkeypatch.setattr(transport_capability, "_DIR", tmp_path / "transport_capability")

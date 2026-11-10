@@ -103,6 +103,23 @@ def test_brief_empty_when_store_knows_nothing():
         assert build_context_brief(store, ["unknown.example.com"]) == ""
 
 
+def test_brief_includes_learned_transport_capability():
+    from dast.ai.copilot.context_brief import _transport_capability_block
+    from dast.session import transport_capability as tc
+    # Cold: nothing learned -> empty block (no behavior change).
+    assert _transport_capability_block("api.phisher.example") == ""
+    tc.record_capability("https://api.phisher.example/queries_api/v2/x", auth="browser",
+                         prefer="browser", reason="api_401_browser_ok")
+    block = _transport_capability_block("api.phisher.example")
+    assert "## Transport capability — api.phisher.example" in block
+    assert "prefer browser" in block
+    # And it is wired into the assembled brief.
+    store = _Store(engine=None, intelligence=SessionIntelligence())
+    with patch("dast.ai.copilot.context_brief._named_sessions_block", return_value=""):
+        brief = build_context_brief(store, ["api.phisher.example"])
+    assert "Transport capability" in brief
+
+
 # ── named-sessions block (login profiles) ───────────────────────────────────────
 def test_named_sessions_block_includes_credential_only_profiles():
     from dast.ai.copilot import context_brief

@@ -202,6 +202,73 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+_DISPATCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": _SCAN_SCHEMA["properties"]["url"],
+        "method": _SCAN_SCHEMA["properties"]["method"],
+        "entry_id": _SCAN_SCHEMA["properties"]["entry_id"],
+        "attack_types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The EXACT attack types to run on this endpoint (e.g. ['sqli'] or "
+                           "['idor','business_logic']). Unlike run_scan's additive attack_types, "
+                           "this RESTRICTS the scan to exactly these agents and bypasses the LLM "
+                           "planner — use it to re-test one dimension or to act on a suggested "
+                           "follow-up. Required and non-empty.",
+        },
+    },
+    "required": ["url", "attack_types"],
+}
+
+
+async def _dispatch_agents(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+    agents = args.get("attack_types")
+    agents = [str(t).strip() for t in agents if str(t).strip()] if isinstance(agents, list) else []
+    if not agents:
+        return {"ok": False, "error": "attack_types is required and must be a non-empty list", "url": url}
+
+    store = getattr(ctx, "store", None)
+    scan_queue = getattr(ctx, "scan_queue", None)
+    scan_queue_state = getattr(ctx, "scan_queue_state", None)
+    if store is None or scan_queue is None or scan_queue_state is None:
+        return {"ok": False, "error": "dispatch_agents is not available in this context", "url": url}
+
+    method = str(args.get("method", "")).strip()
+    entry_id = str(args.get("entry_id", "")).strip()
+    entry = _resolve_entry(store, url, method, entry_id)
+    if entry is None:
+        return {
+            "ok": False,
+            "error": "no matching request in history to scan — proxy this endpoint with "
+                     "send_request or discover it with crawl first, then dispatch agents on it",
+            "url": url,
+        }
+    if not ctx.is_in_scope(entry.url):
+        return {"ok": False, "error": "resolved entry is out of scope", "url": entry.url}
+
+    # RESTRICT to exactly these agents (bypasses the coordinator's LLM planner); see
+    # CheckTarget.only_attack_types. An unknown type is dropped by the coordinator; if NONE are
+    # registered there, it falls through to the planner (never runs zero agents).
+    entry.only_attack_types = agents
+    entry.ai_queued = True
+    entry.queued_for_scan = True
+    agents_ran = True  # a dispatch always runs the agents (ai_queued), like run_scan
+
+    logger.info("dispatch_agents tool: dispatching", url=entry.url, entry_id=entry.id, agents=agents)
+    result = await _enqueue_and_wait(store, scan_queue, scan_queue_state, entry, agents_ran)
+    if result.get("ok"):
+        result["dispatched"] = agents
+        logger.info("dispatch_agents tool: complete", url=entry.url,
+                    status=result.get("status"), findings=result.get("findings_count"))
+    return result
+
+
 # ── scan_surface: breadth-first scan of every observed-but-unscanned endpoint ──
 
 _DEFAULT_MAX_ENDPOINTS = 20
@@ -379,5 +446,22 @@ register(Tool(
     ),
     input_schema=_SCAN_SCHEMA,
     handler=_run_scan,
+    tags=["active"],
+))
+
+register(Tool(
+    name="dispatch_agents",
+    description=(
+        "Run an EXACT set of vulnerability agents against ONE already-observed endpoint, "
+        "bypassing the LLM planner's own agent selection. Same pipeline as run_scan (parallel "
+        "VulnAgents + Red-Team Validator) but you choose precisely which agents run.\n"
+        "Use this when you want to re-test a single dimension (e.g. ['sqli']) or act on a "
+        "suggested_followup from a prior scan's result — instead of run_scan, which lets the "
+        "planner decide and only ADDS your attack_types. The endpoint must already be in history. "
+        "Blocks until the scan finishes; returns the findings plus the structured outcome "
+        "(observations / suggested_followups / blockers / needs)."
+    ),
+    input_schema=_DISPATCH_SCHEMA,
+    handler=_dispatch_agents,
     tags=["active"],
 ))

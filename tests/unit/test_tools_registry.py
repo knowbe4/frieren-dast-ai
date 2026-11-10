@@ -2089,3 +2089,83 @@ async def test_record_transport_capability_validates_values():
     bad_auth = await run_tool(ctx, "record_transport_capability",
                               {"host": "api.x.example", "prefer": "browser", "auth": "nope"})
     assert bad_prefer["ok"] is False and bad_auth["ok"] is False
+
+
+# ── Phase 3: scan result surfaces the structured ScanOutcome ────────────────
+
+@pytest.mark.asyncio
+async def test_enqueue_and_wait_surfaces_scan_outcome_keys():
+    from types import SimpleNamespace
+    from dast.tools.scan_tools import _enqueue_and_wait
+
+    entry = SimpleNamespace(id="e1", method="GET", url="https://app.example/x", host="app.example")
+    scanned = SimpleNamespace(
+        scan_result="vulnerable",
+        findings=[{"title": "SQLi", "severity": "high"}],
+        url="https://app.example/x", method="GET",
+        scan_outcome={
+            "agents_ran": ["sqli"], "suggested_followups": ["ssti"],
+            "blockers": [], "needs": ["auth-refresh"],
+            "observations": [{"attack_type": "sqli", "kind": "waf_bypass", "signal": "x"}],
+        },
+    )
+
+    class _Store:
+        def get_entry(self, _id):
+            return scanned
+
+    class _Q:
+        async def put(self, _id):
+            return None
+
+    class _QS:
+        def completion_event(self, _id):
+            pass
+
+        def enqueue(self, *a):
+            pass
+
+        async def await_entry(self, _id, _t):
+            return True
+
+    res = await _enqueue_and_wait(_Store(), _Q(), _QS(), entry, agents_ran=True)
+    # Existing keys intact...
+    assert res["ok"] is True and res["status"] == "vulnerable"
+    assert res["findings_count"] == 1 and res["findings"]
+    # ...plus the new structured re-plan signals.
+    assert res["needs"] == ["auth-refresh"]
+    assert res["suggested_followups"] == ["ssti"]
+    assert res["blockers"] == []
+    assert res["observations"] == [{"attack_type": "sqli", "kind": "waf_bypass", "signal": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_and_wait_without_outcome_omits_signals():
+    from types import SimpleNamespace
+    from dast.tools.scan_tools import _enqueue_and_wait
+
+    entry = SimpleNamespace(id="e2", method="GET", url="https://app.example/y", host="app.example")
+    scanned = SimpleNamespace(scan_result="safe", findings=[], url="https://app.example/y",
+                              method="GET", scan_outcome=None)
+
+    class _Store:
+        def get_entry(self, _id):
+            return scanned
+
+    class _Q:
+        async def put(self, _id):
+            return None
+
+    class _QS:
+        def completion_event(self, _id):
+            pass
+
+        def enqueue(self, *a):
+            pass
+
+        async def await_entry(self, _id, _t):
+            return True
+
+    res = await _enqueue_and_wait(_Store(), _Q(), _QS(), entry, agents_ran=True)
+    assert res["ok"] is True and res["status"] == "safe"
+    assert "needs" not in res and "suggested_followups" not in res  # no outcome -> no signal keys

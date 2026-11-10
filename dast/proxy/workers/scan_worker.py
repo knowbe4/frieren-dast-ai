@@ -284,6 +284,7 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                       f"Active scan started — {entry.method} {entry.url}{op_label}",
                       url=entry.url, source="agent")
             logger.info("Active scan started", method=entry.method, url=entry.url)
+            outcome = None  # set by run_active_checks; read in the finally for coverage + scan_outcome
             try:
                 model_id = runner._engine_config.get("model_id") or runner._ai_model_id or None
                 confidence_threshold = float(runner._engine_config.get("confidence_threshold", 0.5))
@@ -299,7 +300,7 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                 budget_ceiling = float(
                     runner._engine_config.get("scan_budget_seconds", 300) or 300
                 )
-                findings = await run_active_checks(
+                outcome = await run_active_checks(
                     target, proxy_url=proxy_url, model_id=model_id,
                     confidence_threshold=confidence_threshold,
                     session_intelligence=runner._store.session_intelligence,
@@ -308,7 +309,9 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                     replan=bool(runner._engine_config.get("coordinator_replan", False)),
                     taint_store=runner._store.taint_store,
                     budget_ceiling=budget_ceiling,
+                    return_outcome=True,
                 )
+                findings = outcome.findings
             except asyncio.CancelledError:
                 logger.info("Active scan cancelled by user", url=entry.url)
                 log_event("scan-worker", "info", "Scan cancelled by user", url=entry.url, source="agent")
@@ -347,6 +350,25 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                     except Exception as _cov_exc:
                         logger.debug("recording scanned attack types failed",
                                      url=entry.url, error=str(_cov_exc))
+                # Persist the structured scan outcome (observations/followups/blockers/needs) so
+                # the copilot-as-coordinator can re-plan on it. Codes only + capped observations
+                # (keep to_dict small); findings are already surfaced via add_finding.
+                if outcome is not None:
+                    try:
+                        entry.scan_outcome = {
+                            "agents_ran": list(outcome.agents_ran),
+                            "suggested_followups": list(outcome.suggested_followups),
+                            "blockers": list(outcome.blockers),
+                            "needs": list(outcome.needs),
+                            "observations": [
+                                {"attack_type": o.attack_type, "kind": o.kind,
+                                 "signal": (o.signal or "")[:160]}
+                                for o in list(outcome.observations)[:25]
+                            ],
+                        }
+                    except Exception as _out_exc:
+                        logger.debug("recording scan_outcome failed",
+                                     url=entry.url, error=str(_out_exc))
 
             # Update any stub imported findings on this entry to reflect scan outcome
             update_import_stubs(entry, bool(findings))

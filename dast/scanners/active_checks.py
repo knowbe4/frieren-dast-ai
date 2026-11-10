@@ -1483,17 +1483,19 @@ async def run_active_checks(
     taint_store: Optional[object] = None,
     budget_ceiling: Optional[float] = None,
     replan: bool = False,
+    return_outcome: bool = False,
 ):
     """
     Run all active checks against a single endpoint via the Coordinator.
 
-    Returns a list of AgentFinding objects (from dast.ai.agent_base).
-    The Coordinator handles planning, parallel execution, and LLM validation.
-    Falls back to running all agents when the LLM planner is unavailable.
+    Returns a list of AgentFinding objects (from dast.ai.agent_base), or a structured
+    ``ScanOutcome`` when ``return_outcome=True``. The Coordinator handles planning, parallel
+    execution, and LLM validation. Falls back to running all agents when the LLM planner is
+    unavailable.
     """
     import dast.agents  # noqa: F401 — triggers all Coordinator.register() calls
     from dast.scanners.collaborator import CollaboratorService
-    from dast.ai.coordinator import Coordinator
+    from dast.ai.coordinator import Coordinator, ScanOutcome
 
     # Skip the entire pipeline (canary probes, LLM planner, agents) if this host
     # was already confirmed unreachable — no point spending a scan slot or LLM
@@ -1501,7 +1503,7 @@ async def run_active_checks(
     hostname = urlparse(target.url).hostname or target.url
     if is_host_dead(hostname):
         logger.info("Skipping scan — host previously unreachable", host=hostname, url=target.url)
-        return []
+        return ScanOutcome(blockers=["host_dead"]) if return_outcome else []
 
     async with _client(proxy_url, timeout) as client:
         # Seed unique taint markers into every entry point before attacking, so
@@ -1522,4 +1524,5 @@ async def run_active_checks(
                 probe_diff=probe_diff,
                 budget_ceiling=budget_ceiling,
                 replan=replan,
+                return_outcome=return_outcome,
             )

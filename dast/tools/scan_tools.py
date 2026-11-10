@@ -98,6 +98,54 @@ def _resolve_entry(store: Any, url: str, method: str, entry_id: str) -> Optional
     return None
 
 
+async def _enqueue_and_wait(store, scan_queue, scan_queue_state, entry,
+                            agents_ran: bool) -> Dict[str, Any]:
+    """Enqueue one entry for the scan worker, wait for completion, and shape the result for the
+    copilot: the compacted findings PLUS the structured scan-outcome signals (observations /
+    suggested_followups / blockers / needs) the coordinator produced. Shared by run_scan and
+    dispatch_agents. Register the completion event BEFORE enqueuing so a fast finish() cannot
+    fire before we are waiting on it."""
+    scan_queue_state.completion_event(entry.id)
+    scan_queue_state.enqueue(entry.id, entry.method, entry.url, entry.host)
+    try:
+        await scan_queue.put(entry.id)
+    except Exception as exc:
+        return {"ok": False, "error": f"could not enqueue scan: {str(exc)[:200]}", "url": entry.url}
+    completed = await scan_queue_state.await_entry(entry.id, _SCAN_TIMEOUT_SECONDS)
+
+    scanned = store.get_entry(entry.id)
+    raw_findings: List[Dict[str, Any]] = []
+    scan_result = None
+    outcome = None
+    if scanned is not None:
+        scan_result = scanned.scan_result
+        raw_findings = [f for f in (scanned.findings or []) if f.get("title")]
+        outcome = getattr(scanned, "scan_outcome", None)
+
+    findings = [_compact_finding(f) for f in raw_findings[:_MAX_FINDINGS_RETURNED]]
+    result: Dict[str, Any] = {
+        "ok": True,
+        "url": entry.url,
+        "method": entry.method,
+        "entry_id": entry.id,
+        "status": scan_result or ("scanning" if not completed else "safe"),
+        "findings_count": len(raw_findings),
+        "findings": findings,
+        "agents_ran": agents_ran,
+        "timed_out": not completed,
+    }
+    # Structured re-plan signals from the coordinator's ScanOutcome (empty when none).
+    if isinstance(outcome, dict):
+        result["observations"] = outcome.get("observations") or []
+        result["suggested_followups"] = outcome.get("suggested_followups") or []
+        result["blockers"] = outcome.get("blockers") or []
+        result["needs"] = outcome.get("needs") or []
+    if not agents_ran:
+        result["note"] = ("AI mode is off and this is a proxied (not imported) entry, so only "
+                          "the deterministic layer ran — enable AI mode for the full arsenal.")
+    return result
+
+
 async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -144,43 +192,13 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     agents_ran = (entry.source == "imported" or bool(getattr(store, "ai_mode", False))
                   or bool(entry.ai_queued))
 
-    # Register the completion event BEFORE enqueuing so a fast finish() can't fire
-    # before we're waiting on it.
-    scan_queue_state.completion_event(entry.id)
-    scan_queue_state.enqueue(entry.id, entry.method, entry.url, entry.host)
-    try:
-        await scan_queue.put(entry.id)
-    except Exception as exc:
-        return {"ok": False, "error": f"could not enqueue scan: {str(exc)[:200]}", "url": entry.url}
-
     logger.info("run_scan tool: scanning endpoint", url=entry.url,
                 method=entry.method, entry_id=entry.id, agents_ran=agents_ran)
-    completed = await scan_queue_state.await_entry(entry.id, _SCAN_TIMEOUT_SECONDS)
-
-    scanned = store.get_entry(entry.id)
-    raw_findings: List[Dict[str, Any]] = []
-    scan_result = None
-    if scanned is not None:
-        scan_result = scanned.scan_result
-        raw_findings = [f for f in (scanned.findings or []) if f.get("title")]
-
-    findings = [_compact_finding(f) for f in raw_findings[:_MAX_FINDINGS_RETURNED]]
-    result: Dict[str, Any] = {
-        "ok": True,
-        "url": entry.url,
-        "method": entry.method,
-        "entry_id": entry.id,
-        "status": scan_result or ("scanning" if not completed else "safe"),
-        "findings_count": len(raw_findings),
-        "findings": findings,
-        "agents_ran": agents_ran,
-        "timed_out": not completed,
-    }
-    if not agents_ran:
-        result["note"] = ("AI mode is off and this is a proxied (not imported) entry, so only "
-                          "the deterministic layer ran — enable AI mode for the full arsenal.")
-    logger.info("run_scan tool: scan complete", url=entry.url,
-                status=result["status"], findings=len(raw_findings), timed_out=not completed)
+    result = await _enqueue_and_wait(store, scan_queue, scan_queue_state, entry, agents_ran)
+    if result.get("ok"):
+        logger.info("run_scan tool: scan complete", url=entry.url,
+                    status=result.get("status"), findings=result.get("findings_count"),
+                    timed_out=result.get("timed_out"))
     return result
 
 
@@ -296,12 +314,20 @@ async def _scan_surface(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         finding_count = len([f for f in (scanned.findings or []) if f.get("title")])
         if scanned.scan_result == "vulnerable":
             vulnerable += 1
-        results.append({
+        row: Dict[str, Any] = {
             "url": scanned.url,
             "method": scanned.method,
             "status": scanned.scan_result or "scanning",
             "findings_count": finding_count,
-        })
+        }
+        # Surface the re-plan signals per endpoint (compact — the bulky observation list is
+        # omitted in the breadth summary; use run_scan/dispatch_agents for the full outcome).
+        _outcome = getattr(scanned, "scan_outcome", None)
+        if isinstance(_outcome, dict):
+            for _k in ("suggested_followups", "blockers", "needs"):
+                if _outcome.get(_k):
+                    row[_k] = _outcome[_k]
+        results.append(row)
 
     remaining = len(candidates) - len(batch)
     summary: Dict[str, Any] = {

@@ -1323,6 +1323,19 @@ class CopilotSession:
                                 self._apply_session_auth(tool_ctx, tool_args)
                                 result = await run_tool(tool_ctx, tool_name, tool_args)
 
+                    # Transport fallback: an API request that STILL 401s after the Bearer
+                    # refresh is re-issued via the browser session, which rides the SPA's live
+                    # in-memory token the API path cannot carry (the api.phisher case). Fires
+                    # independently of auto-relogin — it only needs the live browser.
+                    if (
+                        tool_name == "send_request"
+                        and result.get("status") == 401
+                        and getattr(tool_ctx, "browser", None) is not None
+                    ):
+                        fallback = await self._browser_fallback(tool_ctx, tool_args, run_tool)
+                        if fallback is not None:
+                            result = fallback
+
                     if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
                         new_url = str(result.get("url", ""))
                         if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():
@@ -1397,6 +1410,52 @@ class CopilotSession:
         except Exception as exc:
             logger.error("Copilot turn error", session_id=self.session_id, error=str(exc))
             return _finalize(f"Internal error: {str(exc)[:300]}", blocked_reason="error")
+
+    async def _browser_fallback(self, tool_ctx: Any, tool_args: Dict[str, Any],
+                                run_tool: Callable) -> Optional[Dict[str, Any]]:
+        """Re-issue a persistently-401'ing ``send_request`` via the browser session
+        (``browser_fetch``), which rides the SPA's live in-memory token the API path cannot
+        carry. Returns the browser result (annotated) or None when the fallback does not apply.
+        On a browser 2xx/3xx, records that the host/sub-app prefers the browser transport, so
+        later turns pick it up front. Never bypasses the read-only gate ``send_request``
+        enforced: only a method it would have allowed is re-issued."""
+        url = str(tool_args.get("url") or "")
+        method = str(tool_args.get("method", "GET")).upper()
+        body = tool_args.get("body") or ""
+        from dast.utils import read_only
+        if getattr(tool_ctx, "read_only", False) and not read_only.is_safe_method(method):
+            if not (method == "POST" and read_only.is_read_only_graphql(url, body)):
+                logger.debug("transport-fallback: skipped, read-only blocks re-issue",
+                             method=method)
+                return None
+        # Drop session/secret headers the model/engine set for the API path; browser_fetch's
+        # attach(transport="browser") re-injects CSRF and rides the captured Bearer.
+        headers = {k: v for k, v in (tool_args.get("headers") or {}).items()
+                   if k.lower() not in ("cookie", "authorization", "x-csrf-token", "x-xsrf-token")
+                   and not k.lower().startswith("x-dast-")}
+        fallback_args: Dict[str, Any] = {"url": url, "method": method, "body": body}
+        if headers:
+            fallback_args["headers"] = headers
+        logger.info("transport-fallback: API 401, re-issuing via browser session", url=url[:80])
+        browser_result = await run_tool(tool_ctx, "browser_fetch", fallback_args)
+        if not isinstance(browser_result, dict):
+            return None
+        browser_result = dict(browser_result)
+        browser_result["note"] = ("API path returned 401; re-issued via the browser session "
+                                   "(transport=browser)")
+        status = browser_result.get("status")
+        if isinstance(status, int) and 200 <= status < 400:
+            parsed = urlparse(url)
+            try:
+                from dast.session.transport_capability import record_capability
+                record_capability(parsed.hostname or "", parsed.path or "/",
+                                  auth="browser", prefer="browser", reason="api_401_browser_ok")
+            except Exception as exc:
+                logger.debug("transport-fallback: capability record failed",
+                             error=str(exc)[:120])
+            logger.info("transport-fallback: browser re-issue succeeded",
+                        host=parsed.hostname, status=status)
+        return browser_result
 
     def _apply_session_auth(self, tool_ctx: Any, tool_args: Dict[str, Any]) -> None:
         """Reuse the operator's already-captured session on a request-shaped call.

@@ -1047,3 +1047,85 @@ async def test_refresh_bearer_reload_tier():
     assert outcome.acted is True
     assert outcome.tier_reached == RefreshTier.RELOAD
     assert outcome.record and outcome.record["token"] == _unexpired_jwt()
+
+
+# ── Phase 2: auto API->browser transport fallback (_browser_fallback) ──
+
+from types import SimpleNamespace  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_reissues_via_browser_and_seeds_store():
+    session = CopilotSession("s-fb")
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_tool(ctx, name, args):
+        captured["name"] = name
+        captured["args"] = args
+        return {"ok": True, "status": 200, "body": "{}", "length": 2}
+
+    tool_ctx = SimpleNamespace(read_only=False)
+    tool_args = {
+        "url": "https://api.phisher.example/queries_api/v2/accounts/1",
+        "method": "GET",
+        "headers": {"Cookie": "x=1", "Authorization": "Bearer stale", "X-CSRF-Token": "t",
+                    "Content-Type": "application/json", "x-dast-source": "copilot"},
+    }
+    result = await session._browser_fallback(tool_ctx, tool_args, fake_run_tool)
+
+    assert captured["name"] == "browser_fetch"
+    assert captured["args"]["url"] == tool_args["url"] and captured["args"]["method"] == "GET"
+    hdrs = captured["args"].get("headers", {})
+    assert "Cookie" not in hdrs and "Authorization" not in hdrs and "X-CSRF-Token" not in hdrs
+    assert not any(k.lower().startswith("x-dast-") for k in hdrs)
+    assert hdrs.get("Content-Type") == "application/json"   # non-session headers kept
+    assert result["status"] == 200 and "transport=browser" in result["note"]
+
+    from dast.session.transport_capability import capability_for
+    rec = capability_for("api.phisher.example", "/queries_api/v2/accounts/1")
+    assert rec is not None and rec["prefer"] == "browser" and rec["reason"] == "api_401_browser_ok"
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_respects_read_only_for_unsafe_method():
+    session = CopilotSession("s-ro")
+    called = {"n": 0}
+
+    async def fake_run_tool(ctx, name, args):
+        called["n"] += 1
+        return {"ok": True, "status": 200}
+
+    tool_ctx = SimpleNamespace(read_only=True)
+    result = await session._browser_fallback(
+        tool_ctx, {"url": "https://api.x.example/thing", "method": "DELETE"}, fake_run_tool)
+    assert result is None and called["n"] == 0   # a DELETE is never re-issued under read-only
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_read_only_allows_safe_get():
+    session = CopilotSession("s-ro-get")
+    called = {"n": 0}
+
+    async def fake_run_tool(ctx, name, args):
+        called["n"] += 1
+        return {"ok": True, "status": 200}
+
+    tool_ctx = SimpleNamespace(read_only=True)
+    await session._browser_fallback(
+        tool_ctx, {"url": "https://api.z.example/a", "method": "GET"}, fake_run_tool)
+    assert called["n"] == 1   # a GET passes the read-only gate and is re-issued
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_non_2xx_returned_but_not_recorded():
+    session = CopilotSession("s-fb2")
+
+    async def fake_run_tool(ctx, name, args):
+        return {"ok": True, "status": 403, "body": "denied"}
+
+    tool_ctx = SimpleNamespace(read_only=False)
+    result = await session._browser_fallback(
+        tool_ctx, {"url": "https://api.y.example/z", "method": "GET"}, fake_run_tool)
+    assert result["status"] == 403 and "transport=browser" in result["note"]
+    from dast.session.transport_capability import capability_for
+    assert capability_for("api.y.example", "/z") is None   # only 2xx/3xx seeds the store

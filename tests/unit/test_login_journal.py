@@ -61,3 +61,30 @@ def test_bad_input_is_ignored():
     assert login_journal.record("", "success") is None
     assert login_journal.record("https://app.example.com", "bogus") is None
     assert login_journal.last_success("never-seen.example.com") is None
+
+
+def test_recent_records_most_recent_first_all_strategies():
+    # A deterministic success has no endpoint, so last_success skips it — recent_records sees it.
+    login_journal.record("https://app.example.com/login", "error", strategy="deterministic",
+                         reason="bad creds")
+    login_journal.record("https://app.example.com/login", "success", strategy="deterministic",
+                         success_url="https://app.example.com/dashboard")
+    recs = login_journal.recent_records("app.example.com")
+    assert [r["strategy"] for r in recs] == ["deterministic", "deterministic"]
+    assert recs[0]["outcome"] == "success"   # most recent first
+    assert login_journal.recent_records("never-seen.example.com") == []
+
+
+def test_last_winning_strategy_returns_recent_success_any_strategy():
+    login_journal.record("https://app.example.com/login", "success", strategy="deterministic",
+                         success_url="https://app.example.com/dashboard")
+    assert login_journal.last_winning_strategy("app.example.com") == "deterministic"
+    # A later spa_api success wins.
+    login_journal.record("https://app.example.com/login", "success", strategy="spa_api",
+                         endpoint="https://app.example.com/spa/auth/login")
+    assert login_journal.last_winning_strategy("app.example.com") == "spa_api"
+    # A later failure does not overwrite the last SUCCESS.
+    login_journal.record("https://app.example.com/login", "error", strategy="llm",
+                         reason="gave up")
+    assert login_journal.last_winning_strategy("app.example.com") == "spa_api"
+    assert login_journal.last_winning_strategy("never-seen.example.com") is None

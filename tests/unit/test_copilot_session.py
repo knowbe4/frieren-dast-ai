@@ -1129,3 +1129,26 @@ async def test_browser_fallback_non_2xx_returned_but_not_recorded():
     assert result["status"] == 403 and "transport=browser" in result["note"]
     from dast.session.transport_capability import capability_for
     assert capability_for("api.y.example", "/z") is None   # only 2xx/3xx seeds the store
+
+
+# ── regression: _browser_on_host must read the REAL AgentBrowser.page accessor ──
+# The Bearer-refresh ladder gates its re-mint tiers (WAIT_SPA / RELOAD) on
+# _browser_on_host, which reads browser.page.url. AgentBrowser stored the page as _page
+# and exposed no .page, so getattr(browser,"page") was always None and those tiers never
+# fired against a real browser (short-TTL tokens could not be re-minted). The earlier
+# ladder tests masked this with fakes that happened to define .page.
+
+def test_agent_browser_exposes_page_for_on_host_check():
+    from dast.browser.agent_browser import AgentBrowser
+    ab = AgentBrowser(proxy_port=0, store=None, headless=True)
+    assert hasattr(type(ab), "page"), "AgentBrowser must expose a .page accessor"
+    assert ab.page is None  # not launched yet -> on-host check is False, no crash
+    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is False
+
+    # A launched page on the host's registrable domain -> on-host is True (was False
+    # before the fix because .page did not exist on the real AgentBrowser).
+    ab._page = SimpleNamespace(url="https://phisher.example/")
+    assert ab.page is ab._page
+    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is True
+    ab._page = SimpleNamespace(url="https://unrelated.example/")
+    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is False

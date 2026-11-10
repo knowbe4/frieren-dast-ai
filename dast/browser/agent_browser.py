@@ -166,6 +166,15 @@ class AgentBrowser:
         self._lock = asyncio.Lock()
         self._last_cookie_sync: float = 0.0
 
+    @property
+    def page(self) -> Any:
+        """The current Playwright page, or None if the browser has not launched yet.
+
+        Read-only accessor for callers that only need to INSPECT the live page (e.g. its
+        current URL, as the Bearer-refresh ladder's ``_browser_on_host`` check does) without
+        forcing a launch. Use ``_ensure_page()`` when a page must actually exist."""
+        return self._page
+
     async def _ensure_page(self) -> Any:
         if self._page is not None:
             return self._page

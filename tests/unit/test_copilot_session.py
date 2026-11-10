@@ -913,3 +913,137 @@ async def test_ensure_fresh_bearer_no_wait_when_browser_elsewhere():
         browser=_Elsewhere(), timeout_s=5.0)
     assert rec is None
     assert _time.monotonic() - t0 < 1.0   # did NOT burn the timeout — browser not on this host
+
+
+# ── refresh_bearer: the reactive escalation ladder (REFETCH / RELOAD tiers) ──
+
+class _FetchResp:
+    def __init__(self, token: str, status: int = 200):
+        self.status = status
+        self._token = token
+
+    async def text(self) -> str:
+        import json as _json
+        return _json.dumps({"token": self._token})
+
+
+class _FetchRequest:
+    def __init__(self, token: str):
+        self._token = token
+
+    async def fetch(self, url: str, method: str = "GET"):
+        return _FetchResp(self._token)
+
+
+class _RefetchBrowser:
+    """A browser parked on an unrelated host (so WAIT_SPA is skipped) whose
+    page.request.fetch mints a fresh token — exercises the REFETCH tier."""
+
+    class _Page:
+        url = "https://elsewhere.example/"
+
+    def __init__(self, token: str):
+        self._page = self._Page()
+        self._page.request = _FetchRequest(token)
+
+    @property
+    def page(self):
+        return self._page
+
+    async def _ensure_page(self):
+        return self._page
+
+
+class _ReloadBrowser:
+    """A browser on the target host that records whether reload() was called."""
+
+    class _Page:
+        url = "https://api.phisher.example/"
+
+    def __init__(self):
+        self._page = self._Page()
+        self.reloaded = False
+
+    @property
+    def page(self):
+        return self._page
+
+    async def _ensure_page(self):
+        return self._page
+
+    async def reload(self, timeout_ms: int = 20000):
+        self.reloaded = True
+        return {"ok": True, "url": self._page.url, "status": 200}
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_refetch_tier_mints_token():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-refetch")
+    host = "api.phisher.example"
+    # A known Bearer host whose cached token has expired, with a re-usable auth endpoint.
+    session._bearer_tokens[host] = {
+        "token": "old", "exp": _time.time() - 10,
+        "auth_endpoint": "/api/auth/token", "source_entry_id": "e1"}
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    outcome = await session.refresh_bearer(
+        _Empty(), host, "/queries_api/v2/x",
+        browser=_RefetchBrowser(_unexpired_jwt()),
+        max_tier=RefreshTier.RELOGIN)
+    assert outcome.acted is True
+    assert outcome.tier_reached == RefreshTier.REFETCH
+    assert outcome.record and outcome.record["token"] == _unexpired_jwt()
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_refetch_respects_cooldown():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-refetch-cd")
+    host = "api.phisher.example"
+    session._bearer_tokens[host] = {
+        "token": "old", "exp": _time.time() - 10,
+        "auth_endpoint": "/api/auth/token", "source_entry_id": "e1"}
+    session._last_bearer_refresh_ts = _time.time()  # just refreshed -> cooldown active
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    outcome = await session.refresh_bearer(
+        _Empty(), host, "/x", browser=_RefetchBrowser(_unexpired_jwt()),
+        max_tier=RefreshTier.REFETCH)
+    assert outcome.acted is False               # REFETCH skipped by the 15s cooldown
+    assert outcome.record["token"] == "old"     # the stale token is returned, unrefreshed
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_reload_tier():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-reload")
+    host = "api.phisher.example"
+    # Known Bearer host (so RELOAD is allowed), cached token expired, NO auth endpoint
+    # (so REFETCH no-ops and the ladder escalates to RELOAD).
+    session._bearer_tokens[host] = {"token": "old", "exp": _time.time() - 10}
+    browser = _ReloadBrowser()
+    entry = _BearerEntry(host=host,
+                         request_headers={"Authorization": f"Bearer {_unexpired_jwt()}"})
+
+    class _ReloadMintStore:
+        """Returns the SPA's fresh token only after the page has been reloaded."""
+        def all_entries(self):
+            return [entry] if browser.reloaded else []
+
+    outcome = await session.refresh_bearer(
+        _ReloadMintStore(), host, "/queries_api/v2/x", browser=browser,
+        max_tier=RefreshTier.RELOAD, timeout_s=0.5)
+    assert browser.reloaded is True
+    assert outcome.acted is True
+    assert outcome.tier_reached == RefreshTier.RELOAD
+    assert outcome.record and outcome.record["token"] == _unexpired_jwt()

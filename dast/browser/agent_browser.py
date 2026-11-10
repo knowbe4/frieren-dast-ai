@@ -388,6 +388,25 @@ class AgentBrowser:
                               "check get_history for captured traffic, then snapshot/retry")
         return result
 
+    async def reload(self, timeout_ms: int = 20000) -> Dict[str, Any]:
+        """Reload the current page to force a client-rendered SPA to re-mint any
+        short-lived in-memory token (e.g. a Bearer the app holds in JS state, not a
+        cookie). Mirrors ``navigate``'s resilience: ``wait_until="commit"`` and never
+        hard-fails, then settles on hydration so the SPA's re-authenticated XHR (and the
+        fresh token the MITM proxy captures from it) has a chance to land.
+
+        Internal re-mint mechanism for the Bearer refresh ladder — not an agent-chosen
+        primitive, so it is not registered as an MCP tool."""
+        page = await self._ensure_page()
+        resp = None
+        try:
+            resp = await page.reload(wait_until="commit", timeout=timeout_ms)
+        except Exception as exc:
+            logger.debug("AgentBrowser reload: did not settle, continuing",
+                         error=str(exc)[:160])
+        await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
+        return {"ok": True, "url": page.url, "status": (resp.status if resp else None)}
+
     async def fill(self, selector: str, value: str, timeout_ms: int = 10000) -> Dict[str, Any]:
         page = await self._ensure_page()
         await page.fill(selector, value, timeout=timeout_ms)

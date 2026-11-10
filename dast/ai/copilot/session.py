@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -46,6 +47,38 @@ _MAX_NORMALIZED_REPEATS = 3
 # Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 4
+
+
+class RefreshTier(IntEnum):
+    """Bearer-refresh escalation tiers, cheapest -> most expensive. ``refresh_bearer``
+    runs them in order up to the caller's ``max_tier`` and stops at the first fresh token.
+
+    The cooldown is cost-proportional: the cheap, idempotent tiers are unthrottled so a
+    token the SPA just minted is picked up immediately, while the expensive, session-mutating
+    tiers keep a widening cooldown so a burst of 401s cannot trigger a relogin flood (which
+    is exactly what invalidates server-side sessions)."""
+    RESCAN = 0    # re-scan proxy history (free, idempotent)
+    WAIT_SPA = 1  # poll history while the live SPA mints a token (bounded by timeout_s)
+    REFETCH = 2   # re-fetch the auth endpoint through the browser (15s cooldown)
+    RELOAD = 3    # reload the SPA to force a re-mint, then re-scan (~30s cooldown)
+    RELOGIN = 4   # full browser re-login via the cascade (60s cooldown + reentrancy lock)
+
+
+# Per-tier cooldown (seconds) for the mutating tiers; the cheap tiers are unthrottled.
+_REFETCH_COOLDOWN_S = 15.0
+_RELOAD_COOLDOWN_S = 30.0
+_RELOGIN_COOLDOWN_S = 60.0
+
+
+@dataclass
+class RefreshOutcome:
+    """Result of a ``refresh_bearer`` run. ``record`` is a fresh Bearer record or None;
+    ``acted`` is True when a mutating tier (REFETCH/RELOAD/RELOGIN) actually executed, so
+    the caller re-applies auth and re-runs the request once even when no token was minted
+    (a relogin can refresh cookie state without producing a Bearer)."""
+    record: Optional[Dict[str, Any]] = None
+    tier_reached: RefreshTier = RefreshTier.RESCAN
+    acted: bool = False
 
 
 def _normalized_call_sig(tool_name: str, args: Dict[str, Any]) -> str:
@@ -574,6 +607,7 @@ class CopilotSession:
         self._last_relogin_ts: float = 0.0
         self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
         self._last_bearer_refresh_ts: float = 0.0
+        self._last_reload_ts: float = 0.0
         self._auth_prompted_hosts: set[str] = set()
         # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
         # fabricated host escalate and trip the failure breaker instead of looping.
@@ -646,25 +680,85 @@ class CopilotSession:
         want_suffix = ".".join(want[-2:]) if len(want) >= 2 else host.lower()
         return want_suffix in cur_host
 
-    async def _ensure_fresh_bearer(self, store: Any, host: str, path: str,
-                                   browser: Any = None,
-                                   timeout_s: float = 8.0) -> Optional[Dict[str, Any]]:
-        """Return a NON-expired Bearer record for (host, path), waiting briefly for the
-        live SPA to mint one when needed.
+    async def refresh_bearer(self, store: Any, host: str, path: str, *,
+                             browser: Any = None, tool_ctx: Any = None,
+                             max_tier: RefreshTier = RefreshTier.WAIT_SPA,
+                             timeout_s: float = 8.0,
+                             reason: str = "") -> RefreshOutcome:
+        """Single Bearer-refresh policy: run the escalation ladder (see ``RefreshTier``)
+        from cheapest to the caller's ``max_tier``, stopping at the first fresh token.
 
-        ``navigate`` resolves on ``commit`` (before the SPA makes its authenticated calls),
-        so right after entering a sub-app the proxy may not have captured a Bearer yet. When
-        the browser is on this host's app, poll history for up to ``timeout_s`` so the token
-        the SPA is about to emit is captured and attached — otherwise a tool request to the
-        sub-app 401s with the token sitting one network round-trip away."""
-        import asyncio
+        The proactive, pre-flight caller (``send_request``, no 401 yet) passes
+        ``max_tier=WAIT_SPA`` so it only ever re-scans history and waits for the live SPA;
+        the reactive caller (after a 401) passes ``max_tier=RELOGIN`` to escalate through
+        the auth-endpoint refetch, an SPA reload, and finally a full re-login. The cooldown
+        is cost-proportional and lives entirely in this method, so a burst of 401s cannot
+        trigger a relogin flood. ``acted`` in the result tells the caller a mutating tier
+        ran, so it should re-apply auth and re-run the request once."""
         import time as _time
+
+        # Tier 0 — RESCAN: re-scan proxy history (free, idempotent).
         self._capture_bearer_tokens(store, host)
         rec = self._select_bearer(host, path)
         if self._rec_is_fresh(rec):
-            return rec
-        # Only wait when the SPA for this host is live — otherwise the host simply has no
-        # Bearer and waiting is pointless latency.
+            return RefreshOutcome(rec, RefreshTier.RESCAN, False)
+        reached = RefreshTier.RESCAN
+        acted = False
+
+        # Tier 1 — WAIT_SPA: poll while the live SPA mints a token (bounded by timeout_s).
+        if max_tier >= RefreshTier.WAIT_SPA:
+            reached = RefreshTier.WAIT_SPA
+            rec = await self._tier_wait_spa(store, host, path, browser, timeout_s)
+            if self._rec_is_fresh(rec):
+                return RefreshOutcome(rec, RefreshTier.WAIT_SPA, False)
+
+        now = _time.time
+        # Tier 2 — REFETCH: re-fetch the auth endpoint through the browser (15s cooldown).
+        if (max_tier >= RefreshTier.REFETCH and browser is not None
+                and (now() - self._last_bearer_refresh_ts) > _REFETCH_COOLDOWN_S):
+            reached = RefreshTier.REFETCH
+            self._last_bearer_refresh_ts = now()  # throttle regardless of outcome
+            if await self._tier_refetch(host, browser):
+                acted = True
+                rec = self._select_bearer(host, path)
+                if self._rec_is_fresh(rec):
+                    return RefreshOutcome(rec, RefreshTier.REFETCH, True)
+
+        # Tier 3 — RELOAD: reload the SPA to force a re-mint, then re-scan (~30s cooldown).
+        if (max_tier >= RefreshTier.RELOAD and browser is not None
+                and self._browser_on_host(browser, host)
+                and (now() - self._last_reload_ts) > _RELOAD_COOLDOWN_S):
+            reached = RefreshTier.RELOAD
+            self._last_reload_ts = now()
+            if await self._tier_reload(store, host, path, browser, timeout_s):
+                acted = True
+                rec = self._select_bearer(host, path)
+                if self._rec_is_fresh(rec):
+                    return RefreshOutcome(rec, RefreshTier.RELOAD, True)
+
+        # Tier 4 — RELOGIN: full browser re-login (60s cooldown + reentrancy lock).
+        if (max_tier >= RefreshTier.RELOGIN and browser is not None
+                and self._last_login is not None
+                and not self._relogin_in_progress
+                and (now() - self._last_relogin_ts) > _RELOGIN_COOLDOWN_S):
+            reached = RefreshTier.RELOGIN
+            if await self._tier_relogin(store, host, browser, tool_ctx):
+                acted = True
+                rec = self._select_bearer(host, path)
+                return RefreshOutcome(rec, RefreshTier.RELOGIN, True)
+
+        return RefreshOutcome(rec, reached, acted)
+
+    async def _tier_wait_spa(self, store: Any, host: str, path: str,
+                             browser: Any, timeout_s: float) -> Optional[Dict[str, Any]]:
+        """Poll proxy history for up to ``timeout_s`` while the live SPA mints a token.
+
+        ``navigate`` resolves on ``commit`` (before the SPA makes its authenticated calls),
+        so right after entering a sub-app the proxy may not have captured a Bearer yet. Only
+        waits when the browser is on this host's app — otherwise the host simply has no
+        Bearer and waiting is pointless latency."""
+        import time as _time
+        rec = self._select_bearer(host, path)
         if not self._browser_on_host(browser, host):
             return rec
         deadline = _time.monotonic() + max(0.0, timeout_s)
@@ -676,6 +770,113 @@ class CopilotSession:
                 logger.info("Fresh sub-app Bearer captured after wait", host=host)
                 return rec
         return rec
+
+    async def _tier_refetch(self, host: str, browser: Any) -> bool:
+        """Re-fetch the cached auth endpoint through the live browser session to mint a
+        fresh Bearer, re-caching it. Returns True when a new token was obtained."""
+        import json as _json
+        import time as _time
+        cached = self._bearer_tokens.get(host)
+        if not cached:
+            return False
+        auth_ep = cached.get("auth_endpoint")
+        if not auth_ep:
+            return False
+        logger.info("bearer-refresh: trying fast path", host=host, endpoint=auth_ep[:60])
+        try:
+            page = await browser._ensure_page()
+            resp = await page.request.fetch(f"https://{host}{auth_ep}", method="GET")
+            if resp.status == 200:
+                body = _json.loads(await resp.text())
+                new_token = body.get("token") or body.get("access_token") or ""
+                if new_token:
+                    exp = self._decode_jwt_exp(new_token)
+                    self._bearer_tokens[host] = {
+                        "token": new_token,
+                        "captured_at": _time.time(),
+                        "source_entry_id": cached.get("source_entry_id", ""),
+                        "auth_endpoint": auth_ep,
+                        "exp": exp,
+                    }
+                    logger.info("bearer-refresh: succeeded", host=host,
+                                ttl=int(exp - _time.time()) if exp else -1)
+                    return True
+        except Exception as exc:
+            logger.debug("bearer-refresh: failed, falling back", error=str(exc)[:100])
+        return False
+
+    async def _tier_reload(self, store: Any, host: str, path: str,
+                           browser: Any, timeout_s: float) -> bool:
+        """Reload the SPA to force it to re-mint an in-memory token, then wait for the
+        proxy to capture it. Returns True when a fresh token appeared after the reload.
+
+        Only hosts already known to use Bearer auth are reloaded: reloading is for
+        re-minting an in-memory token, so a pure cookie-session 401 must not trigger a
+        page reload (wasted latency + disrupts the agent's browser state)."""
+        if not self._bearer_tokens.get(host):
+            return False
+        logger.info("bearer-refresh: reloading SPA to force re-mint", host=host)
+        try:
+            await browser.reload()
+        except Exception as exc:
+            logger.debug("bearer-refresh: reload failed", error=str(exc)[:120])
+            return False
+        rec = await self._tier_wait_spa(store, host, path, browser, timeout_s)
+        return self._rec_is_fresh(rec)
+
+    async def _tier_relogin(self, store: Any, host: str, browser: Any,
+                            tool_ctx: Any) -> bool:
+        """Full browser re-login through the cascade (form -> spa_api -> LLM). On success
+        syncs the browser cookies into the session and re-captures any Bearer. Returns True
+        when the cascade re-authenticated (the caller then re-applies auth and re-runs)."""
+        import time as _time
+        logger.info("auto-relogin: session expired, re-authenticating",
+                    request_host=host, login_url=self._last_login["url"][:60])
+        self._relogin_in_progress = True
+        self._last_relogin_ts = _time.time()
+        try:
+            # Re-login through the full cascade, not raw browser.login: a SPA whose form is
+            # in an iframe/shadow root only re-authenticates via the spa_api strategy. The
+            # cascade syncs the jar on spa_api success; the browser cookies are folded in
+            # below so every engine path updates the session.
+            from dast.browser.login_cascade import adaptive_login
+            cascade = await adaptive_login(
+                browser,
+                self._last_login["url"],
+                self._last_login["email"],
+                self._last_login["password"],
+                in_scope=getattr(tool_ctx, "is_in_scope", None),
+                store=getattr(tool_ctx, "store", None),
+                session=self,
+            )
+            if cascade.ok:
+                try:
+                    self._session_cookies.update(await browser.export_cookies())
+                except Exception as exc:
+                    logger.debug("auto-relogin: cookie sync failed", error=str(exc)[:120])
+                logger.info("auto-relogin: succeeded via %s, retrying request",
+                            cascade.engine)
+                self._capture_bearer_tokens(store, host)
+                return True
+            logger.warning("auto-relogin: cascade failed", engine=cascade.engine,
+                           error=str(cascade.error)[:100])
+            return False
+        except Exception as exc:
+            logger.warning("auto-relogin: exception", error=str(exc)[:200])
+            return False
+        finally:
+            self._relogin_in_progress = False
+
+    async def _ensure_fresh_bearer(self, store: Any, host: str, path: str,
+                                   browser: Any = None,
+                                   timeout_s: float = 8.0) -> Optional[Dict[str, Any]]:
+        """Proactive, pre-flight Bearer refresh for (host, path): back-compat thin wrapper
+        over ``refresh_bearer`` capped at WAIT_SPA (re-scan + wait for the live SPA only —
+        never the reactive, session-mutating tiers, which belong to the 401 path)."""
+        outcome = await self.refresh_bearer(
+            store, host, path, browser=browser,
+            max_tier=RefreshTier.WAIT_SPA, timeout_s=timeout_s)
+        return outcome.record
 
     def seed_session_cookies(self, cookies: Dict[str, str]) -> None:
         """Preload an authenticated session (e.g. from an activated login profile)
@@ -1097,7 +1298,6 @@ class CopilotSession:
                         and not self._relogin_in_progress
                         and self._last_login is not None
                     ):
-                        import time as _time
                         status = result.get("status")
                         request_url = str(tool_args.get("url") or result.get("url") or "")
                         host = urlparse(request_url).hostname or ""
@@ -1107,96 +1307,21 @@ class CopilotSession:
                             (status == 302 and any(p in final_url for p in login_paths))
                             or status == 401
                         )
-                        cooldown_ok = (_time.time() - self._last_relogin_ts) > 60
-                        if session_expired and cooldown_ok:
-                            browser = getattr(tool_ctx, "browser", None)
-                            bearer_refreshed = False
-                            # Fast path: refresh Bearer token via auth endpoint
-                            if (
-                                status == 401
-                                and host in self._bearer_tokens
-                                and browser is not None
-                                and (_time.time() - self._last_bearer_refresh_ts) > 15
-                            ):
-                                cached = self._bearer_tokens[host]
-                                auth_ep = cached.get("auth_endpoint")
-                                if auth_ep:
-                                    logger.info("bearer-refresh: trying fast path",
-                                                host=host, endpoint=auth_ep[:60])
-                                    self._last_bearer_refresh_ts = _time.time()
-                                    try:
-                                        page = await browser._ensure_page()
-                                        resp = await page.request.fetch(
-                                            f"https://{host}{auth_ep}",
-                                            method="GET")
-                                        if resp.status == 200:
-                                            import json as _json
-                                            body = _json.loads(await resp.text())
-                                            new_token = (body.get("token")
-                                                         or body.get("access_token") or "")
-                                            if new_token:
-                                                exp = self._decode_jwt_exp(new_token)
-                                                self._bearer_tokens[host] = {
-                                                    "token": new_token,
-                                                    "captured_at": _time.time(),
-                                                    "source_entry_id": cached.get("source_entry_id", ""),
-                                                    "auth_endpoint": auth_ep,
-                                                    "exp": exp,
-                                                }
-                                                logger.info("bearer-refresh: succeeded",
-                                                            host=host,
-                                                            ttl=int(exp - _time.time()) if exp else -1)
-                                                self._apply_session_auth(tool_ctx, tool_args)
-                                                result = await run_tool(tool_ctx, tool_name, tool_args)
-                                                bearer_refreshed = True
-                                    except Exception as exc:
-                                        logger.debug("bearer-refresh: failed, falling back to login",
-                                                     error=str(exc)[:100])
-
-                            # Slow path: full browser re-login
-                            if not bearer_refreshed and browser is not None:
-                                logger.info("auto-relogin: session expired, re-authenticating",
-                                            request_host=urlparse(str(result.get("url", ""))).hostname,
-                                            login_url=self._last_login["url"][:60])
-                                self._relogin_in_progress = True
-                                self._last_relogin_ts = _time.time()
-                                try:
-                                    # Re-login through the full cascade (form -> spa_api ->
-                                    # LLM), not raw browser.login: a SPA whose form is in an
-                                    # iframe/shadow root only re-authenticates via the spa_api
-                                    # strategy. The cascade syncs the jar on spa_api success;
-                                    # we also fold the browser's cookies into the handoff below
-                                    # so every engine path updates the session.
-                                    from dast.browser.login_cascade import adaptive_login
-                                    cascade = await adaptive_login(
-                                        browser,
-                                        self._last_login["url"],
-                                        self._last_login["email"],
-                                        self._last_login["password"],
-                                        in_scope=getattr(tool_ctx, "is_in_scope", None),
-                                        store=getattr(tool_ctx, "store", None),
-                                        session=self,
-                                    )
-                                    if cascade.ok:
-                                        try:
-                                            self._session_cookies.update(await browser.export_cookies())
-                                        except Exception as exc:
-                                            logger.debug("auto-relogin: cookie sync failed",
-                                                         error=str(exc)[:120])
-                                        logger.info("auto-relogin: succeeded via %s, retrying request",
-                                                    cascade.engine)
-                                        self._capture_bearer_tokens(
-                                            getattr(tool_ctx, "store", None), host)
-                                        self._apply_session_auth(tool_ctx, tool_args)
-                                        result = await run_tool(tool_ctx, tool_name, tool_args)
-                                    else:
-                                        logger.warning("auto-relogin: cascade failed",
-                                                       engine=cascade.engine,
-                                                       error=str(cascade.error)[:100])
-                                except Exception as exc:
-                                    logger.warning("auto-relogin: exception", error=str(exc)[:200])
-                                finally:
-                                    self._relogin_in_progress = False
+                        if session_expired and host:
+                            # One refresh policy: the ladder escalates (re-scan -> wait for
+                            # the SPA -> refetch the auth endpoint -> reload the SPA -> full
+                            # re-login) and owns every cooldown, so a burst of 401s cannot
+                            # trigger a relogin flood. ``acted`` means a mutating tier ran,
+                            # so re-apply auth and re-run the request once.
+                            request_path = urlparse(request_url).path or "/"
+                            outcome = await self.refresh_bearer(
+                                getattr(tool_ctx, "store", None), host, request_path,
+                                browser=getattr(tool_ctx, "browser", None),
+                                tool_ctx=tool_ctx,
+                                max_tier=RefreshTier.RELOGIN, reason="401")
+                            if outcome.acted:
+                                self._apply_session_auth(tool_ctx, tool_args)
+                                result = await run_tool(tool_ctx, tool_name, tool_args)
 
                     if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
                         new_url = str(result.get("url", ""))

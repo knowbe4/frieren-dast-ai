@@ -129,7 +129,7 @@ async def test_run_preserves_findings_confirmed_before_timeout():
 
     async def _fake_inner(target, client, collaborator, use_llm_planner,
                           model_id, confidence_threshold, session_intelligence,
-                          probe_diff, collected, replan=False):
+                          probe_diff, collected, replan=False, outcome_sink=None):
         # Simulate: validation finalised one confirmed finding into the shared
         # collector, then the run stalls (e.g. slow write-back) and times out.
         collected.append(kept)
@@ -688,3 +688,108 @@ async def test_replan_off_by_default_skips_followup():
 
     assert ran == ["sqli"], "no follow-up pass when replan is off"
     assert {f.title for f in result} == {"SQLi"}
+
+
+# ── Phase 3: structured ScanOutcome (return_outcome=True) ──────────────────
+
+from dast.ai.coordinator import ScanOutcome, _AUTH_WALL_REASON_PREFIX  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_empty_registry_returns_scanoutcome():
+    with _Registry():  # cleared registry
+        out = await Coordinator.run(_target(), MagicMock(), return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert out.blockers == ["no_registry"] and out.findings == []
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_blocker_auth_endpoint():
+    class _AnyAgent(VulnAgent):
+        name = "Any"; attack_type = "_o_auth_ep"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+    with _Registry():
+        Coordinator.register(_AnyAgent)
+        out = await Coordinator.run(
+            _target(url="https://example.com/oauth/callback"), MagicMock(),
+            budget_seconds=5.0, return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert "auth_endpoint" in out.blockers and out.findings == []
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_blocker_all_auth_tokens():
+    class _AnyAgent(VulnAgent):
+        name = "Any"; attack_type = "_o_tok"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+    target = _target(params=[{"name": "nonce", "location": "query", "value": "abc"}])
+    with _Registry():
+        Coordinator.register(_AnyAgent)
+        out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0, return_outcome=True)
+    assert "all_auth_tokens" in out.blockers
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_populated_on_success():
+    class _HitAgent(VulnAgent):
+        name = "Hit"; attack_type = "xss"; description = ""
+        async def run(self, target, client, collaborator=None):
+            self.observe("waf_bypass", payload="<x>", signal="200 reflected")
+            return [_finding(attack_type="xss", bypass_validation=True)]
+
+    plan_mock = AsyncMock(return_value=(["xss"], "selected xss", False))
+    with _Registry():
+        Coordinator.register(_HitAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(_target(), MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert len(out.findings) == 1 and out.findings[0].attack_type == "xss"
+    assert out.agents_ran == ["xss"]
+    assert any(o.kind == "waf_bypass" for o in out.observations)
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_auth_wall_sets_needs_auth_refresh():
+    class _AuthBypassAgent(VulnAgent):
+        name = "AuthBypass"; attack_type = "auth_bypass"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    with _Registry():
+        Coordinator.register(_AuthBypassAgent)
+        with patch.object(Coordinator, "_baseline_check",
+                          new=AsyncMock(return_value=(f"{_AUTH_WALL_REASON_PREFIX} 401 login", ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(_target(method="POST", body="{}"), MagicMock(),
+                                        budget_seconds=5.0, return_outcome=True)
+    assert "auth-refresh" in out.needs
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_timeout_marks_budget_blocker():
+    kept = _finding(title="SQL Injection", attack_type="sqli")
+
+    class _NoopAgent(VulnAgent):
+        name = "Noop"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    async def _slow_inner(target, client, collaborator, use_llm_planner,
+                          model_id, confidence_threshold, session_intelligence,
+                          probe_diff, collected, replan=False, outcome_sink=None):
+        collected.append(kept)
+        await asyncio.sleep(10)
+        return collected
+
+    with _Registry():
+        Coordinator.register(_NoopAgent)
+        with patch.object(Coordinator, "_run_inner", new=_slow_inner):
+            out = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.05,
+                                        return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert "budget_timeout" in out.blockers and len(out.findings) == 1

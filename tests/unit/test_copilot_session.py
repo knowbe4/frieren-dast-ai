@@ -876,19 +876,17 @@ class _DelayedStore:
 
 
 class _BrowserOnHost:
-    class _Page:
-        url = "https://phisher.example/"
-    page = _Page()
+    current_url = "https://svc.example/"
 
 
 @pytest.mark.asyncio
 async def test_ensure_fresh_bearer_waits_for_spa_token():
     session = CopilotSession("s-bearer")
-    entry = _BearerEntry(host="api.phisher.example",
+    entry = _BearerEntry(host="api.svc.example",
                          request_headers={"Authorization": f"Bearer {_unexpired_jwt()}"})
     store = _DelayedStore(appears_on_call=2, entry=entry)  # absent on the fast path, appears after a poll
     rec = await session._ensure_fresh_bearer(
-        store, "api.phisher.example", "/queries_api/v2/x",
+        store, "api.svc.example", "/queries_api/v2/x",
         browser=_BrowserOnHost(), timeout_s=3.0)
     assert rec and rec.get("token")
 
@@ -903,13 +901,11 @@ async def test_ensure_fresh_bearer_no_wait_when_browser_elsewhere():
             return []
 
     class _Elsewhere:
-        class _Page:
-            url = "https://unrelated.example.com/"
-        page = _Page()
+        current_url = "https://unrelated.example.com/"
 
     t0 = _time.monotonic()
     rec = await session._ensure_fresh_bearer(
-        _Empty(), "api.phisher.example", "/queries_api/v2/x",
+        _Empty(), "api.svc.example", "/queries_api/v2/x",
         browser=_Elsewhere(), timeout_s=5.0)
     assert rec is None
     assert _time.monotonic() - t0 < 1.0   # did NOT burn the timeout — browser not on this host
@@ -939,16 +935,14 @@ class _RefetchBrowser:
     """A browser parked on an unrelated host (so WAIT_SPA is skipped) whose
     page.request.fetch mints a fresh token — exercises the REFETCH tier."""
 
+    current_url = "https://elsewhere.example/"
+
     class _Page:
         url = "https://elsewhere.example/"
 
     def __init__(self, token: str):
         self._page = self._Page()
         self._page.request = _FetchRequest(token)
-
-    @property
-    def page(self):
-        return self._page
 
     async def _ensure_page(self):
         return self._page
@@ -957,16 +951,14 @@ class _RefetchBrowser:
 class _ReloadBrowser:
     """A browser on the target host that records whether reload() was called."""
 
+    current_url = "https://api.svc.example/"
+
     class _Page:
-        url = "https://api.phisher.example/"
+        url = "https://api.svc.example/"
 
     def __init__(self):
         self._page = self._Page()
         self.reloaded = False
-
-    @property
-    def page(self):
-        return self._page
 
     async def _ensure_page(self):
         return self._page
@@ -981,7 +973,7 @@ async def test_refresh_bearer_refetch_tier_mints_token():
     import time as _time
     from dast.ai.copilot.session import RefreshTier
     session = CopilotSession("s-refetch")
-    host = "api.phisher.example"
+    host = "api.svc.example"
     # A known Bearer host whose cached token has expired, with a re-usable auth endpoint.
     session._bearer_tokens[host] = {
         "token": "old", "exp": _time.time() - 10,
@@ -1005,7 +997,7 @@ async def test_refresh_bearer_refetch_respects_cooldown():
     import time as _time
     from dast.ai.copilot.session import RefreshTier
     session = CopilotSession("s-refetch-cd")
-    host = "api.phisher.example"
+    host = "api.svc.example"
     session._bearer_tokens[host] = {
         "token": "old", "exp": _time.time() - 10,
         "auth_endpoint": "/api/auth/token", "source_entry_id": "e1"}
@@ -1027,7 +1019,7 @@ async def test_refresh_bearer_reload_tier():
     import time as _time
     from dast.ai.copilot.session import RefreshTier
     session = CopilotSession("s-reload")
-    host = "api.phisher.example"
+    host = "api.svc.example"
     # Known Bearer host (so RELOAD is allowed), cached token expired, NO auth endpoint
     # (so REFETCH no-ops and the ladder escalates to RELOAD).
     session._bearer_tokens[host] = {"token": "old", "exp": _time.time() - 10}
@@ -1066,7 +1058,7 @@ async def test_browser_fallback_reissues_via_browser_and_seeds_store():
 
     tool_ctx = SimpleNamespace(read_only=False)
     tool_args = {
-        "url": "https://api.phisher.example/queries_api/v2/accounts/1",
+        "url": "https://api.svc.example/queries_api/v2/accounts/1",
         "method": "GET",
         "headers": {"Cookie": "x=1", "Authorization": "Bearer stale", "X-CSRF-Token": "t",
                     "Content-Type": "application/json", "x-dast-source": "copilot"},
@@ -1082,7 +1074,7 @@ async def test_browser_fallback_reissues_via_browser_and_seeds_store():
     assert result["status"] == 200 and "transport=browser" in result["note"]
 
     from dast.session.transport_capability import capability_for
-    rec = capability_for("api.phisher.example", "/queries_api/v2/accounts/1")
+    rec = capability_for("api.svc.example", "/queries_api/v2/accounts/1")
     assert rec is not None and rec["prefer"] == "browser" and rec["reason"] == "api_401_browser_ok"
 
 
@@ -1131,24 +1123,26 @@ async def test_browser_fallback_non_2xx_returned_but_not_recorded():
     assert capability_for("api.y.example", "/z") is None   # only 2xx/3xx seeds the store
 
 
-# ── regression: _browser_on_host must read the REAL AgentBrowser.page accessor ──
-# The Bearer-refresh ladder gates its re-mint tiers (WAIT_SPA / RELOAD) on
-# _browser_on_host, which reads browser.page.url. AgentBrowser stored the page as _page
-# and exposed no .page, so getattr(browser,"page") was always None and those tiers never
-# fired against a real browser (short-TTL tokens could not be re-minted). The earlier
-# ladder tests masked this with fakes that happened to define .page.
+# ── regression: the browser-location CONTRACT the refresh ladder depends on ──
+# The Bearer-refresh ladder gates its re-mint tiers (WAIT_SPA / RELOAD) on _browser_on_host,
+# which reads the browser's current URL. It used to reach into browser.page.url, but the real
+# AgentBrowser stored the page as _page and exposed no .page -> the gate was always False ->
+# the re-mint tiers never fired against a real browser (short-TTL tokens could not be
+# re-minted). The earlier ladder tests masked this with fakes that happened to define .page.
+# The fix made AgentBrowser.current_url the stable contract; this test runs the REAL
+# AgentBrowser so an interface drift fails here.
 
-def test_agent_browser_exposes_page_for_on_host_check():
+def test_agent_browser_current_url_contract_drives_on_host_check():
     from dast.browser.agent_browser import AgentBrowser
     ab = AgentBrowser(proxy_port=0, store=None, headless=True)
-    assert hasattr(type(ab), "page"), "AgentBrowser must expose a .page accessor"
-    assert ab.page is None  # not launched yet -> on-host check is False, no crash
-    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is False
+    assert hasattr(type(ab), "current_url"), "AgentBrowser must expose the current_url contract"
+    assert ab.current_url == ""  # not launched yet -> on-host is False, no crash
+    assert CopilotSession._browser_on_host(ab, "api.svc.example") is False
 
-    # A launched page on the host's registrable domain -> on-host is True (was False
-    # before the fix because .page did not exist on the real AgentBrowser).
-    ab._page = SimpleNamespace(url="https://phisher.example/")
-    assert ab.page is ab._page
-    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is True
+    # A launched page on the host's registrable domain -> current_url reflects it -> on-host
+    # is True (was False before the fix because the ladder read a non-existent .page).
+    ab._page = SimpleNamespace(url="https://svc.example/")
+    assert ab.current_url == "https://svc.example/"
+    assert CopilotSession._browser_on_host(ab, "api.svc.example") is True
     ab._page = SimpleNamespace(url="https://unrelated.example/")
-    assert CopilotSession._browser_on_host(ab, "api.phisher.example") is False
+    assert CopilotSession._browser_on_host(ab, "api.svc.example") is False

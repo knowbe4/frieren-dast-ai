@@ -1091,9 +1091,21 @@ class Coordinator:
         # The planner now receives the baseline response so it can reason about
         # what the endpoint actually does, not just its URL structure.
         mine_params = False
+        # Targeted dispatch: a caller (the copilot acting as coordinator) may RESTRICT the scan
+        # to an exact agent set, bypassing the LLM planner. Unknown/unregistered types are
+        # filtered out here; if the caller passed types but NONE are registered, `restrict` is
+        # empty and we fall through to the normal planner — never run zero agents by accident.
+        restrict = [t for t in (getattr(target, "only_attack_types", None) or [])
+                    if t in cls._registry]
+        _restricted = False
         if auth_wall:
             selected_types = ["auth_bypass"]
             plan_reason = "Baseline returned 401/403 — only auth bypass applies"
+        elif restrict:
+            selected_types = list(dict.fromkeys(restrict))  # exactly these, de-duped, order-kept
+            plan_reason = f"Targeted dispatch (planner bypassed): {', '.join(selected_types)}"
+            _restricted = True
+            logger.info("coordinator: targeted dispatch", url=target.url, agents=selected_types)
         elif use_llm_planner:
             from dast.ai.bedrock_client import get_fast_model
             plan_model = model_id or get_fast_model()
@@ -1116,18 +1128,23 @@ class Coordinator:
         # otherwise a real tokenless state-changing request (e.g. DVWA /exec/) is
         # silently skipped. business_logic stays planner-gated — it genuinely
         # needs the LLM to judge whether the response computes extra state.
-        if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
+        # Targeted dispatch means EXACTLY the requested set — skip the CSRF force-add and the
+        # additive focus union so "only these agents" is honored literally (the caller can
+        # include "csrf" explicitly if it wants it).
+        if not _restricted and "csrf" in candidate_types and "csrf" in cls._registry \
+                and "csrf" not in selected_types:
             selected_types = [*selected_types, "csrf"]
 
         # Caller-requested attack focus (e.g. run_scan recommended by the evidence
         # router for an LLM endpoint -> guarantee llm_injection runs). Additive, so
         # it never REDUCES the planner's selection — it only ensures the requested,
         # evidence-backed types are included.
-        focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
-                 if t in cls._registry and t not in selected_types]
-        if focus:
-            selected_types = [*selected_types, *focus]
-            logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
+        if not _restricted:
+            focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
+                     if t in cls._registry and t not in selected_types]
+            if focus:
+                selected_types = [*selected_types, *focus]
+                logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
 
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented

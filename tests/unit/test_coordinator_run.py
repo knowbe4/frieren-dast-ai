@@ -793,3 +793,53 @@ async def test_run_outcome_timeout_marks_budget_blocker():
                                         return_outcome=True)
     assert isinstance(out, ScanOutcome)
     assert "budget_timeout" in out.blockers and len(out.findings) == 1
+
+
+# ── Phase 3: targeted dispatch (only_attack_types bypasses the planner) ────
+
+@pytest.mark.asyncio
+async def test_targeted_dispatch_bypasses_planner():
+    class _XssAgent(VulnAgent):
+        name = "X"; attack_type = "xss"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    class _SqliAgent(VulnAgent):
+        name = "S"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    plan_mock = AsyncMock(return_value=(["sqli"], "planner would pick sqli", False))
+    target = _target()
+    target.only_attack_types = ["xss"]
+    with _Registry():
+        Coordinator.register(_XssAgent)
+        Coordinator.register(_SqliAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    plan_mock.assert_not_called()                 # planner bypassed
+    assert out.agents_ran == ["xss"]              # exactly the restricted set (no sqli, no csrf)
+
+
+@pytest.mark.asyncio
+async def test_targeted_dispatch_invalid_set_falls_through_to_planner():
+    class _SqliAgent(VulnAgent):
+        name = "S"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    plan_mock = AsyncMock(return_value=(["sqli"], "planner picked sqli", False))
+    target = _target()
+    target.only_attack_types = ["not_a_registered_type"]   # none registered -> fall through
+    with _Registry():
+        Coordinator.register(_SqliAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    plan_mock.assert_called_once()                # fell through to the planner
+    assert out.agents_ran == ["sqli"]

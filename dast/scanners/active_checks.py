@@ -86,6 +86,8 @@ class CheckTarget:
     probe_diff_hint: str = ""    # per-param injection-context hypotheses from the probe-diff pass
     param_mining_hint: str = ""  # hidden parameters discovered by the automatic param-mining pass
     focus_attack_types: List[str] = None  # caller-requested attack types to guarantee (additive)
+    only_attack_types: List[str] = None   # caller RESTRICTS to exactly these agents (bypasses the
+                                          # LLM planner); None/empty = normal planner selection
     # Side-channel OUT: the coordinator records here which attack types it actually
     # evaluated on this endpoint (canary-probed candidates + dispatched agents), so the
     # scan worker can persist per-dimension coverage onto the ProxyEntry. Not an input.

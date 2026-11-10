@@ -14,7 +14,8 @@ dashboard's ``/api/findings/manual`` endpoint. One tool, both callers.
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
@@ -23,6 +24,37 @@ from dast.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
+
+# Deterministic FP guard (record-path twin of dast/ai/fp_filter.py, which record_finding
+# bypasses). A finding whose evidence shows an auth-layer REJECTION or an infrastructure
+# error must not be recorded as a positive — the copilot once recorded a CRITICAL
+# "JWT alg:none Accepted" whose own evidence said "Response: 403".
+_INFRA_ERROR_SIGNATURES = (
+    "invalid key=value pair", "aws4-hmac", "missing equal-sign",
+    "signaturedoesnotmatch", "x-amzn-errortype",
+)
+_SUCCESS_CLAIM_MARKERS = (
+    "accepted", "bypass", "alg:none", "alg: none", "algorithm confusion",
+    "unsigned token", "no signature",
+)
+_REJECTION_STATUS_RE = re.compile(
+    r"(?:response|status|http|returned|got|code)\D{0,16}\b(?:401|403)\b", re.IGNORECASE)
+
+
+def _reject_reason(title: str, evidence: str, reasoning: str) -> Optional[str]:
+    """Refuse a self-contradicting finding: evidence showing an infra error, or a
+    401/403 rejection paired with an acceptance/bypass claim. Returns the reason or None."""
+    text = f"{title}\n{evidence}\n{reasoning}".lower()
+    if any(sig in text for sig in _INFRA_ERROR_SIGNATURES):
+        return ("the evidence is an AWS SigV4 / API-gateway infrastructure error (a malformed "
+                "Authorization parsed as a signature), not application behavior — this is not a "
+                "vulnerability. Re-send with NO Authorization/headers (auth auto-injects) and "
+                "re-read the response body.")
+    if _REJECTION_STATUS_RE.search(text) and any(m in text for m in _SUCCESS_CLAIM_MARKERS):
+        return ("the evidence shows a 401/403 (an auth-layer rejection) but the finding claims "
+                "acceptance/bypass — a rejection is not acceptance. Read the response BODY and "
+                "re-verify before recording.")
+    return None
 
 _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
     "type": "object",
@@ -71,8 +103,11 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
         },
         "attack_type": {
             "type": "string",
-            "description": "Optional machine-readable class, e.g. broken-access-control, "
-                           "sqli, xss, ssrf, sensitive-param.",
+            "description": "Optional machine-readable class, e.g. sqli, xss, ssrf, "
+                           "sensitive-param. For access control, pick precisely: 'idor' "
+                           "(object-level/BOLA — reaching ANOTHER tenant's/user's object, "
+                           "CWE-639) vs 'bfla' (function-level — a SAME-tenant action your "
+                           "role should not allow / vertical privilege escalation, CWE-862).",
         },
         "cwe": {"type": "string", "description": "Optional CWE id, e.g. CWE-284."},
         "method": {"type": "string", "description": "HTTP method of the request (default GET)."},
@@ -132,6 +167,14 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
         return {"ok": False, "error": "url is required"}
     if not evidence:
         return {"ok": False, "error": "evidence is required"}
+
+    # Deterministic FP guard: refuse a finding that contradicts its own evidence
+    # (infra error, or a 401/403 rejection claimed as an acceptance/bypass).
+    _reject = _reject_reason(title, evidence, str(args.get("reasoning", "")))
+    if _reject:
+        logger.info("record_finding refused self-contradicting finding",
+                    title=title[:80], reason=_reject[:80])
+        return {"ok": False, "error": _reject}
 
     method = str(args.get("method", "GET")).strip().upper() or "GET"
     finding = _build_finding(args)

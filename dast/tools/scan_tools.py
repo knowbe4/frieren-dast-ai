@@ -125,8 +125,6 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if not ctx.is_in_scope(entry.url):
         return {"ok": False, "error": "resolved entry is out of scope", "url": entry.url}
 
-    agents_ran = entry.source == "imported" or bool(getattr(store, "ai_mode", False))
-
     # Optional caller-requested attack focus (additive; the coordinator unions
     # these into the planner's selection). Stashed on the entry so it reaches the
     # CheckTarget built by the scan worker.
@@ -135,9 +133,16 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         entry.focus_attack_types = [str(t).strip() for t in focus if str(t).strip()]
 
     # Mark it the way "Send to AI" does: ai_queued bypasses the once-per-endpoint
-    # dedup so a deliberate re-scan actually runs.
+    # dedup so a deliberate re-scan actually runs. It is also an EXPLICIT-scan signal:
+    # the scan worker runs the full VulnAgent arsenal on an ai_queued entry even when
+    # ambient ai_mode is off (so a session_safe autonomous run still gets real agents).
     entry.ai_queued = True
     entry.queued_for_scan = True
+
+    # An explicit run_scan always runs the agents (via ai_queued), regardless of ambient
+    # ai_mode — so report that, matching the worker's run_agents gate.
+    agents_ran = (entry.source == "imported" or bool(getattr(store, "ai_mode", False))
+                  or bool(entry.ai_queued))
 
     # Register the completion event BEFORE enqueuing so a fast finish() can't fire
     # before we're waiting on it.

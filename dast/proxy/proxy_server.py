@@ -26,6 +26,7 @@ import httpx
 from dast.proxy.cert_authority import CertAuthority
 from dast.proxy.session_store import SessionStore
 from dast.utils.logger import get_logger
+from dast.utils.tasks import spawn_tracked
 
 logger = get_logger(__name__)
 
@@ -97,7 +98,7 @@ class ProxyServer:
             port = requested_port + attempt
             try:
                 self._server = await asyncio.start_server(
-                    self._handle_connection, self._host, port
+                    self._on_client, self._host, port
                 )
                 self._port = port
                 if attempt > 0:
@@ -125,25 +126,44 @@ class ProxyServer:
         # Cancel any in-flight connections (open CONNECT tunnels would otherwise
         # keep wait_closed() blocked forever) before waiting, with a hard ceiling
         # so shutdown can never hang and strand the listening port.
-        for task in list(self._conn_tasks):
+        conn_tasks = list(self._conn_tasks)
+        for task in conn_tasks:
             task.cancel()
         try:
             await asyncio.wait_for(self._server.wait_closed(), timeout=3.0)
         except (asyncio.TimeoutError, Exception) as exc:
             logger.warning("Proxy listener close timed out", error=str(exc))
+        # Drive the cancelled connection tasks to completion so they are not
+        # garbage-collected while still pending ("Task was destroyed but it is
+        # pending!" noise on shutdown). Bounded so shutdown can never hang.
+        if conn_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*conn_tasks, return_exceptions=True), timeout=3.0)
+            except (asyncio.TimeoutError, Exception) as exc:
+                logger.warning("Proxy connection drain timed out", error=str(exc))
         self._server = None
 
     # ------------------------------------------------------------------
     # Connection dispatcher
     # ------------------------------------------------------------------
 
+    async def _on_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        """start_server callback. Run the connection handler in a task that is
+        STRONGLY referenced in ``_conn_tasks`` for its whole life, so the task is not
+        garbage-collected while pending (the "Task was destroyed but it is pending!"
+        noise) — asyncio only holds the connection task weakly, and the start_tls
+        transport swap can drop that hold mid-session. spawn_tracked registers the task
+        at creation and discards it (and logs any error) on completion."""
+        spawn_tracked(self._handle_connection(reader, writer),
+                      name="proxy-conn", registry=self._conn_tasks)
+
     async def _handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         peer = writer.get_extra_info("peername")
-        current = asyncio.current_task()
-        if current is not None:
-            self._conn_tasks.add(current)
         try:
             request_line = await reader.readline()
             if not request_line:
@@ -170,8 +190,7 @@ class ProxyServer:
         except Exception as e:
             logger.warning("Proxy connection error", peer=peer, error=str(e), exc_info=True)
         finally:
-            if current is not None:
-                self._conn_tasks.discard(current)
+            # (registration/discard in _conn_tasks is handled by spawn_tracked in _on_client)
             try:
                 writer.close()
                 await writer.wait_closed()

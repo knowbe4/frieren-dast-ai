@@ -100,6 +100,10 @@ class ProxyEntry:
     queued_for_scan: bool = False
     scan_result: Optional[str] = None  # "vulnerable" | "safe" | "error"
     findings: List[dict] = field(default_factory=list)
+    # attack types the scan actually evaluated on this endpoint (canary-probed +
+    # dispatched agents), for per-dimension coverage tracking. Set by the scan worker
+    # from the coordinator's side-channel on CheckTarget.
+    scanned_attack_types: List[str] = field(default_factory=list)
     # hints from imported reports: [{parameter, payload, attack_type}]
     import_hints: List[dict] = field(default_factory=list)
     # payload injected by an agent probe (for display in HTTP history)
@@ -126,6 +130,7 @@ class ProxyEntry:
             "queued_for_scan": self.queued_for_scan,
             "scan_result": self.scan_result,
             "findings": self.findings,
+            "scanned_attack_types": self.scanned_attack_types or [],
             "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
@@ -164,6 +169,7 @@ class ProxyEntry:
             queued_for_scan=d.get("queued_for_scan", False),
             scan_result=d.get("scan_result"),
             findings=d.get("findings") or [],
+            scanned_attack_types=d.get("scanned_attack_types") or [],
             import_hints=d.get("import_hints") or [],
             ai_queued=d.get("ai_queued", False),
             manual_note=d.get("manual_note"),
@@ -620,6 +626,40 @@ class SessionStore:
             result.update(self._cookies.get(host, {}))
             # Drop single-use OIDC/OAuth handshake cookies: they are dead weight after
             # login and their bulk can push the Cookie header past a server's limit.
+            return [c for c in result.values()
+                    if not _is_transient_login_cookie(c.get("name", ""))]
+
+    def get_named_session_cookies(self, name: str) -> List[dict]:
+        """All cookies of one named session as jar-shaped dicts (for browser seeding).
+
+        Returns an empty list when the session does not exist yet (e.g. a credential-only
+        profile before its first login) — the browser then starts clean and logs in,
+        which is the desired per-session isolation.
+        """
+        with self._lock:
+            session = self.named_sessions.get(name)
+            if session is None:
+                return []
+            return list(session.cookies.values())
+
+    def get_named_session_cookies_for_host(self, name: str, host: str) -> List[dict]:
+        """Return Playwright-compatible cookie dicts for *host* from ONE named session.
+
+        Same host-matching semantics as ``get_cookies_for_host``, but scoped to a
+        single named session so a copilot run reads only its own account's cookies
+        instead of the shared global jar (per-session isolation).
+        """
+        with self._lock:
+            session = self.named_sessions.get(name)
+            if session is None:
+                return []
+            result: Dict[str, dict] = {}
+            for cookie_name, cookie in session.cookies.items():
+                domain = (cookie.get("domain") or "").lstrip(".").lower()
+                if not domain:
+                    continue
+                if domain == host or host.endswith("." + domain):
+                    result[cookie_name] = cookie
             return [c for c in result.values()
                     if not _is_transient_login_cookie(c.get("name", ""))]
 

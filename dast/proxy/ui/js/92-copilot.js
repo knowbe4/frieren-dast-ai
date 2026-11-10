@@ -7,6 +7,7 @@
 
 let _cpActive = null;      // active session_id
 let _cpPollTimer = null;
+let _cpBannerTimer = null;  // periodic reconcile of the pause banner vs server state
 let _cpWs = null;
 let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (see cpRender)
 // session_id -> { kind, payload } for every copilot run currently waiting on the
@@ -294,13 +295,29 @@ function cpBannerGoto() {
 // the paused set from any run already waiting (e.g. a pause before page load).
 async function cpInitBanner() {
   cpConnectWs();
+  await cpReconcilePausedBanner();
+  // Periodic reconcile so a missed WS 'resumed' event or a dropped socket still
+  // clears (or restores) the banner on its own, without a full page refresh.
+  if (_cpBannerTimer) clearInterval(_cpBannerTimer);
+  _cpBannerTimer = setInterval(cpReconcilePausedBanner, 4000);
+}
+
+// Reconcile the paused-run set against the server (the source of truth) and
+// re-render the banner. Clears entries the server no longer reports as paused and
+// seeds any newly-paused run; preserves a richer WS-supplied payload when present.
+async function cpReconcilePausedBanner() {
   try {
     const sessions = await (await fetch('/api/copilot/sessions')).json();
+    const serverPaused = {};
     (sessions || []).forEach(s => {
       const st = s.status || '';
-      if (st.indexOf('paused_') === 0) {
-        _cpPaused[s.session_id] = { kind: st.slice('paused_'.length), payload: {} };
-      }
+      if (st.indexOf('paused_') === 0) serverPaused[s.session_id] = st.slice('paused_'.length);
+    });
+    Object.keys(_cpPaused).forEach(id => {
+      if (!(id in serverPaused)) delete _cpPaused[id];
+    });
+    Object.keys(serverPaused).forEach(id => {
+      if (!_cpPaused[id]) _cpPaused[id] = { kind: serverPaused[id], payload: {} };
     });
     cpRenderPauseBanner();
   } catch (e) { /* banner is best-effort */ }
@@ -385,9 +402,13 @@ function cpRender(session) {
     ? cpBlockedBadge(session.last_reply.blocked_reason) : '';
   const activity = cpRenderActivity(session, inProgress);
 
+  // Sticky auto-scroll: only pin to the bottom when the operator is already there.
+  // Otherwise a paused run's poll/WS re-renders would yank the view down on every
+  // tick and they could never scroll up to read the earlier trace.
+  const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) < 40;
   el.innerHTML = bubbles + blocked + activity;
   cpEnsurePulse();
-  el.scrollTop = el.scrollHeight;
+  if (nearBottom) el.scrollTop = el.scrollHeight;
 
   // Only rewrite the pause panel when the pause identity actually changes. The
   // poll loop and WS nudges re-render on every tick during a paused_* status; if

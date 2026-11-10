@@ -80,3 +80,18 @@ async def test_sso_mfa_combo_bails_at_mfa(agent_browser: AgentBrowser) -> None:
     assert result.ok is False, result.to_dict()
     assert result.error == "mfa_required"
     assert result.engine == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_spa_json_solved_by_spa_api_strategy(agent_browser: AgentBrowser) -> None:
+    # The login form is in a CLOSED shadow root the deterministic form-fill cannot reach
+    # ("no email field"); the DOM-independent spa_api strategy must log in via the JSON
+    # /api/auth/login endpoint, BEFORE and WITHOUT the LLM fallback. This locks the
+    # SvelteKit-shape login so it does not regress.
+    with env_fixture() as server:
+        result = await adaptive_login(
+            agent_browser, env_login_url(server.base_url, "spa_json"), USERNAME, PASSWORD,
+            decide=_never_called_decider(), in_scope=lambda u: True,
+        )
+    assert result.ok is True, result.to_dict()
+    assert result.engine == "spa_api", result.to_dict()

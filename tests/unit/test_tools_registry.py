@@ -125,6 +125,239 @@ async def test_send_request_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_injects_csrf_from_jar(monkeypatch):
+    # A cookie-authed Rails/SPA endpoint 403s without X-CSRF-Token + X-Requested-With.
+    # The raw send_request tool path must inject them from the jar's CSRF cookie
+    # (parity with the copilot engine's _apply_session_auth).
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        text = "{}"
+        url = "https://api.acme-corp.com/graphql"
+        headers = {"Content-Type": "application/json"}
+
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, method, url, headers=None, content=None):
+            captured["headers"] = headers
+            return _Resp()
+
+    class _Store:
+        def get_cookies_for_host(self, host):
+            return [{"name": "CSRF-TOKEN", "value": "tok123"},
+                    {"name": "_session", "value": "s"}]
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/graphql", "method": "POST",
+        "body": '{"query": "query { me { id } }"}',
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in captured["headers"].items()}
+    assert sent.get("x-csrf-token") == "tok123"
+    assert sent.get("x-requested-with") == "XMLHttpRequest"
+    assert "csrf-token=tok123" in sent.get("cookie", "").lower()
+
+
+class _CaptureClient:
+    """httpx.AsyncClient stub that records the outgoing headers."""
+    captured: dict = {}
+
+    def __init__(self, **kw): pass
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+    async def request(self, method, url, headers=None, content=None):
+        _CaptureClient.captured = dict(headers or {})
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+            headers = {"Content-Type": "application/json"}
+        _Resp.url = url
+        return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_send_request_strips_hand_pasted_token(monkeypatch):
+    # A raw bearer/JWT pasted into Authorization must be stripped (not forwarded) and
+    # flagged — auth is auto-injected; the model must not hand-paste secrets. Built at
+    # runtime so no static eyJ... literal sits in the source (gitleaks flags that).
+    import base64 as _b64, json as _json
+    def _seg(o):
+        return _b64.urlsafe_b64encode(_json.dumps(o).encode()).rstrip(b"=").decode()
+    _jwt = f"{_seg({'alg': 'HS256'})}.{_seg({'sub': '1', 'account_id': 7})}.{_seg('sigvalue1234567890')}"
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store/session -> nothing re-attached
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/x", "method": "GET",
+        "headers": {"Authorization": f"Bearer {_jwt}", "Accept": "application/json"},
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert "authorization" not in sent          # stripped, not forwarded upstream
+    assert sent.get("accept") == "application/json"
+    assert "note" in result and "stripped" in result["note"].lower()
+    assert _jwt not in str(result)              # the token value never echoed back
+
+
+@pytest.mark.asyncio
+async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
+    # The copilot engine's per-sub-app Bearer selection is reused by the tool: a
+    # /modstore request gets modstore's token, /customercontent gets ccm's.
+    class _Session:
+        def _capture_bearer_tokens(self, store, host): pass
+        def _select_bearer(self, host, path):
+            return {"token": "MOD" if "/modstore" in path else "CCM", "exp": None}
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+
+    r1 = await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "body": '{"query":"{me}"}'})
+    assert r1["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"
+    assert "MOD" not in str(r1)  # token never surfaced in the tool result
+
+    await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/customercontent/graphql", "method": "POST",
+        "body": '{"query":"{me}"}'})
+    assert _CaptureClient.captured.get("Authorization") == "Bearer CCM"
+
+
+@pytest.mark.asyncio
+async def test_send_request_drops_non_secret_authorization(monkeypatch):
+    # The schema promises Authorization is ALWAYS stripped. A non-secret-looking garbage
+    # Authorization (a forged alg-confusion token / raw hash) must NOT survive to the wire —
+    # it otherwise blocks the auto-inject and hits the upstream (an AWS SigV4 parse error that
+    # reads like a finding). "Token abc123" is not flagged by the secret detector, so a clean
+    # outgoing request proves the UNCONDITIONAL drop, not strip_pasted_secret_headers.
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True))  # no store/session -> nothing re-attached
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/x", "method": "GET",
+        "headers": {"Authorization": "Token abc123", "Accept": "application/json"},
+    })
+    assert result["ok"] is True
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert "authorization" not in sent              # dropped, not forwarded upstream
+    assert sent.get("accept") == "application/json"  # non-auth header preserved
+    assert "note" in result and "authorization" in result["note"].lower()
+
+
+# ── record_finding deterministic FP guard ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_record_finding_refuses_success_claim_on_403():
+    # The copilot once recorded a CRITICAL "alg:none Accepted" whose evidence said 403.
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "record_finding", {
+        "title": "JWT Algorithm Confusion — alg:none Accepted", "severity": "critical",
+        "url": "https://api.acme-corp.com/x",
+        "evidence": "Server accepted unsigned token (alg:none). Response: 403 (176 chars)",
+    })
+    assert result["ok"] is False
+    assert "rejection is not acceptance" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_record_finding_refuses_infra_sigv4_error():
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Auth bypass", "severity": "high", "url": "https://api.acme-corp.com/x",
+        "evidence": ('Response: {"message":"Invalid key=value pair (missing equal-sign) in '
+                     'Authorization header (hashed with SHA-256 and encoded with Base64)"}'),
+    })
+    assert result["ok"] is False
+    assert "infrastructure error" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_record_finding_records_clean_finding():
+    class _Store:
+        def __init__(self): self.recorded = None
+        def record_manual_finding(self, finding, url, method):
+            self.recorded = (finding, url, method)
+            return "entry-1"
+
+    store = _Store()
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "record_finding", {
+        "title": "Cross-tenant record disclosure", "severity": "high",
+        "url": "https://api.acme-corp.com/users/42",
+        "evidence": "200 OK — returned another tenant's user record {id: 42, account_id: 999}",
+        "attack_type": "idor",
+    })
+    assert result["ok"] is True
+    assert result["entry_id"] == "entry-1"
+    assert store.recorded is not None
+
+
+@pytest.mark.asyncio
+async def test_send_request_attaches_bearer_from_history(monkeypatch):
+    # No copilot session attached: resolve the Bearer from proxy history.
+    class _Store:
+        def get_cookies_for_host(self, host): return []
+        def all_entries(self):
+            return [{"host": "api.acme-corp.com", "path": "/graphql",
+                     "request_headers": {"Authorization": "Bearer HIST"}}]
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.acme-corp.com/graphql", "method": "POST", "body": "{}"})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer HIST"
+
+
+@pytest.mark.asyncio
+async def test_send_request_overrides_caller_authorization(monkeypatch):
+    # A caller-supplied Authorization is ALWAYS dropped (schema contract: auth is auto-injected,
+    # never caller-set) and the session's own Bearer is resolved and attached instead. Previously
+    # a non-secret caller token was honored, which let a forged alg-confusion header reach the
+    # upstream and read like a finding (AWS SigV4 parse error).
+    class _Session:
+        def _capture_bearer_tokens(self, store, host): pass
+        def _select_bearer(self, host, path):
+            return {"token": "MOD", "exp": None}
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "body": "{}", "headers": {"Authorization": "Bearer CALLER"}})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"  # caller's ignored
+
+
+@pytest.mark.asyncio
+async def test_send_request_uses_ensure_fresh_bearer(monkeypatch):
+    # send_request prefers the session's _ensure_fresh_bearer (waits for the live SPA to mint
+    # a token when none is cached yet) over the plain capture+select pair, and attaches it.
+    class _Session:
+        async def _ensure_fresh_bearer(self, store, host, path, browser=None):
+            return {"token": "FRESH", "exp": None}
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    ctx._session = _Session()
+    result = await run_tool(ctx, "send_request", {
+        "url": "https://api.phisher.example/queries_api/v2/accounts/1/mailservers/x",
+        "method": "GET"})
+    assert result["ok"] is True
+    assert _CaptureClient.captured.get("Authorization") == "Bearer FRESH"
+    assert "FRESH" not in str(result)   # token never surfaced in the tool result
+
+
+@pytest.mark.asyncio
 async def test_send_request_surfaces_all_set_cookies(monkeypatch):
     # Multiple Set-Cookie headers (e.g. CloudFront signed cookies) must be surfaced
     # as a list, not collapsed by dict(resp.headers). A cookie set on a redirect hop
@@ -683,6 +916,24 @@ async def test_validate_chain_requires_input():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_spec", [
+    {"name": "c", "steps": ["https://api.acme-corp.com/x"]},
+    {"name": "c", "steps": [{"name": "s", "url": "https://api.acme-corp.com/x",
+                             "extract": ["token"]}]},
+    {"name": "c", "steps": [{"name": "s", "url": "https://api.acme-corp.com/x",
+                             "assertions": ["status_eq 200"]}]},
+])
+async def test_validate_chain_rejects_bare_string_elements(bad_spec):
+    # A bare string where an object is expected must degrade to a readable
+    # "invalid chain spec" error, not a Python AttributeError.
+    ctx = ToolContext(store=object(), settings=_Scope(True))
+    result = await run_tool(ctx, "validate_chain", {"chain": bad_spec})
+    assert result["ok"] is False
+    assert "invalid chain spec" in result["error"]
+    assert "must be an object" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_validate_chain_out_of_scope_blocked():
     # store set (in-process) so no interactive approval is attempted.
     ctx = ToolContext(store=object(), settings=_Scope(False))
@@ -804,6 +1055,42 @@ async def test_graphql_introspect_http_fallback(monkeypatch):
     assert result["queries"] == ["me"]
     assert posted["url"].endswith("/api/graphql/introspect")
     assert posted["json"]["endpoint"] == "https://api.acme-corp.com/graphql"
+
+
+@pytest.mark.asyncio
+async def test_graphql_type_info_reads_root_query_args():
+    # The root Query type must resolve (fields + arg signatures), not 404 as
+    # "type 'Query' not found" with total_fields=0.
+    class _Store:
+        def __init__(self):
+            self.graphql_schemas = {
+                "https://api.acme-corp.com/graphql": {
+                    "introspected": True,
+                    "queries": {"account": {"args": [{"name": "id", "type": "ID"}],
+                                            "return_type": "Account"}},
+                    "mutations": {},
+                    "input_types": {}, "object_types": {}, "union_types": {},
+                    "enum_types": {},
+                    "root_types": {
+                        "Query": {
+                            "kind": "OBJECT", "role": "query",
+                            "fields": [{"name": "account",
+                                        "args": [{"name": "id", "type": "ID"}],
+                                        "return_type": "Account"}],
+                        },
+                    },
+                }
+            }
+
+    ctx = ToolContext(settings=_Scope(True), store=_Store())
+    result = await run_tool(ctx, "graphql_type_info",
+                            {"url": "https://api.acme-corp.com/graphql", "type_name": "Query"})
+    assert result["ok"] is True
+    assert result["role"] == "query"
+    assert result["total_fields"] == 1
+    assert result["fields"][0]["name"] == "account"
+    assert result["fields"][0]["args"][0]["name"] == "id"
+    assert result["fields"][0]["return_type"] == "Account"
 
 
 # ── MCP conversion (pure, no mcp import) ────────────────────────────────────────
@@ -1309,12 +1596,15 @@ async def test_run_scan_enqueues_awaits_and_returns_findings():
 
 
 @pytest.mark.asyncio
-async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
+async def test_run_scan_runs_agents_even_when_ai_mode_off():
+    # An EXPLICIT run_scan sets ai_queued, and the scan worker runs the full arsenal on an
+    # ai_queued entry regardless of ambient ai_mode — so a session_safe run (ambient ai_mode
+    # OFF) still gets real agents. The tool reports agents_ran=True accordingly.
     from dast.proxy.scan_queue_state import ScanQueueState
     import asyncio
 
     entry = _ScanEntry("GET", "https://api.acme-corp.com/x?q=1", "api.acme-corp.com")
-    store = _ScanStore([entry], ai_mode=False)  # AI off, proxied entry → deterministic only
+    store = _ScanStore([entry], ai_mode=False)  # ambient AI off — but explicit scan still runs agents
     queue: asyncio.Queue = asyncio.Queue()
     qs = ScanQueueState()
 
@@ -1330,8 +1620,8 @@ async def test_run_scan_reports_agents_not_run_when_ai_mode_off():
     await worker_task
 
     assert result["ok"] is True
-    assert result["agents_ran"] is False
-    assert "note" in result
+    assert result["agents_ran"] is True        # explicit scan runs agents via ai_queued
+    assert entry.ai_queued is True
 
 
 # ── browser_login_adaptive (deterministic-first, LLM-fallback) ─────────────────
@@ -1390,6 +1680,42 @@ async def test_adaptive_login_deterministic_success():
     assert result["ok"] is True
     assert result["engine"] == "deterministic"
     assert result["llm_steps"] == 0
+
+
+class _FakeSpaBrowser:
+    """AgentBrowser stand-in where the deterministic form-fill finds no reachable
+    field but the SPA JSON auth endpoint accepts credentials (training-app shape)."""
+
+    async def login(self, url: str, email: str, password: str) -> dict:
+        return {"logged_in": False, "url": url, "error": "no email field found on the page"}
+
+    async def navigate(self, url: str) -> dict:
+        return {"ok": True, "url": url}
+
+    async def export_cookies(self) -> dict:
+        return {"CSRF-TOKEN": "tok", "session": "abc"}
+
+    async def export_cookies_full(self) -> list:
+        return [{"name": "session", "value": "abc", "domain": "app.acme-corp.com"}]
+
+    async def api_post(self, endpoint: str, headers: dict, body: str) -> dict:
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/dashboard"}'}
+
+
+@pytest.mark.asyncio
+async def test_browser_login_falls_through_to_spa_api():
+    """The plain browser_login tool must NOT be a bare form-fill: when no reachable
+    form field exists, it delegates to the cascade and authenticates via spa_api."""
+    browser = _FakeSpaBrowser()
+    store = _FakeSessionStore()
+    store.import_playwright_cookies = lambda full: len(full)
+    ctx = ToolContext(settings=_Scope(True), browser=browser, store=store)
+    result = await run_tool(ctx, "browser_login", {
+        "url": "https://app.acme-corp.com/login", "email": "a@b.com", "password": "x"})
+    assert result["ok"] is True
+    assert result["engine"] == "spa_api"
+    # Never leak cookie values back out of the tool result.
+    assert "cookies" not in result
 
 
 # ── session tools: save/list/activate + run_multiuser_idor ─────────────────────
@@ -1476,3 +1802,244 @@ async def test_run_multiuser_idor_requires_two_sessions():
     result = await run_tool(ctx, "run_multiuser_idor", {"url": "https://app.acme-corp.com/x"})
     assert result["ok"] is False
     assert ">=2" in result["error"] or "2 saved" in result["error"]
+
+
+# ── session tools: external-MCP HTTP fallback (store=None) ─────────────────────
+
+class _FakeDashResp:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPError(f"HTTP {self.status_code}")
+
+
+class _FakeDashClient:
+    """Routes dashboard GET/POST to a handler(method, path, json) -> _FakeDashResp,
+    so the store-less (MCP) tool path can be tested without a live dashboard."""
+
+    def __init__(self, handler, **kw):
+        self._handler = handler
+        self.calls: list = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    @staticmethod
+    def _path(url):
+        from urllib.parse import urlparse
+        return urlparse(url).path
+
+    async def get(self, url, params=None):
+        p = self._path(url)
+        self.calls.append(("GET", p, params))
+        return self._handler("GET", p, params)
+
+    async def post(self, url, json=None):
+        p = self._path(url)
+        self.calls.append(("POST", p, json))
+        return self._handler("POST", p, json)
+
+
+@pytest.mark.asyncio
+async def test_list_login_sessions_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        assert method == "GET" and path == "/api/named-sessions"
+        return _FakeDashResp(200, [{"name": "tenant_a", "role": "admin", "cookie_count": 4}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None → HTTP fallback (MCP path)
+    result = await run_tool(ctx, "list_login_sessions", {})
+    assert result["ok"] is True and result["count"] == 1
+    assert result["sessions"][0]["name"] == "tenant_a"
+    assert result["sessions"][0]["cookies"] == 4
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        if path == "/api/profiles/quick-capture":
+            assert body["name"] == "tenant_a" and body["privilege_level"] == "admin"
+            return _FakeDashResp(200, {"slug": "tenant_a",
+                                       "captured": {"host": body["host"], "cookies": 5, "auth_headers": 2}})
+        if path.endswith("/activate"):
+            assert path == "/api/profiles/tenant_a/activate"
+            return _FakeDashResp(200, {"named_session": "tenant_a", "cookies_imported": 5})
+        raise AssertionError(f"unexpected path {path}")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "save_login_session",
+                            {"name": "tenant_a", "host": "app.acme-corp.com", "role": "admin"})
+    assert result["ok"] is True
+    assert result["cookies"] == 5 and result["auth_headers"] == 2
+    assert result["name"] == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback_no_cookies(monkeypatch):
+    def handler(method, path, body):
+        return _FakeDashResp(404, {"error": "no cookies found in proxy jar"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "app.acme-corp.com"})
+    assert result["ok"] is False and "no cookies" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_http_fallback_still_scope_gated(monkeypatch):
+    def boom(**kw):
+        raise AssertionError("dashboard must not be called for an out-of-scope host")
+    monkeypatch.setattr(httpx, "AsyncClient", boom)
+    ctx = ToolContext(settings=_Scope(False))  # store=None AND out of scope
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "evil.example.com"})
+    assert result["ok"] is False and "out of scope" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_http_fallback(monkeypatch):
+    def handler(method, path, body):
+        assert method == "POST" and path == "/api/profiles/tenant_a/activate"
+        return _FakeDashResp(200, {"activated": True, "cookies_imported": 7, "named_session": "tenant_a"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "activate_login_profile", {"slug": "tenant_a"})
+    assert result["ok"] is True and result["cookies_imported"] == 7
+    assert result["named_session"] == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_http_fallback_missing(monkeypatch):
+    def handler(method, path, body):
+        return _FakeDashResp(404, {"error": "profile not found"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))  # store=None
+    result = await run_tool(ctx, "activate_login_profile", {"slug": "nope"})
+    assert result["ok"] is False and "no login profile" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_run_multiuser_idor_external_mcp_is_in_process_only():
+    # store=None + scan_queue=None is exactly the external MCP ToolContext.
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "run_multiuser_idor", {"url": "https://app.acme-corp.com/x"})
+    assert result["ok"] is False
+    assert "in-process" in result["error"]
+
+
+# ── code_* tools: thin wrappers over the existing code-analysis subsystem ──────
+
+def test_registry_lists_code_tools():
+    names = {t.name for t in tools.all_tools()}
+    assert {"code_search", "code_file", "code_list", "code_lookup_path"}.issubset(names)
+
+
+@pytest.mark.asyncio
+async def test_code_search_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert method == "GET" and path == "/api/code/search"
+        assert params and params.get("q") == "integrations"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "file_path": "app/controllers/integrations_controller.rb",
+                                    "language": "ruby", "preview": "def index", "content_length": 1200}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_search", {"query": "integrations"})
+    assert result["ok"] is True and result["count"] == 1
+    assert result["matches"][0]["file_path"].endswith("integrations_controller.rb")
+
+
+@pytest.mark.asyncio
+async def test_code_search_requires_query():
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_search", {"query": "  "})
+    assert result["ok"] is False and "query is required" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_file_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert path == "/api/code/file"
+        return _FakeDashResp(200, {"path": "a.rb", "language": "ruby", "content": "class A; end"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_file", {"analysis_id": "a1", "path": "a.rb"})
+    assert result["ok"] is True and result["content"] == "class A; end"
+
+
+@pytest.mark.asyncio
+async def test_code_file_not_found(monkeypatch):
+    def handler(method, path, params):
+        return _FakeDashResp(404, {"error": "file not found"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_file", {"analysis_id": "a1", "path": "missing.rb"})
+    assert result["ok"] is False and "not found" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_code_list_reads_dashboard(monkeypatch):
+    def handler(method, path, params):
+        assert path == "/api/code/list"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "status": "scanned", "files_scanned": 42}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_list", {})
+    assert result["ok"] is True and result["count"] == 1 and result["analyses"][0]["analysis_id"] == "a1"
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_stores_credentials_for_relogin(monkeypatch):
+    store = _FakeSessionStore(jar_cookies={"app.acme-corp.com": [
+        {"name": "sid", "value": "secret-cookie", "domain": "app.acme-corp.com"}]})
+    saved = {}
+    import dast.profiles.store as pstore
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: None)
+    monkeypatch.setattr(pstore, "save_profile", lambda profile: saved.setdefault("profile", profile))
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "save_login_session", {
+        "name": "tenant_a", "host": "app.acme-corp.com", "role": "user",
+        "username": "qa@x.com", "password": "hunter2",
+        "auth_url": "https://app.acme-corp.com/login"})
+    assert result["ok"] is True and result["credentials_stored"] is True
+    assert "hunter2" not in str(result)  # secret-free result
+    prof = saved["profile"]
+    assert prof.auth_url == "https://app.acme-corp.com/login"
+    assert prof.credentials and prof.credentials[0].username == "qa@x.com"
+    assert prof.credentials[0].secret == "hunter2"
+
+
+@pytest.mark.asyncio
+async def test_save_login_session_without_creds_skips_profile(monkeypatch):
+    store = _FakeSessionStore(jar_cookies={"app.acme-corp.com": [
+        {"name": "sid", "value": "v", "domain": "app.acme-corp.com"}]})
+    called = {"save": False}
+    import dast.profiles.store as pstore
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: None)
+    monkeypatch.setattr(pstore, "save_profile", lambda p: called.__setitem__("save", True))
+    ctx = ToolContext(settings=_Scope(True), store=store)
+    result = await run_tool(ctx, "save_login_session", {"name": "x", "host": "app.acme-corp.com"})
+    assert result["ok"] is True and result["credentials_stored"] is False
+    assert called["save"] is False
+
+
+@pytest.mark.asyncio
+async def test_code_lookup_path_falls_back_to_search(monkeypatch):
+    # In the test process no analyses are loaded, so lookup_code_for_path returns "" and the
+    # tool falls back to a dashboard search on the last real path segment.
+    def handler(method, path, params):
+        assert path == "/api/code/search"
+        assert params and params.get("q") == "integrations"
+        return _FakeDashResp(200, [{"analysis_id": "a1", "file_path": "integrations_controller.rb",
+                                    "preview": "def show"}])
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _FakeDashClient(handler, **kw))
+    ctx = ToolContext(settings=_Scope(True))
+    result = await run_tool(ctx, "code_lookup_path",
+                            {"url_path": "/app/backend/integrations/11111111-2222-3333-4444-555555555555"})
+    assert result["ok"] is True
+    assert result["count"] == 1 and "integrations" in result.get("note", "")

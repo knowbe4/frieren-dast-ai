@@ -25,7 +25,7 @@ class TestLoad:
         # A representative slice of the top-20 web vulns, keyed to live attack_types.
         for expected in (
             "sqli", "xss", "ssrf", "lfi", "cmdi", "ssti", "xxe", "nosql",
-            "idor", "auth_bypass", "csrf", "open_redirect",
+            "idor", "bfla", "auth_bypass", "csrf", "open_redirect",
             "prototype_pollution", "llm_injection", "sensitive_data",
             "jwt", "business_logic", "mfa_bypass", "crlf", "method_tamper",
         ):

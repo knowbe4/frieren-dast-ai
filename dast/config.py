@@ -2,16 +2,22 @@
 Configuration loading via pydantic-settings.
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Tests set DAST_DISABLE_DOTENV=1 so settings never pick up a developer's local
+# .env (e.g. AI_PROVIDER=gateway, ai_validation_models=...), which would make
+# unit tests depend on that machine's config and hit the no-network guard.
+_ENV_FILE = None if os.environ.get("DAST_DISABLE_DOTENV") else ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore"
     )

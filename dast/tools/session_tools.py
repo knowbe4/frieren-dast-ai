@@ -8,6 +8,13 @@ close that gap with thin adapters over the existing session store and profile st
 
 Guardrails (see dast/tools/CLAUDE.md): scope-gate the host before acting, and NEVER
 return secrets — results carry only names/roles/hosts/counts, never cookie values.
+
+Dual data path (see dast/tools/context.py): the in-process copilot driver passes a
+live ``ctx.store`` and these tools use it directly; the external MCP process has no
+store, so each tool falls back to the dashboard HTTP API (``GET /api/named-sessions``,
+``POST /api/profiles/quick-capture`` + ``POST /api/profiles/{slug}/activate``) so an
+external AI driver can drive session setup too. (Launching the cross-session IDOR scan
+itself stays in-process only, like ``run_scan`` — see ``idor_scan_tools``.)
 """
 
 from __future__ import annotations
@@ -31,15 +38,83 @@ _SAVE_SCHEMA = {
                                                   "jar (e.g. app.example.com). Log in / browse it first so the jar has the session."},
         "role": {"type": "string", "description": "Privilege level / role label for cross-session comparison "
                                                   "(e.g. 'admin', 'member', 'user'). Default 'user'."},
+        "username": {"type": "string", "description": "Optional login username/email. Store it (with password + "
+                                                      "auth_url) so an autonomous run can AUTO-RELOGIN this identity "
+                                                      "when the session expires, instead of pausing. Never echoed back."},
+        "password": {"type": "string", "description": "Optional login password, stored encrypted alongside username. "
+                                                      "Only used for auto-relogin; never returned in any result."},
+        "auth_url": {"type": "string", "description": "Optional login page URL for auto-relogin (required together "
+                                                      "with username/password for relogin to work)."},
     },
     "required": ["name", "host"],
 }
 
 
+def _store_profile_credentials(name: str, host: str, role: str, cookies: list,
+                               auth_headers: Dict[str, str], username: str,
+                               password: str, auth_url: str) -> bool:
+    """Persist a credentialed login profile (encrypted) so the autonomous run can
+    auto-relogin this identity on session expiry. Returns True if stored."""
+    try:
+        from dast.profiles.models import LoginProfile, Credential, slugify
+        from dast.profiles.store import load_profile, save_profile
+    except Exception as exc:
+        logger.warning("save_login_session: profile store unavailable", error=str(exc)[:120])
+        return False
+    slug = slugify(name)
+    profile = load_profile(slug) or LoginProfile(slug=slug, name=name)
+    profile.name = name
+    if not profile.host_pattern:
+        profile.host_pattern = host
+    profile.auth_url = auth_url
+    profile.privilege_level = role
+    profile.credentials = [Credential(label="default", username=username, secret=password)]
+    state: Dict[str, Any] = {"cookies": cookies, "origins": []}
+    if auth_headers:
+        state["_auth_headers"] = auth_headers
+    profile.saved_session = state
+    import time as _time
+    profile.updated_at = _time.time()
+    save_profile(profile)
+    logger.info("save_login_session: stored credentialed profile for auto-relogin",
+                slug=slug, host=host, has_auth_url=bool(auth_url))
+    return True
+
+
+async def _save_via_http(ctx: ToolContext, name: str, host: str, role: str) -> Dict[str, Any]:
+    """External-MCP fallback: capture the jar for the host into a login profile
+    (quick-capture) and immediately activate it into a NAMED session, all over the
+    dashboard HTTP API. Returns secret-free counts, mirroring the in-process path."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            cap = await client.post(
+                f"{ctx.dashboard_base_url}/api/profiles/quick-capture",
+                json={"name": name, "host": host, "privilege_level": role})
+            if cap.status_code == 404:
+                return {"ok": False, "error": f"no cookies in the proxy jar for {host} — log in / "
+                                              "browse it through the proxy first, then save", "host": host}
+            cap.raise_for_status()
+            cap_data = cap.json()
+            slug = cap_data.get("slug") or name
+            captured = cap_data.get("captured", {}) or {}
+            act = await client.post(f"{ctx.dashboard_base_url}/api/profiles/{slug}/activate")
+            act.raise_for_status()
+            act_data = act.json()
+    except Exception as exc:
+        return {"ok": False, "error": f"save failed: {str(exc)[:160]}", "host": host}
+    logger.info("save_login_session: saved via dashboard HTTP", name=name, host=host, role=role,
+                slug=slug, cookies=captured.get("cookies"))
+    return {
+        "ok": True, "name": act_data.get("named_session", slug), "host": host, "role": role,
+        "cookies": captured.get("cookies", act_data.get("cookies_imported", 0)),
+        "auth_headers": captured.get("auth_headers", 0),
+        "note": "saved as a named session via the dashboard; with >=2 named sessions, "
+                "run_multiuser_idor replays requests across them (run it from the in-process copilot)",
+    }
+
+
 async def _save_login_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    store = getattr(ctx, "store", None)
-    if store is None:
-        return {"ok": False, "error": "save_login_session is not available in this context"}
     name = str(args.get("name", "")).strip()
     host = str(args.get("host", "")).strip().lower()
     role = str(args.get("role") or args.get("privilege_level") or "user").strip()
@@ -47,6 +122,9 @@ async def _save_login_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         return {"ok": False, "error": "name and host are required"}
     if not ctx.is_in_scope(f"https://{host}/"):
         return {"ok": False, "error": "host is out of scope", "host": host}
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return await _save_via_http(ctx, name, host, role)
     try:
         cookies = store.get_cookies_for_host(host) or []
     except Exception as exc:
@@ -68,12 +146,23 @@ async def _save_login_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
         return {"ok": False, "error": f"save failed: {str(exc)[:160]}"}
     logger.info("save_login_session: saved named session", name=name, host=host, role=role,
                 cookies=len(session.cookies), auth_headers=len(session.auth_headers))
+    # Optionally persist credentials (encrypted) so an autonomous run can auto-relogin
+    # this identity on expiry instead of pausing. All three fields are required together.
+    username = str(args.get("username") or "").strip()
+    password = str(args.get("password") or "")
+    auth_url = str(args.get("auth_url") or "").strip()
+    credentials_stored = False
+    if username and password and auth_url:
+        credentials_stored = _store_profile_credentials(
+            name, host, role, cookies, auth_headers, username, password, auth_url)
     return {
         "ok": True, "name": name, "host": host, "role": role,
         "cookies": len(session.cookies), "auth_headers": len(session.auth_headers),
         "named_sessions_total": len(store.get_named_sessions()),
+        "credentials_stored": credentials_stored,
         "note": "saved as a named session; with >=2 named sessions, run_multiuser_idor will replay "
-                "requests across them to find cross-account / privilege-escalation leaks",
+                "requests across them to find cross-account / privilege-escalation leaks"
+                + ("; credentials stored for auto-relogin on expiry" if credentials_stored else ""),
     }
 
 
@@ -82,10 +171,26 @@ async def _save_login_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[st
 _EMPTY_SCHEMA = {"type": "object", "properties": {}}
 
 
+async def _list_via_http(ctx: ToolContext) -> Dict[str, Any]:
+    """External-MCP fallback: read named sessions from the dashboard. The HTTP view
+    carries name/role/cookie_count (no per-host breakdown or header count)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"{ctx.dashboard_base_url}/api/named-sessions")
+            resp.raise_for_status()
+            data = resp.json() or []
+    except Exception as exc:
+        return {"ok": False, "error": f"dashboard lookup failed: {str(exc)[:160]}"}
+    out = [{"name": s.get("name"), "role": s.get("role"),
+            "cookies": s.get("cookie_count", 0), "hosts": []} for s in data]
+    return {"ok": True, "count": len(out), "sessions": out}
+
+
 async def _list_login_sessions(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     store = getattr(ctx, "store", None)
     if store is None:
-        return {"ok": False, "error": "list_login_sessions is not available in this context"}
+        return await _list_via_http(ctx)
     try:
         sessions = store.get_named_sessions()
     except Exception as exc:
@@ -110,13 +215,32 @@ _ACTIVATE_SCHEMA = {
 }
 
 
+async def _activate_via_http(ctx: ToolContext, slug: str) -> Dict[str, Any]:
+    """External-MCP fallback: activate a saved login profile into a named session +
+    the live jar over the dashboard HTTP API."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(f"{ctx.dashboard_base_url}/api/profiles/{slug}/activate")
+            if resp.status_code == 404:
+                return {"ok": False, "error": f"no login profile with slug '{slug}'"}
+            if resp.status_code == 400:
+                return {"ok": False, "error": f"profile '{slug}' has no captured session; capture it first"}
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        return {"ok": False, "error": f"activate failed: {str(exc)[:160]}"}
+    return {"ok": True, "slug": slug, "named_session": data.get("named_session", slug),
+            "cookies_imported": data.get("cookies_imported", 0)}
+
+
 async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
-    store = getattr(ctx, "store", None)
-    if store is None:
-        return {"ok": False, "error": "activate_login_profile is not available in this context"}
     slug = str(args.get("slug") or args.get("profile", "")).strip()
     if not slug:
         return {"ok": False, "error": "slug is required"}
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return await _activate_via_http(ctx, slug)
     try:
         from dast.profiles.store import load_profile
     except Exception as exc:

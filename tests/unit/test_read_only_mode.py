@@ -122,6 +122,48 @@ def test_send_request_blocks_write_method_in_read_only():
     assert result.get("read_only") is True
 
 
+# ── read-only GraphQL carve-out ──────────────────────────────────────────────
+
+def test_is_read_only_graphql_allows_introspection_and_queries():
+    url = "https://api.example.com/graphql"
+    assert read_only.is_read_only_graphql(url, {"query": "query { me { id } }"})
+    assert read_only.is_read_only_graphql(url, {"query": "{ me { id } }"})
+    assert read_only.is_read_only_graphql(
+        url, '{"query": "query IntrospectionQuery { __schema { types { name } } }"}')
+    assert read_only.is_read_only_graphql(url, "query { me }")  # raw document string
+
+
+def test_is_read_only_graphql_blocks_mutations_and_non_graphql():
+    url = "https://api.example.com/graphql"
+    assert not read_only.is_read_only_graphql(url, {"query": "mutation { deleteUser(id: 1) }"})
+    assert not read_only.is_read_only_graphql(url, {"query": "subscription { onEvent }"})
+    assert not read_only.is_read_only_graphql(
+        "https://api.example.com/users", {"query": "query { me }"})  # non-graphql path
+    assert not read_only.is_read_only_graphql(url, {"foo": "bar"})  # no query present
+    assert not read_only.is_read_only_graphql(url, "")  # empty body
+
+
+def test_send_request_allows_read_only_graphql_introspection():
+    from dast.tools import http_tools
+
+    ctx = ToolContext(read_only=True)
+    ctx.is_in_scope = lambda url: True  # type: ignore[method-assign]
+    # A read-only introspection POST is allowed despite the GET/HEAD/OPTIONS gate.
+    allowed = asyncio.run(http_tools._send_request(ctx, {
+        "url": "https://api.example.com/graphql", "method": "POST",
+        "body": '{"query": "query { __schema { types { name } } }"}',
+    }))
+    # Reaches the send path (no store -> real network is not hit in this unit;
+    # the point is it is NOT rejected by the read-only gate).
+    assert allowed.get("read_only") is not True
+    # A mutation POST stays blocked.
+    blocked = asyncio.run(http_tools._send_request(ctx, {
+        "url": "https://api.example.com/graphql", "method": "POST",
+        "body": '{"query": "mutation { deleteUser(id: 1) }"}',
+    }))
+    assert blocked["ok"] is False and blocked.get("read_only") is True
+
+
 # ── form-fill canaries (used by the SPA explorer) ────────────────────────────
 
 def test_form_field_value_is_type_aware():

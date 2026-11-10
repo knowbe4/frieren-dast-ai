@@ -11,13 +11,14 @@ This is the repeater primitive exposed to agents and MCP clients.
 from __future__ import annotations
 
 import html
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils import read_only
 from dast.utils.logger import get_logger
+from dast.utils.placeholders import looks_like_placeholder
 
 logger = get_logger(__name__)
 
@@ -140,6 +141,18 @@ def _destructive_reason(text: str) -> Dict[str, str] | None:
     return None
 
 
+def _first_placeholder_field(url: str, headers: Dict[str, str], body: str) -> str | None:
+    """Name of the first field carrying a model placeholder (e.g. ``<UNKNOWN>``), else None."""
+    if looks_like_placeholder(url):
+        return "url"
+    for name, value in headers.items():
+        if looks_like_placeholder(value):
+            return f"header '{name}'"
+    if looks_like_placeholder(body):
+        return "body"
+    return None
+
+
 async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -148,8 +161,12 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
         return {"ok": False, "error": f"unsupported method: {method}"}
     if getattr(ctx, "read_only", False) and not read_only.is_safe_method(method):
-        return {"ok": False, "read_only": True,
-                "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS are sent"}
+        # Carve-out: GraphQL (incl. introspection) must POST, but a read-only
+        # query/introspection changes nothing — allow it; still block mutations.
+        if not (method == "POST" and read_only.is_read_only_graphql(url, args.get("body") or "")):
+            return {"ok": False, "read_only": True,
+                    "error": f"read-only mode: {method} is blocked; only GET/HEAD/OPTIONS "
+                             "(and read-only GraphQL POST) are sent"}
 
     # Scope gate BEFORE anything is sent. Out-of-scope is denied by default, but an
     # MCP caller (no in-process store) can ask the dashboard operator for an
@@ -165,26 +182,82 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
 
     headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
 
-    # Copilot's _apply_session_auth injects jar+handoff cookies and marks them
-    # trusted via x-dast-cookies-injected. Otherwise strip LLM-supplied cookies
-    # (often stale) and inject fresh ones from the proxy jar.
+    # Placeholder gate: refuse model stand-in values (e.g. "<UNKNOWN>", "<jwt>") in the url,
+    # a header, or the body — they are noise and can lock accounts. Run this BEFORE the auth
+    # strip below so a placeholder Authorization is refused with explicit guidance, not
+    # silently dropped by the always-strip step. The real value must come from
+    # history/an earlier response.
+    placeholder_field = _first_placeholder_field(url, headers, args.get("body") or "")
+    if placeholder_field:
+        logger.warning("send_request refused placeholder value", field=placeholder_field)
+        return {"ok": False, "error": (
+            f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
+            "have the real value — read it from get_history or an earlier response, or ask the "
+            "operator; do not invent one.")}
+
+    # Schema contract: Authorization is ALWAYS stripped from caller-supplied headers —
+    # auth is auto-injected below via the shared attach(). A non-secret garbage Authorization
+    # (e.g. a model's forged alg-confusion token or a raw hash) would otherwise survive the
+    # raw-secret strip, block the auto-inject, and hit the upstream as a bogus header — e.g.
+    # an AWS SigV4 parse error that reads like a finding. Dropping it is attach's
+    # drop_all_authorization contract (see auth_provider.attach).
+    #
+    # Cookies: the copilot engine marks its injected cookies trusted via
+    # x-dast-cookies-injected; honor that and leave them. Otherwise strip LLM-supplied
+    # cookies (often stale) and re-seed from the proxy jar. (In a separate `dast-ai mcp`
+    # process ctx.store is None -> no cookie/Bearer source; use browser_fetch there.)
     trusted_cookies = headers.pop("x-dast-cookies-injected", None)
+    jar_cookie_map: Dict[str, str] = {}
     if not trusted_cookies:
         headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
         if ctx.store is not None:
             _host = urlparse(url).hostname or ""
             try:
                 jar_cookies = ctx.store.get_cookies_for_host(_host) or []
-                if jar_cookies:
-                    cookie_header = "; ".join(
-                        f"{c['name']}={c.get('value', '')}"
-                        for c in jar_cookies if c.get("name")
-                    )
-                    if cookie_header:
-                        headers["Cookie"] = cookie_header
+                jar_cookie_map = {c.get("name"): c.get("value", "")
+                                  for c in jar_cookies if c.get("name")}
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
+
+    # Resolve a sub-app Bearer when one is known for this (host, path), so a direct / MCP
+    # caller can reach a Bearer-authed sub-app (modstore/ccm) instead of a 403. Prefer the
+    # session's _ensure_fresh_bearer (waits for the live SPA to mint one); the attach() below
+    # sets the header and never returns the token to the caller.
+    rec: Optional[Dict[str, Any]] = None
+    from dast.session.auth_provider import attach as _attach
+    from dast.session.auth_provider import scan_history_bearer
+    parsed = urlparse(url)
+    bearer_host = parsed.hostname or ""
+    bearer_path = parsed.path or "/"
+    session = getattr(ctx, "_session", None)
+    try:
+        if (session is not None and ctx.store is not None
+                and hasattr(session, "_ensure_fresh_bearer")):
+            rec = await session._ensure_fresh_bearer(
+                ctx.store, bearer_host, bearer_path,
+                browser=getattr(ctx, "browser", None))
+        elif session is not None and hasattr(session, "_select_bearer"):
+            if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
+                session._capture_bearer_tokens(ctx.store, bearer_host)
+            rec = session._select_bearer(bearer_host, bearer_path)
+        elif ctx.store is not None:
+            rec = scan_history_bearer(ctx.store, bearer_host, bearer_path)
+    except Exception as exc:
+        logger.debug("send_request: bearer resolution failed",
+                     host=bearer_host, error=str(exc))
+        rec = None
+
+    # One shared attach: drop any caller Authorization, set the jar Cookie (when not trusted)
+    # + CSRF/XHR, and attach the resolved Bearer. Then drop the internal trusted marker so it
+    # never leaks upstream (the proxy does not strip it).
+    _res = _attach(headers, transport="api", cookies=(jar_cookie_map or None),
+                   bearer_rec=rec, trusted_marker=bool(trusted_cookies),
+                   drop_all_authorization=True)
+    if _res.stripped:
+        logger.warning("send_request stripped hand-pasted/caller auth header(s)",
+                       headers=",".join(_res.stripped))
+    headers.pop("x-dast-cookies-injected", None)
 
     body = args.get("body") or ""
 
@@ -237,6 +310,13 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
+        _flagged = list(dict.fromkeys(_res.stripped))
+        if _flagged:
+            result["note"] = (
+                f"stripped caller-supplied auth header(s) ({', '.join(_flagged)}) — do not set "
+                "Authorization/Cookie; auth is injected automatically "
+                "(use get_bearer_token to confirm a token is cached)."
+            )
         if set_cookies:
             result["set_cookies"] = set_cookies
         if history:
@@ -376,6 +456,11 @@ register(Tool(
         "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
+        "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
+        "headers from the jar, and a cached sub-app Bearer (modstore/ccm) selected by request "
+        "path when one is known. If a sub-app returns 403 for a missing Bearer and none is "
+        "cached, drive it with browser_fetch instead (it runs in the SPA context and carries the "
+        "Bearer + sub-session).\n"
         "Use this when: reproducing or probing a specific endpoint, testing whether a "
         "payload reflects/changes behavior, replaying a captured request with a tweak, or "
         "delivering an SSRF/XXE payload that embeds an OOB URL from oob_generate.\n"
@@ -395,7 +480,7 @@ _GET_BEARER_TOKEN_SCHEMA: Dict[str, Any] = {
     "properties": {
         "host": {
             "type": "string",
-            "description": "Target API host (e.g. 'api.phisher.knowbe4.com'). "
+            "description": "Target API host (e.g. 'api.internal.example.com'). "
                            "If omitted, returns tokens for all hosts.",
         },
     },

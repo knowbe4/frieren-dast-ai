@@ -1,0 +1,47 @@
+# Broken Function Level Authorization (CWE-862 / CWE-863) — OWASP API5:2023.
+# Vertical privilege escalation WITHIN a tenant: a lower-privilege caller performs an
+# action that should require a higher role, because the server authorizes on the
+# token's ACCOUNT/TENANT claim alone and never checks the caller's ROLE.
+#
+# Contrast with IDOR/BOLA (see idor.yaml): IDOR is OBJECT-level and cross-tenant (reach
+# ANOTHER tenant's/user's object by changing an id). BFLA is FUNCTION-level and
+# same-tenant (the object is in your OWN account; what you lack is the privilege to act
+# on it). If the server scopes objects to your account but ignores your role, it is BFLA.
+attack_type: bfla
+
+positive_examples:
+  - payload: >
+      POST /customercontent/graphql {"query":"mutation { storeItemArchive(storeItemUuid:
+      \"<admin-owned module in my OWN account>\") { node { uuid } } }"}
+      as a learner-role user (role=user, canSeeConsole=false) of that same account
+    response_snippet: '200 OK {"data":{"storeItemArchive":{"node":{"uuid":"..."}}}}'
+    reasoning: >
+      The caller is a low-privilege (learner) member of the account that owns the module.
+      The server resolved and archived it off the account claim in the JWT and never
+      checked the caller's role, so a user who should have no catalogue-write ability
+      edited/archived an admin-owned resource in their own tenant. Same tenant, wrong
+      role = function-level authz bypass (BFLA), not IDOR.
+  - payload: "POST /api/orgs/42/billing-plan {\"plan\":\"enterprise\"} as a regular member of org 42"
+    response_snippet: '200 OK {"orgId":42,"plan":"enterprise","updatedBy":150495285}'
+    reasoning: >
+      Changing the org billing plan is an admin-only function. The object belongs to the
+      caller's OWN org (no cross-tenant reference), but a non-admin member performed an
+      admin action — the endpoint enforces membership but not role. Vertical privilege
+      escalation (BFLA).
+
+negative_examples:
+  - payload: "GET /api/orgs/43/invoices (as a member of org 42, not org 43)"
+    response_snippet: '200 OK with org 43''s invoices'
+    reasoning: >
+      This reaches ANOTHER tenant's objects by changing the id — that is object-level,
+      cross-tenant access: IDOR/BOLA (CWE-639), not BFLA. Classify it as idor.
+  - payload: "POST /api/orgs/42/billing-plan {\"plan\":\"enterprise\"} as a non-admin member of org 42"
+    response_snippet: '403 Forbidden {"error":"requires org_admin role"}'
+    reasoning: >
+      The server enforced the role check and refused the admin-only action — function-level
+      authorization is present, so there is no finding.
+  - payload: "POST /api/orgs/42/invite {\"email\":\"x@y.com\"} as an ADMIN of org 42"
+    response_snippet: '200 OK invitation created'
+    reasoning: >
+      The caller's role legitimately permits this action in their own tenant — expected
+      behaviour, not a privilege escalation.

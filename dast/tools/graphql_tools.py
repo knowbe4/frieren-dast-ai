@@ -192,6 +192,12 @@ def _lookup_type(schema: Dict[str, Any], type_name: str) -> Dict[str, Any]:
             }
             return {"found": True, "category": category, "kind": kind_map[category],
                     "data": types_map[type_name]}
+    # The root Query/Mutation types are not in object_types; match them here so a
+    # caller can introspect the root type itself (its fields + their arg signatures).
+    root_types = schema.get("root_types") or {}
+    if type_name in root_types:
+        return {"found": True, "category": "root_types", "kind": "OBJECT",
+                "data": root_types[type_name]}
     # Check if it's a query or mutation root field name
     for root in ("queries", "mutations"):
         root_map = schema.get(root) or {}
@@ -231,7 +237,28 @@ async def _graphql_type_info(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str
     kind = result["kind"]
     out: Dict[str, Any] = {"ok": True, "name": type_name, "kind": kind}
 
-    if kind == "ENUM":
+    if result.get("category") == "root_types":
+        # Root Query/Mutation type: each field is itself a root operation with
+        # an argument signature and a return type.
+        raw_fields = data.get("fields", [])
+        total = len(raw_fields)
+        if field_filter:
+            raw_fields = [f for f in raw_fields if field_filter in f.get("name", "").lower()]
+        out["role"] = data.get("role")
+        out["total_fields"] = total
+        out["filtered"] = bool(field_filter)
+        out["fields"] = [
+            {
+                "name": f["name"],
+                "args": f.get("args", []),
+                "return_type": f.get("return_type"),
+            }
+            for f in raw_fields[:limit]
+        ]
+        if len(raw_fields) > limit:
+            out["truncated"] = True
+            out["showing"] = limit
+    elif kind == "ENUM":
         values = data.get("values", [])
         if field_filter:
             values = [v for v in values if field_filter in v.lower()]

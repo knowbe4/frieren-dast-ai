@@ -2,8 +2,8 @@
 
 > For Claude Code conventions, commands, and key files see [CLAUDE.md](../CLAUDE.md).
 
-**Version:** 0.8.2
-**Last Updated:** 2026-08-14
+**Version:** 0.9.0
+**Last Updated:** 2026-11-10
 
 ---
 
@@ -896,8 +896,9 @@ dast/
   takes NO API key. The gateway pins temperature server-side and forces extended thinking on, so
   `invoke_gateway` strips `temperature` and sends `thinking:{"type":"disabled"}`. The gateway
   hostname is INTERNAL and lives ONLY in `.env` (`GATEWAY_BASE_URL`) — never a code default
-  (`config.py` ships an empty string); `scripts/check_no_internal_data.py` blocks any
-  `*.internal|corp|private.knowbe4.com` host from tracked files.
+  (`config.py` ships an empty string); `scripts/check_no_internal_data.py` blocks
+  internal/corp/private/kmsat/phisher/eai `knowbe4.com` subdomains and any
+  `kb4od.run` on-demand host from tracked files.
 - The `/api/ai/status` badge probes the ACTIVE provider (STS for bedrock; API-key presence for
   anthropic/openai/glm; `gateway_auth.credentials_available()` for gateway). The status is cached
   5 min; `POST /api/scan-config` clears that cache on a provider switch so the badge re-probes.

@@ -103,6 +103,29 @@ def test_brief_empty_when_store_knows_nothing():
         assert build_context_brief(store, ["unknown.example.com"]) == ""
 
 
+# ── named-sessions block (login profiles) ───────────────────────────────────────
+def test_named_sessions_block_includes_credential_only_profiles():
+    from dast.ai.copilot import context_brief
+
+    profiles = [
+        SimpleNamespace(name="Admin", slug="admin", host_pattern="app.example.com",
+                        privilege_level="admin", saved_session={"cookies": []},
+                        credentials=[object()]),
+        SimpleNamespace(name="TenantA", slug="tenant-a", host_pattern="app.example.com",
+                        privilege_level="low", saved_session=None, credentials=[object()]),
+        SimpleNamespace(name="Empty", slug="empty", host_pattern="", privilege_level="",
+                        saved_session=None, credentials=[]),
+    ]
+    with patch("dast.profiles.store.list_profiles", return_value=profiles):
+        block = context_brief._named_sessions_block()
+    # Session-backed profile is listed and marked captured.
+    assert "Admin" in block and "session captured" in block
+    # Credential-only profile is now visible (the orchestrator logs it in on use).
+    assert "TenantA" in block and "credentials only" in block
+    # A profile with neither a session nor credentials is still excluded.
+    assert "Empty" not in block
+
+
 # ── SessionIntelligence.peek ────────────────────────────────────────────────────
 def test_peek_does_not_create_entry():
     intelligence = SessionIntelligence()

@@ -27,26 +27,63 @@ _SNAPSHOT_JS = r"""
 () => {
   const vis = el => { const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
-  const forms = [...document.querySelectorAll('form')].slice(0, 10).map(f => ({
+  // Traverse OPEN shadow roots too: modern SPAs (SvelteKit, web components, the target's
+  // login) render the form inside shadow DOM, which document.querySelectorAll does NOT
+  // pierce — so a plain snapshot reported 0 inputs/buttons on a form that is clearly
+  // there. deepQA walks every shadowRoot so the copilot can see (and then fill/click,
+  // since Playwright CSS selectors pierce open shadow DOM) the real fields.
+  const deepQA = (root, sel, out) => {
+    try { out.push(...root.querySelectorAll(sel)); } catch (e) {}
+    root.querySelectorAll('*').forEach(el => { if (el.shadowRoot) deepQA(el.shadowRoot, sel, out); });
+    return out;
+  };
+  const field = i => ({
+    tag: i.tagName.toLowerCase(), type: (i.getAttribute('type') || '').toLowerCase(),
+    name: i.getAttribute('name') || '', id: i.id || '',
+    placeholder: i.getAttribute('placeholder') || '',
+    label: i.getAttribute('aria-label') || '',
+    autocomplete: i.getAttribute('autocomplete') || '',
+    hidden: (i.getAttribute('type') || '').toLowerCase() === 'hidden' || !vis(i),
+  });
+  const forms = deepQA(document, 'form', []).slice(0, 10).map(f => ({
     id: f.id || '', name: f.getAttribute('name') || '',
     action: f.getAttribute('action') || '', method: (f.getAttribute('method') || 'get').toUpperCase(),
-    fields: [...f.querySelectorAll('input,select,textarea')].slice(0, 40).map(i => ({
-      tag: i.tagName.toLowerCase(), type: (i.getAttribute('type') || '').toLowerCase(),
-      name: i.getAttribute('name') || '', id: i.id || '',
-      hidden: (i.getAttribute('type') || '').toLowerCase() === 'hidden' || !vis(i),
-    })),
+    fields: deepQA(f, 'input,select,textarea', []).slice(0, 40).map(field),
   }));
-  const buttons = [...document.querySelectorAll(
-      'button,input[type=submit],input[type=button],[role=button]')]
+  // All interactive fields across the page (incl. shadow DOM), even when they are NOT
+  // wrapped in a <form> element — SPA login forms frequently are not.
+  const fields = deepQA(document, 'input,select,textarea', []).slice(0, 40).map(field);
+  const buttons = deepQA(document,
+      'button,input[type=submit],input[type=button],[role=button]', [])
     .filter(vis).slice(0, 25).map(b => ({
       text: (b.innerText || b.value || '').trim().slice(0, 40), id: b.id || '',
       name: b.getAttribute('name') || '',
       type: (b.getAttribute('type') || '').toLowerCase(),
     }));
-  const links = [...document.querySelectorAll('a[href]')].filter(vis).slice(0, 25).map(a => ({
+  const links = deepQA(document, 'a[href]', []).filter(vis).slice(0, 25).map(a => ({
     text: (a.innerText || '').trim().slice(0, 40), href: a.getAttribute('href') || '', id: a.id || '',
   }));
-  return { forms, buttons, links };
+  return { forms, fields, buttons, links };
+}
+"""
+
+# True once the page has mounted at least `min` interactive elements, counted across
+# the document, open shadow roots, and same-origin iframes. Used to tell a hydrated SPA
+# from its pre-render shell: a single "Home" link (count 1) must NOT pass, so the wait
+# requires a real threshold rather than "any element".
+_HYDRATION_JS = r"""
+(min) => {
+  const SEL = 'input,button,a,form,select,textarea,[role=button]';
+  const count = (root) => {
+    let n = 0;
+    try { n += root.querySelectorAll(SEL).length; } catch (e) {}
+    try { root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) n += count(el.shadowRoot); }); } catch (e) {}
+    try { root.querySelectorAll('iframe,frame').forEach(f => {
+      try { if (f.contentDocument) n += count(f.contentDocument); } catch (e) {} }); } catch (e) {}
+    return n;
+  };
+  return count(document) >= min;
 }
 """
 
@@ -107,10 +144,16 @@ class AgentBrowser:
     """
 
     def __init__(self, proxy_port: int = 8080, store: Optional[Any] = None,
-                 read_only: bool = False, headless: Optional[bool] = None) -> None:
+                 read_only: bool = False, headless: Optional[bool] = None,
+                 session_name: Optional[str] = None) -> None:
         self._proxy_port = proxy_port
         self._store = store
         self._read_only = read_only
+        # When set, seed/resync cookies from this named session's isolated jar instead
+        # of the shared global jar, so a per-session browser stays isolated from other
+        # concurrent copilot runs. Settable after construction (the session name is
+        # known only once a login profile is activated).
+        self.session_name = session_name
         if headless is not None:
             self._headless = headless
         else:
@@ -151,11 +194,15 @@ class AgentBrowser:
             return self._page
 
     async def _seed_cookies(self) -> None:
-        """Seed the context with the proxy jar so it starts authenticated."""
+        """Seed the context so it starts authenticated. For a session-scoped browser,
+        seed ONLY this run's named-session cookies (isolated); otherwise the global jar."""
         if self._store is None:
             return
         try:
-            jar = self._store.get_all_cookies() or []
+            if self.session_name is not None:
+                jar = self._store.get_named_session_cookies(self.session_name) or []
+            else:
+                jar = self._store.get_all_cookies() or []
         except Exception as exc:
             logger.warning("AgentBrowser: cookie seed read failed", error=str(exc))
             return
@@ -207,7 +254,12 @@ class AgentBrowser:
         if self._context is None or self._store is None:
             return 0
         try:
-            await self._context.clear_cookies()
+            # Unscoped: replace all context cookies with the current global jar.
+            # Scoped: do NOT clear — the context already holds THIS session's own login;
+            # only (re)layer the saved named-session cookies so we never wipe the fresh
+            # login of a credential-only profile whose named jar is still empty.
+            if self.session_name is None:
+                await self._context.clear_cookies()
             await self._seed_cookies()
             cookies = await self._context.cookies()
             logger.info("AgentBrowser cookies re-synced from jar", count=len(cookies))
@@ -221,13 +273,139 @@ class AgentBrowser:
         if _time.time() - self._last_cookie_sync > 30:
             await self.resync_cookies()
 
-    async def navigate(self, url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
+    async def export_cookies_full(self) -> List[dict]:
+        """Export the browser's cookies as Playwright dicts (name/value/domain/path/...),
+        for importing into the proxy jar (which keys by domain). Unlike export_cookies,
+        this preserves the domain so get_cookies_for_host can match."""
+        if self._context is None:
+            return []
+        try:
+            return list(await self._context.cookies())
+        except Exception as exc:
+            logger.debug("AgentBrowser: export_cookies_full failed", error=str(exc))
+            return []
+
+    async def api_post(self, url: str, headers: Optional[Dict[str, str]] = None,
+                       body: Optional[str] = None) -> Dict[str, Any]:
+        """Network-level POST through the browser context (carries its cookies, bypasses
+        CORS). Used by the SPA JSON-API login strategy: it hits the app's JSON auth
+        endpoint without touching the form DOM, so it works regardless of shadow DOM /
+        iframes. Returns {ok, status, text, headers}."""
+        page = await self._ensure_page()
+        fetch_kwargs: Dict[str, Any] = {"method": "POST", "headers": headers or {}}
+        if body is not None:
+            fetch_kwargs["data"] = body
+        try:
+            resp = await page.request.fetch(url, **fetch_kwargs)
+            text = await resp.text()
+            return {"ok": True, "status": resp.status, "text": text[:20000],
+                    "headers": {k: v for k, v in resp.headers.items()}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
+
+    async def api_get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Network-level GET through the browser context (carries its cookies/bearer,
+        bypasses CORS). Used for post-login session gate-checks (e.g. fetching an
+        app's session endpoint to confirm a real account). Returns {ok, status,
+        text, headers}. Never raises."""
+        page = await self._ensure_page()
+        try:
+            resp = await page.request.fetch(url, method="GET", headers=headers or {})
+            text = await resp.text()
+            return {"ok": True, "status": resp.status, "text": text[:20000],
+                    "headers": {k: v for k, v in resp.headers.items()}}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
+
+    async def _wait_for_hydration(self, page: Any, timeout_ms: int = 6000,
+                                  min_elements: int = 3, attempts: int = 2) -> bool:
+        """Wait for the SPA to mount real interactive content (``>= min_elements`` across
+        the document + open shadow roots + same-origin iframes).
+
+        Retries up to ``attempts`` times with a bounded settle between tries: a heavy
+        client-rendered app (modstore3 / CCM studio) can still be fetching on the first
+        wait, so a single short wait caught the pre-hydration shell. Returns True as soon
+        as content appears, False if it never does. Best-effort: a genuinely sparse page
+        returns False without raising, so callers never block on it."""
+        attempts = max(1, attempts)
+        per_attempt = max(1000, timeout_ms // attempts)
+        for attempt in range(attempts):
+            try:
+                await page.wait_for_function(_HYDRATION_JS, arg=min_elements, timeout=per_attempt)
+                return True
+            except Exception as exc:
+                logger.debug("AgentBrowser hydration wait ended", attempt=attempt + 1,
+                             error=str(exc)[:120])
+            if attempt < attempts - 1:
+                # Let in-flight XHR / rendering catch up before retrying. Bounded and
+                # best-effort so a never-idle SPA cannot stall the whole budget.
+                try:
+                    await page.wait_for_load_state("load", timeout=min(per_attempt, 3000))
+                except Exception:
+                    pass
+        return False
+
+    async def navigate(self, url: str, timeout_ms: int = 20000,
+                       wait_selector: Optional[str] = None) -> Dict[str, Any]:
         page = await self._ensure_page()
         if any(kw in url.lower() for kw in ("/login", "/sign_in", "/signin", "/auth/sign")):
             await self.clear_cookies()
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        return {"ok": True, "url": page.url, "status": (resp.status if resp else None),
-                "title": await page.title()}
+        # wait_until="commit" resolves as soon as the final navigation response (after all
+        # 3xx hops) is received and the document starts loading. A redirect chain or a
+        # continuously-streaming SPA (modstore3 / CCM, or the PhishER handoff via
+        # /users/goto_phisher) never cleanly fires domcontentloaded through the MITM proxy,
+        # so blocking on it hangs goto for the whole budget. networkidle is likewise avoided.
+        resp = None
+        timed_out = False
+        try:
+            resp = await page.goto(url, wait_until="commit", timeout=timeout_ms)
+        except Exception as exc:
+            # Never hard-fail the goto: a stalled hop would otherwise raise and make the
+            # agent loop on the error. The navigation has usually committed, so continue
+            # with the current page — the caller can inspect what loaded and what traffic
+            # the proxy captured, instead of being stuck.
+            timed_out = True
+            logger.debug("AgentBrowser navigate: goto did not settle, continuing",
+                         url=url, error=str(exc)[:160])
+        # Settle on real interactive content (a one-link shell does not count), or an
+        # explicit caller-supplied selector. Both are best-effort and never raise.
+        if wait_selector:
+            try:
+                await page.wait_for_selector(wait_selector, timeout=min(timeout_ms, 10000))
+            except Exception as exc:
+                logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
+        else:
+            await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
+        try:
+            title = await page.title()
+        except Exception:
+            title = ""
+        result: Dict[str, Any] = {"ok": True, "url": page.url,
+                                  "status": (resp.status if resp else None),
+                                  "title": title, "timed_out": timed_out}
+        if timed_out:
+            result["note"] = ("navigation did not fully settle; showing the current page — "
+                              "check get_history for captured traffic, then snapshot/retry")
+        return result
+
+    async def reload(self, timeout_ms: int = 20000) -> Dict[str, Any]:
+        """Reload the current page to force a client-rendered SPA to re-mint any
+        short-lived in-memory token (e.g. a Bearer the app holds in JS state, not a
+        cookie). Mirrors ``navigate``'s resilience: ``wait_until="commit"`` and never
+        hard-fails, then settles on hydration so the SPA's re-authenticated XHR (and the
+        fresh token the MITM proxy captures from it) has a chance to land.
+
+        Internal re-mint mechanism for the Bearer refresh ladder — not an agent-chosen
+        primitive, so it is not registered as an MCP tool."""
+        page = await self._ensure_page()
+        resp = None
+        try:
+            resp = await page.reload(wait_until="commit", timeout=timeout_ms)
+        except Exception as exc:
+            logger.debug("AgentBrowser reload: did not settle, continuing",
+                         error=str(exc)[:160])
+        await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
+        return {"ok": True, "url": page.url, "status": (resp.status if resp else None)}
 
     async def fill(self, selector: str, value: str, timeout_ms: int = 10000) -> Dict[str, Any]:
         page = await self._ensure_page()
@@ -253,6 +431,16 @@ class AgentBrowser:
         await page.wait_for_selector(selector, timeout=timeout_ms, state=state)
         return {"ok": True, "selector": selector}
 
+    async def wait_for_text(self, text: str, timeout_ms: int = 10000) -> Dict[str, Any]:
+        """Wait until *text* appears anywhere in the page body — for client-rendered SPAs
+        where content arrives without a stable selector to target."""
+        page = await self._ensure_page()
+        await page.wait_for_function(
+            "(t) => ((document.body && document.body.innerText) || '').includes(t)",
+            arg=text, timeout=timeout_ms,
+        )
+        return {"ok": True, "text": text}
+
     async def extract(self, selector: str, attribute: str = "value") -> Dict[str, Any]:
         page = await self._ensure_page()
         loc = page.locator(selector).first
@@ -266,6 +454,10 @@ class AgentBrowser:
 
     async def snapshot(self) -> Dict[str, Any]:
         page = await self._ensure_page()
+        # A snapshot taken right after navigate can catch the pre-hydration shell. Settle
+        # for real content first with a retry + longer budget (best-effort; a sparse page
+        # still snapshots promptly once both attempts time out).
+        await self._wait_for_hydration(page, timeout_ms=8000)
         view = await page.evaluate(_SNAPSHOT_JS)
         return {"ok": True, "url": page.url, "title": await page.title(), **view}
 
@@ -354,7 +546,7 @@ class AgentBrowser:
 
         Handles single-page, two-step, and SSO/Auth0 cross-domain flows:
         - Single-page: email + password on one page, click submit.
-        - Two-step (KMSAT): email -> Continue -> password appears on same domain.
+        - Two-step (SSO): email -> Continue -> password appears on same domain.
         - SSO (Auth0/Okta): email -> Continue -> redirect to IdP domain ->
           password on IdP -> MFA prompt -> redirect back to app.
         If MFA is required, returns mfa_required=True so the operator can
@@ -416,7 +608,17 @@ class AgentBrowser:
             return {"ok": False, "error": "no submit button found after email",
                     "url": page.url}
         pre_submit_url = page.url
-        await submit_btn.click()
+        try:
+            await submit_btn.click(timeout=10000)
+        except Exception as exc:
+            # A disabled / non-actionable submit button never becomes clickable, so
+            # Playwright's actionability wait would raise and abort the whole login.
+            # Return a clean "no submit button" failure so the cascade falls through
+            # to the SPA JSON-API strategy instead of dying here.
+            logger.debug("browser_login: submit button not actionable",
+                         error=str(exc)[:120], url=page.url)
+            return {"ok": False, "error": "no submit button actionable after email",
+                    "url": page.url}
         await page.wait_for_timeout(3000)
         try:
             await page.wait_for_load_state("networkidle", timeout=10000)
@@ -456,7 +658,7 @@ class AgentBrowser:
 
         # Detect SSO redirect: the page may have navigated to an IdP domain.
         # Federated login often lands on a new email-first form on the IdP
-        # (e.g. PhishER → KMSAT SSO → email → Continue → password).
+        # (e.g. app → SSO → email → Continue → password).
         # If we detect an email field but no password, fill + submit again.
         sso_redirected = page.url != pre_submit_url
         if sso_redirected:

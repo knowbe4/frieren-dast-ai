@@ -43,8 +43,8 @@ def test_save_load_encrypts_secret_on_disk(profiles_env, tmp_path):
     _, models_mod, store_mod, _ = profiles_env
     profile = models_mod.LoginProfile(
         name="Training App",
-        host_pattern="*.knowbe4.com",
-        auth_url="https://training.knowbe4.com/login",
+        host_pattern="*.example.com",
+        auth_url="https://app.example.com/login",
         credentials=[
             models_mod.Credential(label="admin", username="a@b.com", secret="s3cr3t"),
             models_mod.Credential(label="user", username="u@b.com", secret="p4ss"),

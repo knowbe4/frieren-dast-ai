@@ -277,6 +277,40 @@ async def test_stop_autonomous_kills_the_run():
 
 
 @pytest.mark.asyncio
+async def test_stop_autonomous_closes_the_session_browser():
+    # A cancelled driver task may not run its cleanup, so stop() must close the
+    # session's own browser itself — otherwise each stopped run leaves an orphan
+    # (logged-out) Chromium window open.
+    service = CopilotService(_FakeCtx())
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+
+    closed = asyncio.Event()
+
+    class _FakeBrowser:
+        async def close(self) -> None:
+            closed.set()
+
+    # The driver rebuilds the tool ctx every turn (which would replace the
+    # browser with a real AgentBrowser); keep our fake attached so we can assert
+    # stop() closes whatever browser the session holds.
+    import types
+    service._build_tool_ctx = lambda s: types.SimpleNamespace()  # type: ignore[assignment]
+
+    async def slow_send(text: str, tool_ctx: Any, *, on_event, wait_for_human) -> _Reply:
+        await asyncio.sleep(0.05)
+        return _Reply("working")
+
+    session["engine"].send = slow_send
+    assert await _wait_for(lambda: session["autonomous"]["turns"] >= 1)
+    session["_agent_browser"] = _FakeBrowser()
+    assert service.stop_autonomous(sid) is True
+    await asyncio.gather(session["_task"], return_exceptions=True)
+    assert await _wait_for(closed.is_set)                # browser.close() was scheduled
+    assert session.get("_agent_browser") is None         # detached from the session
+
+
+@pytest.mark.asyncio
 async def test_pause_and_resume_toggle_the_gate():
     service = CopilotService(_FakeCtx())
     sid = service.run_autonomous("obj", focus_hosts=["h"])
@@ -711,3 +745,210 @@ def test_effective_hosts_puts_identity_providers_last():
         "api.example.com", "app.example.com",       # non-IdP first, alphabetical
         "identity.example.com", "login.sso.example.com",  # IdP hosts last
     ]
+
+
+# ── complete-mode: per-dimension coverage matrix + cross-tenant gate ──────────
+
+class _CovEntry:
+    """Richer fake entry carrying the fields _surface_coverage reads for the
+    per-dimension matrix."""
+    def __init__(self, method, path, host, scan_result="safe",
+                 scanned_attack_types=None, findings=None):
+        self.method = method
+        self.path = path
+        self.host = host
+        self.url = f"https://{host}{path}"
+        self.source = "proxy"
+        self.scan_result = scan_result
+        self.scanned_attack_types = scanned_attack_types or []
+        self.findings = findings or []
+        self.request_body = None
+        self.content_type = ""
+
+
+class _DimStore(_FakeStore):
+    def __init__(self, entries, named_sessions=0):
+        super().__init__(entries)
+        self._named = named_sessions
+
+    def get_named_sessions(self):
+        return [object()] * self._named
+
+
+def test_coverage_dimension_matrix_and_cross_tenant_gate():
+    # One scanned endpoint tested for injection (sqli) + access_control (idor) but NOT
+    # cross_tenant. With two named sessions saved, cross-tenant is applicable → gap.
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli", "idor"])
+    store = _DimStore([e], named_sessions=2)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+
+    dims = cov["dimensions"]
+    assert dims["injection"]["untested"] == []          # sqli covers injection
+    assert dims["access_control"]["untested"] == []     # idor covers access_control
+    assert dims["cross_tenant"]["untested"] == ["POST /app/backend/x"]
+    assert cov["cross_tenant_applicable"] is True
+    assert cov["cross_tenant_gap"] is True
+    assert cov["complete"] is False                     # cross-tenant gap blocks complete
+
+
+def test_coverage_cross_tenant_closed_when_replayed():
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli", "idor", "cross_session_idor"])
+    store = _DimStore([e], named_sessions=2)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["cross_tenant_gap"] is False
+    assert cov["complete"] is True                      # all gaps closed
+
+
+def test_coverage_cross_tenant_na_without_two_sessions():
+    # Only one identity → cross-tenant is N/A and must NOT count as a gap.
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["sqli"])
+    store = _DimStore([e], named_sessions=1)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["cross_tenant_applicable"] is False
+    assert "cross_tenant" not in cov["dimensions"]
+    assert cov["cross_tenant_gap"] is False
+    assert cov["complete"] is True
+
+
+def test_coverage_access_control_counts_auth_and_sensitive_data():
+    # Regression: the scan emitted attack types 'auth_bypass' and 'sensitive_data'
+    # which were unmapped, so access_control read as untested. They must map to access_control.
+    from dast.proxy.api.copilot_service import _ATTACK_TYPE_DIMENSION
+    assert _ATTACK_TYPE_DIMENSION.get("auth_bypass") == "access_control"
+    assert _ATTACK_TYPE_DIMENSION.get("sensitive_data") == "access_control"
+    e = _CovEntry("POST", "/app/backend/x", "app.example.com",
+                  scanned_attack_types=["auth_bypass", "sensitive_data"])
+    store = _DimStore([e], named_sessions=1)
+    service = CopilotService(_FakeCtx(store))
+    cov = service._surface_coverage(["app.example.com"])
+    assert cov["dimensions"]["access_control"]["untested"] == []   # evaluated, not a gap
+
+
+# ── validation-only mode: no breadth ───────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_validation_only_skips_graphql_sweep_and_autoroute():
+    # A validate-this-finding run must test ONLY the finding's endpoint — the
+    # per-turn auto GraphQL sweep and evidence auto-route must NOT fire.
+    service = CopilotService(_FakeCtx())
+    service._auto_test_graphql = AsyncMock()
+    service._auto_route = AsyncMock()
+    sid = service.run_autonomous("validate finding X", focus_hosts=["h"],
+                                 validation_only=True)
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    service._auto_test_graphql.assert_not_awaited()
+    service._auto_route.assert_not_awaited()
+    assert session["autonomous"]["validation_only"] is True
+    assert session["autonomous"]["mode"] == "bounded"
+
+
+@pytest.mark.asyncio
+async def test_normal_run_still_does_breadth():
+    # A normal (non-validation) run keeps the auto GraphQL/route breadth.
+    service = CopilotService(_FakeCtx())
+    service._auto_test_graphql = AsyncMock()
+    service._auto_route = AsyncMock()
+    sid = service.run_autonomous("obj", focus_hosts=["h"])
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(side_effect=[_Reply("done", "complete")])
+    await session["_task"]
+    service._auto_test_graphql.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_validation_only_accepts_complete_without_coverage_gate():
+    # A validation-only run cares about one finding, not surface coverage. Even with a
+    # mapped-but-untested surface (which would bounce 'complete' in a normal run), the
+    # model's verdict must end the run immediately — not get pushed into breadth.
+    e = _CovEntry("POST", "/app/backend/x", "h", scanned_attack_types=["sqli"])
+    store = _DimStore([e])
+    service = CopilotService(_FakeCtx(store))
+    sid = service.run_autonomous("validate finding Y", focus_hosts=["h"],
+                                 validation_only=True)
+    session = service.get(sid)
+    session["engine"].send = AsyncMock(
+        side_effect=[_Reply("NOT CONFIRMED: no differential", "complete")])
+    await session["_task"]
+    assert session["autonomous"]["status"] == "complete"
+    assert session["autonomous"]["complete_rejections"] == 0   # gate skipped, not bounced
+
+
+# ── Phase 1: parallel multi-agent isolation ────────────────────────────────────
+class _HostStatusEntry:
+    def __init__(self, host, status):
+        self.host = host
+        self.status = status
+        self.findings = []
+        self.scan_result = None
+
+
+def test_scope_entries_filters_by_host_exact_and_subdomain():
+    es = [_HostStatusEntry("training.knowbe4.com", 200),
+          _HostStatusEntry("api.training.knowbe4.com", 403),
+          _HostStatusEntry("other.knowbe4.com", 200)]
+    scoped = CopilotService._scope_entries(es, {"training.knowbe4.com"})
+    hosts = {e.host for e in scoped}
+    assert hosts == {"training.knowbe4.com", "api.training.knowbe4.com"}  # subdomain in, sibling out
+    assert CopilotService._scope_entries(es, None) == es                   # no filter = all
+
+
+def test_response_counts_scoped_to_focus_hosts():
+    es = [_HostStatusEntry("training.knowbe4.com", 200),
+          _HostStatusEntry("training.knowbe4.com", 403),
+          _HostStatusEntry("noise.example.com", 200)]
+    service = CopilotService(_FakeCtx(_DimStore(es)))
+    total, ok = service._response_counts({"training.knowbe4.com"})
+    assert (total, ok) == (2, 1)                 # the noise host is excluded
+
+
+def test_gc_never_evicts_a_live_run(monkeypatch):
+    import dast.proxy.api.copilot_service as cs
+    monkeypatch.setattr(cs, "_MAX_SESSIONS", 1)
+    service = CopilotService(_FakeCtx())
+    live = service.new_session()
+
+    class _T:
+        def done(self):
+            return False
+    service._sessions[live]["_task"] = _T()           # live task
+    service.new_session()                              # second session triggers _gc
+    assert live in service._sessions                   # live run was not evicted
+
+
+@pytest.mark.asyncio
+async def test_run_validation_batch_forces_validation_only_and_session_safe():
+    service = CopilotService(_FakeCtx())
+    result = service.run_validation_batch([
+        {"objective": "validate finding A", "focus_hosts": ["h"]},
+        {"objective": "   ", "focus_hosts": ["h"]},     # invalid → error, not launched
+    ])
+    assert result["count"] == 1
+    assert len(result["errors"]) == 1
+    sid = result["launched"][0]["session_id"]
+    auto = service.get(sid)["autonomous"]
+    assert auto["validation_only"] is True
+    assert auto["session_safe"] is True
+    assert auto["mode"] == "bounded"
+    service.get(sid)["_task"].cancel()
+    await asyncio.gather(service.get(sid)["_task"], return_exceptions=True)
+
+
+def test_each_session_gets_its_own_browser():
+    # Per-session isolation: two sessions must not share one AgentBrowser (that was the
+    # parallel-run blocker — shared page/cookies clobbered each other).
+    service = CopilotService(_FakeCtx())
+    a = service.new_session()
+    b = service.new_session()
+    ctx_a = service._build_tool_ctx(service.get(a))
+    ctx_b = service._build_tool_ctx(service.get(b))
+    ba = service.get(a)["_agent_browser"]
+    bb = service.get(b)["_agent_browser"]
+    assert ba is not None and bb is not None and ba is not bb
+    assert ctx_a.browser is ba and ctx_b.browser is bb

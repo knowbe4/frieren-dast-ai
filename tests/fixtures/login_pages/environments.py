@@ -50,6 +50,7 @@ _FIELD_MAP: Dict[str, Tuple[str, str]] = {
     "intl_ptbr": ("usuario", "senha"),
     "shadow_dom": ("email", "password"),
     "sso_mfa": ("email", "password"),
+    "spa_json": ("email", "password"),
 }
 
 ENVIRONMENTS = tuple(_FIELD_MAP.keys())
@@ -243,7 +244,26 @@ _SSO_MFA_OTP = _page("Two-step verification",
     "<button type='submit'>Verify</button></form>")
 
 
+def _spa_json_page() -> str:
+    # SPA whose login form is in a CLOSED shadow root — Playwright locators and the
+    # deterministic form-fill CANNOT pierce it ("no email field") — and which authenticates
+    # via a JSON POST to /api/auth/login. Mirrors the SvelteKit shape: only the
+    # DOM-independent spa_api strategy can solve it.
+    return _page("SPA Login", _noise()
+        + "<h1>Sign In</h1><p>Please sign in with your email address below:</p>"
+          "<spa-login></spa-login>"
+          "<script>"
+          "class SpaLogin extends HTMLElement{connectedCallback(){"
+          "const r=this.attachShadow({mode:'closed'});"
+          "r.innerHTML=\"<form><input name='email' type='email' placeholder='Email'>"
+          "<input name='password' type='password' placeholder='Password'>"
+          "<button type='submit'>Continue</button></form>\";}}"
+          "customElements.define('spa-login',SpaLogin);"
+          "</script>")
+
+
 _PAGE_BUILDERS = {
+    "spa_json": _spa_json_page,
     "okta": _okta_page,
     "auth0": _auth0_page,
     "keycloak": _keycloak_page,
@@ -279,8 +299,35 @@ class _EnvHandler(_Handler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
-        form = self._read_form()
         server: "EnvFixtureServer" = self.server  # type: ignore[assignment]
+        # SPA JSON-API login endpoint (the spa_json env): a JSON POST, authenticated by body
+        # fields, returning {redirectTo} + a session cookie — the shape the spa_api strategy
+        # drives. Handle BEFORE _read_form() so the JSON body is not consumed as a form.
+        if path == "/api/auth/login":
+            import json as _json
+            try:
+                length = int(self.headers.get("content-length", 0) or 0)
+                data = _json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                data = {}
+            server.posts.append((path, data))
+            if data.get("email") == USERNAME and data.get("password") == PASSWORD:
+                body = _json.dumps({"redirectTo": "/dashboard", "redirectReport": None}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Set-Cookie", f"{SESSION_COOKIE}={SESSION_VALUE}; Path=/")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                body = _json.dumps({"error": "invalid credentials"}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            return
+        form = self._read_form()
         server.posts.append((path, form))
         # sso_mfa combo: correct credentials lead to an OTP wall, not a session.
         if path == "/env/sso_mfa/submit":

@@ -217,7 +217,7 @@ async def test_out_of_scope_denied_records_observation_not_call():
 
     run_tool.assert_not_awaited()  # denied before dispatch
     assert reply.blocked_reason == "out_of_scope"
-    assert "Denied by operator" in reply.transcript[0]["observation"]
+    assert "Denied" in reply.transcript[0]["observation"]
 
 
 @pytest.mark.asyncio
@@ -523,7 +523,10 @@ async def test_session_auth_injects_jar_cookies_and_borrowed_headers():
 
     headers = captured["args"]["headers"]
     assert headers["Cookie"] == "session=abc"  # from the host-scoped jar
-    assert headers["Authorization"] == "Bearer XYZ"  # borrowed from history
+    # Authorization is NOT borrowed from the global history directly (that would
+    # leak a token across concurrent sessions); it is captured into this engine's
+    # own per-session _bearer_tokens cache and applied from there.
+    assert headers["Authorization"] == "Bearer XYZ"
 
 
 @pytest.mark.asyncio
@@ -559,6 +562,49 @@ async def test_session_auth_never_overwrites_model_set_headers():
     headers = captured["args"]["headers"]
     assert headers["Authorization"] == "Bearer MINE"  # model's header preserved
     assert headers["Cookie"] == "session=abc"  # jar cookie still added
+
+
+@pytest.mark.asyncio
+async def test_session_auth_strips_model_pasted_stale_cookie():
+    # The model must NOT be able to pin a stale/foreign session by pasting its own
+    # Cookie/X-CSRF-Token — the tool replaces them with the ACTIVE jar session (this is
+    # the loop that stalled the 2nd run).
+    session = CopilotSession("s-auth3")
+    _, on_event = _collector()
+
+    store = _FakeStore(
+        cookies=[{"name": "session", "value": "ACTIVE"},
+                 {"name": "CSRF-TOKEN", "value": "FRESH"}],
+        entries=[],
+    )
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    captured: Dict[str, Any] = {}
+
+    async def fake_run_tool(_ctx, _name, args):
+        captured["args"] = args
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x",
+                       "headers": {"Cookie": "session=STALE; CSRF-TOKEN=old",
+                                   "X-CSRF-Token": "oldtok"}}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    headers = captured["args"]["headers"]
+    # stale cookie replaced with the active jar session
+    assert "STALE" not in headers["Cookie"]
+    assert "session=ACTIVE" in headers["Cookie"]
+    # stale CSRF refreshed from the active session cookie, not the model's "oldtok"
+    assert headers["X-CSRF-Token"] == "FRESH"
+    assert headers["x-dast-cookies-injected"] == "1"
 
 
 def test_render_arg_signature_marks_required_and_anyof():
@@ -718,3 +764,286 @@ def test_copilot_step_schema_does_not_require_action():
                            "tool_args": {"url": "https://app.example.com/"}}
     # Must NOT raise now that `action` is optional.
     assert _require_fields(step_without_action, COPILOT_STEP_SCHEMA) == step_without_action
+
+
+# ── coordinator watchdog: kill a turn looping on the same normalized call ─────
+
+def test_normalized_call_sig_ignores_header_literals():
+    from dast.ai.copilot.session import _normalized_call_sig
+    a = {"url": "https://in.scope/x", "method": "POST", "body": "b",
+         "headers": {"Cookie": "session=1", "X-CSRF-Token": "t1"}}
+    b = {"url": "https://in.scope/x", "method": "POST", "body": "b",
+         "headers": {"Cookie": "session=2", "X-CSRF-Token": "t2"}}
+    assert _normalized_call_sig("send_request", a) == _normalized_call_sig("send_request", b)
+    # a different endpoint is a different signature
+    c = dict(a); c["url"] = "https://in.scope/y"
+    assert _normalized_call_sig("send_request", c) != _normalized_call_sig("send_request", a)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_kills_turn_repeating_same_normalized_call():
+    # The model pastes a DIFFERENT Cookie literal each call (slips the exact-dedup) but
+    # the intent is identical — the watchdog must break the turn with stuck_loop.
+    session = CopilotSession("s-watchdog")
+    _, on_event = _collector()
+    store = _FakeStore(cookies=[{"name": "session", "value": "A"}], entries=[])
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    async def fake_run_tool(_ctx, _name, args):
+        return {"ok": True, "status": 200}
+
+    steps = [
+        {"action": "call_tool", "thought": "p", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/x", "method": "POST", "body": "b",
+                       "headers": {"Cookie": f"session=STALE{i}"}}}
+        for i in range(4)
+    ] + [{"action": "reply", "thought": "d", "message": "ok"}]
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "stuck_loop"
+    assert "cookie" in reply.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_kills_model_repeatedly_pasting_session_headers_across_endpoints():
+    # The per-call watchdog misses this: the model pastes Cookie on DIFFERENT urls each time.
+    # The cross-endpoint strip-counter must trip stuck_loop once it is clear the model keeps
+    # supplying session headers the tool ignores.
+    from dast.ai.copilot.session import _MAX_HEADER_STRIPS
+    session = CopilotSession("s-strip")
+    _, on_event = _collector()
+    store = _FakeStore(cookies=[{"name": "session", "value": "ACTIVE"}], entries=[])
+    ctx = _FakeCtx()
+    ctx.store = store
+
+    async def fake_run_tool(_ctx, _name, args):
+        return {"ok": True, "status": 200}
+
+    n = _MAX_HEADER_STRIPS * 2
+    steps = [
+        {"action": "call_tool", "thought": "p", "tool_name": "send_request",
+         "tool_args": {"url": f"https://in.scope/e{i}", "headers": {"Cookie": "session=STALE"}}}
+        for i in range(n)
+    ] + [{"action": "reply", "thought": "d", "message": "ok"}]
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=fake_run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", ctx, on_event=on_event, wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "stuck_loop"
+    assert "cookie" in reply.message.lower()
+
+
+# ── _ensure_fresh_bearer: wait for the SPA to mint a Bearer after navigate-commit ──
+
+def _unexpired_jwt() -> str:
+    """A structurally valid JWT with NO exp claim (so _decode_jwt_exp -> None -> treated
+    fresh). Built at runtime so no eyJ... literal sits in the source (gitleaks)."""
+    import base64 as _b64, json as _json
+
+    def seg(obj):
+        return _b64.urlsafe_b64encode(_json.dumps(obj).encode()).rstrip(b"=").decode()
+    return f"{seg({'alg': 'HS512'})}.{seg({'sub': '1', 'account_id': 999})}.{seg('sig1234567890')}"
+
+
+@dataclass
+class _BearerEntry:
+    host: str
+    request_headers: Dict[str, str]
+    path: str = "/v1/dashboard"
+    source: str = "proxy"
+    id: str = "e1"
+
+
+class _DelayedStore:
+    """all_entries() returns the Bearer entry only from the Nth call onward — simulating
+    the SPA's authenticated call landing shortly after navigate resolved on 'commit'."""
+
+    def __init__(self, appears_on_call: int, entry):
+        self._n = 0
+        self._appears = appears_on_call
+        self._entry = entry
+
+    def all_entries(self):
+        self._n += 1
+        return [self._entry] if self._n >= self._appears else []
+
+
+class _BrowserOnHost:
+    class _Page:
+        url = "https://phisher.example/"
+    page = _Page()
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_bearer_waits_for_spa_token():
+    session = CopilotSession("s-bearer")
+    entry = _BearerEntry(host="api.phisher.example",
+                         request_headers={"Authorization": f"Bearer {_unexpired_jwt()}"})
+    store = _DelayedStore(appears_on_call=2, entry=entry)  # absent on the fast path, appears after a poll
+    rec = await session._ensure_fresh_bearer(
+        store, "api.phisher.example", "/queries_api/v2/x",
+        browser=_BrowserOnHost(), timeout_s=3.0)
+    assert rec and rec.get("token")
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_bearer_no_wait_when_browser_elsewhere():
+    import time as _time
+    session = CopilotSession("s-bearer2")
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    class _Elsewhere:
+        class _Page:
+            url = "https://unrelated.example.com/"
+        page = _Page()
+
+    t0 = _time.monotonic()
+    rec = await session._ensure_fresh_bearer(
+        _Empty(), "api.phisher.example", "/queries_api/v2/x",
+        browser=_Elsewhere(), timeout_s=5.0)
+    assert rec is None
+    assert _time.monotonic() - t0 < 1.0   # did NOT burn the timeout — browser not on this host
+
+
+# ── refresh_bearer: the reactive escalation ladder (REFETCH / RELOAD tiers) ──
+
+class _FetchResp:
+    def __init__(self, token: str, status: int = 200):
+        self.status = status
+        self._token = token
+
+    async def text(self) -> str:
+        import json as _json
+        return _json.dumps({"token": self._token})
+
+
+class _FetchRequest:
+    def __init__(self, token: str):
+        self._token = token
+
+    async def fetch(self, url: str, method: str = "GET"):
+        return _FetchResp(self._token)
+
+
+class _RefetchBrowser:
+    """A browser parked on an unrelated host (so WAIT_SPA is skipped) whose
+    page.request.fetch mints a fresh token — exercises the REFETCH tier."""
+
+    class _Page:
+        url = "https://elsewhere.example/"
+
+    def __init__(self, token: str):
+        self._page = self._Page()
+        self._page.request = _FetchRequest(token)
+
+    @property
+    def page(self):
+        return self._page
+
+    async def _ensure_page(self):
+        return self._page
+
+
+class _ReloadBrowser:
+    """A browser on the target host that records whether reload() was called."""
+
+    class _Page:
+        url = "https://api.phisher.example/"
+
+    def __init__(self):
+        self._page = self._Page()
+        self.reloaded = False
+
+    @property
+    def page(self):
+        return self._page
+
+    async def _ensure_page(self):
+        return self._page
+
+    async def reload(self, timeout_ms: int = 20000):
+        self.reloaded = True
+        return {"ok": True, "url": self._page.url, "status": 200}
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_refetch_tier_mints_token():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-refetch")
+    host = "api.phisher.example"
+    # A known Bearer host whose cached token has expired, with a re-usable auth endpoint.
+    session._bearer_tokens[host] = {
+        "token": "old", "exp": _time.time() - 10,
+        "auth_endpoint": "/api/auth/token", "source_entry_id": "e1"}
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    outcome = await session.refresh_bearer(
+        _Empty(), host, "/queries_api/v2/x",
+        browser=_RefetchBrowser(_unexpired_jwt()),
+        max_tier=RefreshTier.RELOGIN)
+    assert outcome.acted is True
+    assert outcome.tier_reached == RefreshTier.REFETCH
+    assert outcome.record and outcome.record["token"] == _unexpired_jwt()
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_refetch_respects_cooldown():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-refetch-cd")
+    host = "api.phisher.example"
+    session._bearer_tokens[host] = {
+        "token": "old", "exp": _time.time() - 10,
+        "auth_endpoint": "/api/auth/token", "source_entry_id": "e1"}
+    session._last_bearer_refresh_ts = _time.time()  # just refreshed -> cooldown active
+
+    class _Empty:
+        def all_entries(self):
+            return []
+
+    outcome = await session.refresh_bearer(
+        _Empty(), host, "/x", browser=_RefetchBrowser(_unexpired_jwt()),
+        max_tier=RefreshTier.REFETCH)
+    assert outcome.acted is False               # REFETCH skipped by the 15s cooldown
+    assert outcome.record["token"] == "old"     # the stale token is returned, unrefreshed
+
+
+@pytest.mark.asyncio
+async def test_refresh_bearer_reload_tier():
+    import time as _time
+    from dast.ai.copilot.session import RefreshTier
+    session = CopilotSession("s-reload")
+    host = "api.phisher.example"
+    # Known Bearer host (so RELOAD is allowed), cached token expired, NO auth endpoint
+    # (so REFETCH no-ops and the ladder escalates to RELOAD).
+    session._bearer_tokens[host] = {"token": "old", "exp": _time.time() - 10}
+    browser = _ReloadBrowser()
+    entry = _BearerEntry(host=host,
+                         request_headers={"Authorization": f"Bearer {_unexpired_jwt()}"})
+
+    class _ReloadMintStore:
+        """Returns the SPA's fresh token only after the page has been reloaded."""
+        def all_entries(self):
+            return [entry] if browser.reloaded else []
+
+    outcome = await session.refresh_bearer(
+        _ReloadMintStore(), host, "/queries_api/v2/x", browser=browser,
+        max_tier=RefreshTier.RELOAD, timeout_s=0.5)
+    assert browser.reloaded is True
+    assert outcome.acted is True
+    assert outcome.tier_reached == RefreshTier.RELOAD
+    assert outcome.record and outcome.record["token"] == _unexpired_jwt()

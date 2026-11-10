@@ -17,24 +17,23 @@ schema-forced action and prompt-injection fencing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from dast.ai import prompt_safety
+from dast.browser.login_strategies.base import (
+    _MAX_LLM_STEPS,
+    AuthDecider,
+    LoginResult,
+    current_url as _current_url,
+    looks_authenticated as _looks_authenticated,
+)
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# A decider maps (page_snapshot, context) -> one action dict, or None to stop.
-# context carries: email, password, target_url, history (prior actions).
-AuthDecider = Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]]
-
-_LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
-                "/auth/login", "/u/login", "/authorize")
-_SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
-                "accounts.google", "cognito")
-
-_MAX_LLM_STEPS = 8
+# The cascade's result type is the shared LoginResult (promoted from the old
+# LoginCascadeResult); the alias keeps every `from ... import LoginCascadeResult` caller working.
+LoginCascadeResult = LoginResult
 
 
 def _journal(url: str, outcome: str, **fields: str) -> None:
@@ -45,52 +44,6 @@ def _journal(url: str, outcome: str, **fields: str) -> None:
         login_journal.record(url, outcome, **fields)
     except Exception as exc:  # noqa: BLE001 — journaling is non-critical
         logger.debug("adaptive_login: journal write failed", error=str(exc)[:120])
-
-
-@dataclass
-class LoginCascadeResult:
-    """Outcome of an adaptive login attempt."""
-
-    ok: bool
-    engine: str  # "deterministic" | "llm" | "none"
-    url: str
-    llm_steps: int = 0
-    actions: List[Dict[str, Any]] = field(default_factory=list)
-    error: str = ""
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "ok": self.ok,
-            "engine": self.engine,
-            "url": self.url,
-            "llm_steps": self.llm_steps,
-            "actions": self.actions,
-            "error": self.error,
-        }
-
-
-def _looks_authenticated(url: str, success_url_suffix: Optional[str]) -> bool:
-    """Decide whether *url* represents a logged-in state.
-
-    When ``success_url_suffix`` is given (tests, or a known post-login path) it is
-    the ground truth. Otherwise fall back to the heuristic the deterministic engine
-    uses: not sitting on a login/auth path and not parked on an SSO domain.
-    """
-    low = (url or "").lower()
-    if success_url_suffix:
-        return low.split("?")[0].rstrip("/").endswith(success_url_suffix.rstrip("/"))
-    path = low.split("?")[0]
-    on_login = any(path.endswith(p) or f"{p}/" in path for p in _LOGIN_PATHS)
-    on_sso = any(d in low for d in _SSO_DOMAINS)
-    return not on_login and not on_sso
-
-
-async def _current_url(browser: Any) -> str:
-    try:
-        snap = await browser.snapshot()
-        return str(snap.get("url", ""))
-    except Exception:
-        return ""
 
 
 async def adaptive_login(

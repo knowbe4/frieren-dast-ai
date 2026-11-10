@@ -2043,3 +2043,49 @@ async def test_code_lookup_path_falls_back_to_search(monkeypatch):
                             {"url_path": "/app/backend/integrations/11111111-2222-3333-4444-555555555555"})
     assert result["ok"] is True
     assert result["count"] == 1 and "integrations" in result.get("note", "")
+
+
+# ── transport_capability tools ──────────────────────────────────────────────────
+
+def test_transport_capability_tools_registered():
+    names = {t.name for t in tools.all_tools()}
+    assert {"get_transport_capability", "record_transport_capability"} <= names
+
+
+@pytest.mark.asyncio
+async def test_record_then_get_transport_capability_round_trip():
+    ctx = ToolContext(settings=_Scope(True))
+    rec = await run_tool(ctx, "record_transport_capability", {
+        "host": "api.phisher.example", "prefer": "browser", "auth": "browser",
+        "reason": "api_401_browser_ok"})
+    assert rec["ok"] is True and rec["host"] == "api.phisher.example"
+    got = await run_tool(ctx, "get_transport_capability", {"host": "api.phisher.example"})
+    assert got["ok"] is True and got["known"] is True
+    assert got["prefer"] == "browser" and got["auth"] == "browser"
+
+
+@pytest.mark.asyncio
+async def test_get_transport_capability_unknown_host():
+    ctx = ToolContext(settings=_Scope(True))
+    got = await run_tool(ctx, "get_transport_capability", {"host": "never-seen.example"})
+    assert got["ok"] is True and got["known"] is False
+
+
+@pytest.mark.asyncio
+async def test_transport_capability_tools_scope_gated():
+    ctx = ToolContext(settings=_Scope(allow=False))
+    rec = await run_tool(ctx, "record_transport_capability",
+                         {"host": "out.example", "prefer": "browser", "auth": "browser"})
+    got = await run_tool(ctx, "get_transport_capability", {"host": "out.example"})
+    assert rec["ok"] is False and "out of scope" in rec["error"]
+    assert got["ok"] is False and "out of scope" in got["error"]
+
+
+@pytest.mark.asyncio
+async def test_record_transport_capability_validates_values():
+    ctx = ToolContext(settings=_Scope(True))
+    bad_prefer = await run_tool(ctx, "record_transport_capability",
+                                {"host": "api.x.example", "prefer": "nope", "auth": "browser"})
+    bad_auth = await run_tool(ctx, "record_transport_capability",
+                              {"host": "api.x.example", "prefer": "browser", "auth": "nope"})
+    assert bad_prefer["ok"] is False and bad_auth["ok"] is False

@@ -17,15 +17,19 @@ schema-forced action and prompt-injection fencing.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Optional
 
-from dast.ai import prompt_safety
 from dast.browser.login_strategies.base import (
     _MAX_LLM_STEPS,
     AuthDecider,
+    LoginContext,
     LoginResult,
-    current_url as _current_url,
     looks_authenticated as _looks_authenticated,
+)
+from dast.browser.login_strategies.llm import (
+    LlmStrategy,
+    _apply_action,  # noqa: F401 — re-exported; the scope test imports it from this module
+    make_llm_decider,  # noqa: F401 — re-exported; evals/tools import it from this module
 )
 from dast.utils.logger import get_logger
 
@@ -118,167 +122,20 @@ async def adaptive_login(
             logger.warning("adaptive_login: spa_api strategy raised", error=str(exc)[:200])
 
     # --- Phase 2: LLM-driven fallback over the browser primitives -----------
-    decider = decide or make_llm_decider()
     logger.info("adaptive_login: deterministic engine did not authenticate, "
                 "escalating to LLM", url=det_url)
-    try:
-        await browser.navigate(url)
-    except Exception as exc:
-        logger.warning("adaptive_login: re-navigate before LLM failed",
-                       error=str(exc)[:200])
-
-    history: List[Dict[str, Any]] = []
-    for step in range(max_llm_steps):
-        current = await _current_url(browser)
-        if _looks_authenticated(current, success_url_suffix) and current != url:
-            logger.info("adaptive_login: solved by LLM fallback",
-                        url=current, steps=step)
-            _journal(url, "success", strategy="llm", success_url=current)
-            return LoginCascadeResult(ok=True, engine="llm", url=current,
-                                      llm_steps=step, actions=history)
-        try:
-            snapshot = await browser.snapshot()
-        except Exception as exc:
-            logger.warning("adaptive_login: snapshot failed", error=str(exc)[:200])
-            break
-
-        context = {"email": email, "password": password,
-                   "target_url": url, "history": list(history)}
-        try:
-            action = decider(snapshot, context)
-        except Exception as exc:
-            logger.warning("adaptive_login: decider raised", error=str(exc)[:200])
-            break
-        if not action or action.get("action") == "stop":
-            logger.info("adaptive_login: LLM chose to stop", step=step)
-            break
-
-        history.append(action)
-        ok = await _apply_action(browser, action, in_scope)
-        if not ok:
-            logger.debug("adaptive_login: action did not apply cleanly",
-                         action=action.get("action"), selector=action.get("selector"))
-
-    final = await _current_url(browser)
-    authenticated = _looks_authenticated(final, success_url_suffix) and final != url
-    engine = "llm" if history else "none"
-    logger.info("adaptive_login: finished", ok=authenticated, engine=engine,
-                url=final, llm_steps=len(history))
-    if authenticated:
-        _journal(url, "success", strategy=engine, success_url=final)
-    else:
-        _journal(url, "error", strategy=engine, reason="login not completed")
-    return LoginCascadeResult(
-        ok=authenticated, engine=engine, url=final,
-        llm_steps=len(history), actions=history,
-        error="" if authenticated else "login not completed",
+    ctx = LoginContext(
+        browser, url, email, password,
+        success_url_suffix=success_url_suffix, in_scope=in_scope,
+        store=store, session=session, decide=decide, max_llm_steps=max_llm_steps,
     )
-
-
-async def _apply_action(browser: Any, action: Dict[str, Any],
-                        in_scope: Optional[Callable[[str], bool]] = None) -> bool:
-    """Execute one decider action against the browser. Returns False on error.
-
-    A ``navigate`` action is scope-gated: the decider reads untrusted target page
-    content, so a prompt-injected navigate to an out-of-scope URL (credential/SSRF
-    exfil) must be refused. ``fill``/``click``/``wait`` act on the already-loaded,
-    in-scope page.
-    """
-    kind = str(action.get("action") or "").lower()
-    selector = str(action.get("selector") or "")
-    try:
-        if kind == "fill":
-            await browser.fill(selector, str(action.get("value") or ""))
-        elif kind == "click":
-            await browser.click(selector, expect_nav=bool(action.get("expect_navigation")))
-        elif kind == "wait":
-            await browser.wait_for(selector)
-        elif kind == "navigate":
-            if in_scope is not None and not in_scope(selector):
-                logger.warning("adaptive_login: refused out-of-scope navigate",
-                               url=selector[:120])
-                return False
-            await browser.navigate(selector)
-        else:
-            return False
-        return True
-    except Exception as exc:
-        logger.debug("adaptive_login: _apply_action error",
-                     kind=kind, error=str(exc)[:160])
-        return False
-
-
-_DECIDER_SYSTEM = """\
-You are driving a web browser to log in to an application on behalf of an \
-authorized security operator. The deterministic auto-login already failed, so you \
-must adapt like a human: look at the page snapshot and choose exactly ONE next \
-browser action that advances the login.
-
-Rules:
-- Fill the username/email field with the provided email, and the password field \
-with the provided password. Never invent or guess credentials.
-- Identify fields and buttons from the snapshot (names, ids, types, button text). \
-Prefer stable selectors (#id, [name=...], input[type=...]).
-- The page may have MORE THAN ONE form (e.g. a header search box). Act only on the \
-login form: match the field/button to the login form's id/name and, when several \
-forms exist, scope the selector to it (e.g. "#login-form input[type=submit]", \
-"form[name=loginform] [type=submit]"). A generic "button[type=submit]" may hit a \
-search or newsletter button instead - avoid it when multiple submits exist.
-- To submit, pick the control whose text clearly means sign-in (Sign In, Log In, \
-Continue, Next, Yes), never one that says Search/Go/Subscribe.
-- Some flows need an extra click (Continue/Next) before the password appears, or a \
-consent/Authorize/Stay-signed-in button after the password. Take them one step at a time.
-- Do not attempt to solve CAPTCHAs or MFA/OTP challenges; choose "stop" if you hit one.
-- Choose "stop" when the page is clearly logged in, or when no action can progress."""
-
-
-def make_llm_decider(model_id: Optional[str] = None) -> AuthDecider:
-    """Default decider: ask the model for the next login action, schema-forced.
-
-    Routed through ``bedrock_client.invoke_json`` with ``LOGIN_ACTION_SCHEMA`` so a
-    malformed action is impossible. The untrusted page snapshot is fenced with
-    ``prompt_safety``. Any AI error degrades to None (stop), never raising.
-    """
-    import json
-
-    from dast.ai import bedrock_client
-    from dast.ai.schemas import LOGIN_ACTION_SCHEMA
-
-    def decide(snapshot: Dict[str, Any], context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        snapshot_json = json.dumps({
-            "url": snapshot.get("url"),
-            "title": snapshot.get("title"),
-            "forms": snapshot.get("forms"),
-            "buttons": snapshot.get("buttons"),
-            "links": snapshot.get("links"),
-        }, default=str)[:8000]
-        history_json = json.dumps(context.get("history") or [], default=str)[:2000]
-        user = (
-            f"Credentials to use:\n  email: {context.get('email')}\n"
-            f"  password: {context.get('password')}\n\n"
-            f"Actions already taken this attempt:\n{history_json}\n\n"
-            "Current page snapshot:\n"
-            + prompt_safety.wrap_untrusted(snapshot_json, "page_snapshot")
-            + "\n\nReturn the single next action."
-        )
-        system = _DECIDER_SYSTEM + "\n\n" + prompt_safety.UNTRUSTED_CONTENT_DIRECTIVE
-        try:
-            result = bedrock_client.invoke_json(
-                system=system,
-                user=user,
-                model_id=model_id,
-                temperature=0,
-                schema=LOGIN_ACTION_SCHEMA,
-            )
-        except Exception as exc:
-            logger.warning("adaptive_login: LLM decider call failed",
-                           error=str(exc)[:200])
-            return None
-        if not isinstance(result, dict) or not result.get("action"):
-            return None
-        return result
-
-    return decide
+    result = await LlmStrategy().attempt(ctx)
+    if result.ok:
+        _journal(url, "success", strategy=result.engine, success_url=result.url)
+    else:
+        _journal(url, "error", strategy=result.engine,
+                 reason=result.error or "login not completed")
+    return result
 
 
 __all__ = ["adaptive_login", "make_llm_decider", "LoginCascadeResult", "AuthDecider"]

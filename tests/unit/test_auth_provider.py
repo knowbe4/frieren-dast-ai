@@ -8,6 +8,7 @@ import json
 import time
 
 from dast.session.auth_provider import (
+    attach,
     collect_host_bearer,
     decode_jwt_exp,
     rec_is_fresh,
@@ -96,3 +97,78 @@ def test_domain_suffix_match_and_scan_wrapper():
     rec = scan_history_bearer(store, "api.phisher.example", "/modstore/y")
     assert rec and rec["auth_endpoint"] == "/modstore/g"   # matched on registrable domain
     assert scan_history_bearer(None, "h", "/p") is None    # null store -> None, no raise
+
+
+# --------------------------------------------------------------- attach()
+
+
+def test_attach_api_sets_cookie_csrf_and_bearer():
+    headers: dict = {}
+    res = attach(headers, transport="api",
+                 cookies={"session": "abc", "CSRF-TOKEN": "tok123"},
+                 bearer_rec={"token": "BEAR", "exp": None})
+    assert headers["Cookie"] == "session=abc; CSRF-TOKEN=tok123"
+    assert headers["X-CSRF-Token"] == "tok123"
+    assert headers["X-Requested-With"] == "XMLHttpRequest"
+    assert headers["Authorization"] == "Bearer BEAR"
+    assert headers["x-dast-cookies-injected"] == "1"
+    assert res.attached_bearer is True
+
+
+def test_attach_api_strips_model_cookie_unless_trusted():
+    # Not trusted: a model-pasted Cookie/CSRF is replaced with the active session's.
+    headers = {"Cookie": "evil=1", "X-CSRF-Token": "stale"}
+    res = attach(headers, transport="api", cookies={"session": "real", "CSRF-TOKEN": "fresh"})
+    assert headers["Cookie"] == "session=real; CSRF-TOKEN=fresh"   # re-seeded from the jar
+    assert "evil=1" not in headers["Cookie"]
+    assert headers["X-CSRF-Token"] == "fresh"                      # stale model CSRF refreshed
+    assert res.overrode_session_header is True
+
+    # Trusted marker: leave the model's cookie in place (we set it on a prior pass).
+    headers2 = {"Cookie": "ours=1", "x-dast-cookies-injected": "1"}
+    res2 = attach(headers2, transport="api", cookies={"session": "real"}, trusted_marker=True)
+    assert headers2["Cookie"] == "ours=1"            # not overwritten
+    assert res2.overrode_session_header is False
+
+
+def test_attach_api_drop_all_authorization():
+    # A non-secret caller Authorization survives the raw-secret strip but drop_all removes it,
+    # so the resolved Bearer is attached instead.
+    headers = {"Authorization": "Token notasecret"}
+    attach(headers, transport="api", cookies={"session": "x"},
+           bearer_rec={"token": "BEAR", "exp": None}, drop_all_authorization=True)
+    assert headers["Authorization"] == "Bearer BEAR"
+
+    # Without drop_all, a non-secret caller Authorization is kept and blocks the Bearer.
+    headers2 = {"Authorization": "Token notasecret"}
+    attach(headers2, transport="api", bearer_rec={"token": "BEAR", "exp": None})
+    assert headers2["Authorization"] == "Token notasecret"
+
+
+def test_attach_skips_expired_bearer():
+    headers: dict = {}
+    res = attach(headers, transport="api",
+                 bearer_rec={"token": "OLD", "exp": time.time() - 10})
+    assert "Authorization" not in headers
+    assert res.attached_bearer is False
+
+
+def test_attach_browser_strips_cookie_auth_keeps_csrf_and_bearer():
+    headers = {"Cookie": "a=1", "Authorization": "Bearer caller", "Content-Type": "application/json"}
+    attach(headers, transport="browser",
+           cookies={"XSRF-TOKEN": "xt"},
+           bearer_rec={"token": "RIDE", "exp": None})
+    assert "Cookie" not in headers                   # browser context owns the jar
+    assert headers["X-CSRF-Token"] == "xt"
+    assert headers["X-Requested-With"] == "XMLHttpRequest"
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Authorization"] == "Bearer RIDE"  # caller auth dropped, captured Bearer rides
+
+
+def test_attach_no_cookies_is_a_clean_noop():
+    # The MCP-process case: no store -> cookies None -> no Cookie set, no crash.
+    headers: dict = {}
+    res = attach(headers, transport="api", cookies=None, bearer_rec=None)
+    assert headers == {}
+    assert res.attached_bearer is False
+    assert res.overrode_session_header is False

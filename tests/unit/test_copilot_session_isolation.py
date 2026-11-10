@@ -19,7 +19,8 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from dast.ai.copilot.session import CopilotSession, _subapp_for_path
+from dast.ai.copilot.session import CopilotSession
+from dast.session.auth_provider import subapp_for_path as _subapp_for_path
 from dast.proxy.session_store import SessionStore
 
 

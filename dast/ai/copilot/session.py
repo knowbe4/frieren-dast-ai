@@ -27,11 +27,11 @@ from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.authorization import AUTHORIZED_ENGAGEMENT_DIRECTIVE, is_full_authorization
 from dast.ai.schemas import COPILOT_STEP_SCHEMA
 from dast.session.auth_provider import (
+    attach,
     collect_host_bearer,
     decode_jwt_exp,
     rec_is_fresh,
     select_bearer,
-    subapp_for_path as _subapp_for_path,
 )
 from dast.utils.logger import get_logger
 
@@ -1468,80 +1468,37 @@ class CopilotSession:
             return
 
         headers = dict(tool_args.get("headers") or {})
-
-        # The model must NOT be able to pin a stale or foreign session by pasting its own
-        # Cookie / X-CSRF-Token literal — it loops doing exactly that, which defeats
-        # activate_login_profile and multi-user (cross-tenant) switching. The tool owns the
-        # session: unless WE injected the cookie on a prior pass (trusted marker), drop any
-        # model-supplied Cookie + CSRF header for this host and re-seed from the jar's ACTIVE
-        # session. (A model Cookie carrying x-dast-cookies-injected=1 is ours — keep it.)
         model_marked = str(headers.get("x-dast-cookies-injected", "")) == "1"
-        if cookies and not model_marked:
-            stripped = [k for k in list(headers)
-                        if k.lower() in ("cookie", "x-csrf-token", "x-xsrf-token")]
-            for key in stripped:
-                del headers[key]
-            if stripped:
-                # The model pasted a session header we had to override. Count it (URL-
-                # independent) so the dispatch loop can break a model that keeps doing this
-                # across many endpoints — the per-call watchdog misses it (different URLs).
-                self._stripped_header_count += 1
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-            headers["x-dast-cookies-injected"] = "1"
 
-        # Guardrail: a model-pasted raw Authorization bearer/JWT must never be sent.
-        # Authorization comes ONLY from this engine's own per-session Bearer cache
-        # (injected below) — never from the model (stale/wrong, and a cross-session
-        # leak risk). Strip a pasted raw-token Authorization; a <placeholder> is left
-        # for the placeholder gate. (Cookie is already handled above.)
-        from dast.proxy.auth_headers import is_raw_secret_value
-        for key in [k for k in list(headers) if k.lower() == "authorization"]:
-            if is_raw_secret_value(str(headers.get(key, ""))):
-                del headers[key]
-                self._stripped_header_count += 1
-
-        present = {key.lower() for key in headers}
-
-        # CSRF and XHR headers from the ACTIVE session cookies (shared injector; single
-        # implementation with the active-scan path). refresh=True so a stale token the model
-        # pasted (and we did not strip above, e.g. when the trusted marker was present) is
-        # corrected to the active session's value.
-        if cookies:
-            from dast.proxy.auth_headers import inject_csrf
-            inject_csrf(headers, cookies, refresh=True)
-
-        for name, value in borrowed_headers.items():
-            if name.lower() == "cookie":
-                continue  # cookies come from the host-scoped jar above
-            if name.lower() == "authorization":
-                # Authorization is per-session (a Bearer belongs to ONE account): never
-                # borrow it from the GLOBAL proxy history — a concurrent/earlier run's
-                # token would leak across sessions. It comes only from this engine's own
-                # _bearer_tokens cache below (populated by get_app_token / this session's
-                # own captured traffic).
-                continue
-            if name.lower() not in present:
-                headers[name] = value
-
-        if "authorization" not in present and host:
+        # Bearer source: this session's per-sub-app cache; an UNSCOPED interactive run may
+        # also borrow one from the shared proxy history (a scoped run must NOT — that would
+        # leak a concurrent/earlier run's token across sessions).
+        cached = self._select_bearer(host, request_path)
+        if cached is None and store is not None and not scoped:
+            self._capture_bearer_tokens(store, host)
             cached = self._select_bearer(host, request_path)
-            # Only an UNSCOPED interactive run may borrow a Bearer from the shared proxy
-            # history; a scoped run relies solely on its own cache (get_app_token / its
-            # own captured traffic) so a concurrent run's token cannot leak in.
-            if cached is None and store is not None and not scoped:
-                self._capture_bearer_tokens(store, host)
-                cached = self._select_bearer(host, request_path)
-            if cached:
-                import time as _time
-                exp = cached.get("exp")
-                if exp is None or exp > _time.time():
-                    headers["Authorization"] = f"Bearer {cached['token']}"
-                    logger.debug("Injected cached Bearer token", host=host,
-                                 app=_subapp_for_path(request_path),
-                                 ttl=int(exp - _time.time()) if exp else -1)
-                else:
-                    logger.debug("Cached Bearer token expired, will rely on 401 refresh",
-                                 host=host)
+
+        # One shared attach: cookie (re-seeded from the active session unless the model's
+        # headers already carry our trusted marker) + CSRF/XHR + the resolved Bearer.
+        res = attach(headers, transport="api", cookies=cookies, bearer_rec=cached,
+                     trusted_marker=model_marked)
+        # Count an overridden session Cookie/CSRF and a stripped raw Authorization URL-
+        # independently so the dispatch loop can break a model that keeps pasting ignored
+        # session headers across many endpoints (the per-call watchdog misses it).
+        if res.overrode_session_header:
+            self._stripped_header_count += 1
+        if any(key.lower() == "authorization" for key in res.stripped):
+            self._stripped_header_count += 1
+
+        # Non-cookie auth headers borrowed from the freshest real request to this host
+        # (unscoped only): add what the model did not set. Cookie/Authorization are never
+        # borrowed from the GLOBAL history — they are per-session and would leak.
+        present = {key.lower() for key in headers}
+        for name, value in borrowed_headers.items():
+            low = name.lower()
+            if low in ("cookie", "authorization") or low in present:
+                continue
+            headers[name] = value
 
         if headers:
             tool_args["headers"] = headers

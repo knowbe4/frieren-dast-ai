@@ -11,7 +11,7 @@ This is the repeater primitive exposed to agents and MCP clients.
 from __future__ import annotations
 
 import html
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
 from dast.tools.base import Tool, register
@@ -195,88 +195,69 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "have the real value — read it from get_history or an earlier response, or ask the "
             "operator; do not invent one.")}
 
-    # Guardrail: refuse a hand-pasted raw secret (bearer/JWT) in Authorization/Cookie.
-    # Auth is injected automatically below (jar cookies + CSRF + a cached sub-app
-    # Bearer), so a pasted raw token is a secret-handling violation and usually stale.
-    # Strip it and tell the caller; the auto-injection then runs normally.
-    from dast.proxy.auth_headers import strip_pasted_secret_headers
-    _stripped_secret = strip_pasted_secret_headers(headers)
-    if _stripped_secret:
-        logger.warning("send_request stripped hand-pasted secret header(s)",
-                       headers=",".join(_stripped_secret))
     # Schema contract: Authorization is ALWAYS stripped from caller-supplied headers —
-    # auth is auto-injected below. strip_pasted_secret_headers only removes secret-LOOKING
-    # values; a non-secret garbage Authorization (e.g. a model's forged alg-confusion token
-    # or a raw hash) would otherwise survive, block the auto-inject (which only fires when no
-    # Authorization is present), and hit the upstream as a bogus header — e.g. an AWS SigV4
-    # parse error that reads like a finding. Drop any remainder unconditionally.
-    _dropped_auth = [k for k in list(headers) if k.lower() == "authorization"]
-    for _k in _dropped_auth:
-        del headers[_k]
-    if _dropped_auth:
-        logger.warning("send_request dropped caller-supplied Authorization (auth auto-injects)")
-
-    # Copilot's _apply_session_auth injects jar+handoff cookies and marks them
-    # trusted via x-dast-cookies-injected. Otherwise strip LLM-supplied cookies
-    # (often stale) and inject fresh ones from the proxy jar.
+    # auth is auto-injected below via the shared attach(). A non-secret garbage Authorization
+    # (e.g. a model's forged alg-confusion token or a raw hash) would otherwise survive the
+    # raw-secret strip, block the auto-inject, and hit the upstream as a bogus header — e.g.
+    # an AWS SigV4 parse error that reads like a finding. Dropping it is attach's
+    # drop_all_authorization contract (see auth_provider.attach).
+    #
+    # Cookies: the copilot engine marks its injected cookies trusted via
+    # x-dast-cookies-injected; honor that and leave them. Otherwise strip LLM-supplied
+    # cookies (often stale) and re-seed from the proxy jar. (In a separate `dast-ai mcp`
+    # process ctx.store is None -> no cookie/Bearer source; use browser_fetch there.)
     trusted_cookies = headers.pop("x-dast-cookies-injected", None)
+    jar_cookie_map: Dict[str, str] = {}
     if not trusted_cookies:
         headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
         if ctx.store is not None:
             _host = urlparse(url).hostname or ""
             try:
                 jar_cookies = ctx.store.get_cookies_for_host(_host) or []
-                if jar_cookies:
-                    from dast.proxy.auth_headers import apply_cookies
-                    # Inject jar cookies AND the CSRF/XHR headers a cookie-authed
-                    # SPA (Rails, etc.) requires. The copilot engine path does this
-                    # via _apply_session_auth; the raw tool path must match it or
-                    # every Rails /graphql POST 403s.
-                    apply_cookies(headers, jar_cookies, refresh=True)
+                jar_cookie_map = {c.get("name"): c.get("value", "")
+                                  for c in jar_cookies if c.get("name")}
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
 
-    # Auto-attach a sub-app Bearer when the caller supplied no Authorization and one
-    # is known for this (host, path). Mirrors the copilot engine's _apply_session_auth
-    # so a direct / MCP caller can reach a Bearer-authed sub-app (modstore/ccm) instead
-    # of a 403. The token is attached server-side and never returned to the caller.
-    # (In a separate `dast-ai mcp` process ctx.store is None -> this no-ops; use
-    # browser_fetch there, which carries the SPA's Bearer + sub-session.)
-    if not any(k.lower() == "authorization" for k in headers):
-        from dast.session.auth_provider import scan_history_bearer
-        from dast.session.auth_provider import subapp_for_path as _subapp_for_path
-        parsed = urlparse(url)
-        bearer_host = parsed.hostname or ""
-        bearer_path = parsed.path or "/"
+    # Resolve a sub-app Bearer when one is known for this (host, path), so a direct / MCP
+    # caller can reach a Bearer-authed sub-app (modstore/ccm) instead of a 403. Prefer the
+    # session's _ensure_fresh_bearer (waits for the live SPA to mint one); the attach() below
+    # sets the header and never returns the token to the caller.
+    rec: Optional[Dict[str, Any]] = None
+    from dast.session.auth_provider import attach as _attach
+    from dast.session.auth_provider import scan_history_bearer
+    parsed = urlparse(url)
+    bearer_host = parsed.hostname or ""
+    bearer_path = parsed.path or "/"
+    session = getattr(ctx, "_session", None)
+    try:
+        if (session is not None and ctx.store is not None
+                and hasattr(session, "_ensure_fresh_bearer")):
+            rec = await session._ensure_fresh_bearer(
+                ctx.store, bearer_host, bearer_path,
+                browser=getattr(ctx, "browser", None))
+        elif session is not None and hasattr(session, "_select_bearer"):
+            if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
+                session._capture_bearer_tokens(ctx.store, bearer_host)
+            rec = session._select_bearer(bearer_host, bearer_path)
+        elif ctx.store is not None:
+            rec = scan_history_bearer(ctx.store, bearer_host, bearer_path)
+    except Exception as exc:
+        logger.debug("send_request: bearer resolution failed",
+                     host=bearer_host, error=str(exc))
         rec = None
-        session = getattr(ctx, "_session", None)
-        try:
-            if (session is not None and ctx.store is not None
-                    and hasattr(session, "_ensure_fresh_bearer")):
-                # Wait briefly for the live SPA to mint a Bearer when none is cached yet
-                # (navigate resolves on "commit", before the SPA's authenticated calls).
-                rec = await session._ensure_fresh_bearer(
-                    ctx.store, bearer_host, bearer_path,
-                    browser=getattr(ctx, "browser", None))
-            elif session is not None and hasattr(session, "_select_bearer"):
-                if ctx.store is not None and hasattr(session, "_capture_bearer_tokens"):
-                    session._capture_bearer_tokens(ctx.store, bearer_host)
-                rec = session._select_bearer(bearer_host, bearer_path)
-            elif ctx.store is not None:
-                rec = scan_history_bearer(ctx.store, bearer_host, bearer_path)
-        except Exception as exc:
-            logger.debug("send_request: bearer resolution failed",
-                         host=bearer_host, error=str(exc))
-            rec = None
-        if isinstance(rec, dict) and rec.get("token"):
-            import time as _time
-            exp = rec.get("exp")
-            if exp is None or exp > _time.time():
-                headers["Authorization"] = f"Bearer {rec['token']}"
-                logger.debug("send_request: attached cached Bearer", host=bearer_host,
-                             app=_subapp_for_path(bearer_path),
-                             ttl=int(exp - _time.time()) if exp else -1)
+
+    # One shared attach: drop any caller Authorization, set the jar Cookie (when not trusted)
+    # + CSRF/XHR, and attach the resolved Bearer. Then drop the internal trusted marker so it
+    # never leaks upstream (the proxy does not strip it).
+    _res = _attach(headers, transport="api", cookies=(jar_cookie_map or None),
+                   bearer_rec=rec, trusted_marker=bool(trusted_cookies),
+                   drop_all_authorization=True)
+    if _res.stripped:
+        logger.warning("send_request stripped hand-pasted/caller auth header(s)",
+                       headers=",".join(_res.stripped))
+    headers.pop("x-dast-cookies-injected", None)
 
     body = args.get("body") or ""
 
@@ -329,7 +310,7 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
-        _flagged = list(dict.fromkeys(_stripped_secret + _dropped_auth))
+        _flagged = list(dict.fromkeys(_res.stripped))
         if _flagged:
             result["note"] = (
                 f"stripped caller-supplied auth header(s) ({', '.join(_flagged)}) — do not set "

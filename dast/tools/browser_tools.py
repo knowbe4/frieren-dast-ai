@@ -13,6 +13,7 @@ with the proxy cookie jar (starts authenticated).
 from __future__ import annotations
 
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
@@ -223,22 +224,6 @@ async def _resolve_url(page: Any, raw: str) -> str:
     return raw
 
 
-async def _inject_csrf(browser: Any, headers: Dict[str, str]) -> None:
-    """Auto-inject CSRF token and X-Requested-With if not already present."""
-    lower = {k.lower(): v for k, v in headers.items()}
-    if "x-csrf-token" not in lower:
-        try:
-            cookies = await browser.export_cookies()
-            csrf = cookies.get("CSRF-TOKEN") or cookies.get("XSRF-TOKEN") or ""
-            if csrf:
-                from urllib.parse import unquote
-                headers["X-CSRF-Token"] = unquote(csrf)
-        except Exception:
-            pass
-    if "x-requested-with" not in lower:
-        headers["X-Requested-With"] = "XMLHttpRequest"
-
-
 async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     browser = _browser(ctx)
     if browser is None:
@@ -258,37 +243,43 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     headers = dict(args.get("headers") or {"Content-Type": "application/json"})
     body = args.get("body")
 
-    await _inject_csrf(browser, headers)
+    # Primary path: Playwright's network-level fetch (bypasses CORS entirely, carries the
+    # browser context's cookies automatically). The shared attach() handles the browser
+    # transport: it strips any caller Cookie/Authorization (the browser context owns the
+    # jar — a manual Cookie conflicts and causes "Invalid token" / "Access denied"),
+    # injects X-CSRF-Token + X-Requested-With, and rides the SPA's captured Bearer.
+    #
+    # An SPA like PhishER injects a short-lived Authorization from in-memory JS state onto
+    # its OWN native XHR; page.request.fetch does not carry that, so a tool fetch 401s while
+    # the app's native calls 200. The MITM proxy captured that Bearer — attach the freshest
+    # non-expired one for this host, but only when the caller did not supply an Authorization.
+    caller_had_auth = any(k.lower() == "authorization" for k in headers)
+    try:
+        from urllib.parse import unquote
+        raw_cookies = await browser.export_cookies()
+        # CSRF cookies arrive percent-encoded from the browser; attach() does not unquote,
+        # so decode here or the SPA 403s a state-changing call on a mismatched token.
+        cookie_map = {k: unquote(str(v)) for k, v in (raw_cookies or {}).items()}
+    except Exception:
+        cookie_map = {}
 
-    # Primary path: Playwright's network-level fetch (bypasses CORS entirely,
-    # carries the browser context's cookies automatically).
-    # Strip Cookie/Authorization from caller-supplied headers — the browser
-    # context handles auth via its own cookie jar. Manual Cookie headers
-    # conflict with context cookies and cause "Invalid token" / "Access denied".
-    fetch_headers = {k: v for k, v in headers.items()
-                     if k.lower() not in ("cookie", "authorization")}
-
-    # Ride the SPA's live Bearer. An SPA like PhishER injects a short-lived
-    # Authorization from in-memory JS state onto its OWN native XHR; page.request.fetch
-    # does not carry that, so a tool fetch 401s while the app's native calls 200. The
-    # MITM proxy captured that Bearer from the SPA's own requests — attach the freshest
-    # non-expired one for this host (only when the caller did not supply Authorization
-    # and the app actually uses Bearer auth, i.e. a token was captured).
-    if not any(k.lower() == "authorization" for k in headers) and getattr(ctx, "store", None):
+    bearer_rec = None
+    if not caller_had_auth and getattr(ctx, "store", None):
         try:
-            import time as _time
-            from urllib.parse import urlparse as _urlparse
             from dast.session.auth_provider import scan_history_bearer
-            _parsed = _urlparse(url)
-            rec = scan_history_bearer(ctx.store, _parsed.hostname or "", _parsed.path or "/")
-            if rec and rec.get("token"):
-                exp = rec.get("exp")
-                if exp is None or exp > _time.time():
-                    fetch_headers["Authorization"] = f"Bearer {rec['token']}"
-                    logger.debug("browser_fetch: attached captured Bearer",
-                                 host=_parsed.hostname)
+            _parsed = urlparse(url)
+            bearer_rec = scan_history_bearer(
+                ctx.store, _parsed.hostname or "", _parsed.path or "/")
         except Exception as exc:
-            logger.debug("browser_fetch: bearer attach failed", error=str(exc)[:120])
+            logger.debug("browser_fetch: bearer resolution failed", error=str(exc)[:120])
+
+    fetch_headers = dict(headers)
+    from dast.session.auth_provider import attach as _attach
+    _res = _attach(fetch_headers, transport="browser", cookies=cookie_map,
+                   bearer_rec=bearer_rec)
+    if _res.attached_bearer:
+        logger.debug("browser_fetch: attached captured Bearer",
+                     host=urlparse(url).hostname)
 
     primary_error = ""
     try:

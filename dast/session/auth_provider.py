@@ -13,7 +13,8 @@ overwrite the other's; selection is by request path instead (``by_app`` index).
 from __future__ import annotations
 
 import time as _time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 # Sub-app path prefixes -> app name. Keep in sync with
 # dast/tools/app_knowledge_tools.py::_APP_MAP probe paths.
@@ -143,3 +144,97 @@ def scan_history_bearer(store: Any, host: str, path: str, *,
     ``{token, exp, auth_endpoint, ...}`` or None. Never raises."""
     rec = collect_host_bearer(store, host, exclude_source=exclude_source)
     return select_bearer(rec, path) if rec else None
+
+
+@dataclass
+class AttachResult:
+    """What :func:`attach` did, for the caller's logging and loop watchdogs.
+
+    ``stripped`` is the names of caller-pasted raw-secret headers removed; ``attached_bearer``
+    is True when a Bearer was injected; ``overrode_session_header`` is True when a model-pasted
+    session Cookie/CSRF was replaced with the active session's (the copilot increments its
+    stuck-loop watchdog on this)."""
+    stripped: List[str] = field(default_factory=list)
+    attached_bearer: bool = False
+    overrode_session_header: bool = False
+
+
+def attach(headers: Dict[str, str], *, transport: str,
+           cookies: Optional[Dict[str, str]] = None,
+           bearer_rec: Optional[Dict[str, Any]] = None,
+           trusted_marker: bool = False,
+           drop_all_authorization: bool = False,
+           now: Optional[float] = None) -> AttachResult:
+    """Attach the active session's cookie + CSRF + Bearer onto outgoing request *headers*,
+    mutating them in place. ONE mechanism for all three call paths (the copilot engine,
+    ``send_request``, ``browser_fetch``); the caller resolves the cookie/Bearer SOURCE and
+    passes the transport plus policy flags, so the session-specific sourcing (scoped jar,
+    handoff overlay, per-sub-app Bearer) stays at the call site and this helper stays pure.
+
+    - ``transport="api"``: set ``Cookie`` from *cookies* (the jar/named session is the source
+      of truth) and the CSRF/XHR headers a cookie-authed SPA needs.
+    - ``transport="browser"``: the browser context owns the cookie jar, so NEVER set Cookie
+      and drop any caller ``Cookie``/``Authorization``; still inject CSRF + X-Requested-With
+      and ride the captured Bearer. (Pass CSRF-cookie values already URL-decoded — this helper
+      does not unquote.)
+    - ``trusted_marker``: the model's headers already carry our ``x-dast-cookies-injected=1``
+      (we set them on a prior pass), so leave its Cookie/CSRF in place.
+    - ``drop_all_authorization``: drop ANY remaining caller ``Authorization``, not only
+      raw-secret ones (the ``send_request`` schema contract — auth is always auto-injected).
+
+    A caller-pasted raw secret (JWT/bearer) in ``Authorization``/``Cookie`` is always stripped
+    first; a Bearer is attached only when no ``Authorization`` is already present and the
+    record is non-expired. Never raises."""
+    from dast.proxy.auth_headers import (
+        build_cookie_header,
+        inject_csrf,
+        strip_pasted_secret_headers,
+    )
+
+    result = AttachResult()
+    now = now if now is not None else _time.time()
+
+    # Always refuse a hand-pasted raw secret (Cookie/Authorization) — never forward it.
+    result.stripped = strip_pasted_secret_headers(headers)
+
+    if drop_all_authorization:
+        for key in [k for k in list(headers) if k.lower() == "authorization"]:
+            del headers[key]
+            if key not in result.stripped:
+                result.stripped.append(key)
+
+    cookie_map = {str(k): str(v) for k, v in (cookies or {}).items() if k}
+
+    if transport == "browser":
+        # The browser context owns cookies/auth; never set them here.
+        for key in [k for k in list(headers) if k.lower() in ("cookie", "authorization")]:
+            del headers[key]
+        inject_csrf(headers, cookie_map, refresh=False)
+        # The old browser path set X-Requested-With unconditionally (even with no cookies).
+        if "x-requested-with" not in {k.lower() for k in headers}:
+            headers["X-Requested-With"] = "XMLHttpRequest"
+    else:  # "api"
+        if cookie_map and not trusted_marker:
+            # The model must not be able to pin a stale/foreign session by pasting its own
+            # Cookie/CSRF: strip them and re-seed from the active session. (A model Cookie
+            # carrying our x-dast-cookies-injected=1 marker is ours — kept via trusted_marker.)
+            removed = [k for k in list(headers)
+                       if k.lower() in ("cookie", "x-csrf-token", "x-xsrf-token")]
+            for key in removed:
+                del headers[key]
+            if removed:
+                result.overrode_session_header = True
+            headers["Cookie"] = build_cookie_header(cookie_map)
+            headers["x-dast-cookies-injected"] = "1"
+        if cookie_map:
+            # refresh=True so a stale model CSRF (e.g. kept under the trusted marker) is
+            # corrected to the active session's value.
+            inject_csrf(headers, cookie_map, refresh=True)
+
+    # Bearer: only when the caller left no Authorization and the record is still fresh.
+    if (bearer_rec and rec_is_fresh(bearer_rec, now)
+            and not any(k.lower() == "authorization" for k in headers)):
+        headers["Authorization"] = f"Bearer {bearer_rec['token']}"
+        result.attached_bearer = True
+
+    return result

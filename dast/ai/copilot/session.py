@@ -247,11 +247,14 @@ Operational notes:
   returns mfa_required=true, the operator must complete the MFA challenge manually
   (browser is visible on their screen). Only fall back to manual
   browser_navigate/fill/click if browser_login fails for an unusual login form.
-  After browser_login succeeds, use send_request for authenticated API calls — the
-  CSRF token and session cookies are auto-injected. Use send_request (not
-  browser_fetch) for GraphQL/API calls because browser_fetch has a proxy
-  interference issue. Only ask the operator for help if you genuinely cannot log
-  in (captcha, no credentials).
+  After browser_login succeeds, auth (CSRF token + session cookies, and a captured
+  Bearer) is auto-injected on BOTH send_request and browser_fetch. Use send_request as
+  the default for API/GraphQL calls; you do not need to hand-manage transport — if a
+  request still gets 401/403 after auth injection (e.g. an SPA whose token lives only in
+  in-memory JS state), the system automatically re-issues it via the browser session and
+  remembers that the host prefers the browser. The `## Transport capability` brief tells
+  you a host's learned preference up front. Only ask the operator for help if you
+  genuinely cannot log in (captcha, no credentials).
 - Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
   may need time to render, or the URL may be wrong. Before giving up: (1) check
   get_history for the same host to find URLs that returned real content — the operator's

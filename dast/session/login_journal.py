@@ -107,3 +107,39 @@ def last_success(host_or_url: str) -> Optional[Dict[str, Any]]:
         if isinstance(rec, dict) and rec.get("outcome") == "success" and rec.get("endpoint"):
             return rec
     return None
+
+
+def recent_records(host_or_url: str, *, limit: int = _MAX_SCAN_LINES) -> list[Dict[str, Any]]:
+    """Parsed records for a host, most-recent-first (all outcomes, all strategies). Unlike
+    :func:`last_success` this does not require an ``endpoint``, so it sees deterministic/llm
+    wins too. Tolerates malformed lines; returns [] for an unknown host. Never raises."""
+    host = _normalise_host(host_or_url)
+    if not host:
+        return []
+    path = _path_for(host)
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-_MAX_SCAN_LINES:]
+    except OSError:
+        return []
+    records: list[Dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+        if len(records) >= limit:
+            break
+    return records
+
+
+def last_winning_strategy(host_or_url: str) -> Optional[str]:
+    """The ``strategy`` name of the most recent success for a host, or None. Any strategy
+    (deterministic/spa_api/llm) — used to try a host's known-good strategy first."""
+    for rec in recent_records(host_or_url):
+        if rec.get("outcome") == "success" and rec.get("strategy"):
+            return str(rec["strategy"])
+    return None

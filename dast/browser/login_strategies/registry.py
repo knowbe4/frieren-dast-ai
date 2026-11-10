@@ -11,6 +11,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Sequence
 
 from dast.browser.login_strategies.base import LoginStrategy
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 # Default try-order: the cheap token-free form first, the DOM-independent JSON path next,
 # the LLM last. Learned ordering only moves a known winner to the front of this.
@@ -33,9 +36,16 @@ def reorder(default: Sequence[str], winner: Optional[str]) -> List[str]:
 
 
 def ordered_strategies(host: Optional[str] = None) -> List[LoginStrategy]:
-    """The registered strategies in try-order for *host* (default order in Phase 1; per-host
-    learned reordering is wired in a later commit)."""
+    """The registered strategies in try-order for *host*: the host's last-winning strategy
+    (from the login journal) first, then the rest in default order. No journal history (or an
+    unknown host) leaves the default order untouched."""
     winner: Optional[str] = None
+    if host:
+        try:
+            from dast.session import login_journal
+            winner = login_journal.last_winning_strategy(host)
+        except Exception as exc:  # noqa: BLE001 — a journal read must never break login
+            logger.debug("login registry: journal read failed", error=str(exc)[:120])
     order = reorder(_DEFAULT_ORDER, winner)
     return [_REGISTRY[name] for name in order if name in _REGISTRY]
 

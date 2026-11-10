@@ -17,6 +17,7 @@ import json as _json
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
+from dast.browser.login_strategies.base import LoginContext, LoginResult
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -149,3 +150,32 @@ async def _sync_session(browser: Any, store: Any, session: Any,
     except Exception as exc:
         logger.debug("spa_api: session handoff sync failed", error=str(exc)[:120])
     return synced
+
+
+class SpaApiStrategy:
+    """The SPA JSON-API login as a LoginStrategy. Thin adapter over the module-level
+    ``attempt`` (kept as-is for its callers and tests); the registry drives this class."""
+
+    name = "spa_api"
+
+    async def can_attempt(self, ctx: LoginContext) -> bool:
+        """Applicable when ordered first (a learned win — nothing tried yet) OR when the
+        preceding strategy could not REACH a form: the DOM-independent JSON path is the
+        fallback for an iframe/closed-shadow form. A form that WAS reached but failed
+        (invalid creds / extra step) is left to the LLM, so this does not fire there."""
+        if not ctx.prior:
+            return True
+        return ctx.prior[-1].reachable is False
+
+    async def attempt(self, ctx: LoginContext) -> LoginResult:
+        # Bare ``attempt`` resolves to the module-level function below, so a test that
+        # monkeypatches ``spa_api.attempt`` still drives this strategy.
+        result = await attempt(ctx.browser, ctx.url, ctx.email, ctx.password,
+                               store=ctx.store, session=ctx.session, in_scope=ctx.in_scope)
+        return LoginResult(
+            ok=bool(result.get("ok") and result.get("logged_in")),
+            engine="spa_api",
+            url=result.get("url") or ctx.url,
+            endpoint=result.get("endpoint", ""),
+            error=result.get("error", ""),
+        )

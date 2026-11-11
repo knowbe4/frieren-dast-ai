@@ -406,6 +406,27 @@ def test_summarize_result_passes_through_non_body_results():
     assert _summarize_result({"ok": True, "count": 3}) == '{"ok": true, "count": 3}'
 
 
+def test_summarize_result_flags_truncated_body_with_extract_hint():
+    # A body larger than the observation cap must carry body_truncated + a hint pointing at
+    # extract_response, ahead of the trimmed body so the truncation never eats them.
+    from dast.ai.copilot.session import (
+        _OBSERVATION_BODY_CHARS,
+        _OBSERVATION_MAX_CHARS,
+        _summarize_result,
+    )
+
+    big = {"ok": True, "status": 200, "final_url": "https://in.scope/list",
+           "length": 104663, "body": "{" + "x" * (_OBSERVATION_BODY_CHARS + 5000)}
+    summary = _summarize_result(big)[:_OBSERVATION_MAX_CHARS]
+    assert '"body_truncated": true' in summary
+    assert "extract_response" in summary and "https://in.scope/list" in summary
+
+    # A small body carries neither field.
+    small = {"ok": True, "status": 200, "body": "tiny"}
+    s2 = _summarize_result(small)
+    assert "body_truncated" not in s2 and "extract_response" not in s2
+
+
 @pytest.mark.asyncio
 async def test_turn_ceiling_forces_reply():
     session = CopilotSession("s7")

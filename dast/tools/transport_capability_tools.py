@@ -80,7 +80,7 @@ register(Tool(
         "properties": {
             "host": {"type": "string", "description": "Target host (e.g. api.phisher.example)."},
             "path": {"type": "string", "description": "Optional request path, so the learned "
-                     "preference for a specific sub-app (e.g. /modstore) is resolved."},
+                     "preference for a specific sub-app (e.g. /serviceA) is resolved."},
             "task": {"type": "string", "description": "Optional task label (e.g. graphql)."},
         },
         "required": ["host"],

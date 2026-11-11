@@ -339,7 +339,7 @@ class AgentBrowser:
         the document + open shadow roots + same-origin iframes).
 
         Retries up to ``attempts`` times with a bounded settle between tries: a heavy
-        client-rendered app (modstore3 / CCM studio) can still be fetching on the first
+        client-rendered app (a heavy SPA area) can still be fetching on the first
         wait, so a single short wait caught the pre-hydration shell. Returns True as soon
         as content appears, False if it never does. Best-effort: a genuinely sparse page
         returns False without raising, so callers never block on it."""

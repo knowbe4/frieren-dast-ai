@@ -208,28 +208,28 @@ async def test_send_request_strips_hand_pasted_token(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
-    # The copilot engine's per-sub-app Bearer selection is reused by the tool: a
-    # /modstore request gets modstore's token, /customercontent gets ccm's.
+    # The copilot engine's per-sub-app Bearer selection is reused by the tool: an
+    # /alpha request gets alpha's token, /beta gets beta's.
     class _Session:
         def _capture_bearer_tokens(self, store, host): pass
         def _select_bearer(self, host, path):
-            return {"token": "MOD" if "/modstore" in path else "CCM", "exp": None}
+            return {"token": "TOKA" if "/alpha" in path else "TOKB", "exp": None}
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
     ctx = ToolContext(settings=_Scope(True), store=object())
     ctx._session = _Session()
 
     r1 = await run_tool(ctx, "send_request", {
-        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "url": "https://app.acme-corp.com/alpha/graphql", "method": "POST",
         "body": '{"query":"{me}"}'})
     assert r1["ok"] is True
-    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"
-    assert "MOD" not in str(r1)  # token never surfaced in the tool result
+    assert _CaptureClient.captured.get("Authorization") == "Bearer TOKA"
+    assert "TOKA" not in str(r1)  # token never surfaced in the tool result
 
     await run_tool(ctx, "send_request", {
-        "url": "https://app.acme-corp.com/customercontent/graphql", "method": "POST",
+        "url": "https://app.acme-corp.com/beta/graphql", "method": "POST",
         "body": '{"query":"{me}"}'})
-    assert _CaptureClient.captured.get("Authorization") == "Bearer CCM"
+    assert _CaptureClient.captured.get("Authorization") == "Bearer TOKB"
 
 
 @pytest.mark.asyncio
@@ -326,16 +326,16 @@ async def test_send_request_overrides_caller_authorization(monkeypatch):
     class _Session:
         def _capture_bearer_tokens(self, store, host): pass
         def _select_bearer(self, host, path):
-            return {"token": "MOD", "exp": None}
+            return {"token": "TOKA", "exp": None}
 
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
     ctx = ToolContext(settings=_Scope(True), store=object())
     ctx._session = _Session()
     result = await run_tool(ctx, "send_request", {
-        "url": "https://app.acme-corp.com/modstore/graphql", "method": "POST",
+        "url": "https://app.acme-corp.com/alpha/graphql", "method": "POST",
         "body": "{}", "headers": {"Authorization": "Bearer CALLER"}})
     assert result["ok"] is True
-    assert _CaptureClient.captured.get("Authorization") == "Bearer MOD"  # caller's ignored
+    assert _CaptureClient.captured.get("Authorization") == "Bearer TOKA"  # caller's ignored
 
 
 @pytest.mark.asyncio

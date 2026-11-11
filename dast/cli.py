@@ -612,9 +612,9 @@ def verify(
     dynamically.
 
     Example:
-      uv run dast-ai verify security-scan-results/20260512/ccm/scanner-findings_ccm.json \\
-        --target https://ccm.example.com \\
-        --auth-url https://ccm.example.com/login \\
+      uv run dast-ai verify security-scan-results/20260512/myapp/scanner-findings_myapp.json \\
+        --target https://myapp.example.com \\
+        --auth-url https://myapp.example.com/login \\
         --username admin@test.com --password secret
     """
     from dast.importers.findings_reader import read_findings

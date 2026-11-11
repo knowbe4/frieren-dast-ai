@@ -72,3 +72,30 @@ def _isolate_transport_capability(tmp_path, monkeypatch):
     read/write the developer's real ~/.dast-ai/transport_capability."""
     from dast.session import transport_capability  # noqa: PLC0415
     monkeypatch.setattr(transport_capability, "_DIR", tmp_path / "transport_capability")
+
+
+# Generic PLACEHOLDER sub-app map for the whole unit suite — never real target topology.
+# Two prefixed apps (alpha/beta) + one prefix-less app (gamma) exercise prefix resolution and
+# the app->jwt-field map. Redirects subapp_map._CONFIG_PATH so sub-app selection resolves in
+# tests (it is empty by default without the operator's local ~/.dast-ai/subapp_map.json) and
+# never reads the developer's real config.
+_PLACEHOLDER_SUBAPP_MAP = {
+    "sub_apps": [
+        {"prefix": "/alpha", "app": "alpha", "jwt_field": "alphaJwt", "probe": "/alpha/graphql"},
+        {"prefix": "/beta", "app": "beta", "jwt_field": "betaJwt", "probe": "/beta/graphql"},
+        {"app": "gamma", "jwt_field": "gammaJwt"},
+    ]
+}
+
+
+@pytest.fixture(autouse=True)
+def _seed_subapp_map(tmp_path, monkeypatch):
+    import json  # noqa: PLC0415
+
+    from dast.session import subapp_map  # noqa: PLC0415
+    cfg = tmp_path / "subapp_map.json"
+    cfg.write_text(json.dumps(_PLACEHOLDER_SUBAPP_MAP), encoding="utf-8")
+    monkeypatch.setattr(subapp_map, "_CONFIG_PATH", cfg)
+    subapp_map._reset_cache()
+    yield
+    subapp_map._reset_cache()

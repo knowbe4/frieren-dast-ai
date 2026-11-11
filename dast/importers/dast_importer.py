@@ -72,7 +72,7 @@ Path / URL inference rules:
   Example: schema says "createCourse($input: CreateCourseInput { title: String, locale: String })"
   → request_body: {"query":"mutation CreateCourse($input: CreateCourseInput!) { createCourse(input: $input) { course { id } } }","variables":{"input":{"title":"test","locale":"en"}}}
 - For GraphQL findings without a schema, infer the path from the endpoint listed in the schema
-  section header (e.g. "/modstore/graphql") if the mutation/query name matches. Otherwise use "/graphql".
+  section header (e.g. "/serviceA/graphql") if the mutation/query name matches. Otherwise use "/graphql".
 - Rails REST controllers: app/controllers/users_controller.rb action=update → path="/users/:id", method=PATCH
 - Vue/Nuxt frontend-only findings (postMessage, v-html, CSP): these are client-side; path="/" method=GET
 - If the report already contains a full example HTTP request with payload, extract the URL, body and payload from it exactly.

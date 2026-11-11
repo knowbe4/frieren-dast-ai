@@ -6,8 +6,8 @@ same history scan — the module-level ``scan_history_bearer`` and
 sub-app path map and the JWT ``exp``/freshness helpers that were duplicated across the copilot
 engine and the raw tool path.
 
-modstore and ccm share one host, so a single host-keyed token would let one sub-app's token
-overwrite the other's; selection is by request path instead (``by_app`` index).
+sub-apps can share one host, so a single host-keyed token would let one sub-app's token
+overwrite another's; selection is by request path instead (``by_app`` index).
 """
 
 from __future__ import annotations
@@ -16,18 +16,17 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-# Sub-app path prefixes -> app name. Keep in sync with
-# dast/tools/app_knowledge_tools.py::_APP_MAP probe paths.
-SUBAPP_PREFIXES: tuple = (
-    ("/modstore", "modstore"),
-    ("/customercontent", "ccm"),
-)
+from dast.session import subapp_map
 
 
 def subapp_for_path(path: str) -> Optional[str]:
-    """Map a request path to its sub-app name, or None for a non-sub-app path."""
+    """Map a request path to its sub-app name, or None for a non-sub-app path.
+
+    The prefix->app map is target-specific internal topology, so it is NOT hardcoded here — it is
+    read from the operator's local ``~/.dast-ai/subapp_map.json`` (see ``dast/session/subapp_map``).
+    With no local config the map is empty and every path returns None (host-level Bearer selection)."""
     p = (path or "").lower()
-    for prefix, app in SUBAPP_PREFIXES:
+    for prefix, app in subapp_map.subapp_prefixes():
         if p.startswith(prefix):
             return app
     return None

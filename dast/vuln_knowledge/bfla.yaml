@@ -11,10 +11,10 @@ attack_type: bfla
 
 positive_examples:
   - payload: >
-      POST /customercontent/graphql {"query":"mutation { storeItemArchive(storeItemUuid:
-      \"<admin-owned module in my OWN account>\") { node { uuid } } }"}
+      POST /api/graphql {"query":"mutation { archiveItem(itemUuid:
+      \"<admin-owned item in my OWN account>\") { node { uuid } } }"}
       as a learner-role user (role=user, canSeeConsole=false) of that same account
-    response_snippet: '200 OK {"data":{"storeItemArchive":{"node":{"uuid":"..."}}}}'
+    response_snippet: '200 OK {"data":{"archiveItem":{"node":{"uuid":"..."}}}}'
     reasoning: >
       The caller is a low-privilege (learner) member of the account that owns the module.
       The server resolved and archived it off the account claim in the JWT and never

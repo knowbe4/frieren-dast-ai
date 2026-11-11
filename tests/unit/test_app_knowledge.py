@@ -20,28 +20,28 @@ def kb_dir(tmp_path, monkeypatch):
 
 
 def test_store_round_trip_and_parent_resolve(kb_dir):
-    assert store.load_for_host("training.knowbe4.com") == ""        # nothing yet
-    assert store.append_note("training.knowbe4.com", "use user.attributes.modstoreJwt") \
-        == "training.knowbe4.com"
-    note = store.load_for_host("training.knowbe4.com")
-    assert "user.attributes.modstoreJwt" in note
+    assert store.load_for_host("app.example.com") == ""        # nothing yet
+    assert store.append_note("app.example.com", "use user.attributes.alphaJwt") \
+        == "app.example.com"
+    note = store.load_for_host("app.example.com")
+    assert "user.attributes.alphaJwt" in note
     # a subdomain resolves to the parent-domain note
-    assert "user.attributes.modstoreJwt" in store.load_for_host("api.training.knowbe4.com")
+    assert "user.attributes.alphaJwt" in store.load_for_host("api.app.example.com")
 
 
 def test_context_brief_includes_app_knowledge(kb_dir):
-    store.append_note("training.knowbe4.com", "ccmJwt authenticates /customercontent/graphql")
+    store.append_note("app.example.com", "betaJwt authenticates /beta/graphql")
     from dast.ai.copilot.context_brief import _app_knowledge_block
-    block = _app_knowledge_block("training.knowbe4.com")
-    assert "App knowledge" in block and "ccmJwt" in block
+    block = _app_knowledge_block("app.example.com")
+    assert "App knowledge" in block and "betaJwt" in block
 
 
 @pytest.mark.asyncio
 async def test_record_app_knowledge_tool(kb_dir):
     ctx = SimpleNamespace(is_in_scope=lambda u: True)
-    r = await _record_app_knowledge(ctx, {"host": "training.knowbe4.com", "note": "x"})
-    assert r["ok"] is True and r["host"] == "training.knowbe4.com"
-    assert "x" in store.load_for_host("training.knowbe4.com")
+    r = await _record_app_knowledge(ctx, {"host": "app.example.com", "note": "x"})
+    assert r["ok"] is True and r["host"] == "app.example.com"
+    assert "x" in store.load_for_host("app.example.com")
     # out-of-scope is refused
     ctx2 = SimpleNamespace(is_in_scope=lambda u: False)
     assert (await _record_app_knowledge(ctx2, {"host": "h", "note": "x"}))["ok"] is False
@@ -86,7 +86,7 @@ async def test_get_app_token_extracts_decodes_caches_without_leaking(monkeypatch
                            "can_download_modules": False}, "exp": 999}
     seg = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     jwt = f"h.{seg}.sig"
-    spa = {"user": {"attributes": {"modstoreJwt": "x.y.z", "ccmJwt": jwt}}}
+    spa = {"user": {"attributes": {"alphaJwt": "x.y.z", "betaJwt": jwt}}}
 
     import dast.tools.app_knowledge_tools as akt
     monkeypatch.setattr(akt.httpx, "AsyncClient", lambda **kw: _FakeClient(spa))
@@ -94,19 +94,20 @@ async def test_get_app_token_extracts_decodes_caches_without_leaking(monkeypatch
     engine = SimpleNamespace(_bearer_tokens={}, _session_cookies={})
     ctx = SimpleNamespace(is_in_scope=lambda u: True, proxy_url="http://127.0.0.1:8080",
                           store=None, _session=engine)
-    r = await _get_app_token(ctx, {"host": "training.knowbe4.com", "app": "ccm"})
+    # "beta" is an app in the placeholder sub-app map seeded by the conftest fixture.
+    r = await _get_app_token(ctx, {"host": "app.example.com", "app": "beta"})
 
-    assert r["ok"] is True and r["app"] == "ccm"
+    assert r["ok"] is True and r["app"] == "beta"
     assert r["account_id"] == 625289
     assert r["entitlements"]["ai_translations_active"] is True
     assert "token_preview" in r and jwt not in json.dumps(r)        # raw token never echoed
-    assert engine._bearer_tokens["training.knowbe4.com"]["token"] == jwt  # cached for the engine
+    assert engine._bearer_tokens["app.example.com"]["token"] == jwt  # cached for the engine
 
 
 @pytest.mark.asyncio
 async def test_get_app_token_rejects_out_of_scope_and_bad_app():
     ctx = SimpleNamespace(is_in_scope=lambda u: False, proxy_url="http://127.0.0.1:8080",
                           store=None, _session=None)
-    assert (await _get_app_token(ctx, {"host": "h", "app": "ccm"}))["ok"] is False
+    assert (await _get_app_token(ctx, {"host": "h", "app": "beta"}))["ok"] is False  # out of scope
     ctx2 = SimpleNamespace(is_in_scope=lambda u: True, proxy_url="x", store=None, _session=None)
-    assert (await _get_app_token(ctx2, {"host": "h", "app": "nope"}))["ok"] is False
+    assert (await _get_app_token(ctx2, {"host": "h", "app": "nope"}))["ok"] is False  # unknown app

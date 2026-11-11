@@ -235,6 +235,29 @@ async def test_send_request_attaches_subapp_bearer_from_session(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_request_defaults_json_content_type(monkeypatch):
+    # A JSON body with no caller Content-Type must get application/json, else a JSON/GraphQL
+    # endpoint will not parse the body (GraphQL: "No query string was present").
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/graphql", "method": "POST",
+        "body": '{"query":"{ __typename }"}'})
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert sent.get("content-type") == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_send_request_does_not_force_content_type_on_non_json(monkeypatch):
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _CaptureClient(**kw))
+    ctx = ToolContext(settings=_Scope(True), store=object())
+    await run_tool(ctx, "send_request", {
+        "url": "https://app.acme-corp.com/x", "method": "POST", "body": "a=1&b=2"})
+    sent = {k.lower(): v for k, v in _CaptureClient.captured.items()}
+    assert "content-type" not in sent
+
+
+@pytest.mark.asyncio
 async def test_send_request_drops_non_secret_authorization(monkeypatch):
     # The schema promises Authorization is ALWAYS stripped. A non-secret-looking garbage
     # Authorization (a forged alg-confusion token / raw hash) must NOT survive to the wire —

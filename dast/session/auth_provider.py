@@ -136,6 +136,39 @@ def select_bearer(record: Optional[Dict[str, Any]], path: str) -> Optional[Dict[
     return record
 
 
+def scan_history_csrf(store: Any, host: str, *,
+                      exclude_source: Optional[str] = None) -> Optional[str]:
+    """Freshest ``X-CSRF-Token`` request header seen on *host*'s registrable domain in proxy
+    history (the SPA's own authenticated requests). For an SPA whose CSRF token is NOT mirrored
+    into a cookie (e.g. Rails meta-tag CSRF), this is the only place to recover it so the tool can
+    attach it to its own state-changing requests. Returns the token string or None. Never raises.
+
+    ``exclude_source`` skips entries whose ``source`` matches (callers pass ``"copilot"`` so the
+    tool never re-reads a token from its own prior failed attempts)."""
+    if store is None or not host:
+        return None
+    try:
+        entries = store.all_entries()
+    except Exception:
+        return None
+    parts = host.lower().split(".")
+    domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+    for entry in reversed(entries):  # freshest first
+        try:
+            entry_host = (_field(entry, "host") or host).lower()
+            if domain_suffix not in entry_host:
+                continue
+            if exclude_source is not None and _field(entry, "source") == exclude_source:
+                continue
+            req_headers = _field(entry, "request_headers") or {}
+            for key, value in req_headers.items():
+                if key.lower() == "x-csrf-token" and str(value).strip():
+                    return str(value).strip()
+        except Exception:
+            continue
+    return None
+
+
 def scan_history_bearer(store: Any, host: str, path: str, *,
                         exclude_source: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Freshest non-expired Bearer in proxy history for a (host, request path). One-call
@@ -163,6 +196,7 @@ def attach(headers: Dict[str, str], *, transport: str,
            bearer_rec: Optional[Dict[str, Any]] = None,
            trusted_marker: bool = False,
            drop_all_authorization: bool = False,
+           csrf_token: Optional[str] = None,
            now: Optional[float] = None) -> AttachResult:
     """Attach the active session's cookie + CSRF + Bearer onto outgoing request *headers*,
     mutating them in place. ONE mechanism for all three call paths (the copilot engine,
@@ -229,6 +263,15 @@ def attach(headers: Dict[str, str], *, transport: str,
             # refresh=True so a stale model CSRF (e.g. kept under the trusted marker) is
             # corrected to the active session's value.
             inject_csrf(headers, cookie_map, refresh=True)
+
+    # CSRF fallback: a cookie-authed SPA whose CSRF token is NOT in a cookie (e.g. Rails
+    # meta-tag CSRF) yields nothing from inject_csrf, so a state-changing POST 302/403s. When the
+    # caller supplies a token captured from the SPA's own observed requests, inject it here (only
+    # if the cookie path didn't already set one). This is what makes authenticated POSTs work.
+    if csrf_token and not any(k.lower() in ("x-csrf-token", "x-xsrf-token") for k in headers):
+        headers["X-CSRF-Token"] = csrf_token
+        if "x-requested-with" not in {k.lower() for k in headers}:
+            headers["X-Requested-With"] = "XMLHttpRequest"
 
     # Bearer: only when the caller left no Authorization and the record is still fresh.
     if (bearer_rec and rec_is_fresh(bearer_rec, now)

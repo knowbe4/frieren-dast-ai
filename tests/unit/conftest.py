@@ -102,3 +102,25 @@ def _seed_subapp_map(tmp_path, monkeypatch):
     subapp_map._reset_cache()
     yield
     subapp_map._reset_cache()
+
+
+# Generic PLACEHOLDER site (product-group) map — never real target topology. 'alpha' groups an exact
+# host + a wildcard subdomain so site grouping, wildcard match, and fallback-to-host are all exercised.
+_PLACEHOLDER_SITES = {
+    "sites": [
+        {"id": "alpha", "domains": ["admin.alpha.example.com", "*.esi.alpha.example.com"]},
+    ]
+}
+
+
+@pytest.fixture(autouse=True)
+def _seed_site_map(tmp_path, monkeypatch):
+    import json  # noqa: PLC0415
+
+    from dast.session import site_map  # noqa: PLC0415
+    cfg = tmp_path / "sites.json"
+    cfg.write_text(json.dumps(_PLACEHOLDER_SITES), encoding="utf-8")
+    monkeypatch.setattr(site_map, "_CONFIG_PATH", cfg)
+    site_map._reset_cache()
+    yield
+    site_map._reset_cache()

@@ -130,11 +130,11 @@ async def _prime_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     if not ctx.is_in_scope(url):
         return {"ok": False, "error": "prime endpoint is out of scope", "host": host, "url": url}
 
-    # Already primed? No-op (idempotent — cheap to call before every authenticated request).
-    existing = _jar_cookie_value(ctx, host, cookie)
-    if existing:
-        return {"ok": True, "app": app, "host": host, "cookie": cookie,
-                "primed": False, "verified": True, "note": "session cookie already present"}
+    # NOTE: we do NOT short-circuit on "cookie already present". Cookie-store frameworks (e.g.
+    # Rails) set the session cookie for ANONYMOUS sessions too, so the cookie name existing does
+    # not mean the session is AUTHENTICATED — hitting the prime endpoint with the app Bearer is
+    # what upgrades it. The caller (recovery loop / tool user) owns loop-prevention.
+    before = _jar_cookie_value(ctx, host, cookie)
 
     probe_path = subapp_map.app_map().get(app, {}).get("probe", "")
     bearer = await _app_bearer(ctx, host, app, probe_path)
@@ -184,13 +184,19 @@ async def _prime_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
         if isinstance(overlay, dict):
             overlay[cookie] = value
 
-    verified = bool(value)
+    # "verified" = the prime endpoint accepted the Bearer (2xx); that is when it (re)issues the
+    # authenticated session cookie. The decisive proof is the caller's retry of the real request,
+    # not the cookie name (which pre-exists for anonymous sessions). Report whether the value
+    # rotated, a useful signal that an authenticated session replaced the anonymous one.
+    verified = bool(status is not None and 200 <= status < 300)
     return {
         "ok": verified, "app": app, "host": host, "cookie": cookie,
         "primed": verified, "verified": verified, "prime_status": status,
-        "note": ("session cookie minted and seeded; retry the authenticated request" if verified
-                 else f"prime endpoint returned {status} but no {cookie} cookie was set — the Bearer "
-                      "may be stale (refresh it) or this sub-app may not use a primed session cookie"),
+        "cookie_rotated": bool(value and value != before),
+        "note": ("prime endpoint accepted the Bearer and (re)issued the session cookie; retry the "
+                 "authenticated request" if verified
+                 else f"prime endpoint returned {status} — the Bearer may be stale/invalid or the "
+                      "endpoint needs a Referer (set 'referer' in the sub-app map's prime descriptor)"),
     }
 
 

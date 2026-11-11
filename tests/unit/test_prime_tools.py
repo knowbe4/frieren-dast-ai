@@ -90,28 +90,21 @@ async def test_prime_session_mints_and_seeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prime_session_noop_when_already_present(monkeypatch):
+async def test_prime_session_primes_even_when_cookie_name_present(monkeypatch):
+    # Cookie-store frameworks set the session cookie for ANONYMOUS sessions too, so a present
+    # cookie name does NOT mean authenticated — prime_session must still hit the endpoint and
+    # (re)issue the authenticated session, reporting cookie_rotated when the value changes.
     store = _Store()
-    store.cookies["app.example.com"] = {"_beta_session": "EXISTING"}
+    store.cookies["app.example.com"] = {"_beta_session": "ANON"}
     engine = _engine(bearer="B.T.K")
-    calls = {"n": 0}
+    client = _Client(store, "app.example.com", "_beta_session", "AUTHED")
+    monkeypatch.setattr(pt.httpx, "AsyncClient", lambda **kw: client)
 
-    class _NoCall:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return False
-
-        async def request(self, *a, **k):
-            calls["n"] += 1
-            return _Resp(200)
-
-    monkeypatch.setattr(pt.httpx, "AsyncClient", lambda **kw: _NoCall())
     r = await _prime_session(_ctx(store, engine), {"host": "app.example.com", "app": "beta"})
 
-    assert r["ok"] and r["primed"] is False and r["verified"]
-    assert calls["n"] == 0                                     # idempotent: no request issued
+    assert r["ok"] and r["primed"] and r["verified"]
+    assert r["cookie_rotated"] is True                         # anon -> authenticated value
+    assert any(c[1].endswith("/beta/session") for c in client.calls)   # it DID prime
 
 
 @pytest.mark.asyncio

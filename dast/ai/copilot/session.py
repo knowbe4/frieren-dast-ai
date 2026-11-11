@@ -1684,11 +1684,10 @@ class CopilotSession:
             prime = subapp_map.prime_for_app(app)
             if not prime:
                 return None
-            cookie = prime.get("cookie") or ""
-            if cookie and (self._session_cookies.get(cookie)
-                           or any(c.get("name") == cookie
-                                  for c in self._scoped_cookies_for_host(host))):
-                return None  # the cookie is present — priming is not the blocker
+            # NB: do NOT skip when the session-cookie name is already present — cookie-store
+            # frameworks set it for ANONYMOUS sessions too, so the not_authorized means the
+            # existing session is unauthenticated; priming (Bearer -> prime endpoint) upgrades it.
+            # The per-(host, app) guard below is what prevents a loop.
             key = (host, app)
             if key in self._primed_subapps:
                 return None

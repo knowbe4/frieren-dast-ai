@@ -84,14 +84,17 @@ async def test_noop_when_path_not_a_primeable_subapp():
 
 
 @pytest.mark.asyncio
-async def test_noop_when_cookie_already_present():
+async def test_primes_even_when_cookie_name_already_present():
+    # A session cookie name present does NOT mean authenticated (anon sessions set it too);
+    # a not_authorized response must still trigger priming.
     s = _session()
-    s._session_cookies["_beta_session"] = "ALREADY"
+    s._session_cookies["_beta_session"] = "ANON"
     calls = []
     args = {"url": "https://app.example.com/beta/graphql"}
     out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                      _run_tool(calls))
-    assert out is None and calls == []
+                                      _run_tool(calls, rerun_status=200))
+    assert out is not None and out["status"] == 200
+    assert [c[0] for c in calls] == ["prime_session", "send_request"]
 
 
 @pytest.mark.asyncio

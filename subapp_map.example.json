@@ -1,8 +1,11 @@
 {
-  "_README": "Copy this to ~/.dast-ai/subapp_map.json and fill in YOUR target's sub-app topology. It maps a request-path prefix to the internal service that serves it, the JWT field that service's Bearer lives under in GET /spa/session (user.attributes.<jwt_field>), and a probe endpoint to prove the token. It is target-specific internal topology, so it is NEVER committed (the repo ships only this generic example). With no local file, sub-app Bearer selection is disabled and Frieren falls back to host-level Bearer selection. 'prefix' and 'probe' are optional.",
+  "_README": "Copy this to ~/.dast-ai/subapp_map.json and fill in YOUR target's sub-app topology. It maps a request-path prefix to the internal service that serves it, the JWT field that service's Bearer lives under in GET /spa/session (user.attributes.<jwt_field>), and a probe endpoint to prove the token. It is target-specific internal topology, so it is NEVER committed (the repo ships only this generic example). With no local file, sub-app Bearer selection is disabled and Frieren falls back to host-level Bearer selection. 'prefix' and 'probe' are optional. 'prime' is an optional per-app recovery descriptor for sub-apps that need their session established before an authenticated request works. It has two combinable modes (login systems differ; Frieren tries one then falls back to the other): COOKIE mode {endpoint, method (default GET), cookie (session cookie name), referer (optional)} = authenticated GET to 'endpoint' through the proxy to mint 'cookie'; BROWSER-ACTIVATION mode {nav} = open 'nav' (a URL/path) in the live browser so the SPA mints the sub-app's working Bearer (then captured from history). Declare either or both.",
   "sub_apps": [
     {"prefix": "/serviceA", "app": "appA", "jwt_field": "appAJwt", "probe": "/serviceA/graphql"},
-    {"prefix": "/serviceB", "app": "appB", "jwt_field": "appBJwt", "probe": "/serviceB/graphql"},
+    {"prefix": "/serviceB", "app": "appB", "jwt_field": "appBJwt", "probe": "/serviceB/graphql",
+     "prime": {"endpoint": "/serviceB/session", "method": "GET", "cookie": "_serviceB_session"}},
+    {"prefix": "/serviceC", "app": "appC2", "jwt_field": "appC2Jwt", "probe": "/serviceC/graphql",
+     "prime": {"nav": "/app/serviceC-home", "endpoint": "/serviceC/session", "cookie": "_serviceC_session"}},
     {"app": "appC", "jwt_field": "appCJwt"}
   ]
 }

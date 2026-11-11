@@ -623,6 +623,9 @@ class CopilotSession:
         self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
         self._last_bearer_refresh_ts: float = 0.0
         self._last_reload_ts: float = 0.0
+        # (host, app) pairs already session-primed this run, so a sub-app that stays
+        # not_authorized after priming cannot loop the prime+retry recovery.
+        self._primed_subapps: set[tuple[str, str]] = set()
         self._auth_prompted_hosts: set[str] = set()
         # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
         # fabricated host escalate and trip the failure breaker instead of looping.
@@ -1347,6 +1350,18 @@ class CopilotSession:
                         if fallback is not None:
                             result = fallback
 
+                    # Session-cookie priming: a sub-app that gates on a session COOKIE (not
+                    # just the Bearer) returns not_authorized/403 when the jar lacks it. The
+                    # Bearer refresh/browser fallback above cannot fix that. Mint the cookie
+                    # once through the proxy (prime_session) and re-run — the coordinator's
+                    # in-loop decision to recover, mirroring the blocks above. Bounded to one
+                    # attempt per (host, app) so a genuine denial cannot loop.
+                    if tool_name == "send_request":
+                        primed = await self._maybe_prime_subapp(
+                            tool_ctx, tool_name, tool_args, result, run_tool)
+                        if primed is not None:
+                            result = primed
+
                     if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
                         new_url = str(result.get("url", ""))
                         if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():
@@ -1638,6 +1653,76 @@ class CopilotSession:
             msg = ("STOP inventing hostnames. " + msg +
                    " Continuing to invent hosts will end this turn.")
         return msg
+
+    async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
+                                  tool_args: Dict[str, Any], result: Dict[str, Any],
+                                  run_tool: Any) -> Optional[Dict[str, Any]]:
+        """Recover a send_request that failed not_authorized/403 on a sub-app because its session
+        was not established — trying BOTH known login mechanisms, falling back one to the other
+        (different sub-apps authenticate differently):
+
+        1. COOKIE prime: mint the sub-app's session cookie via ``prime_session`` (authenticated GET
+           to the prime endpoint through the proxy), re-apply auth, retry.
+        2. BROWSER activation: ``browser_navigate`` the sub-app's activation URL so the SPA mints
+           its working service Bearer (captured from history), then retry — the per-service bearer
+           selection attaches the captured token. (Needs a live browser.)
+
+        The sub-app's ``prime`` descriptor (local sub-app map) declares either or both modes. Each
+        retry's result is re-checked; the first that authenticates wins. Bounded to one full ladder
+        per (host, app) so a genuine denial cannot loop. Returns the freshest retried result, or
+        None when no recovery was attempted. Never raises."""
+        def _authfail(res: Dict[str, Any]) -> bool:
+            st = res.get("status")
+            b = str(res.get("body", "") or "")[:2000].lower()
+            return st == 403 or "not_authorized" in b or "not authorized" in b
+
+        try:
+            if not _authfail(result):
+                return None
+            request_url = str(tool_args.get("url") or result.get("final_url") or "")
+            parsed = urlparse(request_url)
+            host = parsed.hostname or ""
+            if not host:
+                return None
+            from dast.session import subapp_map
+            from dast.session.auth_provider import subapp_for_path
+            app = subapp_for_path(parsed.path or "/")
+            if not app:
+                return None
+            prime = subapp_map.prime_for_app(app)
+            if not prime:
+                return None
+            key = (host, app)
+            if key in self._primed_subapps:
+                return None
+            self._primed_subapps.add(key)
+
+            current = result
+            acted = False
+            # Mechanism 1 — cookie prime (when the descriptor declares endpoint+cookie).
+            if prime.get("endpoint") and prime.get("cookie"):
+                pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
+                if isinstance(pr, dict) and pr.get("ok") and pr.get("verified"):
+                    self._apply_session_auth(tool_ctx, tool_args)
+                    current = await run_tool(tool_ctx, tool_name, tool_args)
+                    acted = True
+                    if not _authfail(current):
+                        return current
+            # Mechanism 2 — browser activation (when the descriptor declares a nav URL and a live
+            # browser exists). Open the activation page so the SPA mints the sub-app's working
+            # Bearer; the retry then rides the captured per-service token.
+            nav = prime.get("nav")
+            if nav and getattr(tool_ctx, "browser", None) is not None and _authfail(current):
+                nav_url = nav if "://" in nav else f"https://{host}{nav if nav.startswith('/') else '/' + nav}"
+                await run_tool(tool_ctx, "browser_navigate", {"url": nav_url})
+                self._apply_session_auth(tool_ctx, tool_args)
+                current = await run_tool(tool_ctx, tool_name, tool_args)
+                acted = True
+            # Return the freshest retried result (even if still failing); None if nothing ran.
+            return current if acted else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("session-prime recovery failed", error=str(exc)[:160])
+            return None
 
     def _scoped_cookies_for_host(self, host: str) -> List[dict]:
         """Cookie list for host from the correct jar: this session's isolated named jar

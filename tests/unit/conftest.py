@@ -76,13 +76,16 @@ def _isolate_transport_capability(tmp_path, monkeypatch):
 
 # Generic PLACEHOLDER sub-app map for the whole unit suite — never real target topology.
 # Two prefixed apps (alpha/beta) + one prefix-less app (gamma) exercise prefix resolution and
-# the app->jwt-field map. Redirects subapp_map._CONFIG_PATH so sub-app selection resolves in
-# tests (it is empty by default without the operator's local ~/.dast-ai/subapp_map.json) and
-# never reads the developer's real config.
+# the app->jwt-field map. 'beta' also declares a 'prime' descriptor so session-prime tests have a
+# primeable app (alpha has none -> exercises the no-prime path). Redirects subapp_map._CONFIG_PATH
+# so sub-app selection resolves in tests (it is empty by default without the operator's local
+# ~/.dast-ai/subapp_map.json) and never reads the developer's real config.
 _PLACEHOLDER_SUBAPP_MAP = {
     "sub_apps": [
         {"prefix": "/alpha", "app": "alpha", "jwt_field": "alphaJwt", "probe": "/alpha/graphql"},
-        {"prefix": "/beta", "app": "beta", "jwt_field": "betaJwt", "probe": "/beta/graphql"},
+        {"prefix": "/beta", "app": "beta", "jwt_field": "betaJwt", "probe": "/beta/graphql",
+         "prime": {"endpoint": "/beta/session", "method": "GET", "cookie": "_beta_session",
+                   "nav": "/beta/home"}},
         {"app": "gamma", "jwt_field": "gammaJwt"},
     ]
 }

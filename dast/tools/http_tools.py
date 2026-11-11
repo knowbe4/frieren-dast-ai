@@ -228,7 +228,7 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     # sets the header and never returns the token to the caller.
     rec: Optional[Dict[str, Any]] = None
     from dast.session.auth_provider import attach as _attach
-    from dast.session.auth_provider import scan_history_bearer
+    from dast.session.auth_provider import scan_history_bearer, scan_history_csrf
     parsed = urlparse(url)
     bearer_host = parsed.hostname or ""
     bearer_path = parsed.path or "/"
@@ -250,18 +250,38 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                      host=bearer_host, error=str(exc))
         rec = None
 
+    # CSRF fallback token: when the SPA's CSRF token is not in a cookie (e.g. Rails meta-tag
+    # CSRF), the cookie-based inject_csrf finds nothing and a POST 302/403s. Recover the token
+    # the SPA itself used from proxy history (exclude our own copilot replays) so attach can
+    # inject it — this is what makes an authenticated state-changing request actually go through.
+    csrf_token = None
+    if ctx.store is not None and method in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            csrf_token = scan_history_csrf(ctx.store, bearer_host, exclude_source="copilot")
+        except Exception as exc:
+            logger.debug("send_request: csrf resolution failed", host=bearer_host, error=str(exc))
+
     # One shared attach: drop any caller Authorization, set the jar Cookie (when not trusted)
     # + CSRF/XHR, and attach the resolved Bearer. Then drop the internal trusted marker so it
     # never leaks upstream (the proxy does not strip it).
     _res = _attach(headers, transport="api", cookies=(jar_cookie_map or None),
                    bearer_rec=rec, trusted_marker=bool(trusted_cookies),
-                   drop_all_authorization=True)
+                   drop_all_authorization=True, csrf_token=csrf_token)
     if _res.stripped:
         logger.warning("send_request stripped hand-pasted/caller auth header(s)",
                        headers=",".join(_res.stripped))
     headers.pop("x-dast-cookies-injected", None)
 
     body = args.get("body") or ""
+
+    # Default Content-Type for a JSON body when the caller did not set one. Without it a JSON
+    # API / GraphQL endpoint does not parse the body (e.g. GraphQL returns "No query string was
+    # present"), so an authenticated POST reaches the handler but does nothing. Only applied to a
+    # body that is clearly JSON and only when no Content-Type is already present.
+    if body and not any(k.lower() == "content-type" for k in headers):
+        _stripped = body.lstrip()
+        if _stripped[:1] in ("{", "["):
+            headers["Content-Type"] = "application/json"
 
     # Tag the proxy-history entry with the caller's source (e.g. "copilot") so the
     # operator can tell this traffic apart from manual browsing. The proxy reads

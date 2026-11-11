@@ -99,6 +99,42 @@ def test_domain_suffix_match_and_scan_wrapper():
     assert scan_history_bearer(None, "h", "/p") is None    # null store -> None, no raise
 
 
+# --------------------------------------------------------------- scan_history_csrf + CSRF fallback
+
+
+def test_scan_history_csrf_recovers_token_from_history():
+    from dast.session.auth_provider import scan_history_csrf
+    host = "app.example.com"
+    store = _Store([
+        {"host": host, "path": "/graphql", "source": "proxy",
+         "request_headers": {"X-CSRF-Token": "spa-tok-1"}},
+        {"host": host, "path": "/graphql", "source": "proxy",
+         "request_headers": {"X-CSRF-Token": "spa-tok-2"}},  # freshest (last)
+    ])
+    assert scan_history_csrf(store, host) == "spa-tok-2"
+    # a copilot-sourced entry is skipped when excluded
+    store2 = _Store([{"host": host, "path": "/graphql", "source": "copilot",
+                      "request_headers": {"X-CSRF-Token": "mine"}}])
+    assert scan_history_csrf(store2, host, exclude_source="copilot") is None
+    assert scan_history_csrf(None, host) is None          # null store -> None, no raise
+
+
+def test_attach_injects_csrf_token_fallback_when_no_cookie_csrf():
+    # Cookie-authed SPA with NO CSRF cookie (Rails meta-tag CSRF): the captured token is injected.
+    headers: dict = {}
+    attach(headers, transport="api", cookies={"session": "abc"}, csrf_token="captured-xyz")
+    assert headers["X-CSRF-Token"] == "captured-xyz"
+    assert headers["X-Requested-With"] == "XMLHttpRequest"
+
+
+def test_attach_csrf_cookie_wins_over_fallback():
+    # When a CSRF cookie yields a token, the fallback must NOT override it.
+    headers: dict = {}
+    attach(headers, transport="api",
+           cookies={"session": "abc", "CSRF-TOKEN": "from-cookie"}, csrf_token="fallback")
+    assert headers["X-CSRF-Token"] == "from-cookie"
+
+
 # --------------------------------------------------------------- attach()
 
 

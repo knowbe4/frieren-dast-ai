@@ -104,6 +104,10 @@ class ProxyEntry:
     # dispatched agents), for per-dimension coverage tracking. Set by the scan worker
     # from the coordinator's side-channel on CheckTarget.
     scanned_attack_types: List[str] = field(default_factory=list)
+    # structured outcome of the last scan (agents_ran/suggested_followups/blockers/needs/
+    # observations), set by the scan worker from the coordinator's ScanOutcome — the
+    # copilot-as-coordinator re-plans on it. None until the endpoint has been scanned.
+    scan_outcome: Optional[dict] = None
     # hints from imported reports: [{parameter, payload, attack_type}]
     import_hints: List[dict] = field(default_factory=list)
     # payload injected by an agent probe (for display in HTTP history)
@@ -131,6 +135,7 @@ class ProxyEntry:
             "scan_result": self.scan_result,
             "findings": self.findings,
             "scanned_attack_types": self.scanned_attack_types or [],
+            "scan_outcome": self.scan_outcome,
             "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
@@ -170,6 +175,7 @@ class ProxyEntry:
             scan_result=d.get("scan_result"),
             findings=d.get("findings") or [],
             scanned_attack_types=d.get("scanned_attack_types") or [],
+            scan_outcome=d.get("scan_outcome"),
             import_hints=d.get("import_hints") or [],
             ai_queued=d.get("ai_queued", False),
             manual_note=d.get("manual_note"),

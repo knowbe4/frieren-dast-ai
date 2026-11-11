@@ -1693,6 +1693,83 @@ class CopilotService:
                 except Exception as exc:  # noqa: BLE001 — never crash the run on one tool
                     logger.warning("auto-route tool failed", kind=rec.kind, error=str(exc))
 
+    async def _consume_scan_outcomes(self, sid: str, session: dict, ctx: Any, hosts: set) -> None:
+        """Phase 3 structured re-plan: act on the ScanOutcome signals the coordinator stashed on
+        scanned entries (entry.scan_outcome) this turn — a CODE decision, not free-text prompting.
+
+        - needs "auth-refresh" -> re-authenticate once per host (reuse the profile-login cascade).
+        - suggested_followups -> dispatch exactly those agents (dispatch_agents), active runs only.
+        - blockers -> surface via a broadcast (do NOT silently drop; structural/baseline aborts are
+          surfaced, never re-dispatched).
+
+        Deduped via the shared ``routed`` set plus a consumed-signature set so it never loops.
+        Best-effort and stop-aware; the free-text playbooks remain the fallback for everything else."""
+        from dast.tools import run_tool
+
+        auto = session["autonomous"]
+        read_only = bool(auto.get("read_only"))
+        stop_event: asyncio.Event = auto["stop_event"]
+        routed: set = auto.setdefault("routed", set())
+        consumed: set = auto.setdefault("consumed_outcomes", set())
+        store = self._ctx.store
+        if store is None:
+            return
+        for host in self._without_deferred_identity(hosts):
+            if stop_event.is_set():
+                return
+            bare = str(host).split(":")[0]
+            try:
+                entries = [e for e in store.all_entries()
+                           if (urlparse(e.url).hostname or "") == bare
+                           and isinstance(getattr(e, "scan_outcome", None), dict)]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("consume-outcomes: entry scan failed", host=host, error=str(exc))
+                continue
+            for entry in entries:
+                if stop_event.is_set():
+                    return
+                outcome = entry.scan_outcome
+                needs = outcome.get("needs") or []
+                followups = outcome.get("suggested_followups") or []
+                blockers = outcome.get("blockers") or []
+                sig = (entry.id, tuple(needs), tuple(followups), tuple(blockers))
+                if sig in consumed:
+                    continue
+                consumed.add(sig)
+
+                if "auth-refresh" in needs:
+                    rk = ("auth-refresh", bare)
+                    if rk not in routed:
+                        routed.add(rk)
+                        try:
+                            auto["_proactive_login_done"] = False  # allow a mid-run re-login
+                            await self._ensure_profile_login(sid, session)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("consume-outcomes: auth-refresh failed",
+                                           host=host, error=str(exc))
+
+                if not read_only:
+                    for atype in followups:
+                        dk = (entry.url, "dispatch_agents", atype)
+                        if dk in routed:
+                            continue
+                        routed.add(dk)
+                        try:
+                            logger.info("consume-outcomes: dispatching follow-up",
+                                        url=entry.url, attack=atype)
+                            await run_tool(ctx, "dispatch_agents",
+                                           {"url": entry.url, "attack_types": [atype]})
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("consume-outcomes: dispatch failed",
+                                           attack=atype, error=str(exc))
+
+                for blocker in blockers:
+                    try:
+                        await self._broadcast_autonomous(
+                            sid, "scan_blocked", {"url": entry.url, "blocker": blocker})
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("consume-outcomes: broadcast failed", error=str(exc))
+
     async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
         """Drive breadth deterministically in complete mode so it is never left to
         LLM discretion: per in-scope host (focus hosts expanded with every in-scope
@@ -2033,6 +2110,11 @@ class CopilotService:
                     # Evidence-driven auto-routing of the unambiguous leads (bounded
                     # and complete). The prompt block surfaces the rest for the LLM.
                     await self._auto_route(session, turn_ctx, set(effective_hosts))
+                    # Phase 3: act on the STRUCTURED scan outcomes a scan produced this
+                    # turn (re-authenticate on needs=auth-refresh, dispatch suggested
+                    # follow-up agents, surface blockers) — a code re-plan, not free text.
+                    await self._consume_scan_outcomes(sid, session, turn_ctx,
+                                                      set(effective_hosts))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot(scope_hosts)

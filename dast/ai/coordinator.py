@@ -17,10 +17,11 @@ from __future__ import annotations
 import asyncio
 import collections
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
 
 from dast.ai import bedrock_client
-from dast.ai.agent_base import AgentFinding, VulnAgent
+from dast.ai.agent_base import AgentFinding, AgentObservation, VulnAgent
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import BASELINE_SCHEMA, PLANNER_SCHEMA
 from dast.utils.logger import get_logger
@@ -31,6 +32,35 @@ if TYPE_CHECKING:
     from dast.scanners.collaborator import CollaboratorService
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class ScanOutcome:
+    """Structured result of one ``Coordinator.run`` — for a driver that dispatches agents and
+    re-plans on the result (the copilot acting as the coordinator). Assembled entirely from data
+    the Coordinator already has; the per-agent contract (``VulnAgent.run -> List[AgentFinding]``)
+    is unchanged. ``blockers`` are stable code strings (not prose) so a caller can switch on them."""
+
+    findings: List[AgentFinding] = field(default_factory=list)        # confirmed + held-for-review
+    observations: List[AgentObservation] = field(default_factory=list)
+    agents_ran: List[str] = field(default_factory=list)               # attack_types dispatched
+    suggested_followups: List[str] = field(default_factory=list)      # evidence_router implications
+    blockers: List[str] = field(default_factory=list)                 # stable codes (below)
+    needs: List[str] = field(default_factory=list)                    # e.g. "auth-refresh"
+
+
+@dataclass
+class _OutcomeSink:
+    """Mutable accumulator threaded into ``_run_inner`` (like the ``collected`` findings list) so
+    the structured outcome survives the early-abort returns and a budget timeout. ``run()`` freezes
+    it into a :class:`ScanOutcome`."""
+
+    observations: List[AgentObservation] = field(default_factory=list)
+    agents_ran: List[str] = field(default_factory=list)
+    suggested_followups: List[str] = field(default_factory=list)
+    blockers: List[str] = field(default_factory=list)
+    needs: List[str] = field(default_factory=list)
+
 
 # ── Activity log ───────────────────────────────────────────────────────────
 # Rolling buffer of the last 200 scan events — exposed via /api/ai/log.
@@ -744,9 +774,12 @@ class Coordinator:
         probe_diff: bool = False,
         budget_ceiling: Optional[float] = None,
         replan: bool = False,
-    ) -> List[AgentFinding]:
+        return_outcome: bool = False,
+    ) -> "Union[List[AgentFinding], ScanOutcome]":
+        # return_outcome=False keeps the historical List[AgentFinding] contract (every existing
+        # caller + test); True returns a structured ScanOutcome for the copilot-as-coordinator.
         if not cls._registry:
-            return []
+            return ScanOutcome(blockers=["no_registry"]) if return_outcome else []
 
         # Compute adaptive budget unless caller explicitly set one
         if budget_seconds is None:
@@ -768,15 +801,17 @@ class Coordinator:
         # whatever was confirmed rather than an empty list (which had marked a
         # genuinely-vulnerable endpoint "safe").
         collected: List[AgentFinding] = []
+        sink = _OutcomeSink()
         try:
-            return await asyncio.wait_for(
+            findings = await asyncio.wait_for(
                 cls._run_inner(
                     target, client, collaborator, use_llm_planner,
                     model_id, confidence_threshold, session_intelligence,
-                    probe_diff, collected, replan,
+                    probe_diff, collected, replan, sink,
                 ),
                 timeout=effective_budget,
             )
+            return cls._freeze_outcome(findings, sink) if return_outcome else findings
         except asyncio.TimeoutError:
             from dast.proxy.plugin_manager import log_event as _le
             kept = len(collected)
@@ -788,7 +823,22 @@ class Coordinator:
             )
             logger.warning("Coordinator scan timed out", url=target.url,
                            budget_s=effective_budget, kept_findings=kept)
-            return list(collected)
+            if "budget_timeout" not in sink.blockers:
+                sink.blockers.append("budget_timeout")
+            kept_findings = list(collected)
+            return cls._freeze_outcome(kept_findings, sink) if return_outcome else kept_findings
+
+    @staticmethod
+    def _freeze_outcome(findings: List[AgentFinding], sink: "_OutcomeSink") -> "ScanOutcome":
+        """Snapshot the mutable sink into an immutable ScanOutcome result."""
+        return ScanOutcome(
+            findings=findings,
+            observations=list(sink.observations),
+            agents_ran=list(sink.agents_ran),
+            suggested_followups=list(sink.suggested_followups),
+            blockers=list(sink.blockers),
+            needs=list(sink.needs),
+        )
 
     @classmethod
     async def _run_inner(
@@ -803,11 +853,16 @@ class Coordinator:
         probe_diff: bool = False,
         collected: Optional[List[AgentFinding]] = None,
         replan: bool = False,
+        outcome_sink: Optional["_OutcomeSink"] = None,
     ) -> List[AgentFinding]:
         from urllib.parse import urlparse as _urlparse
         _parsed_url = _urlparse(target.url)
         _host = _parsed_url.netloc
         _path = _parsed_url.path
+
+        def _sink_blocker(code: str) -> None:
+            if outcome_sink is not None and code not in outcome_sink.blockers:
+                outcome_sink.blockers.append(code)
 
         # Extract operation label for per-operation intelligence scoping
         _operation = _extract_operation(target)
@@ -832,6 +887,7 @@ class Coordinator:
             from dast.proxy.plugin_manager import log_event as _le_auth
             _le_auth("coordinator", "info", _log_reason, url=target.url, source="agent")
             logger.debug("Coordinator early abort: auth endpoint by path", url=target.url)
+            _sink_blocker("auth_endpoint")
             _activity_log.appendleft({
                 "ts": time.time(),
                 "method": target.method,
@@ -853,6 +909,7 @@ class Coordinator:
             from dast.proxy.plugin_manager import log_event as _le0
             _le0("coordinator", "info", _log_reason, url=target.url, source="agent")
             logger.debug("Coordinator early abort: auth-token params only", url=target.url)
+            _sink_blocker("all_auth_tokens")
             _activity_log.appendleft({
                 "ts": time.time(),
                 "method": target.method,
@@ -967,13 +1024,19 @@ class Coordinator:
                     f"Skipping scan — structural error already known for [{_operation or _path}]: {prev_error}",
                     url=target.url, source="agent",
                 )
+                _sink_blocker("structural_error")
                 return []
 
         baseline_response_summary = ""
-        _run_baseline = (
-            target.method in ("GET", "POST", "PUT", "PATCH", "DELETE")
-            and (bool(target.body) or bool(target.params))
-        )
+        # Run the baseline for any request we might scan — not only injectable ones.
+        # Even with no params/body to inject, the baseline's deterministic checks catch
+        # an auth wall (401/403 -> run auth_bypass only + signal needs=auth-refresh) and
+        # structural dead-ends (404/405). A no-param GET to a protected endpoint would
+        # otherwise skip the baseline and let the non-injection agents (sensitive_data,
+        # cache_poisoning, header probes) flood it blindly without recognizing the wall.
+        # Cost is one request (the agents hit the endpoint anyway) and _baseline_check
+        # still gates the LLM call behind should_ask_llm, so a clear 200/401 costs no tokens.
+        _run_baseline = target.method in ("GET", "POST", "PUT", "PATCH", "DELETE")
         auth_wall = False
         if _run_baseline:
             from dast.ai.bedrock_client import get_fast_model as _get_fast
@@ -985,6 +1048,8 @@ class Coordinator:
                 # must not blacklist the path), and it is exactly where header-based
                 # auth bypass applies — so run that agent alone instead of aborting.
                 auth_wall = True
+                if outcome_sink is not None and "auth-refresh" not in outcome_sink.needs:
+                    outcome_sink.needs.append("auth-refresh")
                 _log_event(
                     "coordinator", "info",
                     f"Baseline hit an auth wall — running auth bypass only: "
@@ -1014,6 +1079,7 @@ class Coordinator:
                     "Coordinator aborting: baseline structural error",
                     url=target.url, reason=baseline_abort,
                 )
+                _sink_blocker("baseline_structural")
                 _activity_log.appendleft({
                     "ts": time.time(),
                     "method": target.method,
@@ -1030,9 +1096,21 @@ class Coordinator:
         # The planner now receives the baseline response so it can reason about
         # what the endpoint actually does, not just its URL structure.
         mine_params = False
+        # Targeted dispatch: a caller (the copilot acting as coordinator) may RESTRICT the scan
+        # to an exact agent set, bypassing the LLM planner. Unknown/unregistered types are
+        # filtered out here; if the caller passed types but NONE are registered, `restrict` is
+        # empty and we fall through to the normal planner — never run zero agents by accident.
+        restrict = [t for t in (getattr(target, "only_attack_types", None) or [])
+                    if t in cls._registry]
+        _restricted = False
         if auth_wall:
             selected_types = ["auth_bypass"]
             plan_reason = "Baseline returned 401/403 — only auth bypass applies"
+        elif restrict:
+            selected_types = list(dict.fromkeys(restrict))  # exactly these, de-duped, order-kept
+            plan_reason = f"Targeted dispatch (planner bypassed): {', '.join(selected_types)}"
+            _restricted = True
+            logger.info("coordinator: targeted dispatch", url=target.url, agents=selected_types)
         elif use_llm_planner:
             from dast.ai.bedrock_client import get_fast_model
             plan_model = model_id or get_fast_model()
@@ -1055,18 +1133,23 @@ class Coordinator:
         # otherwise a real tokenless state-changing request (e.g. DVWA /exec/) is
         # silently skipped. business_logic stays planner-gated — it genuinely
         # needs the LLM to judge whether the response computes extra state.
-        if "csrf" in candidate_types and "csrf" in cls._registry and "csrf" not in selected_types:
+        # Targeted dispatch means EXACTLY the requested set — skip the CSRF force-add and the
+        # additive focus union so "only these agents" is honored literally (the caller can
+        # include "csrf" explicitly if it wants it).
+        if not _restricted and "csrf" in candidate_types and "csrf" in cls._registry \
+                and "csrf" not in selected_types:
             selected_types = [*selected_types, "csrf"]
 
         # Caller-requested attack focus (e.g. run_scan recommended by the evidence
         # router for an LLM endpoint -> guarantee llm_injection runs). Additive, so
         # it never REDUCES the planner's selection — it only ensures the requested,
         # evidence-backed types are included.
-        focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
-                 if t in cls._registry and t not in selected_types]
-        if focus:
-            selected_types = [*selected_types, *focus]
-            logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
+        if not _restricted:
+            focus = [t for t in (getattr(target, "focus_attack_types", None) or [])
+                     if t in cls._registry and t not in selected_types]
+            if focus:
+                selected_types = [*selected_types, *focus]
+                logger.info("coordinator: focus attack types added", url=target.url, focus=focus)
 
         # ── Automatic hidden-parameter mining (planner-decided) ───────────────
         # When the planner judges this endpoint likely to accept undocumented
@@ -1115,6 +1198,7 @@ class Coordinator:
                 f"No agents selected — {plan_reason or 'no matching agents'}",
                 url=target.url, source="agent",
             )
+            _sink_blocker("no_agents")
             return []
 
         agent_names = ", ".join(a.name for a in agents)
@@ -1276,6 +1360,13 @@ class Coordinator:
             except Exception as exc:
                 logger.warning("Session intelligence write-back failed", url=target.url, error=str(exc))
 
+        # Structured-outcome aggregation (for the copilot-as-coordinator): which agents ran and
+        # every observation they recorded. Independent of session_intelligence being present.
+        if outcome_sink is not None:
+            outcome_sink.agents_ran = [a.attack_type for a in agents]
+            for _a in agents:
+                outcome_sink.observations.extend(getattr(_a, "observations", []))
+
         # Build per-agent outcome log entries
         confirmed_titles = {f.title for f in confirmed}
         outcomes = []
@@ -1369,6 +1460,24 @@ class Coordinator:
                             )
             except Exception as exc:  # noqa: BLE001 — replan must never break the base scan
                 logger.warning("Coordinator replan pass failed", url=target.url, error=str(exc))
+
+        # Suggested follow-ups for a re-planning driver: the injection-adjacent agents a
+        # confirmed finding implies (same shared implication map the replan pass uses), computed
+        # regardless of the replan flag so the copilot-as-coordinator can decide whether to dispatch.
+        if outcome_sink is not None:
+            try:
+                _confirmed_types = {
+                    atype for atype, fs in agent_raw.items()
+                    if any(f.title in confirmed_titles for f in fs)
+                }
+                if _confirmed_types:
+                    from dast.ai.evidence_router import implied_followups
+                    outcome_sink.suggested_followups = [
+                        t for t in implied_followups(_confirmed_types, selected_types)
+                        if t in cls._registry
+                    ]
+            except Exception as exc:  # noqa: BLE001 — never break the scan over a hint
+                logger.debug("suggested_followups computation failed", url=target.url, error=str(exc))
 
         # Return confirmed vulns plus any held-for-review findings. Held findings
         # carry needs_review=True so the runner serializes them as unconfirmed;

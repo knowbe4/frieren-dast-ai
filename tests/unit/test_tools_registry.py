@@ -2089,3 +2089,144 @@ async def test_record_transport_capability_validates_values():
     bad_auth = await run_tool(ctx, "record_transport_capability",
                               {"host": "api.x.example", "prefer": "browser", "auth": "nope"})
     assert bad_prefer["ok"] is False and bad_auth["ok"] is False
+
+
+# ── Phase 3: scan result surfaces the structured ScanOutcome ────────────────
+
+@pytest.mark.asyncio
+async def test_enqueue_and_wait_surfaces_scan_outcome_keys():
+    from types import SimpleNamespace
+    from dast.tools.scan_tools import _enqueue_and_wait
+
+    entry = SimpleNamespace(id="e1", method="GET", url="https://app.example/x", host="app.example")
+    scanned = SimpleNamespace(
+        scan_result="vulnerable",
+        findings=[{"title": "SQLi", "severity": "high"}],
+        url="https://app.example/x", method="GET",
+        scan_outcome={
+            "agents_ran": ["sqli"], "suggested_followups": ["ssti"],
+            "blockers": [], "needs": ["auth-refresh"],
+            "observations": [{"attack_type": "sqli", "kind": "waf_bypass", "signal": "x"}],
+        },
+    )
+
+    class _Store:
+        def get_entry(self, _id):
+            return scanned
+
+    class _Q:
+        async def put(self, _id):
+            return None
+
+    class _QS:
+        def completion_event(self, _id):
+            pass
+
+        def enqueue(self, *a):
+            pass
+
+        async def await_entry(self, _id, _t):
+            return True
+
+    res = await _enqueue_and_wait(_Store(), _Q(), _QS(), entry, agents_ran=True)
+    # Existing keys intact...
+    assert res["ok"] is True and res["status"] == "vulnerable"
+    assert res["findings_count"] == 1 and res["findings"]
+    # ...plus the new structured re-plan signals.
+    assert res["needs"] == ["auth-refresh"]
+    assert res["suggested_followups"] == ["ssti"]
+    assert res["blockers"] == []
+    assert res["observations"] == [{"attack_type": "sqli", "kind": "waf_bypass", "signal": "x"}]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_and_wait_without_outcome_omits_signals():
+    from types import SimpleNamespace
+    from dast.tools.scan_tools import _enqueue_and_wait
+
+    entry = SimpleNamespace(id="e2", method="GET", url="https://app.example/y", host="app.example")
+    scanned = SimpleNamespace(scan_result="safe", findings=[], url="https://app.example/y",
+                              method="GET", scan_outcome=None)
+
+    class _Store:
+        def get_entry(self, _id):
+            return scanned
+
+    class _Q:
+        async def put(self, _id):
+            return None
+
+    class _QS:
+        def completion_event(self, _id):
+            pass
+
+        def enqueue(self, *a):
+            pass
+
+        async def await_entry(self, _id, _t):
+            return True
+
+    res = await _enqueue_and_wait(_Store(), _Q(), _QS(), entry, agents_ran=True)
+    assert res["ok"] is True and res["status"] == "safe"
+    assert "needs" not in res and "suggested_followups" not in res  # no outcome -> no signal keys
+
+
+# ── Phase 3: dispatch_agents tool (targeted dispatch from the copilot) ──────
+
+def test_dispatch_agents_registered_with_schema():
+    t = next((t for t in tools.all_tools() if t.name == "dispatch_agents"), None)
+    assert t is not None
+    assert t.input_schema.get("type") == "object"
+    assert "attack_types" in t.input_schema["properties"]
+    assert set(t.input_schema.get("required", [])) == {"url", "attack_types"}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_agents_sets_only_attack_types_and_enqueues():
+    from types import SimpleNamespace
+    entry = SimpleNamespace(id="e1", method="GET", url="https://app.example/x", host="app.example",
+                            source="proxy", ai_queued=False, queued_for_scan=False,
+                            only_attack_types=None)
+    scanned = SimpleNamespace(scan_result="safe", findings=[], url=entry.url, method="GET",
+                              scan_outcome={"agents_ran": ["sqli"], "blockers": [],
+                                            "needs": [], "suggested_followups": []})
+    enqueued = []
+
+    class _Store:
+        def get_entry(self, _id):
+            return scanned
+        def all_entries(self):
+            return [entry]
+
+    class _Q:
+        async def put(self, _id):
+            enqueued.append(_id)
+
+    class _QS:
+        def completion_event(self, _id):
+            pass
+        def enqueue(self, *a):
+            pass
+        async def await_entry(self, _id, _t):
+            return True
+
+    ctx = ToolContext(settings=_Scope(True), store=_Store(),
+                      scan_queue=_Q(), scan_queue_state=_QS())
+    res = await run_tool(ctx, "dispatch_agents",
+                         {"url": "https://app.example/x", "attack_types": ["sqli"]})
+    assert res["ok"] is True and res["dispatched"] == ["sqli"]
+    assert entry.only_attack_types == ["sqli"]       # restricted set stashed for the worker
+    assert enqueued == [entry.id]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_agents_requires_nonempty_attack_types():
+    ctx = ToolContext(settings=_Scope(True), store=object(),
+                      scan_queue=object(), scan_queue_state=object())
+    res = await run_tool(ctx, "dispatch_agents", {"url": "https://app.example/x", "attack_types": []})
+    assert res["ok"] is False and "attack_types" in res["error"]
+
+
+def test_dispatch_agents_blocked_in_read_only():
+    from dast.utils import read_only
+    assert "dispatch_agents" in read_only.BLOCKED_TOOLS

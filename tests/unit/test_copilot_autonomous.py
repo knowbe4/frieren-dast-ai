@@ -952,3 +952,84 @@ def test_each_session_gets_its_own_browser():
     bb = service.get(b)["_agent_browser"]
     assert ba is not None and bb is not None and ba is not bb
     assert ctx_a.browser is ba and ctx_b.browser is bb
+
+
+# ── Phase 3: structured re-plan from ScanOutcome (_consume_scan_outcomes) ───
+
+class _OutcomeEntry:
+    def __init__(self, eid, url, scan_outcome):
+        self.id = eid
+        self.url = url
+        self.scan_outcome = scan_outcome
+
+
+class _OutcomeStore(_FakeStore):
+    def all_entries(self):
+        return self._entries
+
+
+def _auto_session(read_only=False):
+    return {"autonomous": {"stop_event": asyncio.Event(), "read_only": read_only}}
+
+
+@pytest.mark.asyncio
+async def test_consume_outcomes_triggers_auth_refresh_once():
+    entry = _OutcomeEntry("e1", "https://app.example/x",
+                          {"needs": ["auth-refresh"], "suggested_followups": [], "blockers": []})
+    service = CopilotService(_FakeCtx(_OutcomeStore([entry])))
+    service._ensure_profile_login = AsyncMock()
+    session = _auto_session()
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})  # 2nd turn
+    service._ensure_profile_login.assert_awaited_once()  # deduped per host
+
+
+@pytest.mark.asyncio
+async def test_consume_outcomes_dispatches_followups_deduped(monkeypatch):
+    entry = _OutcomeEntry("e1", "https://app.example/x",
+                          {"needs": [], "suggested_followups": ["ssti", "sqli"], "blockers": []})
+    service = CopilotService(_FakeCtx(_OutcomeStore([entry])))
+    calls = []
+
+    async def fake_run_tool(ctx, name, args):
+        calls.append((name, args))
+
+    monkeypatch.setattr("dast.tools.run_tool", fake_run_tool)
+    session = _auto_session()
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})  # dedup
+    assert calls == [
+        ("dispatch_agents", {"url": "https://app.example/x", "attack_types": ["ssti"]}),
+        ("dispatch_agents", {"url": "https://app.example/x", "attack_types": ["sqli"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_consume_outcomes_read_only_skips_dispatch(monkeypatch):
+    entry = _OutcomeEntry("e1", "https://app.example/x",
+                          {"needs": [], "suggested_followups": ["sqli"], "blockers": []})
+    service = CopilotService(_FakeCtx(_OutcomeStore([entry])))
+    calls = []
+    monkeypatch.setattr("dast.tools.run_tool",
+                        lambda *a, **k: calls.append(a) or _async_none())
+    session = _auto_session(read_only=True)
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})
+    assert calls == []  # dispatch_agents is active-only
+
+
+@pytest.mark.asyncio
+async def test_consume_outcomes_broadcasts_blockers_without_stopping():
+    entry = _OutcomeEntry("e1", "https://app.example/x",
+                          {"needs": [], "suggested_followups": [], "blockers": ["structural_error"]})
+    ctx = _FakeCtx(_OutcomeStore([entry]))
+    service = CopilotService(ctx)
+    session = _auto_session()
+    await service._consume_scan_outcomes("sid1", session, object(), {"app.example"})
+    assert ctx.broadcast_copilot.await_count == 1
+    payload = ctx.broadcast_copilot.await_args.args[0]
+    assert payload["event"] == "scan_blocked" and payload["blocker"] == "structural_error"
+    assert not session["autonomous"]["stop_event"].is_set()  # surfaced, run not stopped
+
+
+async def _async_none():
+    return None

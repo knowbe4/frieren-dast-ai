@@ -129,7 +129,7 @@ async def test_run_preserves_findings_confirmed_before_timeout():
 
     async def _fake_inner(target, client, collaborator, use_llm_planner,
                           model_id, confidence_threshold, session_intelligence,
-                          probe_diff, collected, replan=False):
+                          probe_diff, collected, replan=False, outcome_sink=None):
         # Simulate: validation finalised one confirmed finding into the shared
         # collector, then the run stalls (e.g. slow write-back) and times out.
         collected.append(kept)
@@ -267,7 +267,10 @@ async def test_run_aborts_when_baseline_returns_404():
 
 
 @pytest.mark.asyncio
-async def test_run_skips_baseline_probe_when_no_params_and_no_body():
+async def test_run_runs_baseline_probe_even_without_params_or_body():
+    # The baseline runs for any scannable method, not only injectable ones: it is
+    # the only place an auth wall (401/403) or structural dead-end (404) on a
+    # no-param GET is detected. A clean 200 does not abort and does not call the LLM.
     class _AnyAgent(VulnAgent):
         name = "Any"
         attack_type = "_no_params_test"
@@ -289,7 +292,37 @@ async def test_run_skips_baseline_probe_when_no_params_and_no_body():
             client = MagicMock()
             await Coordinator.run(target, client, budget_seconds=5.0)
 
-    send_mock.assert_not_called()
+    send_mock.assert_called()  # baseline ran despite no params/body
+
+
+@pytest.mark.asyncio
+async def test_run_no_param_get_detects_auth_wall_via_baseline():
+    # Regression guard for the fixed edge: a protected no-param GET (401) must be
+    # recognized as an auth wall -> run auth_bypass only + signal needs=auth-refresh,
+    # instead of silently skipping the baseline and flooding the endpoint.
+    class _AuthBypassAgent(VulnAgent):
+        name = "AuthBypass"
+        attack_type = "auth_bypass"
+        description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    send_mock = AsyncMock(return_value=_resp(
+        status=401, text='{"message":"Missing authorization token"}'))
+    target = CheckTarget(
+        method="GET", url="https://example.com/protected",
+        headers={}, body=None, params=[],
+    )
+    with _Registry():
+        Coordinator.register(_AuthBypassAgent)
+        with patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)), \
+             patch("dast.scanners.active_checks._send", new=send_mock):
+            out = await Coordinator.run(target, MagicMock(), use_llm_planner=False,
+                                        budget_seconds=5.0, return_outcome=True)
+
+    send_mock.assert_called()  # baseline ran despite no params
+    assert "auth-refresh" in out.needs
+    assert out.agents_ran == ["auth_bypass"]
 
 
 # ── structural-error short-circuit via session intelligence ──────────────
@@ -688,3 +721,158 @@ async def test_replan_off_by_default_skips_followup():
 
     assert ran == ["sqli"], "no follow-up pass when replan is off"
     assert {f.title for f in result} == {"SQLi"}
+
+
+# ── Phase 3: structured ScanOutcome (return_outcome=True) ──────────────────
+
+from dast.ai.coordinator import ScanOutcome, _AUTH_WALL_REASON_PREFIX  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_empty_registry_returns_scanoutcome():
+    with _Registry():  # cleared registry
+        out = await Coordinator.run(_target(), MagicMock(), return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert out.blockers == ["no_registry"] and out.findings == []
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_blocker_auth_endpoint():
+    class _AnyAgent(VulnAgent):
+        name = "Any"; attack_type = "_o_auth_ep"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+    with _Registry():
+        Coordinator.register(_AnyAgent)
+        out = await Coordinator.run(
+            _target(url="https://example.com/oauth/callback"), MagicMock(),
+            budget_seconds=5.0, return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert "auth_endpoint" in out.blockers and out.findings == []
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_blocker_all_auth_tokens():
+    class _AnyAgent(VulnAgent):
+        name = "Any"; attack_type = "_o_tok"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+    target = _target(params=[{"name": "nonce", "location": "query", "value": "abc"}])
+    with _Registry():
+        Coordinator.register(_AnyAgent)
+        out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0, return_outcome=True)
+    assert "all_auth_tokens" in out.blockers
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_populated_on_success():
+    class _HitAgent(VulnAgent):
+        name = "Hit"; attack_type = "xss"; description = ""
+        async def run(self, target, client, collaborator=None):
+            self.observe("waf_bypass", payload="<x>", signal="200 reflected")
+            return [_finding(attack_type="xss", bypass_validation=True)]
+
+    plan_mock = AsyncMock(return_value=(["xss"], "selected xss", False))
+    with _Registry():
+        Coordinator.register(_HitAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(_target(), MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert len(out.findings) == 1 and out.findings[0].attack_type == "xss"
+    assert out.agents_ran == ["xss"]
+    assert any(o.kind == "waf_bypass" for o in out.observations)
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_auth_wall_sets_needs_auth_refresh():
+    class _AuthBypassAgent(VulnAgent):
+        name = "AuthBypass"; attack_type = "auth_bypass"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    with _Registry():
+        Coordinator.register(_AuthBypassAgent)
+        with patch.object(Coordinator, "_baseline_check",
+                          new=AsyncMock(return_value=(f"{_AUTH_WALL_REASON_PREFIX} 401 login", ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(_target(method="POST", body="{}"), MagicMock(),
+                                        budget_seconds=5.0, return_outcome=True)
+    assert "auth-refresh" in out.needs
+
+
+@pytest.mark.asyncio
+async def test_run_outcome_timeout_marks_budget_blocker():
+    kept = _finding(title="SQL Injection", attack_type="sqli")
+
+    class _NoopAgent(VulnAgent):
+        name = "Noop"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    async def _slow_inner(target, client, collaborator, use_llm_planner,
+                          model_id, confidence_threshold, session_intelligence,
+                          probe_diff, collected, replan=False, outcome_sink=None):
+        collected.append(kept)
+        await asyncio.sleep(10)
+        return collected
+
+    with _Registry():
+        Coordinator.register(_NoopAgent)
+        with patch.object(Coordinator, "_run_inner", new=_slow_inner):
+            out = await Coordinator.run(_target(), MagicMock(), budget_seconds=0.05,
+                                        return_outcome=True)
+    assert isinstance(out, ScanOutcome)
+    assert "budget_timeout" in out.blockers and len(out.findings) == 1
+
+
+# ── Phase 3: targeted dispatch (only_attack_types bypasses the planner) ────
+
+@pytest.mark.asyncio
+async def test_targeted_dispatch_bypasses_planner():
+    class _XssAgent(VulnAgent):
+        name = "X"; attack_type = "xss"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    class _SqliAgent(VulnAgent):
+        name = "S"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    plan_mock = AsyncMock(return_value=(["sqli"], "planner would pick sqli", False))
+    target = _target()
+    target.only_attack_types = ["xss"]
+    with _Registry():
+        Coordinator.register(_XssAgent)
+        Coordinator.register(_SqliAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    plan_mock.assert_not_called()                 # planner bypassed
+    assert out.agents_ran == ["xss"]              # exactly the restricted set (no sqli, no csrf)
+
+
+@pytest.mark.asyncio
+async def test_targeted_dispatch_invalid_set_falls_through_to_planner():
+    class _SqliAgent(VulnAgent):
+        name = "S"; attack_type = "sqli"; description = ""
+        async def run(self, target, client, collaborator=None):
+            return []
+
+    plan_mock = AsyncMock(return_value=(["sqli"], "planner picked sqli", False))
+    target = _target()
+    target.only_attack_types = ["not_a_registered_type"]   # none registered -> fall through
+    with _Registry():
+        Coordinator.register(_SqliAgent)
+        with patch.object(Coordinator, "_plan", new=plan_mock), \
+             patch.object(Coordinator, "_baseline_check", new=AsyncMock(return_value=(None, ""))), \
+             patch("dast.ai.coordinator._run_canary_probe", new=AsyncMock(return_value=False)):
+            out = await Coordinator.run(target, MagicMock(), budget_seconds=5.0,
+                                        return_outcome=True)
+    plan_mock.assert_called_once()                # fell through to the planner
+    assert out.agents_ran == ["sqli"]

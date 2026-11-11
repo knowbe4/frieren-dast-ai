@@ -27,6 +27,7 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # crawl) and reads stay available; they are covered by the network guard.
 BLOCKED_TOOLS = frozenset({
     "run_scan",
+    "dispatch_agents",
     "scan_surface",
     "idor_probe",
     "graphql_sweep",

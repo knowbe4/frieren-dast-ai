@@ -98,6 +98,54 @@ def _resolve_entry(store: Any, url: str, method: str, entry_id: str) -> Optional
     return None
 
 
+async def _enqueue_and_wait(store, scan_queue, scan_queue_state, entry,
+                            agents_ran: bool) -> Dict[str, Any]:
+    """Enqueue one entry for the scan worker, wait for completion, and shape the result for the
+    copilot: the compacted findings PLUS the structured scan-outcome signals (observations /
+    suggested_followups / blockers / needs) the coordinator produced. Shared by run_scan and
+    dispatch_agents. Register the completion event BEFORE enqueuing so a fast finish() cannot
+    fire before we are waiting on it."""
+    scan_queue_state.completion_event(entry.id)
+    scan_queue_state.enqueue(entry.id, entry.method, entry.url, entry.host)
+    try:
+        await scan_queue.put(entry.id)
+    except Exception as exc:
+        return {"ok": False, "error": f"could not enqueue scan: {str(exc)[:200]}", "url": entry.url}
+    completed = await scan_queue_state.await_entry(entry.id, _SCAN_TIMEOUT_SECONDS)
+
+    scanned = store.get_entry(entry.id)
+    raw_findings: List[Dict[str, Any]] = []
+    scan_result = None
+    outcome = None
+    if scanned is not None:
+        scan_result = scanned.scan_result
+        raw_findings = [f for f in (scanned.findings or []) if f.get("title")]
+        outcome = getattr(scanned, "scan_outcome", None)
+
+    findings = [_compact_finding(f) for f in raw_findings[:_MAX_FINDINGS_RETURNED]]
+    result: Dict[str, Any] = {
+        "ok": True,
+        "url": entry.url,
+        "method": entry.method,
+        "entry_id": entry.id,
+        "status": scan_result or ("scanning" if not completed else "safe"),
+        "findings_count": len(raw_findings),
+        "findings": findings,
+        "agents_ran": agents_ran,
+        "timed_out": not completed,
+    }
+    # Structured re-plan signals from the coordinator's ScanOutcome (empty when none).
+    if isinstance(outcome, dict):
+        result["observations"] = outcome.get("observations") or []
+        result["suggested_followups"] = outcome.get("suggested_followups") or []
+        result["blockers"] = outcome.get("blockers") or []
+        result["needs"] = outcome.get("needs") or []
+    if not agents_ran:
+        result["note"] = ("AI mode is off and this is a proxied (not imported) entry, so only "
+                          "the deterministic layer ran — enable AI mode for the full arsenal.")
+    return result
+
+
 async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -144,43 +192,80 @@ async def _run_scan(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     agents_ran = (entry.source == "imported" or bool(getattr(store, "ai_mode", False))
                   or bool(entry.ai_queued))
 
-    # Register the completion event BEFORE enqueuing so a fast finish() can't fire
-    # before we're waiting on it.
-    scan_queue_state.completion_event(entry.id)
-    scan_queue_state.enqueue(entry.id, entry.method, entry.url, entry.host)
-    try:
-        await scan_queue.put(entry.id)
-    except Exception as exc:
-        return {"ok": False, "error": f"could not enqueue scan: {str(exc)[:200]}", "url": entry.url}
-
     logger.info("run_scan tool: scanning endpoint", url=entry.url,
                 method=entry.method, entry_id=entry.id, agents_ran=agents_ran)
-    completed = await scan_queue_state.await_entry(entry.id, _SCAN_TIMEOUT_SECONDS)
+    result = await _enqueue_and_wait(store, scan_queue, scan_queue_state, entry, agents_ran)
+    if result.get("ok"):
+        logger.info("run_scan tool: scan complete", url=entry.url,
+                    status=result.get("status"), findings=result.get("findings_count"),
+                    timed_out=result.get("timed_out"))
+    return result
 
-    scanned = store.get_entry(entry.id)
-    raw_findings: List[Dict[str, Any]] = []
-    scan_result = None
-    if scanned is not None:
-        scan_result = scanned.scan_result
-        raw_findings = [f for f in (scanned.findings or []) if f.get("title")]
 
-    findings = [_compact_finding(f) for f in raw_findings[:_MAX_FINDINGS_RETURNED]]
-    result: Dict[str, Any] = {
-        "ok": True,
-        "url": entry.url,
-        "method": entry.method,
-        "entry_id": entry.id,
-        "status": scan_result or ("scanning" if not completed else "safe"),
-        "findings_count": len(raw_findings),
-        "findings": findings,
-        "agents_ran": agents_ran,
-        "timed_out": not completed,
-    }
-    if not agents_ran:
-        result["note"] = ("AI mode is off and this is a proxied (not imported) entry, so only "
-                          "the deterministic layer ran — enable AI mode for the full arsenal.")
-    logger.info("run_scan tool: scan complete", url=entry.url,
-                status=result["status"], findings=len(raw_findings), timed_out=not completed)
+_DISPATCH_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": _SCAN_SCHEMA["properties"]["url"],
+        "method": _SCAN_SCHEMA["properties"]["method"],
+        "entry_id": _SCAN_SCHEMA["properties"]["entry_id"],
+        "attack_types": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The EXACT attack types to run on this endpoint (e.g. ['sqli'] or "
+                           "['idor','business_logic']). Unlike run_scan's additive attack_types, "
+                           "this RESTRICTS the scan to exactly these agents and bypasses the LLM "
+                           "planner — use it to re-test one dimension or to act on a suggested "
+                           "follow-up. Required and non-empty.",
+        },
+    },
+    "required": ["url", "attack_types"],
+}
+
+
+async def _dispatch_agents(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return {"ok": False, "error": "url is required"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+    agents = args.get("attack_types")
+    agents = [str(t).strip() for t in agents if str(t).strip()] if isinstance(agents, list) else []
+    if not agents:
+        return {"ok": False, "error": "attack_types is required and must be a non-empty list", "url": url}
+
+    store = getattr(ctx, "store", None)
+    scan_queue = getattr(ctx, "scan_queue", None)
+    scan_queue_state = getattr(ctx, "scan_queue_state", None)
+    if store is None or scan_queue is None or scan_queue_state is None:
+        return {"ok": False, "error": "dispatch_agents is not available in this context", "url": url}
+
+    method = str(args.get("method", "")).strip()
+    entry_id = str(args.get("entry_id", "")).strip()
+    entry = _resolve_entry(store, url, method, entry_id)
+    if entry is None:
+        return {
+            "ok": False,
+            "error": "no matching request in history to scan — proxy this endpoint with "
+                     "send_request or discover it with crawl first, then dispatch agents on it",
+            "url": url,
+        }
+    if not ctx.is_in_scope(entry.url):
+        return {"ok": False, "error": "resolved entry is out of scope", "url": entry.url}
+
+    # RESTRICT to exactly these agents (bypasses the coordinator's LLM planner); see
+    # CheckTarget.only_attack_types. An unknown type is dropped by the coordinator; if NONE are
+    # registered there, it falls through to the planner (never runs zero agents).
+    entry.only_attack_types = agents
+    entry.ai_queued = True
+    entry.queued_for_scan = True
+    agents_ran = True  # a dispatch always runs the agents (ai_queued), like run_scan
+
+    logger.info("dispatch_agents tool: dispatching", url=entry.url, entry_id=entry.id, agents=agents)
+    result = await _enqueue_and_wait(store, scan_queue, scan_queue_state, entry, agents_ran)
+    if result.get("ok"):
+        result["dispatched"] = agents
+        logger.info("dispatch_agents tool: complete", url=entry.url,
+                    status=result.get("status"), findings=result.get("findings_count"))
     return result
 
 
@@ -296,12 +381,20 @@ async def _scan_surface(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         finding_count = len([f for f in (scanned.findings or []) if f.get("title")])
         if scanned.scan_result == "vulnerable":
             vulnerable += 1
-        results.append({
+        row: Dict[str, Any] = {
             "url": scanned.url,
             "method": scanned.method,
             "status": scanned.scan_result or "scanning",
             "findings_count": finding_count,
-        })
+        }
+        # Surface the re-plan signals per endpoint (compact — the bulky observation list is
+        # omitted in the breadth summary; use run_scan/dispatch_agents for the full outcome).
+        _outcome = getattr(scanned, "scan_outcome", None)
+        if isinstance(_outcome, dict):
+            for _k in ("suggested_followups", "blockers", "needs"):
+                if _outcome.get(_k):
+                    row[_k] = _outcome[_k]
+        results.append(row)
 
     remaining = len(candidates) - len(batch)
     summary: Dict[str, Any] = {
@@ -353,5 +446,22 @@ register(Tool(
     ),
     input_schema=_SCAN_SCHEMA,
     handler=_run_scan,
+    tags=["active"],
+))
+
+register(Tool(
+    name="dispatch_agents",
+    description=(
+        "Run an EXACT set of vulnerability agents against ONE already-observed endpoint, "
+        "bypassing the LLM planner's own agent selection. Same pipeline as run_scan (parallel "
+        "VulnAgents + Red-Team Validator) but you choose precisely which agents run.\n"
+        "Use this when you want to re-test a single dimension (e.g. ['sqli']) or act on a "
+        "suggested_followup from a prior scan's result — instead of run_scan, which lets the "
+        "planner decide and only ADDS your attack_types. The endpoint must already be in history. "
+        "Blocks until the scan finishes; returns the findings plus the structured outcome "
+        "(observations / suggested_followups / blockers / needs)."
+    ),
+    input_schema=_DISPATCH_SCHEMA,
+    handler=_dispatch_agents,
     tags=["active"],
 ))

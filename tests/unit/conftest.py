@@ -84,7 +84,8 @@ _PLACEHOLDER_SUBAPP_MAP = {
     "sub_apps": [
         {"prefix": "/alpha", "app": "alpha", "jwt_field": "alphaJwt", "probe": "/alpha/graphql"},
         {"prefix": "/beta", "app": "beta", "jwt_field": "betaJwt", "probe": "/beta/graphql",
-         "prime": {"endpoint": "/beta/session", "method": "GET", "cookie": "_beta_session"}},
+         "prime": {"endpoint": "/beta/session", "method": "GET", "cookie": "_beta_session",
+                   "nav": "/beta/home"}},
         {"app": "gamma", "jwt_field": "gammaJwt"},
     ]
 }

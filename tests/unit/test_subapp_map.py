@@ -63,23 +63,42 @@ def test_prime_descriptor_parses_and_defaults_method(tmp_path, monkeypatch):
     }))
     assert subapp_map.prime_for_app("withprime") == {
         "endpoint": "/wp/session", "method": "GET",   # method defaults to GET
-        "cookie": "_wp_session", "referer": "/wp/area",
+        "cookie": "_wp_session", "referer": "/wp/area", "nav": "",
     }
     assert subapp_map.prime_for_app("noprime") is None
     assert subapp_map.prime_for_app("absent") is None
 
 
-def test_prime_descriptor_requires_endpoint_and_cookie(tmp_path, monkeypatch):
+def test_prime_descriptor_browser_nav_mode(tmp_path, monkeypatch):
     _use_config(tmp_path, monkeypatch, json.dumps({
         "sub_apps": [
-            {"app": "a", "jwt_field": "aJwt", "prime": {"endpoint": "/a/session"}},   # no cookie
-            {"app": "b", "jwt_field": "bJwt", "prime": {"cookie": "_b"}},              # no endpoint
-            {"app": "c", "jwt_field": "cJwt", "prime": "not-a-dict"},                  # wrong type
+            {"app": "navonly", "jwt_field": "nJwt", "prime": {"nav": "/app/area"}},
+            {"app": "both", "jwt_field": "bJwt",
+             "prime": {"nav": "/app/area", "endpoint": "/b/session", "cookie": "_b_session"}},
         ]
     }))
-    assert subapp_map.prime_for_app("a") is None
-    assert subapp_map.prime_for_app("b") is None
-    assert subapp_map.prime_for_app("c") is None
+    # nav-only is valid (browser-activation mode); cookie fields blank.
+    assert subapp_map.prime_for_app("navonly") == {
+        "endpoint": "", "method": "", "cookie": "", "referer": "", "nav": "/app/area",
+    }
+    # both modes declared together.
+    assert subapp_map.prime_for_app("both") == {
+        "endpoint": "/b/session", "method": "GET", "cookie": "_b_session",
+        "referer": "", "nav": "/app/area",
+    }
+
+
+def test_prime_descriptor_requires_a_mode(tmp_path, monkeypatch):
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"app": "a", "jwt_field": "aJwt", "prime": {"endpoint": "/a/session"}},   # cookie-mode incomplete, no nav
+            {"app": "b", "jwt_field": "bJwt", "prime": {"cookie": "_b"}},              # cookie-mode incomplete, no nav
+            {"app": "c", "jwt_field": "cJwt", "prime": "not-a-dict"},                  # wrong type
+            {"app": "d", "jwt_field": "dJwt", "prime": {}},                            # empty
+        ]
+    }))
+    for a in ("a", "b", "c", "d"):
+        assert subapp_map.prime_for_app(a) is None
 
 
 def test_malformed_config_never_raises(tmp_path, monkeypatch):

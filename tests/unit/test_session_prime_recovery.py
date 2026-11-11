@@ -1,9 +1,9 @@
-"""Tests for CopilotSession._maybe_prime_subapp — the inline prime-on-auth-fail recovery.
+"""Tests for CopilotSession._maybe_prime_subapp — the inline prime-on-auth-fail recovery LADDER.
 
-When a send_request to a primeable sub-app (one with a `prime` descriptor in the local sub-app
-map) fails with not_authorized/403 because the session COOKIE is missing, the engine mints it once
-via prime_session and re-runs the request. Uses the placeholder map from conftest where 'beta' is
-primeable (prefix /beta, cookie _beta_session) and 'alpha' is not.
+When a send_request to a primeable sub-app fails not_authorized/403, the engine tries both login
+mechanisms with fallback: (1) cookie prime via prime_session + retry; (2) if still failing, browser
+activation (browser_navigate the nav URL) + retry. Uses the conftest placeholder map where 'beta'
+(prefix /beta) declares BOTH modes and 'alpha' declares no prime.
 """
 
 from __future__ import annotations
@@ -14,108 +14,130 @@ import pytest
 
 from dast.ai.copilot.session import CopilotSession
 
+_AUTHFAIL = {"status": 200, "body": '{"error":{"message":"not_authorized"},"data":null}'}
+_OK = {"status": 200, "body": '{"data":{"__typename":"Queries"}}'}
+
 
 def _session():
     s = CopilotSession("s-prime", focus_hosts=["app.example.com"])
-    # isolate: _apply_session_auth would touch a real store; stub it to a no-op.
-    s._apply_session_auth = lambda ctx, args: None
+    s._apply_session_auth = lambda ctx, args: None   # isolate from the real store
     return s
 
 
-def _run_tool(calls, *, prime_ok=True, rerun_status=200):
+def _ctx(browser=True):
+    return SimpleNamespace(browser=object()) if browser else SimpleNamespace()
+
+
+def _run_tool(calls, *, prime_ok=True, send_results=None):
+    """Fake run_tool. send_results feeds successive send_request retries (in order)."""
+    sr = iter(send_results or [])
+
     async def rt(ctx, name, args):
         calls.append((name, dict(args)))
         if name == "prime_session":
             return {"ok": prime_ok, "verified": prime_ok, "primed": prime_ok,
-                    "app": args.get("app"), "cookie": "_beta_session"}
-        return {"ok": True, "status": rerun_status, "body": "{}"}
+                    "cookie": "_beta_session"}
+        if name == "browser_navigate":
+            return {"ok": True, "status": 200}
+        if name == "send_request":
+            try:
+                return next(sr)
+            except StopIteration:
+                return dict(_OK)
+        return {"ok": True}
     return rt
 
 
-_FAIL = {"status": 403, "body": '{"error":"not_authorized"}', "final_url": ""}
+_ARGS = {"url": "https://app.example.com/beta/graphql", "method": "POST"}
 
 
 @pytest.mark.asyncio
-async def test_primes_then_reruns_on_subapp_auth_fail():
+async def test_cookie_prime_authenticates_first():
     s = _session()
     calls = []
-    args = {"url": "https://app.example.com/beta/graphql", "method": "POST"}
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                      _run_tool(calls, rerun_status=200))
-    assert out is not None and out["status"] == 200
+    out = await s._maybe_prime_subapp(_ctx(), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_OK]))
+    assert out is not None and out["body"] == _OK["body"]
+    # cookie mechanism authenticated -> no browser activation attempted
     assert [c[0] for c in calls] == ["prime_session", "send_request"]
-    assert calls[0][1] == {"host": "app.example.com", "app": "beta"}
-    assert ("app.example.com", "beta") in s._primed_subapps
 
 
 @pytest.mark.asyncio
-async def test_triggers_on_200_not_authorized_body():
+async def test_falls_back_to_browser_activation_when_cookie_fails():
     s = _session()
     calls = []
-    result = {"status": 200, "body": '{"error":"not_authorized"}'}
-    args = {"url": "https://app.example.com/beta/graphql"}
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, result,
-                                      _run_tool(calls))
-    assert out is not None and calls[0][0] == "prime_session"
+    # cookie retry still not_authorized -> nav -> retry OK
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_AUTHFAIL, _OK]))
+    assert out is not None and out["body"] == _OK["body"]
+    assert [c[0] for c in calls] == ["prime_session", "send_request", "browser_navigate", "send_request"]
+    # browser_navigate went to the sub-app's activation URL
+    nav_call = [c for c in calls if c[0] == "browser_navigate"][0]
+    assert nav_call[1]["url"] == "https://app.example.com/beta/home"
+
+
+@pytest.mark.asyncio
+async def test_browser_activation_only_when_no_cookie_mode(monkeypatch):
+    # A sub-app whose prime declares ONLY nav (no endpoint/cookie): skip prime_session, go to nav.
+    from dast.session import subapp_map
+    monkeypatch.setattr(subapp_map, "prime_for_app",
+                        lambda app: {"endpoint": "", "method": "", "cookie": "", "referer": "",
+                                     "nav": "/beta/home"} if app == "beta" else None)
+    s = _session()
+    calls = []
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_OK]))
+    assert out is not None and out["body"] == _OK["body"]
+    assert [c[0] for c in calls] == ["browser_navigate", "send_request"]   # no prime_session
+
+
+@pytest.mark.asyncio
+async def test_no_browser_means_only_cookie_mechanism():
+    s = _session()
+    calls = []
+    # cookie retry fails and there is no browser -> return the failing retry, no nav
+    out = await s._maybe_prime_subapp(_ctx(browser=False), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_AUTHFAIL]))
+    assert out is not None and "not_authorized" in out["body"]
+    assert [c[0] for c in calls] == ["prime_session", "send_request"]       # no browser_navigate
+
+
+@pytest.mark.asyncio
+async def test_both_mechanisms_fail_returns_latest_failure():
+    s = _session()
+    calls = []
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_AUTHFAIL, _AUTHFAIL]))
+    assert out is not None and "not_authorized" in out["body"]
+    assert [c[0] for c in calls] == ["prime_session", "send_request", "browser_navigate", "send_request"]
 
 
 @pytest.mark.asyncio
 async def test_noop_when_not_auth_fail():
     s = _session()
     calls = []
-    result = {"status": 200, "body": '{"data":{}}'}
-    args = {"url": "https://app.example.com/beta/graphql"}
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, result,
+    out = await s._maybe_prime_subapp(_ctx(), "send_request", dict(_ARGS), dict(_OK),
                                       _run_tool(calls))
     assert out is None and calls == []
 
 
 @pytest.mark.asyncio
-async def test_noop_when_path_not_a_primeable_subapp():
+async def test_noop_when_path_not_primeable():
     s = _session()
     calls = []
-    # /alpha is a sub-app but has NO prime descriptor; /other is not a sub-app at all.
     for path in ("/alpha/graphql", "/other/thing"):
         args = {"url": f"https://app.example.com{path}"}
-        out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                          _run_tool(calls))
+        out = await s._maybe_prime_subapp(_ctx(), "send_request", args, _AUTHFAIL, _run_tool(calls))
         assert out is None
     assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_primes_even_when_cookie_name_already_present():
-    # A session cookie name present does NOT mean authenticated (anon sessions set it too);
-    # a not_authorized response must still trigger priming.
+async def test_bounded_to_one_ladder_per_host_app():
     s = _session()
-    s._session_cookies["_beta_session"] = "ANON"
-    calls = []
-    args = {"url": "https://app.example.com/beta/graphql"}
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                      _run_tool(calls, rerun_status=200))
-    assert out is not None and out["status"] == 200
-    assert [c[0] for c in calls] == ["prime_session", "send_request"]
-
-
-@pytest.mark.asyncio
-async def test_no_rerun_when_prime_fails():
-    s = _session()
-    calls = []
-    args = {"url": "https://app.example.com/beta/graphql"}
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                      _run_tool(calls, prime_ok=False))
-    assert out is None
-    assert [c[0] for c in calls] == ["prime_session"]      # tried once, did NOT re-run
-
-
-@pytest.mark.asyncio
-async def test_bounded_to_one_attempt_per_host_app():
-    s = _session()
-    args = {"url": "https://app.example.com/beta/graphql"}
-    calls1 = []
-    await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                _run_tool(calls1, prime_ok=False))
+    await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                _run_tool([], send_results=[_AUTHFAIL, _AUTHFAIL]))
     calls2 = []
-    out = await s._maybe_prime_subapp(SimpleNamespace(), "send_request", args, _FAIL,
-                                      _run_tool(calls2))
-    assert out is None and calls2 == []                    # second time: no prime attempt
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls2, send_results=[_OK]))
+    assert out is None and calls2 == []       # second time: ladder already spent for (host, app)

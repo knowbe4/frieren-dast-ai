@@ -1657,19 +1657,27 @@ class CopilotSession:
     async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
                                   tool_args: Dict[str, Any], result: Dict[str, Any],
                                   run_tool: Any) -> Optional[Dict[str, Any]]:
-        """Recover a send_request that failed because a sub-app's SESSION COOKIE is missing.
+        """Recover a send_request that failed not_authorized/403 on a sub-app because its session
+        was not established — trying BOTH known login mechanisms, falling back one to the other
+        (different sub-apps authenticate differently):
 
-        Some sub-apps gate on a session cookie (minted by an authenticated GET to a priming
-        endpoint), not only the per-app Bearer, so the request comes back not_authorized/403
-        even with a valid Bearer. When the failing path maps to a sub-app that declares a
-        ``prime`` descriptor (local sub-app map) and the jar lacks that cookie, mint it once
-        via the ``prime_session`` tool (through the proxy) and re-run the request once. Bounded
-        to one attempt per (host, app). Returns the retried result, or None when no action was
-        taken. Never raises."""
+        1. COOKIE prime: mint the sub-app's session cookie via ``prime_session`` (authenticated GET
+           to the prime endpoint through the proxy), re-apply auth, retry.
+        2. BROWSER activation: ``browser_navigate`` the sub-app's activation URL so the SPA mints
+           its working service Bearer (captured from history), then retry — the per-service bearer
+           selection attaches the captured token. (Needs a live browser.)
+
+        The sub-app's ``prime`` descriptor (local sub-app map) declares either or both modes. Each
+        retry's result is re-checked; the first that authenticates wins. Bounded to one full ladder
+        per (host, app) so a genuine denial cannot loop. Returns the freshest retried result, or
+        None when no recovery was attempted. Never raises."""
+        def _authfail(res: Dict[str, Any]) -> bool:
+            st = res.get("status")
+            b = str(res.get("body", "") or "")[:2000].lower()
+            return st == 403 or "not_authorized" in b or "not authorized" in b
+
         try:
-            status = result.get("status")
-            body = str(result.get("body", "") or "")[:2000].lower()
-            if not (status == 403 or "not_authorized" in body or "not authorized" in body):
+            if not _authfail(result):
                 return None
             request_url = str(tool_args.get("url") or result.get("final_url") or "")
             parsed = urlparse(request_url)
@@ -1684,19 +1692,34 @@ class CopilotSession:
             prime = subapp_map.prime_for_app(app)
             if not prime:
                 return None
-            # NB: do NOT skip when the session-cookie name is already present — cookie-store
-            # frameworks set it for ANONYMOUS sessions too, so the not_authorized means the
-            # existing session is unauthenticated; priming (Bearer -> prime endpoint) upgrades it.
-            # The per-(host, app) guard below is what prevents a loop.
             key = (host, app)
             if key in self._primed_subapps:
                 return None
             self._primed_subapps.add(key)
-            pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
-            if not (isinstance(pr, dict) and pr.get("ok") and pr.get("verified")):
-                return None
-            self._apply_session_auth(tool_ctx, tool_args)
-            return await run_tool(tool_ctx, tool_name, tool_args)
+
+            current = result
+            acted = False
+            # Mechanism 1 — cookie prime (when the descriptor declares endpoint+cookie).
+            if prime.get("endpoint") and prime.get("cookie"):
+                pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
+                if isinstance(pr, dict) and pr.get("ok") and pr.get("verified"):
+                    self._apply_session_auth(tool_ctx, tool_args)
+                    current = await run_tool(tool_ctx, tool_name, tool_args)
+                    acted = True
+                    if not _authfail(current):
+                        return current
+            # Mechanism 2 — browser activation (when the descriptor declares a nav URL and a live
+            # browser exists). Open the activation page so the SPA mints the sub-app's working
+            # Bearer; the retry then rides the captured per-service token.
+            nav = prime.get("nav")
+            if nav and getattr(tool_ctx, "browser", None) is not None and _authfail(current):
+                nav_url = nav if "://" in nav else f"https://{host}{nav if nav.startswith('/') else '/' + nav}"
+                await run_tool(tool_ctx, "browser_navigate", {"url": nav_url})
+                self._apply_session_auth(tool_ctx, tool_args)
+                current = await run_tool(tool_ctx, tool_name, tool_args)
+                acted = True
+            # Return the freshest retried result (even if still failing); None if nothing ran.
+            return current if acted else None
         except Exception as exc:  # noqa: BLE001
             logger.debug("session-prime recovery failed", error=str(exc)[:160])
             return None

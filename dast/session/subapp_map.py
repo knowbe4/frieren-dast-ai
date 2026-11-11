@@ -54,19 +54,30 @@ def _reset_cache() -> None:
 
 
 def _parse_prime(raw: Any) -> Optional[Dict[str, str]]:
-    """Normalize an optional per-app session-prime descriptor. Requires both ``endpoint`` and
-    ``cookie``; ``method`` defaults to GET; ``referer`` is optional. Any other shape yields None."""
+    """Normalize an optional per-app session-prime descriptor. Two independent, combinable modes
+    (different login systems authenticate differently, so a descriptor may declare either or both;
+    the recovery tries one then falls back to the other):
+
+    - COOKIE mode (``endpoint`` + ``cookie``, ``method`` default GET, optional ``referer``): mint a
+      session cookie by an authenticated GET to the prime endpoint (via ``prime_session``).
+    - BROWSER-ACTIVATION mode (``nav``): a URL/path to open in the live browser so the SPA mints
+      the sub-app's working service Bearer (then captured from history by per-service selection).
+
+    Returns the normalized dict, or None when neither mode is validly declared."""
     if not isinstance(raw, dict):
         return None
     endpoint = str(raw.get("endpoint", "")).strip()
     cookie = str(raw.get("cookie", "")).strip()
-    if not endpoint or not cookie:
+    nav = str(raw.get("nav", "")).strip()
+    cookie_mode = bool(endpoint and cookie)
+    if not cookie_mode and not nav:
         return None
     return {
-        "endpoint": endpoint,
-        "method": (str(raw.get("method", "")).strip().upper() or "GET"),
-        "cookie": cookie,
-        "referer": str(raw.get("referer", "")).strip(),
+        "endpoint": endpoint if cookie_mode else "",
+        "method": (str(raw.get("method", "")).strip().upper() or "GET") if cookie_mode else "",
+        "cookie": cookie if cookie_mode else "",
+        "referer": str(raw.get("referer", "")).strip() if cookie_mode else "",
+        "nav": nav,
     }
 
 

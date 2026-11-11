@@ -890,21 +890,21 @@ class _HostStatusEntry:
 
 
 def test_scope_entries_filters_by_host_exact_and_subdomain():
-    es = [_HostStatusEntry("training.knowbe4.com", 200),
-          _HostStatusEntry("api.training.knowbe4.com", 403),
-          _HostStatusEntry("other.knowbe4.com", 200)]
-    scoped = CopilotService._scope_entries(es, {"training.knowbe4.com"})
+    es = [_HostStatusEntry("app.example.com", 200),
+          _HostStatusEntry("api.app.example.com", 403),
+          _HostStatusEntry("other.example.com", 200)]
+    scoped = CopilotService._scope_entries(es, {"app.example.com"})
     hosts = {e.host for e in scoped}
-    assert hosts == {"training.knowbe4.com", "api.training.knowbe4.com"}  # subdomain in, sibling out
+    assert hosts == {"app.example.com", "api.app.example.com"}  # subdomain in, sibling out
     assert CopilotService._scope_entries(es, None) == es                   # no filter = all
 
 
 def test_response_counts_scoped_to_focus_hosts():
-    es = [_HostStatusEntry("training.knowbe4.com", 200),
-          _HostStatusEntry("training.knowbe4.com", 403),
+    es = [_HostStatusEntry("app.example.com", 200),
+          _HostStatusEntry("app.example.com", 403),
           _HostStatusEntry("noise.example.com", 200)]
     service = CopilotService(_FakeCtx(_DimStore(es)))
-    total, ok = service._response_counts({"training.knowbe4.com"})
+    total, ok = service._response_counts({"app.example.com"})
     assert (total, ok) == (2, 1)                 # the noise host is excluded
 
 

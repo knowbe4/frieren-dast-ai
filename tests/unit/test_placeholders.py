@@ -22,7 +22,7 @@ def test_flagged(value: str) -> None:
 
 
 @pytest.mark.parametrize("value", [
-    "", "1234password1234", "training.knowbe4.com", "kmsat-tenant-a.knowbe4.com",
+    "", "1234password1234", "app.example.com", "tenant-a.example.com",
     "https://app.example.com/graphql", "a < b and c > d",
     '{"query":"<script>alert(1)</script>"}',            # XSS payload, not a placeholder
     '{"q":"<img src=x onerror=alert(1)>"}',             # HTML payload

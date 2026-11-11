@@ -623,6 +623,9 @@ class CopilotSession:
         self._bearer_tokens: Dict[str, Dict[str, Any]] = {}
         self._last_bearer_refresh_ts: float = 0.0
         self._last_reload_ts: float = 0.0
+        # (host, app) pairs already session-primed this run, so a sub-app that stays
+        # not_authorized after priming cannot loop the prime+retry recovery.
+        self._primed_subapps: set[tuple[str, str]] = set()
         self._auth_prompted_hosts: set[str] = set()
         # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
         # fabricated host escalate and trip the failure breaker instead of looping.
@@ -1347,6 +1350,18 @@ class CopilotSession:
                         if fallback is not None:
                             result = fallback
 
+                    # Session-cookie priming: a sub-app that gates on a session COOKIE (not
+                    # just the Bearer) returns not_authorized/403 when the jar lacks it. The
+                    # Bearer refresh/browser fallback above cannot fix that. Mint the cookie
+                    # once through the proxy (prime_session) and re-run — the coordinator's
+                    # in-loop decision to recover, mirroring the blocks above. Bounded to one
+                    # attempt per (host, app) so a genuine denial cannot loop.
+                    if tool_name == "send_request":
+                        primed = await self._maybe_prime_subapp(
+                            tool_ctx, tool_name, tool_args, result, run_tool)
+                        if primed is not None:
+                            result = primed
+
                     if tool_name in ("browser_click", "browser_navigate") and result.get("ok"):
                         new_url = str(result.get("url", ""))
                         if new_url and "/login" not in new_url.lower() and "/sign_in" not in new_url.lower():
@@ -1638,6 +1653,54 @@ class CopilotSession:
             msg = ("STOP inventing hostnames. " + msg +
                    " Continuing to invent hosts will end this turn.")
         return msg
+
+    async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
+                                  tool_args: Dict[str, Any], result: Dict[str, Any],
+                                  run_tool: Any) -> Optional[Dict[str, Any]]:
+        """Recover a send_request that failed because a sub-app's SESSION COOKIE is missing.
+
+        Some sub-apps gate on a session cookie (minted by an authenticated GET to a priming
+        endpoint), not only the per-app Bearer, so the request comes back not_authorized/403
+        even with a valid Bearer. When the failing path maps to a sub-app that declares a
+        ``prime`` descriptor (local sub-app map) and the jar lacks that cookie, mint it once
+        via the ``prime_session`` tool (through the proxy) and re-run the request once. Bounded
+        to one attempt per (host, app). Returns the retried result, or None when no action was
+        taken. Never raises."""
+        try:
+            status = result.get("status")
+            body = str(result.get("body", "") or "")[:2000].lower()
+            if not (status == 403 or "not_authorized" in body or "not authorized" in body):
+                return None
+            request_url = str(tool_args.get("url") or result.get("final_url") or "")
+            parsed = urlparse(request_url)
+            host = parsed.hostname or ""
+            if not host:
+                return None
+            from dast.session import subapp_map
+            from dast.session.auth_provider import subapp_for_path
+            app = subapp_for_path(parsed.path or "/")
+            if not app:
+                return None
+            prime = subapp_map.prime_for_app(app)
+            if not prime:
+                return None
+            cookie = prime.get("cookie") or ""
+            if cookie and (self._session_cookies.get(cookie)
+                           or any(c.get("name") == cookie
+                                  for c in self._scoped_cookies_for_host(host))):
+                return None  # the cookie is present — priming is not the blocker
+            key = (host, app)
+            if key in self._primed_subapps:
+                return None
+            self._primed_subapps.add(key)
+            pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
+            if not (isinstance(pr, dict) and pr.get("ok") and pr.get("verified")):
+                return None
+            self._apply_session_auth(tool_ctx, tool_args)
+            return await run_tool(tool_ctx, tool_name, tool_args)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("session-prime recovery failed", error=str(exc)[:160])
+            return None
 
     def _scoped_cookies_for_host(self, host: str) -> List[dict]:
         """Cookie list for host from the correct jar: this session's isolated named jar

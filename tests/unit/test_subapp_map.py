@@ -53,6 +53,35 @@ def test_entries_without_app_or_jwt_field_are_skipped(tmp_path, monkeypatch):
     assert set(subapp_map.app_map()) == {"ok"}
 
 
+def test_prime_descriptor_parses_and_defaults_method(tmp_path, monkeypatch):
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"app": "withprime", "jwt_field": "wpJwt",
+             "prime": {"endpoint": "/wp/session", "cookie": "_wp_session", "referer": "/wp/area"}},
+            {"app": "noprime", "jwt_field": "npJwt"},
+        ]
+    }))
+    assert subapp_map.prime_for_app("withprime") == {
+        "endpoint": "/wp/session", "method": "GET",   # method defaults to GET
+        "cookie": "_wp_session", "referer": "/wp/area",
+    }
+    assert subapp_map.prime_for_app("noprime") is None
+    assert subapp_map.prime_for_app("absent") is None
+
+
+def test_prime_descriptor_requires_endpoint_and_cookie(tmp_path, monkeypatch):
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"app": "a", "jwt_field": "aJwt", "prime": {"endpoint": "/a/session"}},   # no cookie
+            {"app": "b", "jwt_field": "bJwt", "prime": {"cookie": "_b"}},              # no endpoint
+            {"app": "c", "jwt_field": "cJwt", "prime": "not-a-dict"},                  # wrong type
+        ]
+    }))
+    assert subapp_map.prime_for_app("a") is None
+    assert subapp_map.prime_for_app("b") is None
+    assert subapp_map.prime_for_app("c") is None
+
+
 def test_malformed_config_never_raises(tmp_path, monkeypatch):
     _use_config(tmp_path, monkeypatch, "{ this is : not json ]")
     assert subapp_map.subapp_prefixes() == ()

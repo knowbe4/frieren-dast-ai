@@ -1,8 +1,9 @@
 {
-  "_README": "Copy this to ~/.dast-ai/subapp_map.json and fill in YOUR target's sub-app topology. It maps a request-path prefix to the internal service that serves it, the JWT field that service's Bearer lives under in GET /spa/session (user.attributes.<jwt_field>), and a probe endpoint to prove the token. It is target-specific internal topology, so it is NEVER committed (the repo ships only this generic example). With no local file, sub-app Bearer selection is disabled and Frieren falls back to host-level Bearer selection. 'prefix' and 'probe' are optional.",
+  "_README": "Copy this to ~/.dast-ai/subapp_map.json and fill in YOUR target's sub-app topology. It maps a request-path prefix to the internal service that serves it, the JWT field that service's Bearer lives under in GET /spa/session (user.attributes.<jwt_field>), and a probe endpoint to prove the token. It is target-specific internal topology, so it is NEVER committed (the repo ships only this generic example). With no local file, sub-app Bearer selection is disabled and Frieren falls back to host-level Bearer selection. 'prefix' and 'probe' are optional. 'prime' is an optional session-cookie priming descriptor for services that gate on a session cookie (not just a Bearer): {endpoint, method (default GET), cookie (the session cookie name), referer (optional)} — Frieren does an authenticated GET to 'endpoint' through the proxy to mint 'cookie' before authenticated requests to that sub-app.",
   "sub_apps": [
     {"prefix": "/serviceA", "app": "appA", "jwt_field": "appAJwt", "probe": "/serviceA/graphql"},
-    {"prefix": "/serviceB", "app": "appB", "jwt_field": "appBJwt", "probe": "/serviceB/graphql"},
+    {"prefix": "/serviceB", "app": "appB", "jwt_field": "appBJwt", "probe": "/serviceB/graphql",
+     "prime": {"endpoint": "/serviceB/session", "method": "GET", "cookie": "_serviceB_session"}},
     {"app": "appC", "jwt_field": "appCJwt"}
   ]
 }

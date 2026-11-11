@@ -47,7 +47,7 @@ _SCHEMA: Dict[str, Any] = {
             "type": "string",
             "description": "Dependency-free JSON selector over the full response body. Examples: "
                            "'store_items[].uuid' (every uuid in the array), "
-                           "'user.attributes.ccmJwt' (one nested field), 'items[0].id'. "
+                           "'user.attributes.appJwt' (one nested field), 'items[0].id'. "
                            "'[]' maps over an array; '[n]' indexes it.",
         },
         "regex": {
@@ -247,7 +247,7 @@ register(Tool(
     description=(
         "Read fields out of the FULL body of a response you already captured, when the tool "
         "observation only showed a truncated preview. Give the request url (or an entry_id) plus "
-        "a JSON path like 'store_items[].uuid' (every uuid in the array) or 'user.attributes.ccmJwt' "
+        "a JSON path like 'store_items[].uuid' (every uuid in the array) or 'user.attributes.appJwt' "
         "(one nested field); results are paginated (limit/offset) and capped. Use regex for non-JSON "
         "bodies, or omit both to get a shape summary first. This reads already-captured data — it "
         "sends no new request."

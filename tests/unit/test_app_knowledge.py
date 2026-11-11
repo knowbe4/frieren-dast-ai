@@ -66,18 +66,30 @@ class _FakeResp:
 
 
 class _FakeClient:
-    def __init__(self, get_payload):
+    def __init__(self, get_payload, post_status: int = 200):
         self._get_payload = get_payload
+        self._post_status = post_status
         self.posted = []
+        self.got = []
     async def __aenter__(self):
         return self
     async def __aexit__(self, *a):
         return False
     async def get(self, url, headers=None):
+        self.got.append(url)
         return _FakeResp(self._get_payload)
     async def post(self, url, headers=None, content=None):
         self.posted.append((url, headers))
-        return _FakeResp({}, status=200)
+        return _FakeResp({}, status=self._post_status)
+
+
+class _TokenStore:
+    """Minimal store for scan_history_bearer: one /beta/graphql request carrying a Bearer."""
+    def __init__(self, host, path, token):
+        self._entries = [{"host": host, "path": path, "source": "proxy", "id": "e1",
+                          "request_headers": {"Authorization": f"Bearer {token}"}}]
+    def all_entries(self):
+        return self._entries
 
 
 @pytest.mark.asyncio
@@ -102,6 +114,53 @@ async def test_get_app_token_extracts_decodes_caches_without_leaking(monkeypatch
     assert r["entitlements"]["ai_translations_active"] is True
     assert "token_preview" in r and jwt not in json.dumps(r)        # raw token never echoed
     assert engine._bearer_tokens["app.example.com"]["token"] == jwt  # cached for the engine
+
+
+@pytest.mark.asyncio
+async def test_get_app_token_prefers_captured_history_token(monkeypatch):
+    # When the app's real token was already captured on the service path in proxy history,
+    # prefer it over minting from /spa/session (the field token may be a non-working variant).
+    payload = {"account": {"id": 1}, "exp": 9999999999}   # not expired (history freshness filter)
+    seg = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    captured_jwt = f"h.{seg}.sig"
+
+    import dast.tools.app_knowledge_tools as akt
+    fake = _FakeClient({"user": {"attributes": {}}}, post_status=200)
+    monkeypatch.setattr(akt.httpx, "AsyncClient", lambda **kw: fake)
+
+    engine = SimpleNamespace(_bearer_tokens={}, _session_cookies={})
+    store = _TokenStore("app.example.com", "/beta/graphql", captured_jwt)
+    ctx = SimpleNamespace(is_in_scope=lambda u: True, proxy_url="http://127.0.0.1:8080",
+                          store=store, _session=engine)
+    r = await _get_app_token(ctx, {"host": "app.example.com", "app": "beta"})
+
+    assert r["ok"] is True and r["source"] == "captured" and r["verified"] is True
+    assert fake.got == []                                   # /spa/session NOT fetched
+    assert engine._bearer_tokens["app.example.com"]["by_app"]["beta"]["token"] == captured_jwt
+
+
+@pytest.mark.asyncio
+async def test_get_app_token_does_not_cache_unverified_token(monkeypatch):
+    # A /spa/session field token that fails the probe (403 "could not verify") must NOT be
+    # cached — the engine must never attach a dead Bearer. The claims are still returned.
+    payload = {"account": {"id": 2}, "exp": 999}
+    seg = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    jwt = f"h.{seg}.sig"
+    spa = {"user": {"attributes": {"betaJwt": jwt}}}
+
+    import dast.tools.app_knowledge_tools as akt
+    monkeypatch.setattr(akt.httpx, "AsyncClient", lambda **kw: _FakeClient(spa, post_status=403))
+
+    engine = SimpleNamespace(_bearer_tokens={}, _session_cookies={})
+    ctx = SimpleNamespace(is_in_scope=lambda u: True, proxy_url="http://127.0.0.1:8080",
+                          store=None, _session=engine)
+    r = await _get_app_token(ctx, {"host": "app.example.com", "app": "beta"})
+
+    assert r["ok"] is True and r["source"] == "spa_session"
+    assert r["verified"] is False and r["probe_status"] == 403
+    assert "priming" in r["note"] or "navigation" in r["note"].lower() or "mints" in r["note"]
+    assert engine._bearer_tokens == {}                      # dead token NOT cached
+    assert r["account_id"] == 2                             # claims still surfaced
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 import httpx
 
 from dast.session import subapp_map
+from dast.session.auth_provider import scan_history_bearer
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils.logger import get_logger
@@ -102,43 +103,50 @@ async def _get_app_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
 
     field = app_map[app]["field"]
     probe_path = app_map[app]["probe"]
-    cookie = _cookie_header(ctx, host)
-    try:
-        async with httpx.AsyncClient(proxy=ctx.proxy_url, verify=False,
-                                     follow_redirects=True, timeout=15) as client:
-            resp = await client.get(session_url, headers={
-                "Cookie": cookie, "X-Requested-With": "XMLHttpRequest",
-                "Accept": "application/json",
-            })
-            data = resp.json()
-    except Exception as exc:
-        return {"ok": False, "error": f"could not fetch /spa/session: {str(exc)[:160]}"}
 
-    attrs = ((data.get("user") or {}).get("attributes") or {}) if isinstance(data, dict) else {}
-    token = attrs.get(field) or ((data.get("guest") or {}).get(field) if isinstance(data, dict) else None)
+    # 1. Prefer a token already captured on this service's path in proxy history: that is the
+    #    token the app ITSELF used. Some services mint a distinct, primed token at navigation
+    #    that is NOT the raw user.attributes.<field> value (sending the field token straight to
+    #    the service 403s "could not verify token"). Exclude the copilot's own replays so we
+    #    pick the app's genuine request, not a token this resolver previously primed.
+    token = ""
+    source = ""
+    store = getattr(ctx, "store", None)
+    if store is not None and probe_path:
+        try:
+            captured = scan_history_bearer(store, host, probe_path, exclude_source="copilot")
+        except Exception as exc:
+            logger.debug("app token history lookup failed", host=host, error=str(exc)[:160])
+            captured = None
+        if captured and captured.get("token"):
+            token = str(captured["token"])
+            source = "captured"
+
+    # 2. Fall back to minting from GET /spa/session (user.attributes.<field>).
     if not token:
-        available = sorted(k for k in attrs if k.endswith("Jwt"))
-        return {"ok": False, "error": f"no user.attributes.{field} in /spa/session",
-                "available_tokens": available, "host": host}
+        cookie = _cookie_header(ctx, host)
+        try:
+            async with httpx.AsyncClient(proxy=ctx.proxy_url, verify=False,
+                                         follow_redirects=True, timeout=15) as client:
+                resp = await client.get(session_url, headers={
+                    "Cookie": cookie, "X-Requested-With": "XMLHttpRequest",
+                    "Accept": "application/json",
+                })
+                data = resp.json()
+        except Exception as exc:
+            return {"ok": False, "error": f"could not fetch /spa/session: {str(exc)[:160]}"}
+        attrs = ((data.get("user") or {}).get("attributes") or {}) if isinstance(data, dict) else {}
+        token = attrs.get(field) or ((data.get("guest") or {}).get(field) if isinstance(data, dict) else None)
+        if not token:
+            available = sorted(k for k in attrs if k.endswith("Jwt"))
+            return {"ok": False, "error": f"no user.attributes.{field} in /spa/session",
+                    "available_tokens": available, "host": host}
+        source = "spa_session"
 
     claims = _decode_jwt_account(token)
 
-    # Cache onto the engine so the inline bearer-refresh path can use it. Index under
-    # the sub-app (by_app) so two sub-apps that share one host do not overwrite
-    # each other; _apply_session_auth selects the right one by request path.
-    sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
-    cache = getattr(sess, "_bearer_tokens", None)
-    if isinstance(cache, dict):
-        record = {"token": token, "source_entry_id": "app_token_resolver",
-                  "auth_endpoint": probe_path or None, "exp": claims.get("exp")}
-        existing = cache.get(host)
-        by_app = dict(existing.get("by_app", {})) if isinstance(existing, dict) else {}
-        by_app[app] = dict(record)
-        record["by_app"] = by_app
-        cache[host] = record
-
-    # Prime: one authed probe so the token lands in proxy history → the engine's
-    # _apply_session_auth borrows the Authorization header on later copilot calls.
+    # 3. Prove the token against the service's probe endpoint. A captured token already worked
+    #    for the app; a freshly-minted /spa/session token may need priming and can fail here.
     probe_status: Optional[int] = None
     if probe_path:
         try:
@@ -151,16 +159,40 @@ async def _get_app_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
                 probe_status = pr.status_code
         except Exception as exc:
             logger.debug("app token prime probe failed", host=host, error=str(exc)[:160])
+    verified = probe_status is None or 200 <= probe_status < 300
 
+    # 4. Cache ONLY a verified (or un-probeable) token, indexed per sub-app in by_app so two
+    #    sub-apps sharing one host do not overwrite each other. Never cache a token that failed
+    #    the probe — the engine must not attach a dead Bearer that would 401/403 the request.
+    if verified:
+        sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+        cache = getattr(sess, "_bearer_tokens", None)
+        if isinstance(cache, dict):
+            record = {"token": token, "source_entry_id": f"app_token_resolver:{source}",
+                      "auth_endpoint": probe_path or None, "exp": claims.get("exp")}
+            existing = cache.get(host)
+            by_app = dict(existing.get("by_app", {})) if isinstance(existing, dict) else {}
+            by_app[app] = dict(record)
+            record["by_app"] = by_app
+            cache[host] = record
+
+    note = (
+        "token cached + ready; subsequent same-host requests carry it. "
+        "Check entitlements before testing flag-gated findings."
+        if verified else
+        "the /spa/session token did NOT verify on the probe (this service likely mints its "
+        "real token on navigation) — browse the service's area so the app issues its token, "
+        "then retry; it will be picked up from history. Not cached."
+    )
     return {
-        "ok": True, "app": app, "host": host,
+        "ok": True, "app": app, "host": host, "source": source,
+        "verified": verified,
         "account_id": claims.get("account_id"),
         "entitlements": claims.get("entitlements", {}),
         "token_preview": token[:12] + "...",
         "probe_endpoint": probe_path or None,
         "probe_status": probe_status,
-        "note": ("token cached + primed; subsequent same-host requests carry it. "
-                 "Check entitlements before testing flag-gated findings."),
+        "note": note,
     }
 
 

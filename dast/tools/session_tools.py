@@ -234,6 +234,63 @@ async def _activate_via_http(ctx: ToolContext, slug: str) -> Dict[str, Any]:
             "cookies_imported": data.get("cookies_imported", 0)}
 
 
+async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile: Any) -> Dict[str, Any]:
+    """Log a credential-only profile in LIVE (no captured session) via the shared adaptive_login
+    cascade, then persist the session so later requests run authenticated. Mirrors the autonomous
+    run's `_ensure_profile_login`. The model never receives the password. Never raises."""
+    creds = getattr(profile, "credentials", None) or []
+    cred = creds[0] if creds else None
+    auth_url = (getattr(profile, "auth_url", "") or "").strip()
+    browser = getattr(ctx, "browser", None)
+    engine = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+    if browser is None or cred is None or not getattr(cred, "username", "") \
+            or not getattr(cred, "secret", "") or not auth_url:
+        return {"ok": False, "error": (
+            f"profile '{profile.slug}' has no captured session and cannot be logged in automatically "
+            "(needs a browser + a username/secret + auth_url on the profile). Capture a session first.")}
+    try:
+        from dast.browser.login_cascade import adaptive_login
+        result = await adaptive_login(
+            browser, auth_url, cred.username, cred.secret,
+            in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine)
+    except Exception as exc:
+        return {"ok": False, "error": f"login error for profile '{profile.slug}': {str(exc)[:160]}"}
+    if not getattr(result, "ok", False):
+        return {"ok": False, "error": (
+            f"login failed for profile '{profile.slug}': {getattr(result, 'error', '') or 'unknown'}")}
+    # Persist the freshly-logged-in session: named-session jar + global jar, and seed the engine so
+    # the inline 401/expiry auto-relogin keeps working. Best-effort; a persist failure is logged, not fatal.
+    imported = 0
+    try:
+        full = await browser.export_cookies_full()
+    except Exception:
+        full = []
+    try:
+        if full:
+            store.save_named_session_from_playwright(
+                name=profile.slug, role=profile.name, playwright_cookies=full, auth_headers={})
+            imported = store.import_playwright_cookies(full)
+    except Exception as exc:
+        logger.warning("activate_login_profile: session persist failed", slug=profile.slug,
+                       error=str(exc)[:160])
+    try:
+        if engine is not None:
+            simple = {c["name"]: c.get("value", "") for c in full if c.get("name")}
+            sc = getattr(engine, "_session_cookies", None)
+            if simple and isinstance(sc, dict):
+                sc.update(simple)
+            engine._last_login = {"url": auth_url, "email": cred.username, "password": cred.secret}
+            if hasattr(engine, "session_name"):
+                engine.session_name = profile.slug
+    except Exception as exc:
+        logger.warning("activate_login_profile: engine seed failed", slug=profile.slug, error=str(exc)[:160])
+    logger.info("activate_login_profile: logged in from credentials", slug=profile.slug,
+                cookies_imported=imported)
+    return {"ok": True, "slug": profile.slug, "named_session": profile.slug, "logged_in": True,
+            "privilege_level": getattr(profile, "privilege_level", "") or "",
+            "cookies_imported": imported}
+
+
 async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     slug = str(args.get("slug") or args.get("profile", "")).strip()
     if not slug:
@@ -251,7 +308,10 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
     state = getattr(profile, "saved_session", None) or {}
     cookies = state.get("cookies") or []
     if not cookies:
-        return {"ok": False, "error": f"profile '{slug}' has no captured session; capture it first"}
+        # No captured session: log the profile in LIVE from its stored credentials (the same cascade
+        # the autonomous run uses), instead of erroring — so the copilot can authenticate a
+        # credential-only profile by slug alone, with no password and no pre-capture.
+        return await _login_profile_with_credentials(ctx, store, profile)
     try:
         store.save_named_session_from_playwright(
             name=profile.slug, role=profile.name,
@@ -281,5 +341,7 @@ register(Tool(
 register(Tool(
     name="activate_login_profile", input_schema=_ACTIVATE_SCHEMA, handler=_activate_login_profile,
     tags=["session", "active"],
-    description="Load a saved login profile (by slug, from list_login_profiles) into a named session and the "
-                "live cookie jar so subsequent scans/requests run authenticated as that profile."))
+    description="Authenticate as a login profile (by slug, from list_login_profiles): activates its "
+                "captured session if it has one, otherwise LOGS IN LIVE from the profile's stored "
+                "credentials (you never see the password) and saves the session. After it returns ok, "
+                "subsequent scans/requests run authenticated as that profile."))

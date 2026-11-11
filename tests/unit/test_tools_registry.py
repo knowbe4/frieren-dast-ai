@@ -13,6 +13,8 @@ Covers the Phase-4 invariants:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
@@ -1933,6 +1935,85 @@ async def test_activate_login_profile_http_fallback_missing(monkeypatch):
     ctx = ToolContext(settings=_Scope(True))  # store=None
     result = await run_tool(ctx, "activate_login_profile", {"slug": "nope"})
     assert result["ok"] is False and "no login profile" in result["error"]
+
+
+class _CredProfile:
+    def __init__(self, saved_session=None):
+        self.slug = "tenant_a"
+        self.name = "Tenant A"
+        self.auth_url = "https://app.example.com/login"
+        self.privilege_level = "tenant_a"
+        self.saved_session = saved_session
+        self.credentials = [SimpleNamespace(username="u@example.com", secret="pw")]
+
+
+class _LoginStore:
+    def __init__(self):
+        self.saved = []
+        self.imported = []
+    def save_named_session_from_playwright(self, **kw):
+        self.saved.append(kw)
+    def import_playwright_cookies(self, cookies):
+        self.imported.append(cookies)
+        return len(cookies)
+
+
+class _LoginBrowser:
+    async def export_cookies_full(self):
+        return [{"name": "sess", "value": "abc", "domain": "app.example.com"}]
+
+
+def _login_ctx(store, with_browser=True):
+    engine = SimpleNamespace(_session_cookies={}, session_name=None, _last_login=None)
+    return SimpleNamespace(store=store, settings=_Scope(True),
+                           browser=_LoginBrowser() if with_browser else None,
+                           _session=engine, is_in_scope=lambda u: True)
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_logs_in_from_credentials(monkeypatch):
+    # Credential-only profile (no captured session): the tool logs in live and persists the session.
+    import dast.profiles.store as pstore
+    import dast.browser.login_cascade as cascade
+    from dast.tools.session_tools import _activate_login_profile
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: _CredProfile(saved_session={}))
+
+    async def _fake_login(browser, url, email, password, **kw):
+        return SimpleNamespace(ok=True, engine="form", url=url, error="")
+    monkeypatch.setattr(cascade, "adaptive_login", _fake_login)
+
+    store = _LoginStore()
+    ctx = _login_ctx(store)
+    result = await _activate_login_profile(ctx, {"slug": "tenant_a"})
+    assert result["ok"] is True and result["logged_in"] is True
+    assert result["cookies_imported"] == 1
+    assert store.saved and store.imported            # session persisted
+    assert ctx._session._last_login["email"] == "u@example.com"   # relogin creds seeded
+    assert ctx._session.session_name == "tenant_a"
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_credential_login_failure(monkeypatch):
+    import dast.profiles.store as pstore
+    import dast.browser.login_cascade as cascade
+    from dast.tools.session_tools import _activate_login_profile
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: _CredProfile(saved_session={}))
+
+    async def _fake_login(browser, url, email, password, **kw):
+        return SimpleNamespace(ok=False, engine="form", url=url, error="bad password")
+    monkeypatch.setattr(cascade, "adaptive_login", _fake_login)
+
+    result = await _activate_login_profile(_login_ctx(_LoginStore()), {"slug": "tenant_a"})
+    assert result["ok"] is False and "login failed" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_activate_login_profile_no_browser_errors_cleanly(monkeypatch):
+    import dast.profiles.store as pstore
+    from dast.tools.session_tools import _activate_login_profile
+    monkeypatch.setattr(pstore, "load_profile", lambda slug: _CredProfile(saved_session={}))
+    result = await _activate_login_profile(_login_ctx(_LoginStore(), with_browser=False), {"slug": "tenant_a"})
+    assert result["ok"] is False and "capture a session" in result["error"].lower()
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,7 @@ from dast.tools import code_tools as _code_tools  # noqa: F401
 from dast.tools import copilot_tools as _copilot_tools  # noqa: F401
 from dast.tools import crawl_tools as _crawl_tools  # noqa: F401
 from dast.tools import explore_tools as _explore_tools  # noqa: F401
+from dast.tools import extract_tools as _extract_tools  # noqa: F401
 from dast.tools import graphql_fuzz_tools as _graphql_fuzz_tools  # noqa: F401
 from dast.tools import encoding_tools as _encoding_tools  # noqa: F401
 from dast.tools import findings_tools as _findings_tools  # noqa: F401

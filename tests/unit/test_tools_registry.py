@@ -1108,6 +1108,17 @@ def test_tool_definitions_shape():
 
 # ── copilot_ask (message-passing primitive; exposed over MCP) ────────────────────
 
+def test_extract_response_registered():
+    tool = tools.get_tool("extract_response")
+    assert tool is not None
+    assert tool.input_schema.get("type") == "object"
+    props = tool.input_schema.get("properties", {})
+    assert {"url", "entry_id", "path", "regex"} <= set(props)
+    # Not read-only-blocked: it reads already-captured data, sends no request.
+    from dast.utils.read_only import BLOCKED_TOOLS
+    assert "extract_response" not in BLOCKED_TOOLS
+
+
 def test_copilot_ask_registered_and_tagged():
     tool = tools.get_tool("copilot_ask")
     assert tool is not None

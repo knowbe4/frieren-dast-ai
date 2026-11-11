@@ -121,7 +121,7 @@ _OBSERVATION_BODY_CHARS = 900
 # small, decisive signals lead so truncation only ever eats the trailing body.
 _OBSERVATION_PRIORITY_FIELDS = (
     "ok", "status", "length", "final_url", "reflections",
-    "error", "safe_variant", "hint",
+    "error", "safe_variant", "body_truncated", "hint",
 )
 
 
@@ -163,6 +163,18 @@ def _summarize_result(result: Any) -> str:
             ordered[key] = value
     body = result.get("body")
     if isinstance(body, str):
+        # When the body is trimmed, tell the model the full size and how to read it in full — the
+        # whole body is captured in the store, so extract_response can pull fields/arrays out of it
+        # instead of the model giving up on the truncated preview. These two fields lead the body so
+        # the observation trim never eats them.
+        if len(body) > _OBSERVATION_BODY_CHARS:
+            target_url = result.get("final_url") or result.get("url") or ""
+            ordered["body_truncated"] = True
+            ordered["hint"] = (
+                f"body shown is truncated; full response is {len(body)} chars. Call "
+                f"extract_response(url={target_url!r}, path=...) (or regex=...) to read fields or "
+                f"enumerate arrays from the complete captured body."
+            )
         ordered["body"] = body[:_OBSERVATION_BODY_CHARS]
     return json.dumps(ordered, default=str)
 

@@ -12,7 +12,7 @@ Mirrors the per-host local-store pattern of ``dast/session/login_journal.py`` /
 ``dast/app_knowledge/store.py`` (0700 dir + host resolver + parent-domain fallback). No secrets
 are involved (transport names only), but the same defence-in-depth key scrub is applied anyway.
 Keyed by host + sub-app (``auth_provider.subapp_for_path``) + an optional task, because sub-apps
-on one host can differ (modstore vs ccm) and a browser-only quirk of one must not flip the host.
+on one host can differ (two sub-apps) and a browser-only quirk of one must not flip the host.
 """
 
 from __future__ import annotations

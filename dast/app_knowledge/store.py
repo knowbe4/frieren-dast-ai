@@ -57,7 +57,7 @@ def load_for_host(host_or_url: str) -> str:
     """Return the knowledge note for a host, or "" if none.
 
     Tries the exact host first, then each parent domain (longest match wins), so a note filed
-    under ``training.knowbe4.com`` also serves ``api.training.knowbe4.com``."""
+    under ``app.example.com`` also serves ``api.app.example.com``."""
     host = _normalise_host(host_or_url)
     if not host:
         return ""

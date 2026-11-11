@@ -221,7 +221,7 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                              host=_host, error=str(exc))
 
     # Resolve a sub-app Bearer when one is known for this (host, path), so a direct / MCP
-    # caller can reach a Bearer-authed sub-app (modstore/ccm) instead of a 403. Prefer the
+    # caller can reach a Bearer-authed sub-app instead of a 403. Prefer the
     # session's _ensure_fresh_bearer (waits for the live SPA to mint one); the attach() below
     # sets the header and never returns the token to the caller.
     rec: Optional[Dict[str, Any]] = None
@@ -457,7 +457,7 @@ register(Tool(
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
         "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
-        "headers from the jar, and a cached sub-app Bearer (modstore/ccm) selected by request "
+        "headers from the jar, and a cached sub-app Bearer selected by request "
         "path when one is known. If a request still 401/403s after that (e.g. an SPA whose token "
         "lives only in in-memory JS state), it is automatically re-issued via the browser session, "
         "which carries that token — you do not need to switch tools by hand.\n"

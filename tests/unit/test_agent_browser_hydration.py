@@ -1,6 +1,6 @@
 """
-AgentBrowser SPA-hydration wait: a heavy client-rendered app (modstore3 / CCM
-studio) can still be fetching when the first hydration wait fires, so a single
+AgentBrowser SPA-hydration wait: a heavy client-rendered SPA area can still be
+fetching when the first hydration wait fires, so a single
 short wait caught the pre-hydration shell. `_wait_for_hydration` now retries with
 a bounded settle between tries and a longer budget. These tests drive the method
 with a fake Playwright page (no real browser) to assert the retry + best-effort

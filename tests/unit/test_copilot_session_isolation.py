@@ -5,8 +5,8 @@ Covers:
   global jar (cross-session cookie leak);
 - a scoped run never borrows a Bearer from the shared proxy history (cross-session
   token leak — one run's session must never pick up another account's token);
-- the Bearer cache selects the right sub-app token by request path (modstore vs ccm,
-  which share one host) instead of letting one overwrite the other;
+- the Bearer cache selects the right sub-app token by request path (two sub-apps
+  that share one host) instead of letting one overwrite the other;
 - the scope gate returns an escalating denial that names the real focus host, remembers
   a denied host so a repeat does not re-pause the operator, and is counted as a failure;
 - the named-session cookie accessors on the store apply browser host-matching semantics.
@@ -110,16 +110,16 @@ def test_select_bearer_by_subapp_path() -> None:
     session = CopilotSession("s-sub1")
     session._bearer_tokens["h"] = {
         "token": "DEFAULT",
-        "by_app": {"modstore": {"token": "MOD"}, "ccm": {"token": "CCM"}},
+        "by_app": {"alpha": {"token": "TOKA"}, "beta": {"token": "TOKB"}},
     }
-    assert session._select_bearer("h", "/modstore/graphql")["token"] == "MOD"
-    assert session._select_bearer("h", "/customercontent/graphql")["token"] == "CCM"
+    assert session._select_bearer("h", "/alpha/graphql")["token"] == "TOKA"
+    assert session._select_bearer("h", "/beta/graphql")["token"] == "TOKB"
     assert session._select_bearer("h", "/other")["token"] == "DEFAULT"
 
 
 def test_subapp_for_path() -> None:
-    assert _subapp_for_path("/modstore/graphql") == "modstore"
-    assert _subapp_for_path("/customercontent/session") == "ccm"
+    assert _subapp_for_path("/alpha/graphql") == "alpha"
+    assert _subapp_for_path("/beta/session") == "beta"
     assert _subapp_for_path("/spa/session") is None
 
 
@@ -129,15 +129,15 @@ def test_scoped_run_injects_correct_subapp_bearer() -> None:
     session.session_name = "p"
     session._bearer_tokens["in.scope"] = {
         "token": "DEF",
-        "by_app": {"modstore": {"token": "MOD", "exp": None},
-                   "ccm": {"token": "CCM", "exp": None}},
+        "by_app": {"alpha": {"token": "TOKA", "exp": None},
+                   "beta": {"token": "TOKB", "exp": None}},
     }
-    a1: Dict[str, Any] = {"url": "https://in.scope/modstore/graphql"}
+    a1: Dict[str, Any] = {"url": "https://in.scope/alpha/graphql"}
     session._apply_session_auth(_Ctx(store), a1)
-    assert a1["headers"]["Authorization"] == "Bearer MOD"
-    a2: Dict[str, Any] = {"url": "https://in.scope/customercontent/graphql"}
+    assert a1["headers"]["Authorization"] == "Bearer TOKA"
+    a2: Dict[str, Any] = {"url": "https://in.scope/beta/graphql"}
     session._apply_session_auth(_Ctx(store), a2)
-    assert a2["headers"]["Authorization"] == "Bearer CCM"
+    assert a2["headers"]["Authorization"] == "Bearer TOKB"
 
 
 # --- item 4: scope guard ------------------------------------------------------

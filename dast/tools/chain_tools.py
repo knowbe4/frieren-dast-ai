@@ -43,7 +43,7 @@ _CHAIN_STEP_SCHEMA: Dict[str, Any] = {
             "type": "object",
             "description": (
                 "Request headers. Use {{var}} to inject an extracted value, e.g. "
-                '{"authorization": "Bearer {{zenkaJwt}}"}.'
+                '{"authorization": "Bearer {{serviceJwt}}"}.'
             ),
         },
         "body": {"type": "string", "description": "Request body (e.g. a JSON GraphQL query) for POST/PUT/PATCH."},
@@ -63,7 +63,7 @@ _CHAIN_STEP_SCHEMA: Dict[str, Any] = {
                 "properties": {
                     "kind": {"type": "string", "description": "json | regex | set_cookie | b64json | jwt_claim"},
                     "var": {"type": "string", "description": "Variable name to bind; reference it later as {{var}}."},
-                    "expr": {"type": "string", "description": "Dotted JSON path / regex / cookie name, per kind (e.g. user.attributes.zenkaJwt)."},
+                    "expr": {"type": "string", "description": "Dotted JSON path / regex / cookie name, per kind (e.g. user.attributes.serviceJwt)."},
                     "from": {"type": "string", "description": "body (default) | header:<Name> | var:<name>"},
                 },
                 "required": ["kind", "var"],
@@ -122,8 +122,8 @@ _VALIDATE_CHAIN_SCHEMA: Dict[str, Any] = {
                     "items": _CHAIN_STEP_SCHEMA,
                     "description": (
                         "Ordered steps. A later step may reference {{var}} bound by an earlier "
-                        "step's extractor (e.g. extract zenkaJwt from /spa/session, then send it "
-                        "as a Bearer header to /reports/graphql)."
+                        "step's extractor (e.g. extract a service JWT from a session endpoint, then "
+                        "send it as a Bearer header to that service's endpoint)."
                     ),
                 },
             },

@@ -21,19 +21,12 @@ from urllib.parse import urlparse
 
 import httpx
 
+from dast.session import subapp_map
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# app → (field in user.attributes, a probe endpoint path to prime + prove the token)
-_APP_MAP: Dict[str, Dict[str, str]] = {
-    "modstore": {"field": "modstoreJwt", "probe": "/modstore/graphql"},
-    "ccm": {"field": "ccmJwt", "probe": "/customercontent/graphql"},
-    "search": {"field": "searchJwt", "probe": ""},
-    "zenka": {"field": "zenkaJwt", "probe": ""},
-}
 
 
 def _host_of(value: str) -> str:
@@ -97,14 +90,18 @@ async def _get_app_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     app = str(args.get("app", "")).strip().lower()
     if not host:
         return {"ok": False, "error": "host is required"}
-    if app not in _APP_MAP:
-        return {"ok": False, "error": f"app must be one of {sorted(_APP_MAP)}"}
+    # The app -> (jwt_field, probe) map is target-specific internal topology, read from the
+    # operator's local ~/.dast-ai/subapp_map.json (see dast/session/subapp_map); it is empty
+    # on a machine without that config.
+    app_map = subapp_map.app_map()
+    if app not in app_map:
+        return {"ok": False, "error": f"app must be one of {sorted(app_map)}"}
     session_url = f"https://{host}/spa/session"
     if not ctx.is_in_scope(session_url):
         return {"ok": False, "error": "host is out of scope", "host": host}
 
-    field = _APP_MAP[app]["field"]
-    probe_path = _APP_MAP[app]["probe"]
+    field = app_map[app]["field"]
+    probe_path = app_map[app]["probe"]
     cookie = _cookie_header(ctx, host)
     try:
         async with httpx.AsyncClient(proxy=ctx.proxy_url, verify=False,
@@ -127,7 +124,7 @@ async def _get_app_token(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     claims = _decode_jwt_account(token)
 
     # Cache onto the engine so the inline bearer-refresh path can use it. Index under
-    # the sub-app (by_app) so modstore and ccm — which share one host — do not overwrite
+    # the sub-app (by_app) so two sub-apps that share one host do not overwrite
     # each other; _apply_session_auth selects the right one by request path.
     sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     cache = getattr(sess, "_bearer_tokens", None)
@@ -191,16 +188,17 @@ register(Tool(
     input_schema={
         "type": "object",
         "properties": {
-            "host": {"type": "string", "description": "Target host (e.g. training.knowbe4.com)."},
+            "host": {"type": "string", "description": "Target host (e.g. app.example.com)."},
             "app": {"type": "string",
-                    "description": "Which sub-app token to resolve: modstore | ccm | search | zenka."},
+                    "description": "Which sub-app token to resolve (one of the apps in the local "
+                                   "sub-app map; the error lists the valid names)."},
         },
         "required": ["host", "app"],
     },
     handler=_get_app_token,
     tags=["auth"],
     description="Resolve a sub-app Bearer token from GET /spa/session (user.attributes.<app>Jwt), "
-                "untruncated, when a sub-app (modstore/ccm) returns not_authorized/403 because the "
+                "untruncated, when a sub-app returns not_authorized/403 because the "
                 "session cookie alone is not enough. Decodes and returns the account id + entitlement "
                 "flags (ai_translations_active, can_download_modules, ...), caches the token and primes "
                 "it so later same-host requests carry it. Never returns the raw token. Use this BEFORE "
@@ -212,7 +210,7 @@ register(Tool(
     input_schema={
         "type": "object",
         "properties": {
-            "host": {"type": "string", "description": "Host the fact is about (e.g. training.knowbe4.com)."},
+            "host": {"type": "string", "description": "Host the fact is about (e.g. app.example.com)."},
             "note": {"type": "string", "description": "A concise learned fact about the app (auth model, "
                      "token location, endpoint, entitlement). Do NOT include secret values."},
         },

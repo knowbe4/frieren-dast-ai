@@ -14,10 +14,25 @@ import dast.tools.prime_tools as pt
 from dast.tools.prime_tools import _prime_session
 
 
+class _Headers:
+    """Minimal httpx.Headers stand-in supporting get_list + get for set-cookie."""
+    def __init__(self, set_cookies=None):
+        self._sc = list(set_cookies or [])
+
+    def get_list(self, key):
+        return self._sc if key.lower() == "set-cookie" else []
+
+    def get(self, key, default=None):
+        if key.lower() == "set-cookie":
+            return self._sc[0] if self._sc else default
+        return default
+
+
 class _Resp:
-    def __init__(self, status=200, payload=None):
+    def __init__(self, status=200, payload=None, set_cookies=None):
         self.status_code = status
         self._payload = payload if payload is not None else {}
+        self.headers = _Headers(set_cookies)
 
     def json(self):
         return self._payload
@@ -25,7 +40,7 @@ class _Resp:
 
 class _Client:
     """Fake httpx.AsyncClient. request() records the prime call and (when *value* is not None)
-    simulates the proxy ingesting the Set-Cookie into the shared jar. get() serves an optional
+    returns a response whose Set-Cookie (re)issues the session cookie. get() serves an optional
     /spa/session payload for the Bearer fallback."""
 
     def __init__(self, store, host, cookie, value, status=200, spa_payload=None):
@@ -46,9 +61,8 @@ class _Client:
 
     async def request(self, method, url, headers=None):
         self.calls.append((method, url, headers or {}))
-        if self._value is not None:
-            self._store.cookies.setdefault(self._host, {})[self._cookie] = self._value
-        return _Resp(self._status)
+        sc = [f"{self._cookie}={self._value}; Path=/"] if self._value is not None else []
+        return _Resp(self._status, set_cookies=sc)
 
 
 class _Store:
@@ -57,6 +71,15 @@ class _Store:
 
     def get_cookies_for_host(self, host):
         return [{"name": n, "value": v} for n, v in self.cookies.get(host, {}).items()]
+
+    def import_playwright_cookies(self, cookies):
+        n = 0
+        for c in cookies:
+            dom = (c.get("domain") or "").lstrip(".").lower()
+            if c.get("name") and dom:
+                self.cookies.setdefault(dom, {})[c["name"]] = c.get("value", "")
+                n += 1
+        return n
 
 
 def _engine(bearer=None):

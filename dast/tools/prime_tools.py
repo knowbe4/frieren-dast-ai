@@ -156,21 +156,38 @@ async def _prime_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
         headers["Referer"] = ref
 
     status: Optional[int] = None
+    set_cookie_strs: list = []
     try:
         async with httpx.AsyncClient(proxy=ctx.proxy_url, verify=False,
                                      follow_redirects=True, timeout=15) as client:
             resp = await client.request(method, url, headers=headers)
             status = resp.status_code
+            try:
+                set_cookie_strs = list(resp.headers.get_list("set-cookie"))
+            except Exception:
+                sc = resp.headers.get("set-cookie")
+                set_cookie_strs = [sc] if sc else []
     except Exception as exc:
         return {"ok": False, "app": app, "host": host, "cookie": cookie, "primed": False,
                 "verified": False, "error": f"prime request failed: {str(exc)[:160]}"}
 
-    # The proxy auto-ingested any Set-Cookie into the shared jar. Read it back and ALSO seed the
-    # engine's cookie overlay so the scoped _apply_session_auth path (where _session_cookies wins)
-    # carries it on the retry, not only the send_request shared-jar path.
+    # Determine the (re)issued cookie value from the prime response's OWN Set-Cookie — deterministic,
+    # independent of the proxy's async ingest — falling back to the shared jar. Then write it to the
+    # jar(s) the retry reads: the SHARED jar (get_cookies_for_host, what send_request sources) + the
+    # engine overlay (_apply_session_auth's cookies win). Relying only on passive ingest proved
+    # unreliable for a scoped run (the primed cookie never reached the send_request read).
+    from http.cookies import SimpleCookie
     value = ""
+    for sc_str in set_cookie_strs:
+        try:
+            jar = SimpleCookie()
+            jar.load(sc_str)
+            if cookie in jar and jar[cookie].value:
+                value = jar[cookie].value
+        except Exception:
+            pass
     store = getattr(ctx, "store", None)
-    if store is not None:
+    if not value and store is not None:
         try:
             for c in store.get_cookies_for_host(host) or []:
                 if c.get("name") == cookie and c.get("value"):
@@ -179,6 +196,14 @@ async def _prime_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
         except Exception:
             pass
     if value:
+        if store is not None and hasattr(store, "import_playwright_cookies"):
+            try:
+                store.import_playwright_cookies([{
+                    "name": cookie, "value": value, "domain": host, "path": "/",
+                    "secure": True, "httpOnly": True,
+                }])
+            except Exception:
+                pass
         sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
         overlay = getattr(sess, "_session_cookies", None)
         if isinstance(overlay, dict):

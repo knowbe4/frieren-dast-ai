@@ -54,6 +54,8 @@ async def test_send_request_refuses_placeholder_body() -> None:
     assert result["ok"] is False
     assert "placeholder" in result["error"].lower()
     assert "body" in result["error"]
+    # the refusal guides recovery: read real values (extract_response) or use request variables
+    assert "extract_response" in result["error"] and "variables" in result["error"]
 
 
 @pytest.mark.asyncio

@@ -192,8 +192,10 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
         logger.warning("send_request refused placeholder value", field=placeholder_field)
         return {"ok": False, "error": (
             f"refused: placeholder value in {placeholder_field} (e.g. '<UNKNOWN>'). You do not "
-            "have the real value — read it from get_history or an earlier response, or ask the "
-            "operator; do not invent one.")}
+            "have the real value — read it from get_history or an earlier response (use "
+            "extract_response to pull exact fields from a large captured body), or ask the "
+            "operator; do not invent one. For a request that needs many values, pass them as "
+            "request variables (e.g. GraphQL `variables`) rather than inlining them.")}
 
     # Schema contract: Authorization is ALWAYS stripped from caller-supplied headers —
     # auth is auto-injected below via the shared attach(). A non-secret garbage Authorization

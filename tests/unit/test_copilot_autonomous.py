@@ -83,6 +83,29 @@ async def test_run_autonomous_requires_objective():
         service.run_autonomous("   ")
 
 
+def test_autonomous_start_prompt_hardening_and_format():
+    from dast.proxy.api import copilot_service as cs
+    start = cs._AUTONOMOUS_START
+    # in-scope host allowlist (uses {hosts}) + explicit no-invent-host rule
+    assert "{hosts}" in start and "invent" in start.lower()
+    # no-unverified-claims rule
+    assert "never claim a tool succeeded" in start.lower()
+    # still formats with exactly the keys the driver supplies (the 2nd {hosts} didn't break it)
+    rendered = start.format(objective="o", hosts="h.example", read_only="",
+                            leads="", router="", coverage="")
+    assert "h.example" in rendered
+
+
+def test_validation_playbook_has_focused_execution_directives():
+    from dast.proxy.api import copilot_service as cs
+    pb = cs._AUTONOMOUS_VALIDATION_PLAYBOOK.lower()
+    assert "focused execution" in pb
+    assert "override" in pb                      # explicitly overrides the breadth guidance
+    assert "extract_response" in pb              # read large responses via the extractor
+    assert "variables" in pb                     # use request variables, not inlined placeholders
+    assert "scan_surface" in pb and "do not" in pb   # breadth tools are off for validation
+
+
 @pytest.mark.asyncio
 async def test_run_autonomous_enables_ai_mode_and_records_config():
     store = _FakeStore()

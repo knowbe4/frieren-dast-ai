@@ -16,17 +16,21 @@ import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from dast.session import subapp_map
+from dast.session import site_map, subapp_map
 
 
-def subapp_for_path(path: str) -> Optional[str]:
+def subapp_for_path(path: str, site: str = "") -> Optional[str]:
     """Map a request path to its sub-app name, or None for a non-sub-app path.
 
     The prefix->app map is target-specific internal topology, so it is NOT hardcoded here — it is
     read from the operator's local ``~/.dast-ai/subapp_map.json`` (see ``dast/session/subapp_map``).
-    With no local config the map is empty and every path returns None (host-level Bearer selection)."""
+    With no local config the map is empty and every path returns None (host-level Bearer selection).
+
+    When *site* (the host's product-group, from ``site_map``) is given, resolution is scoped to that
+    site's sub-apps (+ site-less ones), so two products sharing a prefix do not collide. Empty *site*
+    (default) matches all prefixes — unchanged behaviour for untagged configs / path-only callers."""
     p = (path or "").lower()
-    for prefix, app in subapp_map.subapp_prefixes():
+    for prefix, app in subapp_map.subapp_prefixes(site):
         if p.startswith(prefix):
             return app
     return None
@@ -83,6 +87,7 @@ def collect_host_bearer(store: Any, host: str, *,
     now = _time.time()
     parts = host.lower().split(".")
     domain_suffix = ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
+    site = site_map.site_for_host(host) or ""  # scope sub-app resolution to the host's product
 
     host_level: Optional[Dict[str, Any]] = None
     by_app: Dict[str, Dict[str, Any]] = {}
@@ -112,7 +117,7 @@ def collect_host_bearer(store: Any, host: str, *,
                       "matched_host": entry_host_raw}
             if host_level is None:
                 host_level = dict(record)  # freshest overall = host-level default
-            app = subapp_for_path(auth_endpoint)
+            app = subapp_for_path(auth_endpoint, site)
             if app and app not in by_app:
                 by_app[app] = dict(record)  # freshest per sub-app
         except Exception:
@@ -129,7 +134,8 @@ def select_bearer(record: Optional[Dict[str, Any]], path: str) -> Optional[Dict[
     to a sub-app and one exists, else the host-level record."""
     if not isinstance(record, dict):
         return None
-    app = subapp_for_path(path)
+    site = site_map.site_for_host(str(record.get("matched_host", ""))) or ""
+    app = subapp_for_path(path, site)
     by_app = record.get("by_app")
     if app and isinstance(by_app, dict) and app in by_app:
         return by_app[app]

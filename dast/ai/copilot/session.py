@@ -1684,9 +1684,9 @@ class CopilotSession:
             host = parsed.hostname or ""
             if not host:
                 return None
-            from dast.session import subapp_map
+            from dast.session import site_map, subapp_map
             from dast.session.auth_provider import subapp_for_path
-            app = subapp_for_path(parsed.path or "/")
+            app = subapp_for_path(parsed.path or "/", site_map.site_for_host(host) or "")
             if not app:
                 return None
             prime = subapp_map.prime_for_app(app)

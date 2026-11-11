@@ -103,6 +103,7 @@ def _load_entries() -> List[Dict[str, Any]]:
                 "jwt_field": str(item.get("jwt_field", "")).strip(),
                 "probe": str(item.get("probe", "")).strip(),
                 "prime": _parse_prime(item.get("prime")),
+                "site": str(item.get("site", "")).strip(),
             })
     except FileNotFoundError:
         pass
@@ -114,10 +115,31 @@ def _load_entries() -> List[Dict[str, Any]]:
     return _cache
 
 
-def subapp_prefixes() -> Tuple[Tuple[str, str], ...]:
+def subapp_prefixes(site: str = "") -> Tuple[Tuple[str, str], ...]:
     """``((path_prefix, app), ...)`` for entries that declare a prefix — the data behind
-    ``auth_provider.subapp_for_path``."""
-    return tuple((e["prefix"], e["app"]) for e in _load_entries() if e["prefix"])
+    ``auth_provider.subapp_for_path``.
+
+    When *site* is given, restrict to sub-apps belonging to that site PLUS site-less entries
+    (a sub-app with no ``site`` is global, as before). When *site* is empty (default), return all
+    prefixes — so an unscoped call behaves exactly as it did before sites existed. This lets two
+    products that happen to share a path prefix keep distinct sub-apps once each is tagged with a
+    ``site``, while leaving today's untagged configs completely unchanged."""
+    out = []
+    for e in _load_entries():
+        if not e["prefix"]:
+            continue
+        if site and e["site"] and e["site"] != site:
+            continue
+        out.append((e["prefix"], e["app"]))
+    return tuple(out)
+
+
+def app_site(app: str) -> str:
+    """The site a sub-app belongs to (its ``site`` field), or "" when untagged/absent."""
+    for e in _load_entries():
+        if e["app"] == app and e["site"]:
+            return e["site"]
+    return ""
 
 
 def app_map() -> Dict[str, Dict[str, str]]:

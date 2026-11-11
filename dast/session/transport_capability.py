@@ -93,7 +93,7 @@ def record_capability(host_or_url: str, path: str = "", *, auth: str, prefer: st
     entry: Dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "host": key,
-        "sub_app": subapp_for_path(_path_component(host_or_url, path)) or "",
+        "sub_app": subapp_for_path(_path_component(host_or_url, path), site_map.site_for_host(host_or_url) or "") or "",
         "task": str(task or ""),
         "auth": auth,
         "prefer": prefer,
@@ -141,7 +141,7 @@ def capability_for(host_or_url: str, path: str = "",
     host = _normalise_host(host_or_url)
     if not host:
         return None
-    want_sub = subapp_for_path(_path_component(host_or_url, path)) or ""
+    want_sub = subapp_for_path(_path_component(host_or_url, path), site_map.site_for_host(host_or_url) or "") or ""
     want_task = str(task or "")
     # Tiers from most to least specific, de-duplicated.
     tiers: List[tuple] = []

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from dast.session import site_map
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -62,8 +63,12 @@ def load_for_host(host_or_url: str) -> str:
     if not host:
         return ""
     labels = host.split(".")
-    # exact host, then progressively broader parent domains (but not a bare TLD)
-    candidates = [".".join(labels[i:]) for i in range(len(labels) - 1)]
+    # Site (product-group) key first — a note filed under the product serves all its sibling
+    # subdomains — then the exact host and progressively broader parent domains (but not a bare
+    # TLD), so an existing per-host note is still found (legacy fallback). De-duped, order kept.
+    candidates = [site_map.site_key(host)] + [".".join(labels[i:]) for i in range(len(labels) - 1)]
+    seen: set = set()
+    candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
     for candidate in candidates:
         path = _path_for(candidate)
         if path.is_file():
@@ -84,14 +89,17 @@ def append_note(host_or_url: str, note: str) -> Optional[str]:
     text = (note or "").strip()
     if not host or not text:
         return None
-    path = _path_for(host)
+    # Write under the site (product-group) key so siblings share one note; falls back to the bare
+    # host when the host is not grouped (empty/absent sites config = unchanged per-host behaviour).
+    key = site_map.site_key(host_or_url) or host
+    path = _path_for(key)
     stamp = time.strftime("%Y-%m-%d")
     try:
         if not path.exists():
-            path.write_text(f"# App knowledge — {host}\n\n", encoding="utf-8")
+            path.write_text(f"# App knowledge — {key}\n\n", encoding="utf-8")
         with path.open("a", encoding="utf-8") as fh:
             fh.write(f"- ({stamp}) {text}\n")
-        return host
+        return key
     except OSError as exc:
-        logger.warning("could not append app-knowledge note", host=host, error=str(exc))
+        logger.warning("could not append app-knowledge note", host=key, error=str(exc))
         return None

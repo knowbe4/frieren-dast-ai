@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from dast.session import site_map
 from dast.session.auth_provider import subapp_for_path
 from dast.utils.logger import get_logger
 
@@ -86,9 +87,12 @@ def record_capability(host_or_url: str, path: str = "", *, auth: str, prefer: st
     host = _normalise_host(host_or_url)
     if not host or auth not in _AUTH_VALUES or prefer not in _PREFER_VALUES:
         return None
+    # Key by the site (product-group) so a product's sibling hosts share learned transport;
+    # falls back to the bare host when ungrouped.
+    key = site_map.site_key(host_or_url) or host
     entry: Dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "host": host,
+        "host": key,
         "sub_app": subapp_for_path(_path_component(host_or_url, path)) or "",
         "task": str(task or ""),
         "auth": auth,
@@ -97,11 +101,11 @@ def record_capability(host_or_url: str, path: str = "", *, auth: str, prefer: st
     }
     entry = {k: v for k, v in entry.items() if k.lower() not in _SECRET_KEYS}
     try:
-        with _path_for(host).open("a", encoding="utf-8") as handle:
+        with _path_for(key).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
-        return host
+        return key
     except OSError as exc:
-        logger.warning("could not append transport capability", host=host, error=str(exc))
+        logger.warning("could not append transport capability", host=key, error=str(exc))
         return None
 
 
@@ -146,7 +150,12 @@ def capability_for(host_or_url: str, path: str = "",
             tiers.append(tier)
 
     labels = host.split(".")
-    host_candidates = [".".join(labels[i:]) for i in range(len(labels) - 1)] or [host]
+    # Site (product-group) key first (shared across a product's hosts), then exact host and
+    # broader parents (legacy per-host fallback). De-duped, order kept.
+    host_candidates = [site_map.site_key(host_or_url)] + \
+        ([".".join(labels[i:]) for i in range(len(labels) - 1)] or [host])
+    _seen: set = set()
+    host_candidates = [c for c in host_candidates if c and not (c in _seen or _seen.add(c))]
     for candidate in host_candidates:
         records = _read_records(candidate)
         if not records:

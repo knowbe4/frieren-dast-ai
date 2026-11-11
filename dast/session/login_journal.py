@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from dast.session import site_map
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -60,6 +61,28 @@ def _path_for(host: str) -> Path:
     return journal_dir() / f"{host}.jsonl"
 
 
+def _key(host_or_url: str) -> str:
+    """Storage key: the site (product-group) id when the host is grouped, else the bare host."""
+    return site_map.site_key(host_or_url) or _normalise_host(host_or_url)
+
+
+def _read_lines(host_or_url: str) -> list[str]:
+    """Trailing journal lines for a host, read from its site-key file, falling back to the legacy
+    per-host file when the host is now grouped but only the old per-host journal exists."""
+    key = _key(host_or_url)
+    path = _path_for(key)
+    if not path.is_file():
+        legacy = _normalise_host(host_or_url)
+        if legacy and legacy != key:
+            path = _path_for(legacy)
+        if not path.is_file():
+            return []
+    try:
+        return path.read_text(encoding="utf-8").splitlines()[-_MAX_SCAN_LINES:]
+    except OSError:
+        return []
+
+
 def record(host_or_url: str, outcome: str, *, strategy: str = "", endpoint: str = "",
            body_shape: str = "", success_url: str = "", reason: str = "") -> Optional[str]:
     """Append one login-attempt record for a host. Returns the host key, or None on bad
@@ -67,9 +90,12 @@ def record(host_or_url: str, outcome: str, *, strategy: str = "", endpoint: str 
     host = _normalise_host(host_or_url)
     if not host or outcome not in ("success", "error"):
         return None
+    # Key by the site (product-group) so all of a product's login hosts (e.g. an SSO identity host
+    # + the app host) share one journal; falls back to the bare host when ungrouped.
+    key = _key(host_or_url)
     entry: Dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "host": host,
+        "host": key,
         "outcome": outcome,
         "strategy": str(strategy or "")[:40],
         "endpoint": str(endpoint or "")[:300],
@@ -79,26 +105,19 @@ def record(host_or_url: str, outcome: str, *, strategy: str = "", endpoint: str 
     }
     entry = {k: v for k, v in entry.items() if k.lower() not in _SECRET_KEYS}
     try:
-        with _path_for(host).open("a", encoding="utf-8") as handle:
+        with _path_for(key).open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
-        return host
+        return key
     except OSError as exc:
-        logger.warning("could not append login journal", host=host, error=str(exc))
+        logger.warning("could not append login journal", host=key, error=str(exc))
         return None
 
 
 def last_success(host_or_url: str) -> Optional[Dict[str, Any]]:
     """Return the most recent success record (with endpoint/body_shape) for a host, or None."""
-    host = _normalise_host(host_or_url)
-    if not host:
+    if not _normalise_host(host_or_url):
         return None
-    path = _path_for(host)
-    if not path.is_file():
-        return None
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-_MAX_SCAN_LINES:]
-    except OSError:
-        return None
+    lines = _read_lines(host_or_url)
     for line in reversed(lines):
         try:
             rec = json.loads(line)
@@ -113,16 +132,9 @@ def recent_records(host_or_url: str, *, limit: int = _MAX_SCAN_LINES) -> list[Di
     """Parsed records for a host, most-recent-first (all outcomes, all strategies). Unlike
     :func:`last_success` this does not require an ``endpoint``, so it sees deterministic/llm
     wins too. Tolerates malformed lines; returns [] for an unknown host. Never raises."""
-    host = _normalise_host(host_or_url)
-    if not host:
+    if not _normalise_host(host_or_url):
         return []
-    path = _path_for(host)
-    if not path.is_file():
-        return []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-_MAX_SCAN_LINES:]
-    except OSError:
-        return []
+    lines = _read_lines(host_or_url)
     records: list[Dict[str, Any]] = []
     for line in reversed(lines):
         try:

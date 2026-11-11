@@ -15,17 +15,23 @@ from dast.tools.prime_tools import _prime_session
 
 
 class _Resp:
-    def __init__(self, status=200):
+    def __init__(self, status=200, payload=None):
         self.status_code = status
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
 
 
 class _Client:
-    """Fake httpx.AsyncClient. Records the request; on response, simulates the proxy ingesting
-    the Set-Cookie into the shared jar (store.cookies) when *value* is not None."""
+    """Fake httpx.AsyncClient. request() records the prime call and (when *value* is not None)
+    simulates the proxy ingesting the Set-Cookie into the shared jar. get() serves an optional
+    /spa/session payload for the Bearer fallback."""
 
-    def __init__(self, store, host, cookie, value, status=200):
+    def __init__(self, store, host, cookie, value, status=200, spa_payload=None):
         self._store, self._host, self._cookie = store, host, cookie
         self._value, self._status = value, status
+        self._spa_payload = spa_payload or {"user": {"attributes": {}}}
         self.calls = []
 
     async def __aenter__(self):
@@ -33,6 +39,10 @@ class _Client:
 
     async def __aexit__(self, *a):
         return False
+
+    async def get(self, url, headers=None):
+        self.calls.append(("GET", url, headers or {}))
+        return _Resp(200, self._spa_payload)
 
     async def request(self, method, url, headers=None):
         self.calls.append((method, url, headers or {}))
@@ -105,11 +115,30 @@ async def test_prime_session_noop_when_already_present(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_prime_session_no_bearer_returns_clean_error():
+async def test_prime_session_no_bearer_returns_clean_error(monkeypatch):
+    # No cached/history Bearer, and /spa/session exposes no betaJwt -> no Bearer to prime with.
     store = _Store()
+    client = _Client(store, "app.example.com", "_beta_session", value=None,
+                     spa_payload={"user": {"attributes": {}}})
+    monkeypatch.setattr(pt.httpx, "AsyncClient", lambda **kw: client)
     r = await _prime_session(_ctx(store, _engine(bearer=None)),
                              {"host": "app.example.com", "app": "beta"})
     assert r["ok"] is False and "Bearer" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_prime_session_bearer_from_spa_session_fallback(monkeypatch):
+    # No cached/history Bearer, but /spa/session exposes user.attributes.betaJwt -> prime with it.
+    store = _Store()
+    client = _Client(store, "app.example.com", "_beta_session", value="COOKIEVAL",
+                     spa_payload={"user": {"attributes": {"betaJwt": "SPA.FIELD.TOKEN"}}})
+    monkeypatch.setattr(pt.httpx, "AsyncClient", lambda **kw: client)
+    r = await _prime_session(_ctx(store, _engine(bearer=None)),
+                             {"host": "app.example.com", "app": "beta"})
+    assert r["ok"] and r["primed"] and r["verified"]
+    # the prime GET rode the /spa/session field token as the Bearer
+    prime_call = [c for c in client.calls if c[0] == "GET" and c[1].endswith("/beta/session")][0]
+    assert prime_call[2]["Authorization"] == "Bearer SPA.FIELD.TOKEN"
 
 
 @pytest.mark.asyncio

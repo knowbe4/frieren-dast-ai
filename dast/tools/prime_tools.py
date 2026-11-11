@@ -50,9 +50,13 @@ def _jar_cookie_value(ctx: ToolContext, host: str, cookie: str) -> str:
     return ""
 
 
-def _app_bearer(ctx: ToolContext, host: str, app: str, probe_path: str) -> str:
-    """The app's Bearer: the per-sub-app cached token first, else one captured on the app's probe
-    path in proxy history (the app's own request). Empty string when none is available."""
+async def _app_bearer(ctx: ToolContext, host: str, app: str, probe_path: str) -> str:
+    """The app's Bearer to prime WITH, tried in order: the per-sub-app cached token; a token
+    captured on the app's probe path in proxy history (the app's own request); finally the
+    ``user.attributes.<field>`` token minted from ``GET /spa/session``. The last fallback matters
+    because priming is circular otherwise — ``get_app_token`` probes the sub-app endpoint, which
+    itself 403s until the session cookie exists, so it never caches a token to prime with. The
+    /spa/session field token is exactly what the SPA uses to mint the cookie. '' when none found."""
     sess = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     cache = getattr(sess, "_bearer_tokens", None)
     if isinstance(cache, dict):
@@ -73,6 +77,25 @@ def _app_bearer(ctx: ToolContext, host: str, app: str, probe_path: str) -> str:
             cap = None
         if cap and cap.get("token"):
             return str(cap["token"])
+    field = subapp_map.app_map().get(app, {}).get("field", "")
+    if field:
+        try:
+            async with httpx.AsyncClient(proxy=ctx.proxy_url, verify=False,
+                                         follow_redirects=True, timeout=15) as client:
+                resp = await client.get(f"https://{host}/spa/session", headers={
+                    "Cookie": _cookie_header(ctx, host),
+                    "X-Requested-With": "XMLHttpRequest", "Accept": "application/json",
+                })
+                data = resp.json()
+        except Exception as exc:
+            logger.debug("prime_session /spa/session bearer fetch failed",
+                         host=host, error=str(exc)[:160])
+            data = None
+        if isinstance(data, dict):
+            attrs = (data.get("user") or {}).get("attributes") or {}
+            tok = attrs.get(field) or (data.get("guest") or {}).get(field)
+            if tok:
+                return str(tok)
     return ""
 
 
@@ -114,7 +137,7 @@ async def _prime_session(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
                 "primed": False, "verified": True, "note": "session cookie already present"}
 
     probe_path = subapp_map.app_map().get(app, {}).get("probe", "")
-    bearer = _app_bearer(ctx, host, app, probe_path)
+    bearer = await _app_bearer(ctx, host, app, probe_path)
     if not bearer:
         return {"ok": False, "app": app, "host": host, "cookie": cookie, "primed": False,
                 "verified": False,

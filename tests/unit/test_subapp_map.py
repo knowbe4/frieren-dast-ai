@@ -111,3 +111,45 @@ def test_non_dict_json_is_empty(tmp_path, monkeypatch):
     _use_config(tmp_path, monkeypatch, json.dumps(["not", "a", "dict"]))
     assert subapp_map.subapp_prefixes() == ()
     assert subapp_map.app_map() == {}
+
+
+def test_site_field_parses_and_app_site(tmp_path, monkeypatch):
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"prefix": "/x", "app": "xapp", "jwt_field": "xJwt", "site": "siteA"},
+            {"prefix": "/y", "app": "yapp", "jwt_field": "yJwt"},   # site-less (global)
+        ]
+    }))
+    assert subapp_map.app_site("xapp") == "siteA"
+    assert subapp_map.app_site("yapp") == ""
+    assert subapp_map.app_site("absent") == ""
+
+
+def test_subapp_prefixes_scoped_by_site(tmp_path, monkeypatch):
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"prefix": "/shared", "app": "a_shared", "jwt_field": "aJwt", "site": "siteA"},
+            {"prefix": "/shared", "app": "b_shared", "jwt_field": "bJwt", "site": "siteB"},
+            {"prefix": "/global", "app": "g", "jwt_field": "gJwt"},   # no site -> always included
+        ]
+    }))
+    # no site -> all prefixes (unchanged behaviour)
+    assert set(subapp_map.subapp_prefixes()) == {("/shared", "a_shared"), ("/shared", "b_shared"),
+                                                 ("/global", "g")}
+    # scoped to siteA -> siteA's entry + the site-less global, NOT siteB's
+    assert set(subapp_map.subapp_prefixes("siteA")) == {("/shared", "a_shared"), ("/global", "g")}
+    assert set(subapp_map.subapp_prefixes("siteB")) == {("/shared", "b_shared"), ("/global", "g")}
+
+
+def test_subapp_for_path_site_scoping(tmp_path, monkeypatch):
+    from dast.session.auth_provider import subapp_for_path
+    _use_config(tmp_path, monkeypatch, json.dumps({
+        "sub_apps": [
+            {"prefix": "/shared", "app": "a_shared", "jwt_field": "aJwt", "site": "siteA"},
+            {"prefix": "/shared", "app": "b_shared", "jwt_field": "bJwt", "site": "siteB"},
+        ]
+    }))
+    # same prefix resolves to the correct sub-app per site; unscoped falls to first match
+    assert subapp_for_path("/shared/graphql", "siteA") == "a_shared"
+    assert subapp_for_path("/shared/graphql", "siteB") == "b_shared"
+    assert subapp_for_path("/shared/graphql") in ("a_shared", "b_shared")   # unscoped: any match

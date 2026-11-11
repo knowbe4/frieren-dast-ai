@@ -170,3 +170,9 @@ async def test_get_app_token_rejects_out_of_scope_and_bad_app():
     assert (await _get_app_token(ctx, {"host": "h", "app": "beta"}))["ok"] is False  # out of scope
     ctx2 = SimpleNamespace(is_in_scope=lambda u: True, proxy_url="x", store=None, _session=None)
     assert (await _get_app_token(ctx2, {"host": "h", "app": "nope"}))["ok"] is False  # unknown app
+
+
+def test_site_grouping_shares_across_subdomains(kb_dir):
+    # site 'alpha' groups admin + *.esi; a note on one host is served to a sibling subdomain.
+    assert store.append_note("admin.alpha.example.com", "login via SSO") == "alpha"
+    assert "login via SSO" in store.load_for_host("us1.esi.alpha.example.com")

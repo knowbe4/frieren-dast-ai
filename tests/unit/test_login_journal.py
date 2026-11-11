@@ -88,3 +88,26 @@ def test_last_winning_strategy_returns_recent_success_any_strategy():
                          reason="gave up")
     assert login_journal.last_winning_strategy("app.example.com") == "spa_api"
     assert login_journal.last_winning_strategy("never-seen.example.com") is None
+
+
+def test_site_grouping_shares_across_subdomains():
+    # conftest seeds site 'alpha' = {admin.alpha.example.com, *.esi.alpha.example.com}; a success
+    # recorded on one host is found from a sibling subdomain (same product group).
+    assert login_journal.record("https://admin.alpha.example.com/login", "success",
+                                 strategy="deterministic",
+                                 endpoint="https://admin.alpha.example.com/auth",
+                                 success_url="https://admin.alpha.example.com/home") == "alpha"
+    rec = login_journal.last_success("us1.esi.alpha.example.com")
+    assert rec is not None and rec["strategy"] == "deterministic"
+    assert login_journal.last_winning_strategy("x.esi.alpha.example.com") == "deterministic"
+
+
+def test_legacy_per_host_journal_still_read_after_grouping():
+    # A pre-existing per-host journal (written before grouping) is still read via legacy fallback.
+    login_journal.journal_dir()
+    legacy = login_journal._path_for("admin.alpha.example.com")
+    legacy.write_text(json.dumps({"outcome": "success", "strategy": "llm",
+                                  "endpoint": "https://admin.alpha.example.com/auth",
+                                  "host": "admin.alpha.example.com"}) + "\n", encoding="utf-8")
+    rec = login_journal.last_success("admin.alpha.example.com")   # site-key file absent -> legacy
+    assert rec is not None and rec["strategy"] == "llm"

@@ -86,3 +86,11 @@ def test_malformed_lines_tolerated(tmp_path):
     # The malformed trailing line is skipped; the good record still resolves.
     rec = tc.capability_for("app.bad.com", "/")
     assert rec is not None and rec["prefer"] == "browser"
+
+
+def test_site_grouping_shares_across_subdomains():
+    # site 'alpha' groups admin + *.esi; a record on one host resolves from a sibling subdomain.
+    assert tc.record_capability("https://admin.alpha.example.com/x", auth="both",
+                                prefer="api", reason="x") == "alpha"
+    rec = tc.capability_for("us1.esi.alpha.example.com", "/x")
+    assert rec is not None and rec["prefer"] == "api" and rec["host"] == "alpha"

@@ -1,0 +1,7 @@
+{
+  "_README": "Copy this to ~/.dast-ai/sites.json and define YOUR targets' product groups. A 'site' is one product that spans several domains/subdomains (admin console, SSO/identity host, add-in hosts, API hosts) which share login/sub-apps. Frieren's learned stores (app_knowledge, login_journal, transport_capability, activation recipes) key off the site id, so a learning on one subdomain is reused by its siblings and isolated from other products. It is target-specific topology, so it is NEVER committed (the repo ships only this generic example). Each 'domains' entry is an exact host or a wildcard suffix '*.sub.example.com' (matches subdomains of sub.example.com, not the bare host). Most specific (longest) pattern wins. With no local file, every host is its own key (per-host, as before).",
+  "sites": [
+    {"id": "productA", "domains": ["admin.product-a.example.com", "*.esi.product-a.example.com", "*.api.product-a.example.com"]},
+    {"id": "productB", "domains": ["app.product-b.example.com"]}
+  ]
+}

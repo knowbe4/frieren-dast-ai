@@ -39,6 +39,9 @@ EXAMPLE_ACCESS_KEYS = frozenset(
 CONTENT_ALLOWLIST: tuple[str, ...] = (
     ".env.example",
     "dast/scope_presets/example.json.example",
+    # This guard itself defines the forbidden hostname/topology patterns, so its own
+    # source legitimately contains those strings — skip content rules on it.
+    "scripts/check_no_internal_data.py",
     "tests/unit/test_secrets_agent.py",
     "tests/unit/test_internal_data_guard.py",
     "tests/unit/test_passive_scanner.py",
@@ -71,20 +74,39 @@ AWS_ACCESS_KEY_RE = re.compile(r"\b((?:AKIA|ASIA)[0-9A-Z]{16})\b")
 AWS_SECRET_ASSIGN_RE = re.compile(
     r"AWS_SECRET_ACCESS_KEY\s*[=:]\s*['\"]?([A-Za-z0-9/+=]{20,})"
 )
-# Internal-only hostnames (e.g. the Claude apps gateway, on-demand demo infra)
-# must stay in .env / local scripts, never in a tracked file. Covers internal
-# env/product subdomains of the corp domain and any on-demand run host. Public
-# references like "github.com/knowbe4", a bare "*.knowbe4.com" / "kb4od.run"
-# mention, or "*.example.com" placeholders are NOT matched (they carry no
-# host-qualified internal subdomain).
+# Internal-only hostnames (e.g. the Claude apps gateway, on-demand demo infra, the
+# KMSAT/PhishER app hosts) must stay in .env / local scripts, never in a tracked
+# file. Covers ANY concrete subdomain of the corp domain and any on-demand run host.
+# NOT matched (they carry no host-qualified concrete subdomain): "github.com/knowbe4"
+# (org path), a bare "knowbe4.com" / "kb4od.run" mention, a "*.knowbe4.com" wildcard
+# rule, and "*.example.com" placeholders.
 _INTERNAL_HOST_PATTERNS: tuple[str, ...] = (
-    # <host>.<internal-env-or-product>.knowbe4.com
-    r"[a-z0-9][a-z0-9.-]*\.(?:internal|corp|private|kmsat|phisher|eai)\.knowbe4\.com",
+    # <concrete-subdomain>.knowbe4.com — e.g. training.knowbe4.com, api.phisher.knowbe4.com.
+    # A bare "knowbe4.com" and a "*.knowbe4.com" wildcard do not match (no alnum label
+    # directly before ".knowbe4.com").
+    r"[a-z0-9][a-z0-9.-]*\.knowbe4\.com",
     # on-demand / demo infra run hosts under the kb4od.run run domain
     r"[a-z0-9][a-z0-9.-]*\.kb4od\.[a-z]{2,}",
 )
 INTERNAL_HOSTNAME_RE = re.compile(
     r"\b(?:" + "|".join(_INTERNAL_HOST_PATTERNS) + r")\b",
+    re.IGNORECASE,
+)
+
+# Internal service/JWT topology identifiers. These name KMSAT sub-app services, their
+# per-service JWT fields, and internal-only endpoints — target-specific internal detail
+# that belongs in the operator's local ~/.dast-ai/subapp_map.json, never in tracked code.
+# Only distinctive compound identifiers are listed (never bare generic words like "search"
+# or "ccm") so a normal sentence cannot trip the guard.
+_INTERNAL_TOPOLOGY_PATTERNS: tuple[str, ...] = (
+    r"modstore",
+    r"customercontent",
+    r"zenka",
+    r"graphql_direct",
+    r"(?:modstore|ccm|zenka|search)Jwt",
+)
+INTERNAL_TOPOLOGY_RE = re.compile(
+    r"\b(?:" + "|".join(_INTERNAL_TOPOLOGY_PATTERNS) + r")\b",
     re.IGNORECASE,
 )
 
@@ -155,6 +177,12 @@ def _check_content_rules(path: str) -> list[str]:
     for match in INTERNAL_HOSTNAME_RE.finditer(text):
         violations.append(
             f"{path}: internal hostname ({match.group(0)}) — keep it in .env, not in tracked files"
+        )
+
+    for match in INTERNAL_TOPOLOGY_RE.finditer(text):
+        violations.append(
+            f"{path}: internal service/JWT identifier ({match.group(0)}) — "
+            "keep target topology in the local ~/.dast-ai/subapp_map.json, not in tracked files"
         )
 
     return violations

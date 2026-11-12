@@ -1684,14 +1684,22 @@ class CopilotSession:
             host = parsed.hostname or ""
             if not host:
                 return None
-            from dast.session import site_map, subapp_map
+            from dast.session import activation_recipe, site_map, subapp_map
             from dast.session.auth_provider import subapp_for_path
             app = subapp_for_path(parsed.path or "/", site_map.site_for_host(host) or "")
             if not app:
                 return None
-            prime = subapp_map.prime_for_app(app)
-            if not prime:
-                return None
+            prime = subapp_map.prime_for_app(app) or {}
+            store = getattr(tool_ctx, "store", None)
+            # Activation nav: prefer a LEARNED recipe (the Referer of the SPA's own authenticated
+            # call to this sub-app, per site), then try to learn it from history now, then fall back
+            # to the hardcoded prime.nav. This removes the per-sub-app nav hardcode over time.
+            nav = (activation_recipe.activation_nav(host, app)
+                   or activation_recipe.learn_from_history(store, host, app)
+                   or prime.get("nav"))
+            has_cookie_mode = bool(prime.get("endpoint") and prime.get("cookie"))
+            if not has_cookie_mode and not nav:
+                return None  # no recovery available for this sub-app
             key = (host, app)
             if key in self._primed_subapps:
                 return None
@@ -1700,7 +1708,7 @@ class CopilotSession:
             current = result
             acted = False
             # Mechanism 1 — cookie prime (when the descriptor declares endpoint+cookie).
-            if prime.get("endpoint") and prime.get("cookie"):
+            if has_cookie_mode:
                 pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
                 if isinstance(pr, dict) and pr.get("ok") and pr.get("verified"):
                     self._apply_session_auth(tool_ctx, tool_args)
@@ -1708,21 +1716,51 @@ class CopilotSession:
                     acted = True
                     if not _authfail(current):
                         return current
-            # Mechanism 2 — browser activation (when the descriptor declares a nav URL and a live
-            # browser exists). Open the activation page so the SPA mints the sub-app's working
-            # Bearer; the retry then rides the captured per-service token.
-            nav = prime.get("nav")
+            # Mechanism 2 — browser activation: open the activation nav (learned or hardcoded) so
+            # the SPA mints the sub-app's working Bearer; the retry rides the captured per-service
+            # token. On success, persist the nav that worked as a learned recipe (reinforce/seed).
             if nav and getattr(tool_ctx, "browser", None) is not None and _authfail(current):
                 nav_url = nav if "://" in nav else f"https://{host}{nav if nav.startswith('/') else '/' + nav}"
                 await run_tool(tool_ctx, "browser_navigate", {"url": nav_url})
+                # Opening the activation page makes the SPA issue its own authenticated call to the
+                # sub-app; learn the recipe from THAT call's Referer now (independent of whether our
+                # immediate retry wins the race to the freshly-minted Bearer), so the activation nav
+                # is captured even when the retry below still races and fails.
+                activation_recipe.learn_from_history(store, host, app)
+                # The SPA mints the sub-app's working Bearer asynchronously after the nav; wait
+                # (bounded) for it to land in history so the retry rides it instead of racing the
+                # mint — this makes the activation authenticate in one shot.
+                await self._await_subapp_bearer(store, host, app)
                 self._apply_session_auth(tool_ctx, tool_args)
                 current = await run_tool(tool_ctx, tool_name, tool_args)
                 acted = True
+                if not _authfail(current):
+                    activation_recipe.record_activation(host, app, nav, source="prime-success")
             # Return the freshest retried result (even if still failing); None if nothing ran.
             return current if acted else None
         except Exception as exc:  # noqa: BLE001
             logger.debug("session-prime recovery failed", error=str(exc)[:160])
             return None
+
+    async def _await_subapp_bearer(self, store: Any, host: str, app: str,
+                                   *, tries: int = 20, interval: float = 0.5) -> bool:
+        """Bounded poll for the sub-app's working Bearer to appear in proxy history after a browser
+        activation nav (the SPA mints it asynchronously). Returns True once a fresh token is
+        captured so the retry can ride it instead of racing the mint. Best-effort; never raises."""
+        from dast.session import subapp_map
+        from dast.session.auth_provider import scan_history_bearer
+        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "")
+        if store is None or not probe:
+            return False
+        for _ in range(max(1, tries)):
+            try:
+                rec = scan_history_bearer(store, host, probe, exclude_source="copilot")
+                if rec and rec.get("token"):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(interval)
+        return False
 
     def _scoped_cookies_for_host(self, host: str) -> List[dict]:
         """Cookie list for host from the correct jar: this session's isolated named jar

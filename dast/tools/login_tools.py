@@ -84,6 +84,8 @@ async def _adaptive_login(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
                             count=len(cookies))
             if session is not None:
                 session._last_login = {"url": url, "email": email, "password": password}
+                if hasattr(session, "reset_dedup"):
+                    session.reset_dedup("browser_login")
         return result.to_dict()
     except Exception as exc:
         return {"ok": False, "error": f"adaptive login failed: {str(exc)[:200]}", "url": url}

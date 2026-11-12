@@ -584,6 +584,7 @@ class CopilotService:
                 merged_cookies.update(batch)
                 hosts_updated.append(host)
         engine.seed_session_cookies(merged_cookies)
+        engine.reset_dedup("refresh_session")
         logger.info("copilot session refreshed from proxy jar",
                     sid=sid, hosts=hosts_updated, cookies=len(merged_cookies))
         return {"ok": True, "hosts_updated": hosts_updated, "cookies_refreshed": len(merged_cookies)}
@@ -2180,11 +2181,8 @@ class CopilotService:
                             "agent repeatedly looped on the same call and could not self-correct")
                         await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
                         return
-                    # Clear the engine's dedup + repeat counters so the corrected strategy
-                    # is not itself suppressed, then re-prompt with a hard constraint.
                     try:
-                        session["engine"]._seen_calls.clear()
-                        session["engine"]._repeat_sigs.clear()
+                        session["engine"].reset_dedup("stuck_loop")
                     except Exception as exc:
                         logger.debug("stuck_loop: could not clear engine dedup", error=str(exc))
                     prompt = _AUTONOMOUS_STUCK_LOOP.format(

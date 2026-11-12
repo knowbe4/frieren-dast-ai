@@ -1727,6 +1727,10 @@ class CopilotSession:
                 # immediate retry wins the race to the freshly-minted Bearer), so the activation nav
                 # is captured even when the retry below still races and fails.
                 activation_recipe.learn_from_history(store, host, app)
+                # The SPA mints the sub-app's working Bearer asynchronously after the nav; wait
+                # (bounded) for it to land in history so the retry rides it instead of racing the
+                # mint — this makes the activation authenticate in one shot.
+                await self._await_subapp_bearer(store, host, app)
                 self._apply_session_auth(tool_ctx, tool_args)
                 current = await run_tool(tool_ctx, tool_name, tool_args)
                 acted = True
@@ -1737,6 +1741,26 @@ class CopilotSession:
         except Exception as exc:  # noqa: BLE001
             logger.debug("session-prime recovery failed", error=str(exc)[:160])
             return None
+
+    async def _await_subapp_bearer(self, store: Any, host: str, app: str,
+                                   *, tries: int = 20, interval: float = 0.5) -> bool:
+        """Bounded poll for the sub-app's working Bearer to appear in proxy history after a browser
+        activation nav (the SPA mints it asynchronously). Returns True once a fresh token is
+        captured so the retry can ride it instead of racing the mint. Best-effort; never raises."""
+        from dast.session import subapp_map
+        from dast.session.auth_provider import scan_history_bearer
+        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "")
+        if store is None or not probe:
+            return False
+        for _ in range(max(1, tries)):
+            try:
+                rec = scan_history_bearer(store, host, probe, exclude_source="copilot")
+                if rec and rec.get("token"):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(interval)
+        return False
 
     def _scoped_cookies_for_host(self, host: str) -> List[dict]:
         """Cookie list for host from the correct jar: this session's isolated named jar

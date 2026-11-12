@@ -74,6 +74,14 @@ def _isolate_transport_capability(tmp_path, monkeypatch):
     monkeypatch.setattr(transport_capability, "_DIR", tmp_path / "transport_capability")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_activation_recipe(tmp_path, monkeypatch):
+    """Redirect the learned activation-recipe store to a per-test tmp dir so tests never
+    read/write the developer's real ~/.dast-ai/activation_recipe."""
+    from dast.session import activation_recipe  # noqa: PLC0415
+    monkeypatch.setattr(activation_recipe, "_DIR", tmp_path / "activation_recipe")
+
+
 # Generic PLACEHOLDER sub-app map for the whole unit suite — never real target topology.
 # Two prefixed apps (alpha/beta) + one prefix-less app (gamma) exercise prefix resolution and
 # the app->jwt-field map. 'beta' also declares a 'prime' descriptor so session-prime tests have a

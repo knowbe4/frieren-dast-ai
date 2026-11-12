@@ -141,3 +141,31 @@ async def test_bounded_to_one_ladder_per_host_app():
     out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
                                       _run_tool(calls2, send_results=[_OK]))
     assert out is None and calls2 == []       # second time: ladder already spent for (host, app)
+
+
+@pytest.mark.asyncio
+async def test_learned_nav_preferred_over_hardcoded():
+    # A learned activation recipe for (site/host, beta) should be used by the browser-activation
+    # mechanism instead of the hardcoded prime.nav ('/beta/home').
+    from dast.session import activation_recipe as ar
+    ar.record_activation("app.example.com", "beta", "/LEARNED/studio")
+    s = _session()
+    calls = []
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool(calls, send_results=[_AUTHFAIL, _OK]))
+    assert out is not None and out["body"] == _OK["body"]
+    nav_call = [c for c in calls if c[0] == "browser_navigate"][0]
+    assert nav_call[1]["url"] == "https://app.example.com/LEARNED/studio"   # learned, not /beta/home
+
+
+@pytest.mark.asyncio
+async def test_records_activation_recipe_on_browser_success():
+    # With no learned recipe, the hardcoded prime.nav is used; on a successful browser activation
+    # the nav that worked is persisted as a learned recipe (reinforce/seed).
+    from dast.session import activation_recipe as ar
+    assert ar.activation_nav("app.example.com", "beta") is None
+    s = _session()
+    out = await s._maybe_prime_subapp(_ctx(browser=True), "send_request", dict(_ARGS), _AUTHFAIL,
+                                      _run_tool([], send_results=[_AUTHFAIL, _OK]))
+    assert out is not None and out["body"] == _OK["body"]
+    assert ar.activation_nav("app.example.com", "beta") == "/beta/home"     # recorded on success

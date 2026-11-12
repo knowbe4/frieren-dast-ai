@@ -47,6 +47,9 @@ _MAX_NORMALIZED_REPEATS = 3
 # Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
+# Expiry detection: distinct paths a previously-2xx host must reject (401/403, in a row)
+# before the copilot treats it as an expired session rather than an authz denial.
+_AUTH_FLIP_PATHS = 2
 
 
 class RefreshTier(IntEnum):
@@ -630,6 +633,10 @@ class CopilotSession:
         # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
         # fabricated host escalate and trip the failure breaker instead of looping.
         self._denied_hosts: Dict[str, int] = {}
+        # Expiry detection: hosts that answered 2xx this session, and the distinct paths
+        # that have since been rejected 401/403 in a row (see _auth_flip).
+        self._host_ok: set[str] = set()
+        self._host_authfail: Dict[str, set[str]] = {}
         self._store: Optional[object] = None
         # Name of this run's isolated named session (set when a login profile is
         # activated). When set, auth (cookies + Bearer) is sourced ONLY from this
@@ -651,6 +658,26 @@ class CopilotSession:
         self._seen_calls.clear()
         self._repeat_sigs.clear()
         logger.info("copilot dedup reset", session_id=self.session_id, reason=reason)
+
+    def _auth_flip(self, host: str, path: str, status: Any) -> bool:
+        """True when a host that answered 2xx earlier this session now rejects
+        ``_AUTH_FLIP_PATHS`` distinct paths in a row with 401/403 — the shape of an expired
+        session. A lone 403 is an expected result in authz testing and never qualifies."""
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return False
+        if not host:
+            return False
+        if 200 <= code < 300:
+            self._host_ok.add(host)
+            self._host_authfail.pop(host, None)
+            return False
+        if code in (401, 403) and host in self._host_ok:
+            paths = self._host_authfail.setdefault(host, set())
+            paths.add(path)
+            return len(paths) >= _AUTH_FLIP_PATHS
+        return False
 
     def get_known_hosts(self) -> List[str]:
         """All hosts this session has targeted (focus + any touched during tool calls)."""
@@ -1340,35 +1367,37 @@ class CopilotSession:
                                     self._session_cookies[name] = morsel.value
                             except Exception:
                                 pass
-                    if (
-                        tool_name in ("send_request", "browser_navigate")
-                        and not self._relogin_in_progress
-                        and self._last_login is not None
-                    ):
+                    if tool_name in ("send_request", "browser_navigate", "browser_fetch"):
                         status = result.get("status")
                         request_url = str(tool_args.get("url") or result.get("url") or "")
                         host = urlparse(request_url).hostname or ""
-                        final_url = str(result.get("final_url") or result.get("url") or "").lower()
-                        login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
-                        session_expired = (
-                            (status == 302 and any(p in final_url for p in login_paths))
-                            or status == 401
-                        )
-                        if session_expired and host:
-                            # One refresh policy: the ladder escalates (re-scan -> wait for
-                            # the SPA -> refetch the auth endpoint -> reload the SPA -> full
-                            # re-login) and owns every cooldown, so a burst of 401s cannot
-                            # trigger a relogin flood. ``acted`` means a mutating tier ran,
-                            # so re-apply auth and re-run the request once.
-                            request_path = urlparse(request_url).path or "/"
-                            outcome = await self.refresh_bearer(
-                                getattr(tool_ctx, "store", None), host, request_path,
-                                browser=getattr(tool_ctx, "browser", None),
-                                tool_ctx=tool_ctx,
-                                max_tier=RefreshTier.RELOGIN, reason="401")
-                            if outcome.acted:
-                                self._apply_session_auth(tool_ctx, tool_args)
-                                result = await run_tool(tool_ctx, tool_name, tool_args)
+                        request_path = urlparse(request_url).path or "/"
+                        flipped = self._auth_flip(host, request_path, status)
+                        if not self._relogin_in_progress and self._last_login is not None:
+                            final_url = str(result.get("final_url") or result.get("url") or "").lower()
+                            login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
+                            session_expired = (
+                                (status == 302 and any(p in final_url for p in login_paths))
+                                or status == 401
+                                or flipped
+                            )
+                            if session_expired and host:
+                                # One refresh policy: the ladder escalates (re-scan -> wait for
+                                # the SPA -> refetch the auth endpoint -> reload the SPA -> full
+                                # re-login) and owns every cooldown, so a burst of 401s cannot
+                                # trigger a relogin flood. ``acted`` means a mutating tier ran,
+                                # so re-apply auth and re-run the request once.
+                                self._host_authfail.pop(host, None)
+                                outcome = await self.refresh_bearer(
+                                    getattr(tool_ctx, "store", None), host, request_path,
+                                    browser=getattr(tool_ctx, "browser", None),
+                                    tool_ctx=tool_ctx,
+                                    max_tier=RefreshTier.RELOGIN,
+                                    reason="auth-flip" if flipped else "401")
+                                if outcome.acted:
+                                    self._apply_session_auth(tool_ctx, tool_args)
+                                    result = await run_tool(tool_ctx, tool_name, tool_args)
+                                    self._auth_flip(host, request_path, result.get("status"))
 
                     # Transport fallback: an API request that STILL 401s after the Bearer
                     # refresh is re-issued via the browser session, which rides the SPA's live

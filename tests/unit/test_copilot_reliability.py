@@ -255,10 +255,19 @@ async def test_activate_saved_profile_seeds_relogin_credentials(has_creds):
 
 
 # ── 2b: expiry detection on a 2xx -> 401/403 flip (incl. browser_fetch) ──
+# The rule: an endpoint (path+query) that answered 2xx this session now answers
+# 401/403 = expired session -> relogin.  A 403 on an endpoint never seen working
+# (forbidden-file probes, IDOR on a different id) is an expected authz result.
+
+_req_counter = 0
+
 
 def _req(path: str, tool: str = "send_request") -> Dict[str, Any]:
+    global _req_counter
+    _req_counter += 1
     return {"action": "call_tool", "thought": "p", "tool_name": tool,
-            "tool_args": {"url": f"https://in.scope{path}", "method": "GET"}}
+            "tool_args": {"url": f"https://in.scope{path}", "method": "GET",
+                          "headers": {"X-Req": str(_req_counter)}}}
 
 
 def _armed_session(sid: str) -> CopilotSession:
@@ -281,21 +290,34 @@ def _status_by_path(statuses: Dict[str, List[int]]):
 
 
 @pytest.mark.asyncio
-async def test_403_flip_on_distinct_paths_triggers_relogin_and_retry():
+async def test_same_endpoint_200_then_403_triggers_relogin_and_retry():
+    """GET /api returns 200, then later the SAME /api returns 403 -> flip -> relogin + retry."""
     session = _armed_session("s-flip")
-    run_tool, calls = _status_by_path({"/a": [200], "/b": [403], "/c": [403, 200]})
-    await _drive(session, _FakeCtx(), [_req("/a"), _req("/b"), _req("/c"), _REPLY], run_tool)
+    run_tool, calls = _status_by_path({"/api": [200, 403, 200]})
+    await _drive(session, _FakeCtx(),
+                 [_req("/api"), _req("/api"), _REPLY], run_tool)
     session.refresh_bearer.assert_awaited_once()
     assert session.refresh_bearer.await_args.kwargs["reason"] == "auth-flip"
-    assert calls == ["/a", "/b", "/c", "/c"]  # retried once after the relogin
-    assert not session._host_authfail
+    assert calls == ["/api", "/api", "/api"]
 
 
 @pytest.mark.asyncio
-async def test_single_403_after_2xx_is_an_authz_result_not_expiry():
-    session = _armed_session("s-one403")
-    run_tool, _ = _status_by_path({"/a": [200], "/admin": [403]})
-    await _drive(session, _FakeCtx(), [_req("/a"), _req("/admin"), _REPLY], run_tool)
+async def test_forbidden_file_403_without_prior_2xx_no_relogin():
+    """403 on /.htaccess and /.htpasswd (never had a 200) = forbidden files, not expiry."""
+    session = _armed_session("s-forbid")
+    run_tool, _ = _status_by_path({"/.htaccess": [403], "/.htpasswd": [403]})
+    await _drive(session, _FakeCtx(),
+                 [_req("/.htaccess"), _req("/.htpasswd"), _REPLY], run_tool)
+    session.refresh_bearer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_different_query_403_is_idor_not_expiry():
+    """/api?id=1 returns 200, /api?id=2 returns 403 — different endpoint (query differs)."""
+    session = _armed_session("s-idor")
+    run_tool, _ = _status_by_path({"/api?id=1": [200], "/api?id=2": [403]})
+    await _drive(session, _FakeCtx(),
+                 [_req("/api?id=1"), _req("/api?id=2"), _REPLY], run_tool)
     session.refresh_bearer.assert_not_awaited()
 
 
@@ -307,17 +329,17 @@ async def test_403s_on_a_never_ok_host_do_not_trigger_relogin():
     session.refresh_bearer.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_2xx_between_403s_resets_the_flip():
-    session = _armed_session("s-reset")
-    run_tool, _ = _status_by_path({"/a": [200], "/b": [403], "/ok": [200], "/c": [403]})
-    await _drive(session, _FakeCtx(), [_req("/a"), _req("/b"), _req("/ok"), _req("/c"), _REPLY],
-                 run_tool)
-    session.refresh_bearer.assert_not_awaited()
+def test_auth_flip_rearms_after_2xx():
+    """After a flip (200 then 403), a fresh 200 re-arms the endpoint for the next flip."""
+    session = CopilotSession("s-rearm")
+    assert not session._auth_flip("h", "/api", 200)
+    assert session._auth_flip("h", "/api", 403)
+    assert not session._auth_flip("h", "/api", 200)
+    assert session._auth_flip("h", "/api", 401)
 
 
 @pytest.mark.asyncio
-async def test_browser_fetch_401_now_triggers_expiry_relogin():
+async def test_browser_fetch_401_triggers_expiry_relogin():
     session = _armed_session("s-bf401")
     run_tool, calls = _status_by_path({"/api": [401, 200]})
     await _drive(session, _FakeCtx(), [_req("/api", tool="browser_fetch"), _REPLY], run_tool)
@@ -329,8 +351,8 @@ async def test_browser_fetch_401_now_triggers_expiry_relogin():
 async def test_flip_without_relogin_credentials_does_nothing():
     session = CopilotSession("s-nocreds")
     session.refresh_bearer = AsyncMock(return_value=SimpleNamespace(acted=True))
-    run_tool, _ = _status_by_path({"/a": [200], "/b": [403], "/c": [403]})
-    await _drive(session, _FakeCtx(), [_req("/a"), _req("/b"), _req("/c"), _REPLY], run_tool)
+    run_tool, _ = _status_by_path({"/api": [200, 403]})
+    await _drive(session, _FakeCtx(), [_req("/api"), _req("/api"), _REPLY], run_tool)
     session.refresh_bearer.assert_not_awaited()
 
 

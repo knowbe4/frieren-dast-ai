@@ -47,9 +47,6 @@ _MAX_NORMALIZED_REPEATS = 3
 # Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
-# Expiry detection: distinct paths a previously-2xx host must reject (401/403, in a row)
-# before the copilot treats it as an expired session rather than an authz denial.
-_AUTH_FLIP_PATHS = 2
 
 
 class RefreshTier(IntEnum):
@@ -633,10 +630,9 @@ class CopilotSession:
         # Per-host count of out-of-scope/off-focus denials, so repeated attempts at a
         # fabricated host escalate and trip the failure breaker instead of looping.
         self._denied_hosts: Dict[str, int] = {}
-        # Expiry detection: hosts that answered 2xx this session, and the distinct paths
-        # that have since been rejected 401/403 in a row (see _auth_flip).
-        self._host_ok: set[str] = set()
-        self._host_authfail: Dict[str, set[str]] = {}
+        # Expiry detection: per host, the endpoints (path+query) that answered 2xx this
+        # session (see _auth_flip).
+        self._ok_endpoints: Dict[str, set[str]] = {}
         self._store: Optional[object] = None
         # Name of this run's isolated named session (set when a login profile is
         # activated). When set, auth (cookies + Bearer) is sourced ONLY from this
@@ -659,24 +655,24 @@ class CopilotSession:
         self._repeat_sigs.clear()
         logger.info("copilot dedup reset", session_id=self.session_id, reason=reason)
 
-    def _auth_flip(self, host: str, path: str, status: Any) -> bool:
-        """True when a host that answered 2xx earlier this session now rejects
-        ``_AUTH_FLIP_PATHS`` distinct paths in a row with 401/403 — the shape of an expired
-        session. A lone 403 is an expected result in authz testing and never qualifies."""
+    def _auth_flip(self, host: str, endpoint: str, status: Any) -> bool:
+        """True when an endpoint (path+query) that answered 2xx earlier this session now
+        answers 401/403 — the shape of an expired session. A 403 on an endpoint never seen
+        working (forbidden-file probes, an IDOR on another id) is an expected result and
+        never qualifies. Fires once per flip; the endpoint re-arms on its next 2xx."""
         try:
             code = int(status)
         except (TypeError, ValueError):
             return False
         if not host:
             return False
+        ok = self._ok_endpoints.setdefault(host, set())
         if 200 <= code < 300:
-            self._host_ok.add(host)
-            self._host_authfail.pop(host, None)
+            ok.add(endpoint)
             return False
-        if code in (401, 403) and host in self._host_ok:
-            paths = self._host_authfail.setdefault(host, set())
-            paths.add(path)
-            return len(paths) >= _AUTH_FLIP_PATHS
+        if code in (401, 403) and endpoint in ok:
+            ok.discard(endpoint)
+            return True
         return False
 
     def get_known_hosts(self) -> List[str]:
@@ -1371,8 +1367,10 @@ class CopilotSession:
                         status = result.get("status")
                         request_url = str(tool_args.get("url") or result.get("url") or "")
                         host = urlparse(request_url).hostname or ""
-                        request_path = urlparse(request_url).path or "/"
-                        flipped = self._auth_flip(host, request_path, status)
+                        _parsed_req = urlparse(request_url)
+                        request_path = _parsed_req.path or "/"
+                        endpoint = request_path + (f"?{_parsed_req.query}" if _parsed_req.query else "")
+                        flipped = self._auth_flip(host, endpoint, status)
                         if not self._relogin_in_progress and self._last_login is not None:
                             final_url = str(result.get("final_url") or result.get("url") or "").lower()
                             login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
@@ -1387,7 +1385,6 @@ class CopilotSession:
                                 # re-login) and owns every cooldown, so a burst of 401s cannot
                                 # trigger a relogin flood. ``acted`` means a mutating tier ran,
                                 # so re-apply auth and re-run the request once.
-                                self._host_authfail.pop(host, None)
                                 outcome = await self.refresh_bearer(
                                     getattr(tool_ctx, "store", None), host, request_path,
                                     browser=getattr(tool_ctx, "browser", None),
@@ -1397,7 +1394,7 @@ class CopilotSession:
                                 if outcome.acted:
                                     self._apply_session_auth(tool_ctx, tool_args)
                                     result = await run_tool(tool_ctx, tool_name, tool_args)
-                                    self._auth_flip(host, request_path, result.get("status"))
+                                    self._auth_flip(host, endpoint, result.get("status"))
 
                     # Transport fallback: an API request that STILL 401s after the Bearer
                     # refresh is re-issued via the browser session, which rides the SPA's live

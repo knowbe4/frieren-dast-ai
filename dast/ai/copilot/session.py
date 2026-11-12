@@ -893,6 +893,7 @@ class CopilotSession:
                 self._last_login["url"],
                 self._last_login["email"],
                 self._last_login["password"],
+                totp_secret=self._last_login.get("totp_secret"),
                 in_scope=getattr(tool_ctx, "is_in_scope", None),
                 store=getattr(tool_ctx, "store", None),
                 session=self,

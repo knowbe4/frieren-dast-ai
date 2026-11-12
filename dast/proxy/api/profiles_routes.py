@@ -41,6 +41,7 @@ class CredentialIn(BaseModel):
     label: str = "default"
     username: str = ""
     secret: Optional[str] = None  # None = leave existing secret unchanged on update
+    totp_secret: Optional[str] = None  # None = leave existing TOTP seed unchanged on update
 
 
 class ProfileIn(BaseModel):
@@ -51,6 +52,7 @@ class ProfileIn(BaseModel):
     credentials: List[CredentialIn] = []
     selector_overrides: Dict[str, str] = {}
     privilege_level: str = ""
+    test_account: bool = False  # disposable test account — required to arm a TOTP seed
 
 
 class SessionImportIn(BaseModel):
@@ -73,18 +75,20 @@ class CaptureFromProxyIn(BaseModel):
 def _merge_credentials(
     incoming: List[CredentialIn], existing: List[Credential]
 ) -> List[Credential]:
-    """Build the credential list, preserving a secret when the client omits it.
+    """Build the credential list, preserving a secret/TOTP seed when the client omits it.
 
-    A credential's secret is only overwritten when the request supplies a non-None
-    ``secret``; sending null/omitting keeps the previously stored secret (so the UI
-    can round-trip a redacted profile without wiping passwords).
+    A credential's secret (or TOTP seed) is only overwritten when the request supplies a
+    non-None value; sending null/omitting keeps the previously stored one (so the UI can
+    round-trip a redacted profile without wiping passwords or seeds).
     """
     by_label = {c.label: c for c in existing}
     merged: List[Credential] = []
     for c in incoming:
         prior = by_label.get(c.label)
         secret = c.secret if c.secret is not None else (prior.secret if prior else "")
-        merged.append(Credential(label=c.label, username=c.username, secret=secret or ""))
+        totp = c.totp_secret if c.totp_secret is not None else (prior.totp_secret if prior else "")
+        merged.append(Credential(label=c.label, username=c.username,
+                                 secret=secret or "", totp_secret=totp or ""))
     return merged
 
 
@@ -123,6 +127,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if not req.name.strip():
             return JSONResponse({"error": "name is required"}, status_code=400)
         slug = req.slug or slugify(req.name)
+        # Reject an obviously-malformed TOTP seed up front (empty/None is fine — it
+        # means "no seed" / "leave unchanged"). Keeps a bad base32 out of the store.
+        from dast.profiles import totp as _totp
+        for c in req.credentials:
+            if c.totp_secret and not _totp.is_valid_secret(c.totp_secret):
+                return JSONResponse(
+                    {"error": f"credential '{c.label}' has an invalid TOTP (base32) seed"},
+                    status_code=400,
+                )
         existing = load_profile(slug)
         profile = existing or LoginProfile(slug=slug, name=req.name)
         profile.name = req.name
@@ -133,6 +146,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             req.credentials, existing.credentials if existing else []
         )
         profile.privilege_level = req.privilege_level
+        profile.test_account = req.test_account
         try:
             save_profile(profile)
         except Exception as exc:

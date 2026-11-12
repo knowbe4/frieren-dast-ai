@@ -26,6 +26,8 @@ dependencies = [
     "websockets>=12.0",
     "cryptography>=42.0.0",
     "pyyaml>=6.0.0",
+    # TOTP (2FA) code generation for test-account login profiles
+    "pyotp>=2.9.0",
     # Tech-stack fingerprinting (passive — uses proxy-captured responses, no extra requests)
     "wappalyzer>=2.0.0",
     "msgpack>=1.1.2",

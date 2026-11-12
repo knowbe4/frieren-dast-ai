@@ -56,6 +56,7 @@ async def adaptive_login(
     email: str,
     password: str,
     *,
+    totp_secret: Optional[str] = None,
     decide: Optional[AuthDecider] = None,
     success_url_suffix: Optional[str] = None,
     max_llm_steps: int = _MAX_LLM_STEPS,
@@ -72,6 +73,7 @@ async def adaptive_login(
     """
     ctx = LoginContext(
         browser, url, email, password,
+        totp_secret=totp_secret,
         success_url_suffix=success_url_suffix, in_scope=in_scope,
         store=store, session=session, decide=decide, max_llm_steps=max_llm_steps,
     )

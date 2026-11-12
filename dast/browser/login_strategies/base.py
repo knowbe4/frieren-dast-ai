@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
+from dast.browser.sso_domains import sso_domains
+
 # A decider maps (page_snapshot, context) -> one action dict, or None to stop.
 # context carries: email, password, target_url, history (prior actions).
 AuthDecider = Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]]
@@ -27,8 +29,7 @@ _MAX_LLM_STEPS = 8
 
 _LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
                 "/auth/login", "/u/login", "/authorize")
-_SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
-                "accounts.google", "cognito")
+_SSO_DOMAINS = sso_domains()
 
 
 @dataclass
@@ -73,6 +74,7 @@ class LoginContext:
     url: str
     email: str
     password: str
+    totp_secret: Optional[str] = None  # base32 2FA seed (test accounts only)
     success_url_suffix: Optional[str] = None
     in_scope: Optional[Callable[[str], bool]] = None
     store: Any = None

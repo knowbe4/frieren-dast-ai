@@ -18,6 +18,7 @@ import asyncio
 import time as _time
 from typing import Any, Dict, List, Optional
 
+from dast.browser.sso_domains import sso_domains as _sso_domains
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -551,12 +552,79 @@ class AgentBrowser:
         "#LOGIN-PASSWORD", "input[type=password]",
         "#password", "input[name=password]",
     ]
-    _SSO_DOMAINS = ("auth0", "okta", "login.microsoftonline",
-                    "accounts.google", "hrmauth", "cognito")
+    _SSO_DOMAINS = _sso_domains()
     _MFA_INDICATORS = ("/mfa", "/otp", "/challenge", "/two-factor",
                        "/u/mfa-otp-challenge", "/u/mfa-detect-browser")
+    _OTP_SELECTORS = (
+        "input[autocomplete=one-time-code]",
+        "input[name=code]", "input[id=code]", "input[name=otp]",
+        "input[name=totp]", "input[name='mfa-code']", "input[name=token]",
+        "input[type=tel][maxlength='6']", "input[inputmode=numeric]",
+    )
+
+    async def _try_totp_autofill(self, page: Any, totp_secret: str) -> bool:
+        """Generate the current TOTP code and fill+submit the OTP challenge.
+
+        Returns True only if, after submitting, the page has left the MFA/SSO wall
+        (i.e. the code was accepted). Never logs the seed or the generated code.
+        Best-effort: any failure returns False so the caller falls back to the
+        operator-wait / mfa_required path."""
+        from dast.profiles import totp as _totp
+        otp_field = None
+        for _attempt in range(3):
+            for sel in self._OTP_SELECTORS:
+                try:
+                    loc = page.locator(sel)
+                    if await loc.count() > 0 and await loc.first.is_visible():
+                        otp_field = loc.first
+                        break
+                except Exception:
+                    continue
+            if otp_field is not None:
+                break
+            await page.wait_for_timeout(2000)
+        if otp_field is None:
+            logger.info("browser_login: TOTP seed present but no OTP input found")
+            return False
+        try:
+            code = _totp.current_code(totp_secret)
+        except Exception as exc:
+            logger.warning("browser_login: TOTP code generation failed",
+                           error=str(exc)[:120])
+            return False
+        try:
+            await otp_field.fill(code)
+        except Exception as exc:
+            logger.debug("browser_login: OTP fill failed", error=str(exc)[:120])
+            return False
+        submit = await self._find_submit(page)
+        try:
+            if submit is not None:
+                try:
+                    async with page.expect_navigation(
+                        wait_until="domcontentloaded", timeout=15000):
+                        await submit.click()
+                except Exception:
+                    await submit.click()
+            else:
+                await otp_field.press("Enter")
+        except Exception as exc:
+            logger.debug("browser_login: OTP submit failed", error=str(exc)[:120])
+        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        low = page.url.lower()
+        still_mfa = any(ind in low for ind in self._MFA_INDICATORS)
+        on_sso = any(d in low for d in self._SSO_DOMAINS)
+        accepted = not still_mfa and not on_sso
+        logger.info("browser_login: TOTP auto-fill attempted",
+                    accepted=accepted, url=page.url)
+        return accepted
 
     async def login(self, url: str, email: str, password: str,
+                    totp_secret: Optional[str] = None,
                     timeout_ms: int = 60000) -> Dict[str, Any]:
         """Autonomous multi-step login: email -> [Continue] -> password -> submit.
 
@@ -655,6 +723,8 @@ class AgentBrowser:
                     on_mfa = await otp.count() > 0
                 except Exception:
                     on_mfa = False
+            if on_mfa and totp_secret and await self._try_totp_autofill(page, totp_secret):
+                on_mfa = False
             if on_mfa:
                 cookies = await self.export_cookies()
                 logger.info("browser_login: single-page submit hit an MFA wall",
@@ -788,7 +858,17 @@ class AgentBrowser:
                 pass
 
         if mfa_required:
-            if not self._headless:
+            # Test-account TOTP: generate + fill the OTP automatically (headed and
+            # headless) so the operator does not have to type it. Falls back to the
+            # operator-wait / mfa_required path below if there is no seed, no OTP
+            # input, or the generated code is rejected.
+            if totp_secret:
+                logger.info("browser_login: MFA detected, attempting TOTP auto-fill",
+                            url=page.url)
+                if await self._try_totp_autofill(page, totp_secret):
+                    mfa_required = False
+
+            if mfa_required and not self._headless:
                 logger.info("browser_login: MFA detected, waiting for operator "
                             "to complete in visible browser", url=page.url)
                 for _poll in range(24):

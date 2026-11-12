@@ -207,7 +207,8 @@ _FETCH_SCHEMA = {
     "properties": {
         "url": {"type": "string", "description": "URL to fetch (absolute or relative to current page origin)."},
         "method": {"type": "string", "description": "HTTP method (default POST).", "default": "POST"},
-        "headers": {"type": "object", "description": "Request headers (Content-Type defaults to application/json)."},
+        "headers": {"type": "object", "description": "Request headers (Content-Type defaults to application/json). "
+                    "Never set Cookie or Authorization: the browser session supplies them."},
         "body": {"type": "string", "description": "Request body (JSON string for POST/PUT)."},
     },
     "required": ["url"],

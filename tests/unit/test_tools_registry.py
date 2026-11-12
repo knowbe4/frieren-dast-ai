@@ -16,6 +16,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import httpx
+from unittest.mock import AsyncMock
 import pytest
 
 import dast.tools as tools
@@ -2345,3 +2346,48 @@ async def test_dispatch_agents_requires_nonempty_attack_types():
 def test_dispatch_agents_blocked_in_read_only():
     from dast.utils import read_only
     assert "dispatch_agents" in read_only.BLOCKED_TOOLS
+
+
+def _counting_oob_client(hit_on_poll: int | None):
+    class _Resp:
+        def __init__(self, payload):
+            self._p = payload
+            self.status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return self._p
+
+    class _Client:
+        gets = 0
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url):
+            _Client.gets += 1
+            hit = hit_on_poll is not None and _Client.gets >= hit_on_poll
+            return _Resp({"oob_url": "http://x.oast.pro",
+                          "callbacks": [{"type": "http"}] if hit else []})
+
+    return _Client
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args,expected_polls", [({}, 5), ({"wait_seconds": 0}, 1)])
+async def test_oob_poll_default_waits_and_zero_is_instant(monkeypatch, args, expected_polls):
+    from dast.tools import oob_tools
+    client = _counting_oob_client(hit_on_poll=None)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client(**kw))
+    monkeypatch.setattr(oob_tools.asyncio, "sleep", AsyncMock())
+    poll = await run_tool(ToolContext(settings=_Scope(True)), "oob_poll", {"id": "abc", **args})
+    assert poll["ok"] is True and poll["hit"] is False
+    assert client.gets == expected_polls
+
+
+@pytest.mark.asyncio
+async def test_oob_poll_returns_as_soon_as_a_callback_lands(monkeypatch):
+    from dast.tools import oob_tools
+    client = _counting_oob_client(hit_on_poll=2)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: client(**kw))
+    monkeypatch.setattr(oob_tools.asyncio, "sleep", AsyncMock())
+    poll = await run_tool(ToolContext(settings=_Scope(True)), "oob_poll", {"id": "abc"})
+    assert poll["hit"] is True
+    assert client.gets == 2

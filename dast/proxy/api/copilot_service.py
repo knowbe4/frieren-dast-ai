@@ -584,6 +584,7 @@ class CopilotService:
                 merged_cookies.update(batch)
                 hosts_updated.append(host)
         engine.seed_session_cookies(merged_cookies)
+        engine.reset_dedup("refresh_session")
         logger.info("copilot session refreshed from proxy jar",
                     sid=sid, hosts=hosts_updated, cookies=len(merged_cookies))
         return {"ok": True, "hosts_updated": hosts_updated, "cookies_refreshed": len(merged_cookies)}
@@ -1267,6 +1268,31 @@ class CopilotService:
                 logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
         except Exception as exc:
             logger.warning("autonomous run: relogin-credential seed failed", slug=slug, error=str(exc))
+
+    async def _breaker_reauth(self, sid: str, session: dict) -> Optional[bool]:
+        """One re-login attempt per run for the uniform-failure breaker. Returns True on
+        success, False if it ran and failed, None if it was not attempted (already used
+        this run, no credentials, or no browser)."""
+        auto = session.get("autonomous")
+        engine = session.get("engine")
+        creds = getattr(engine, "_last_login", None) if engine is not None else None
+        if (not isinstance(auto, dict) or auto.get("_breaker_reauth_done")
+                or not creds or not creds.get("url")):
+            return None
+        auto["_breaker_reauth_done"] = True
+        try:
+            tool_ctx = self._build_tool_ctx(session)
+            browser = getattr(tool_ctx, "browser", None)
+            if browser is None:
+                return None
+            host = urlparse(creds["url"]).hostname or ""
+            ok = bool(await engine._tier_relogin(self._ctx.store, host, browser, tool_ctx))
+        except Exception as exc:
+            logger.warning("uniform-failure breaker: re-auth errored", session_id=sid,
+                           error=str(exc)[:200])
+            ok = False
+        logger.info("uniform-failure breaker: re-auth attempted", session_id=sid, ok=ok)
+        return ok
 
     async def _ensure_profile_login(self, sid: str, session: dict) -> None:
         """Proactively log in a credential-only profile at run start so the run begins
@@ -2156,12 +2182,19 @@ class CopilotService:
                 else:
                     consec_fail_turns = 0
                 if consec_fail_turns >= _MAX_UNIFORM_FAIL_TURNS:
-                    self._finish_autonomous(
-                        session, "stopped",
-                        f"no successful (2xx) responses for {consec_fail_turns} turns — "
-                        f"stopping instead of flooding the target")
-                    await self._broadcast_autonomous(sid, "finished", {"status": "stopped"})
-                    return
+                    # Uniform rejection is also what an expired session looks like: try ONE
+                    # re-login per run before stopping (unbounded would loop on a real block).
+                    reauth = await self._breaker_reauth(sid, session)
+                    if reauth:
+                        consec_fail_turns = 0
+                    else:
+                        tail = " (re-auth also failed)" if reauth is False else ""
+                        self._finish_autonomous(
+                            session, "stopped",
+                            f"no successful (2xx) responses for {consec_fail_turns} turns — "
+                            f"stopping instead of flooding the target{tail}")
+                        await self._broadcast_autonomous(sid, "finished", {"status": "stopped"})
+                        return
 
                 # ── Interpret the reply's control signal ─────────────────────────
                 # Watchdog: the engine killed a turn whose agent looped on the same
@@ -2180,11 +2213,8 @@ class CopilotService:
                             "agent repeatedly looped on the same call and could not self-correct")
                         await self._broadcast_autonomous(sid, "finished", {"status": "stuck"})
                         return
-                    # Clear the engine's dedup + repeat counters so the corrected strategy
-                    # is not itself suppressed, then re-prompt with a hard constraint.
                     try:
-                        session["engine"]._seen_calls.clear()
-                        session["engine"]._repeat_sigs.clear()
+                        session["engine"].reset_dedup("stuck_loop")
                     except Exception as exc:
                         logger.debug("stuck_loop: could not clear engine dedup", error=str(exc))
                     prompt = _AUTONOMOUS_STUCK_LOOP.format(

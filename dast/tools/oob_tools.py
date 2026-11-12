@@ -52,13 +52,15 @@ _OOB_POLL_SCHEMA: Dict[str, Any] = {
         "id": {"type": "string", "description": "The session id returned by oob_generate."},
         "wait_seconds": {
             "type": "integer",
-            "description": "Optional: poll for up to this many seconds until a callback arrives (default 0, max 120).",
+            "description": "Optional: poll for up to this many seconds until a callback arrives (default 15, max 120; pass 0 for a single instant check).",
         },
     },
     "required": ["id"],
 }
 
 _POLL_INTERVAL_SECONDS = 3.0
+# Callbacks land seconds after the payload; an instant check misses them.
+_DEFAULT_WAIT_SECONDS = 15
 
 
 async def _oob_generate(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -107,9 +109,9 @@ async def _oob_poll(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if not session_id:
         return {"ok": False, "error": "id is required"}
     try:
-        wait_seconds = int(args.get("wait_seconds", 0))
+        wait_seconds = int(args.get("wait_seconds", _DEFAULT_WAIT_SECONDS))
     except (TypeError, ValueError):
-        wait_seconds = 0
+        wait_seconds = _DEFAULT_WAIT_SECONDS
     wait_seconds = max(0, min(wait_seconds, 120))
 
     try:

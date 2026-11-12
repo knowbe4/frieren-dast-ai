@@ -284,6 +284,8 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
                 engine.session_name = profile.slug
     except Exception as exc:
         logger.warning("activate_login_profile: engine seed failed", slug=profile.slug, error=str(exc)[:160])
+    if engine is not None and hasattr(engine, "reset_dedup"):
+        engine.reset_dedup("activate_login_profile")
     logger.info("activate_login_profile: logged in from credentials", slug=profile.slug,
                 cookies_imported=imported)
     return {"ok": True, "slug": profile.slug, "named_session": profile.slug, "logged_in": True,
@@ -320,6 +322,17 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
     except Exception as exc:
         return {"ok": False, "error": f"activate failed: {str(exc)[:160]}"}
     logger.info("activate_login_profile: activated", slug=slug, cookies_imported=imported)
+    engine = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
+    if engine is not None:
+        # Arm the expiry auto-relogin: a saved session goes stale, and without these the
+        # copilot has nothing to re-authenticate with (mirrors the autonomous activation).
+        creds = getattr(profile, "credentials", None) or []
+        auth_url = (getattr(profile, "auth_url", "") or "").strip()
+        if auth_url and creds and getattr(creds[0], "username", "") and getattr(creds[0], "secret", ""):
+            engine._last_login = {"url": auth_url, "email": creds[0].username,
+                                  "password": creds[0].secret}
+        if hasattr(engine, "reset_dedup"):
+            engine.reset_dedup("activate_login_profile")
     return {"ok": True, "slug": slug, "named_session": profile.slug,
             "privilege_level": getattr(profile, "privilege_level", "") or "",
             "cookies_imported": imported}

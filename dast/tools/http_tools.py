@@ -396,7 +396,11 @@ async def _test_unauth(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]
     try:
         import httpx
         request_body = body if method in ("POST", "PUT", "PATCH", "DELETE") else ""
-        async with httpx.AsyncClient(verify=False, follow_redirects=False, timeout=15) as client:
+        # Route through the MITM proxy (like send_request / get_app_token) so the
+        # unauthenticated test is RECORDED in history and inspectable — never out-of-band.
+        # proxy=None (MCP/no-proxy context) degrades to a direct send, as before.
+        async with httpx.AsyncClient(proxy=getattr(ctx, "proxy_url", None),
+                                     verify=False, follow_redirects=False, timeout=15) as client:
             resp = await client.request(
                 method, url, headers=headers or None,
                 content=request_body.encode("utf-8") if request_body else None,

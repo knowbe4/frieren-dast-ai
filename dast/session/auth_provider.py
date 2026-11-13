@@ -44,21 +44,30 @@ _NON_SUBAPP_SEGMENTS = frozenset({
 
 
 def _derived_subapp(path: str) -> Optional[str]:
-    """Best-effort sub-app key for a GraphQL path with NO ``subapp_map`` entry: the segment right
-    before ``graphql`` (e.g. ``/reports/graphql`` -> ``reports``). Scoped to GraphQL so it is a
-    high-signal sub-app marker (won't mis-fire on page/version routes like ``/v1/dashboard``).
+    """Best-effort sub-app key for a path with NO ``subapp_map`` entry, so the activation flow can
+    label an unmapped sub-app for its learned-recipe key. Two shapes:
+
+    - GraphQL (high-signal): the segment right before ``graphql`` (``/reports/graphql`` ->
+      ``reports``).
+    - REST: the first segment of a multi-segment API path (``/accounts/session`` ->
+      ``accounts``), excluding shell/static/version segments.
 
     Deliberately NOT wired into ``subapp_for_path`` (that would change the global bearer-index /
-    transport-capability keying contract); it is consulted ONLY by the activation path to label an
-    unmapped GraphQL sub-app for its learned-recipe key. Returns None when not applicable."""
+    transport-capability keying contract); it is consulted ONLY by the activation path. Over-
+    matching is harmless there — activation only navigates when a learned/known nav exists.
+    Returns None when the path is not sub-app-shaped (shell/static/version/single-segment)."""
     import re as _re
     segs = [s for s in (path or "").lower().split("/") if s]
-    if "graphql" not in segs:
+    if "graphql" in segs:
+        i = segs.index("graphql")
+        if i == 0:
+            return None
+        cand = segs[i - 1]
+    elif len(segs) >= 2:
+        # REST: a multi-segment path's first segment is the sub-app area (e.g. /<app>/<resource>).
+        cand = segs[0]
+    else:
         return None
-    i = segs.index("graphql")
-    if i == 0:
-        return None
-    cand = segs[i - 1]
     if cand in _NON_SUBAPP_SEGMENTS or _re.fullmatch(r"v\d+", cand):
         return None
     return cand

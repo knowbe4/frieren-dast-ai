@@ -208,3 +208,71 @@ def test_attach_no_cookies_is_a_clean_noop():
     assert headers == {}
     assert res.attached_bearer is False
     assert res.overrode_session_header is False
+
+
+# ── cross-host / integration token graph (Pass B fallback) ──────────────────
+
+def _jwt_aud(aud=None, exp=None) -> str:
+    def seg(o):
+        return base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b"=").decode()
+    p = {"sub": "1"}
+    if aud is not None:
+        p["aud"] = aud
+    if exp is not None:
+        p["exp"] = exp
+    return f"{seg({'alg': 'HS512'})}.{seg(p)}.{seg('sig1234567890')}"
+
+
+class _SG:
+    def __init__(self, mapping):
+        self._m = mapping
+    def known_hosts_for(self, host):
+        return list(self._m.get(host, []))
+
+
+class _SGStore(_Store):
+    def __init__(self, entries, sg):
+        super().__init__(entries)
+        self.service_graph = sg
+
+
+_APP = "app.target.example"
+_SSO = "sso.other.example"  # different apex -> only reachable via the service graph
+
+
+def test_cross_host_fallback_with_matching_aud():
+    tok = _jwt_aud(aud=["https://app.target.example/"])
+    store = _SGStore([_entry(_SSO, "/oauth/token", tok)], _SG({_APP: [_SSO]}))
+    rec = collect_host_bearer(store, _APP)
+    assert rec and rec["token"] == tok and rec.get("cross_host") is True
+    assert rec["matched_host"] == _SSO
+
+
+def test_cross_host_rejected_by_unrelated_aud():
+    tok = _jwt_aud(aud="service-c")
+    store = _SGStore([_entry(_SSO, "/oauth/token", tok)], _SG({_APP: [_SSO]}))
+    assert collect_host_bearer(store, _APP) is None
+
+
+def test_cross_host_not_used_when_same_apex_exists():
+    same = _jwt_aud()  # no aud; same-apex token on a subdomain of app.target.example
+    sibling = _jwt_aud(aud="https://app.target.example/")
+    store = _SGStore(
+        [_entry("api.target.example", "/x", same), _entry(_SSO, "/oauth/token", sibling)],
+        _SG({_APP: [_SSO]}))
+    rec = collect_host_bearer(store, _APP)
+    assert rec and rec["token"] == same and "cross_host" not in rec  # same-apex wins, Pass B skipped
+
+
+def test_cross_host_none_without_service_graph():
+    store = _Store([_entry(_SSO, "/oauth/token", _jwt_aud(aud=_APP))])  # no service_graph attr
+    assert collect_host_bearer(store, _APP) is None
+
+
+def test_cross_host_skips_expired_and_excluded():
+    expired = _jwt_aud(aud=_APP, exp=int(time.time()) - 10)
+    store = _SGStore([_entry(_SSO, "/oauth/token", expired)], _SG({_APP: [_SSO]}))
+    assert collect_host_bearer(store, _APP) is None
+    fresh = _jwt_aud(aud=_APP, exp=int(time.time()) + 3600)
+    store2 = _SGStore([_entry(_SSO, "/oauth/token", fresh, source="copilot")], _SG({_APP: [_SSO]}))
+    assert collect_host_bearer(store2, _APP, exclude_source="copilot") is None

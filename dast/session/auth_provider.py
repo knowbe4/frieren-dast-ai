@@ -106,6 +106,78 @@ def _field(entry: Any, name: str) -> Any:
     return getattr(entry, name, None)
 
 
+def _aud_allows_host(token: str, host: str) -> bool:
+    """Whether a JWT's ``aud`` (audience) permits using it against *host*. True when there is no
+    audience restriction (aud absent/empty) or when *host* matches an aud entry (exact, as a URL
+    host, or apex overlap). Keeps an SSO/identity token from being handed to a service that would
+    reject it. Never raises."""
+    try:
+        from dast.utils.jwt import decode_jwt_claims
+        claims = decode_jwt_claims(token) or {}
+    except Exception:
+        return True  # can't decode -> don't block (same leniency as a non-JWT token)
+    aud = claims.get("aud") if isinstance(claims, dict) else None
+    if not aud:
+        return True
+    auds = aud if isinstance(aud, list) else [aud]
+    hl = (host or "").lower()
+    for a in auds:
+        al = str(a).lower()
+        if hl and (hl == al or hl in al or al in hl):
+            return True
+    return False
+
+
+def _cross_host_bearer(store: Any, host: str, now: float,
+                       exclude_source: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Cross-host FALLBACK: when no same-apex Bearer exists for *host*, borrow one from a host in
+    the SAME learned service group (``store.service_graph``, grouped passively by shared iss /
+    parent / cookie) whose token's ``aud`` allows *host*. Freshest-first; honors ``exclude_source``.
+    Returns a host-level record tagged ``cross_host`` or None. Never raises. No service graph /
+    no siblings -> None (today's behaviour)."""
+    sg = getattr(store, "service_graph", None)
+    if sg is None:
+        return None
+    try:
+        siblings = {h.lower() for h in (sg.known_hosts_for(host) or [])}
+    except Exception:
+        siblings = set()
+    if not siblings:
+        return None
+    try:
+        entries = store.all_entries()
+    except Exception:
+        return None
+    for entry in reversed(entries):  # freshest first
+        try:
+            entry_host = (_field(entry, "host") or "").lower()
+            if entry_host not in siblings:
+                continue
+            if exclude_source is not None and _field(entry, "source") == exclude_source:
+                continue
+            auth_val = ""
+            for key, value in (_field(entry, "request_headers") or {}).items():
+                if key.lower() == "authorization":
+                    auth_val = str(value)
+                    break
+            if not auth_val.startswith("Bearer "):
+                continue
+            token_val = auth_val[7:].strip()
+            exp = decode_jwt_exp(token_val)
+            if exp is not None and exp < now:
+                continue
+            if not _aud_allows_host(token_val, host):
+                continue
+            return {"token": token_val, "exp": exp,
+                    "auth_endpoint": _field(entry, "path") or "",
+                    "captured_at": now, "source_entry_id": _field(entry, "id") or "",
+                    "matched_host": _field(entry, "host") or entry_host,
+                    "cross_host": True}
+        except Exception:
+            continue
+    return None
+
+
 def collect_host_bearer(store: Any, host: str, *,
                         exclude_source: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Scan proxy history (freshest first) for non-expired ``Authorization: Bearer`` tokens
@@ -160,7 +232,10 @@ def collect_host_bearer(store: Any, host: str, *,
         except Exception:
             continue
     if host_level is None:
-        return None
+        # No same-apex token — fall back to a service-group sibling's token whose aud allows host.
+        host_level = _cross_host_bearer(store, host, now, exclude_source)
+        if host_level is None:
+            return None
     if by_app:
         host_level["by_app"] = by_app
     return host_level

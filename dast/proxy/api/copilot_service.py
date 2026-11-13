@@ -478,10 +478,17 @@ class CopilotService:
         engine._store = self._ctx.store
         return engine
 
-    def new_session(self, focus_hosts: Optional[List[str]] = None) -> str:
+    def new_session(self, focus_hosts: Optional[List[str]] = None,
+                    profile_slug: Optional[str] = None) -> str:
         sid = str(uuid.uuid4())[:12]
+        # When bound to a profile, scope the engine's focus to that profile's host(s) using the
+        # SAME resolver the autonomous path uses, so an interactive run stays on its target.
+        slug = (profile_slug or "").strip() or None
+        hosts = focus_hosts
+        if slug:
+            hosts = self._effective_hosts(focus_hosts or [], slug) or focus_hosts
         self._sessions[sid] = {
-            "engine": self._init_engine(sid, focus_hosts),
+            "engine": self._init_engine(sid, hosts),
             "status": "idle",
             "created_at": time.time(),
             "updated_at": time.time(),
@@ -491,6 +498,10 @@ class CopilotService:
             "origin": "operator",
             "escalation": None,
             "hypothesis": None,
+            # Per-profile binding for a human-in-the-loop conversation: drives the per-profile
+            # refusal downgrade (armed on the first turn). None = unbound (today's default).
+            "profile_slug": slug,
+            "_downgrade_armed": False,
             "_pause_event": asyncio.Event(),
             "_pause_result": None,
             "approved_hosts": set(),
@@ -515,6 +526,7 @@ class CopilotService:
             "origin": session.get("origin", "operator"),
             "escalation": session.get("escalation"),
             "hypothesis": session.get("hypothesis"),
+            "profile": session.get("profile_slug"),
             "messages": list(engine.messages),
             "trace": session.get("trace", []),
             "pause": session.get("pause"),
@@ -633,6 +645,18 @@ class CopilotService:
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
+        # Profile-bound interactive session: arm the per-profile refusal downgrade once, so an
+        # authorized objective survives a gateway content refusal (per-profile, never global).
+        slug = (session.get("profile_slug") or "").strip()
+        if slug and not session.get("_downgrade_armed"):
+            try:
+                from dast.profiles.store import load_profile
+                profile = load_profile(slug)
+                if profile is not None:
+                    self._arm_profile_downgrade(session.get("engine"), profile, slug=slug)
+            except Exception as exc:
+                logger.debug("interactive downgrade arm failed", slug=slug, error=str(exc)[:120])
+            session["_downgrade_armed"] = True
         # spawn_tracked: strong ref + logs a silent driver death (vs bare create_task).
         session["_task"] = spawn_tracked(self._run_turn(sid, text), name=f"copilot-turn-{sid}")
 
@@ -1205,6 +1229,29 @@ class CopilotService:
                 cookies[str(name)] = str(value if value is not None else "")
         return cookies
 
+    def _arm_profile_downgrade(self, engine: object, profile: object,
+                               *, slug: str = "") -> None:
+        """Per-profile opt-in: arm the decision-model refusal downgrade on ``engine`` for THIS
+        session only (never a global model switch), so another operator's profiles never inherit
+        it. Fires only under ``--authorized`` and only when the profile opted in; otherwise clears
+        it. Shared by the autonomous run (``_activate_profile``) and the interactive turn. Never
+        raises."""
+        if engine is None:
+            return
+        try:
+            from dast import authorization
+            authorized = authorization.is_full_authorization()
+            if getattr(profile, "allow_model_downgrade", False) and authorized:
+                engine._downgrade_model = (getattr(profile, "downgrade_model", "")
+                                           or "claude-opus-4-6")
+                logger.info("armed per-profile model downgrade on refusal",
+                            slug=slug or getattr(profile, "slug", ""),
+                            model=engine._downgrade_model)
+            else:
+                engine._downgrade_model = ""
+        except Exception as exc:
+            logger.debug("downgrade arm failed", slug=slug, error=str(exc)[:120])
+
     def _activate_profile(self, slug: str, session: dict) -> None:
         """Activate a login profile server-side the way ``/api/profiles/{slug}/
         activate`` does: register the named session and merge its cookies into the
@@ -1285,19 +1332,7 @@ class CopilotService:
         # Per-profile opt-in: arm the decision-model refusal downgrade for THIS run only (never a
         # global model switch), so another operator's profiles never inherit it. Only under
         # --authorized; off by default on the profile.
-        try:
-            from dast import authorization
-            engine = session.get("engine")
-            authorized = authorization.is_full_authorization()
-            if engine is not None and getattr(profile, "allow_model_downgrade", False) and authorized:
-                engine._downgrade_model = (getattr(profile, "downgrade_model", "")
-                                           or "claude-opus-4-6")
-                logger.info("autonomous run: armed per-profile model downgrade on refusal",
-                            slug=slug, model=engine._downgrade_model)
-            elif engine is not None:
-                engine._downgrade_model = ""
-        except Exception as exc:
-            logger.debug("autonomous run: downgrade arm failed", slug=slug, error=str(exc)[:120])
+        self._arm_profile_downgrade(session.get("engine"), profile, slug=slug)
 
     async def _breaker_reauth(self, sid: str, session: dict) -> Optional[bool]:
         """One re-login attempt per run for the uniform-failure breaker. Returns True on

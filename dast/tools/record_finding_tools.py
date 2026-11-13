@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
@@ -24,6 +25,44 @@ from dast.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
+
+# Stand-in hosts the model uses when it does not know the real target. A finding URL with one of
+# these (or no host) is defaulted from recent in-scope traffic rather than recorded as-is.
+_PLACEHOLDER_HOSTS = frozenset({
+    "unknown", "example.com", "www.example.com", "localhost", "127.0.0.1", "host",
+})
+
+
+def _is_placeholder_url(url: str) -> bool:
+    u = (url or "").strip()
+    if not u:
+        return True
+    host = (urlparse(u).hostname or "").lower().strip("<>")
+    if not host:
+        return True
+    return host in _PLACEHOLDER_HOSTS or host.startswith("unknown")
+
+
+def _default_url_from_history(ctx: ToolContext) -> Optional[str]:
+    """Most recent in-scope request URL from history — a safety-net default for a finding whose
+    url the caller omitted or left as a placeholder host. In-process store only. Never raises."""
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return None
+    try:
+        entries = list(store.all_entries())
+    except Exception:
+        return None
+    for entry in reversed(entries):
+        url = getattr(entry, "url", "") or ""
+        if not (urlparse(url).hostname or ""):
+            continue
+        try:
+            if ctx.is_in_scope(url):
+                return url
+        except Exception:
+            continue
+    return None
 
 # Deterministic FP guard (record-path twin of dast/ai/fp_filter.py, which record_finding
 # bypasses). A finding whose evidence shows an auth-layer REJECTION or an infrastructure
@@ -163,8 +202,18 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
     evidence = str(args.get("evidence", "")).strip()
     if not title:
         return {"ok": False, "error": "title is required"}
-    if not url:
-        return {"ok": False, "error": "url is required"}
+    # Safety net (the copilot's dispatch backfills first): default a missing / placeholder-host
+    # url from the most recent in-scope request so a confirmed finding is not lost to a bad host.
+    # If it is a placeholder and nothing in-scope is available, reject rather than record under a
+    # stand-in host.
+    if _is_placeholder_url(url):
+        backfill = _default_url_from_history(ctx)
+        if backfill:
+            logger.info("record_finding: defaulted url from last in-scope request", url=backfill)
+            url = backfill
+        else:
+            return {"ok": False, "error": "url is required (the url given has no real target host "
+                    "and no in-scope request was found to default from)"}
     if not evidence:
         return {"ok": False, "error": "evidence is required"}
 

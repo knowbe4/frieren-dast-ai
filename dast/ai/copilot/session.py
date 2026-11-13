@@ -443,6 +443,49 @@ def _candidate_urls(args: Dict[str, Any]) -> List[str]:
     return urls
 
 
+# Hosts the model uses as a stand-in when it does not know the real target. A finding URL with
+# one of these (or no host at all) is defaulted from recent in-scope traffic instead of pausing
+# the scope gate as "out of scope".
+_PLACEHOLDER_FINDING_HOSTS = frozenset({
+    "unknown", "example.com", "www.example.com", "localhost", "127.0.0.1", "host",
+})
+
+
+def _is_placeholder_url(url: str) -> bool:
+    """True when a finding URL is missing or carries a stand-in host (so it should be defaulted)."""
+    u = (url or "").strip()
+    if not u:
+        return True
+    host = (urlparse(u).hostname or "").lower().strip("<>")
+    if not host:
+        return True
+    return host in _PLACEHOLDER_FINDING_HOSTS or host.startswith("unknown")
+
+
+def _last_in_scope_url(tool_ctx: Any, focus_hosts: Any) -> Optional[str]:
+    """The most recent request URL in history whose host is in scope (or in focus). Used to
+    default a finding's URL when the model omitted it or used a placeholder host. Never raises."""
+    store = getattr(tool_ctx, "store", None)
+    if store is None:
+        return None
+    try:
+        entries = list(store.all_entries())
+    except Exception:
+        return None
+    for entry in reversed(entries):
+        url = getattr(entry, "url", "") or ""
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            continue
+        try:
+            in_scope = bool(tool_ctx.is_in_scope(url))
+        except Exception:
+            in_scope = False
+        if in_scope or _host_in_focus(host, focus_hosts):
+            return url
+    return None
+
+
 def _host_in_focus(host: str, focus_hosts: Any) -> bool:
     """True if ``host`` equals a focus host or is a subdomain of one."""
     h = (host or "").lower()
@@ -1159,32 +1202,40 @@ class CopilotSession:
                 user = _build_user_prompt(
                     self.messages, tool_menu, turn_transcript, context_brief
                 )
+                decision = None
+                content_blocked = False
                 try:
                     decision = await _llm_step(_system_prompt(), user)
                 except bedrock_client.AiContentBlockedError:
-                    # Per-profile opt-in: retry ONCE with the operator's downgrade model before
-                    # giving up. Only fires when this session's profile enabled it (never global).
-                    decision = None
-                    if self._downgrade_model:
-                        logger.warning("Copilot: decision model safety-blocked — retrying once "
-                                       "with per-profile downgrade model",
-                                       session_id=self.session_id, model=self._downgrade_model)
-                        try:
-                            decision = await _llm_step(_system_prompt(), user,
-                                                       model_override=self._downgrade_model)
-                        except bedrock_client.AiContentBlockedError:
-                            decision = None
-                    if decision is None:
-                        logger.warning("Copilot: decision model blocked by safety classifier")
-                        reply = _finalize(
-                            "The safety classifier blocked this request, so I can't plan "
-                            "the next step this turn. Try rephrasing the objective, or "
-                            "switch the AI provider for this run.",
-                            blocked_reason="safety_blocked",
-                        )
-                        await on_event({"type": "reply", "message": reply.message,
-                                        "blocked_reason": reply.blocked_reason})
-                        return reply
+                    content_blocked = True
+
+                # Per-profile opt-in refusal fallback: the primary decision failed — either a clean
+                # content block, OR (the common case via the model-chain fallback) a refusal-shaped
+                # malformed structured output that surfaces as a generic failure → None. In BOTH
+                # cases retry ONCE with the operator's permissive downgrade model before giving up.
+                # Fires only when this session's profile enabled it (never global).
+                if decision is None and self._downgrade_model:
+                    logger.warning("Copilot: decision step failed — retrying once with per-profile "
+                                   "downgrade model", session_id=self.session_id,
+                                   model=self._downgrade_model)
+                    try:
+                        decision = await _llm_step(_system_prompt(), user,
+                                                   model_override=self._downgrade_model)
+                        content_blocked = False
+                    except bedrock_client.AiContentBlockedError:
+                        content_blocked = True
+
+                if decision is None and content_blocked:
+                    logger.warning("Copilot: decision model blocked by safety classifier")
+                    reply = _finalize(
+                        "The safety classifier blocked this request, so I can't plan "
+                        "the next step this turn. Try rephrasing the objective, or "
+                        "switch the AI provider for this run.",
+                        blocked_reason="safety_blocked",
+                    )
+                    await on_event({"type": "reply", "message": reply.message,
+                                    "blocked_reason": reply.blocked_reason})
+                    return reply
 
                 if decision is None:
                     consecutive_failures += 1
@@ -1244,6 +1295,19 @@ class CopilotSession:
                     tool_args = decision.get("tool_args") or {}
                     if not isinstance(tool_args, dict):
                         tool_args = {}
+
+                    # record_finding host defaulting: when the model records a finding with a
+                    # missing / placeholder host, backfill the URL from the most recent in-scope
+                    # request so the pre-dispatch scope gate sees a real target (instead of pausing
+                    # "out of scope") and the finding is attributed to the right host.
+                    if (tool_name == "record_finding"
+                            and _is_placeholder_url(str(tool_args.get("url", "")))):
+                        backfill = _last_in_scope_url(tool_ctx, self._focus_hosts)
+                        if backfill:
+                            tool_args["url"] = backfill
+                            logger.info("record_finding: defaulted url from last in-scope request",
+                                        session_id=self.session_id, url=backfill)
+
                     entry: Dict[str, Any] = {
                         "step": step, "thought": thought, "action": action,
                         "tool_name": tool_name, "tool_args": tool_args,

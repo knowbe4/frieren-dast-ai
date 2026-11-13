@@ -55,6 +55,8 @@ function loginRenderList() {
       p.credentials.length ? p.credentials.length + ' cred' : '',
       p.session_set ? 'session' : '',
       p.flow_set ? 'flow' : '',
+      p.test_account ? 'test acct' : '',
+      p.credentials.some(c => c.totp_set) ? '2FA' : '',
     ].filter(Boolean).join(' · ');
     return `<div onclick="loginSelectProfile(${jsArg(p.slug)})" style="padding:6px 8px;border:1px solid var(--bd);border-radius:4px;margin-bottom:4px;cursor:pointer;${active}">
       <div style="font-weight:600;display:flex;align-items:center">${_esc(p.name)}${_privBadge(p.privilege_level)}</div>
@@ -71,6 +73,7 @@ function loginNewProfile() {
   document.getElementById('logins-host').value = '';
   document.getElementById('logins-authurl').value = '';
   document.getElementById('logins-privilege').value = '';
+  document.getElementById('logins-test-account').checked = false;
   document.getElementById('logins-creds').innerHTML = '';
   document.getElementById('logins-session-status').textContent = '';
   document.getElementById('logins-editor-status').textContent = '';
@@ -89,6 +92,7 @@ function loginSelectProfile(slug) {
   document.getElementById('logins-host').value = p.host_pattern || '';
   document.getElementById('logins-authurl').value = p.auth_url || '';
   document.getElementById('logins-privilege').value = p.privilege_level || '';
+  document.getElementById('logins-test-account').checked = !!p.test_account;
   document.getElementById('logins-creds').innerHTML = '';
   (p.credentials.length ? p.credentials : [{label: 'default', username: '', secret_set: false}])
     .forEach(c => loginAddCred(c));
@@ -101,16 +105,18 @@ function loginSelectProfile(slug) {
 }
 
 function loginAddCred(cred) {
-  cred = cred || {label: 'default', username: '', secret_set: false};
+  cred = cred || {label: 'default', username: '', secret_set: false, totp_set: false};
   const wrap = document.getElementById('logins-creds');
   const row = document.createElement('div');
   row.className = 'logins-cred-row';
-  row.style.cssText = 'display:flex;gap:4px;margin-bottom:4px';
+  row.style.cssText = 'display:flex;gap:4px;margin-bottom:4px;flex-wrap:wrap';
   const ph = cred.secret_set ? '•••••• (unchanged)' : 'secret';
+  const totpPh = cred.totp_set ? '•••••• (unchanged)' : 'TOTP base32 seed (test only)';
   row.innerHTML = `
     <input class="tinput logins-cred-label" style="width:90px" placeholder="label" value="${_esc(cred.label || '')}">
-    <input class="tinput logins-cred-user" style="flex:1" placeholder="username" value="${_esc(cred.username || '')}">
-    <input class="tinput logins-cred-secret" type="password" style="flex:1" placeholder="${ph}" data-set="${cred.secret_set ? 1 : 0}">
+    <input class="tinput logins-cred-user" style="flex:1;min-width:120px" placeholder="username" value="${_esc(cred.username || '')}">
+    <input class="tinput logins-cred-secret" type="password" style="flex:1;min-width:120px" placeholder="${ph}" data-set="${cred.secret_set ? 1 : 0}">
+    <input class="tinput logins-cred-totp" type="password" style="flex:1;min-width:120px" placeholder="${totpPh}" data-set="${cred.totp_set ? 1 : 0}">
     <button class="tbtn" onclick="this.parentElement.remove()">×</button>`;
   wrap.appendChild(row);
 }
@@ -118,13 +124,16 @@ function loginAddCred(cred) {
 function _loginCollectCreds() {
   return Array.from(document.querySelectorAll('#logins-creds .logins-cred-row')).map(row => {
     const secretInput = row.querySelector('.logins-cred-secret');
+    const totpInput = row.querySelector('.logins-cred-totp');
     const cred = {
       label: row.querySelector('.logins-cred-label').value.trim() || 'default',
       username: row.querySelector('.logins-cred-user').value.trim(),
     };
-    // Only send secret if the user typed a new one; omit to preserve the stored value.
+    // Only send secret/seed if the user typed a new one; omit to preserve the stored value.
     if (secretInput.value) cred.secret = secretInput.value;
     else if (secretInput.dataset.set !== '1') cred.secret = '';
+    if (totpInput.value) cred.totp_secret = totpInput.value.trim();
+    else if (totpInput.dataset.set !== '1') cred.totp_secret = '';
     return cred;
   });
 }
@@ -136,6 +145,7 @@ function loginSaveProfile() {
     host_pattern: document.getElementById('logins-host').value.trim(),
     auth_url: document.getElementById('logins-authurl').value.trim(),
     privilege_level: document.getElementById('logins-privilege').value,
+    test_account: document.getElementById('logins-test-account').checked,
     credentials: _loginCollectCreds(),
   };
   if (!body.name) { _loginStatus('Name is required.', true); return; }

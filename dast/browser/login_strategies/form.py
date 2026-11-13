@@ -46,7 +46,8 @@ class FormStrategy:
 
     async def attempt(self, ctx: LoginContext) -> LoginResult:
         try:
-            det = await ctx.browser.login(ctx.url, ctx.email, ctx.password)
+            det = await ctx.browser.login(ctx.url, ctx.email, ctx.password,
+                                          totp_secret=ctx.totp_secret)
         except Exception as exc:
             logger.warning("form login: deterministic engine raised", error=str(exc)[:200])
             # A raised form-fill (e.g. a submit button that never becomes actionable) must

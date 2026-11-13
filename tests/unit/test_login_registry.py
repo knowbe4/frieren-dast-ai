@@ -33,7 +33,7 @@ class _Browser:
         self.snapshotted = False
         self.navigated = []
 
-    async def login(self, url, email, password):
+    async def login(self, url, email, password, totp_secret=None):
         return self._login_result
 
     async def navigate(self, url):

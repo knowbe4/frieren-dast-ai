@@ -22,7 +22,7 @@ class _FakeBrowser:
         self._login_raises = login_raises
         self.login_called = 0
 
-    async def login(self, url: str, email: str, password: str) -> Dict[str, Any]:
+    async def login(self, url: str, email: str, password: str, totp_secret=None) -> Dict[str, Any]:
         self.login_called += 1
         if self._login_raises:
             raise RuntimeError("Locator.click: Timeout 30000ms exceeded (disabled button)")

@@ -1063,6 +1063,13 @@
                   <option value="admin">Admin</option>
                 </select></label>
 
+              <label style="font-size:11px;color:var(--txt2);display:flex;align-items:center;gap:6px;margin-top:4px">
+                <input id="logins-test-account" type="checkbox" style="width:auto">
+                Test account — allow storing a 2FA (TOTP) seed</label>
+              <p style="color:var(--bad);font-size:10px;margin:0 0 4px 0">
+                ⚠️ Storing a TOTP seed defeats the second factor. Only for disposable
+                test accounts you own — never a real user or shared production account.</p>
+
               <div style="margin-top:8px;display:flex;justify-content:space-between;align-items:center">
                 <strong style="font-size:11px">Credentials</strong>
                 <button class="tbtn" onclick="loginAddCred()">+ Add credential</button>

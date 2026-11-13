@@ -75,6 +75,40 @@ def test_name_required(client):
     assert client.post("/api/profiles", json={"name": "  "}).status_code == 400
 
 
+def test_totp_seed_and_test_account(client):
+    r = client.post("/api/profiles", json={
+        "name": "T", "test_account": True,
+        "credentials": [{"label": "default", "username": "qa@test.example",
+                         "secret": "pw", "totp_secret": "JBSWY3DPEHPK3PXP"}],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["test_account"] is True
+    assert body["credentials"][0]["totp_set"] is True
+
+    # The seed never leaves the server.
+    got = client.get("/api/profiles/t").json()
+    assert "JBSWY3DPEHPK3PXP" not in json.dumps(got)
+
+    # Update omitting totp_secret preserves the stored seed.
+    client.post("/api/profiles", json={
+        "slug": "t", "name": "T", "test_account": True,
+        "credentials": [{"label": "default", "username": "qa@test.example"}],
+    })
+    from dast.profiles.store import load_profile
+    p = load_profile("t")
+    assert p.credentials[0].totp_secret == "JBSWY3DPEHPK3PXP"
+    assert p.test_account is True
+
+
+def test_invalid_totp_seed_rejected(client):
+    r = client.post("/api/profiles", json={
+        "name": "Bad", "test_account": True,
+        "credentials": [{"label": "default", "username": "x", "totp_secret": "not base32!!!"}],
+    })
+    assert r.status_code == 400
+
+
 def test_session_import_then_activate(client):
     client.post("/api/profiles", json={"name": "S", "host_pattern": "app.example.com"})
     r = client.post("/api/profiles/s/session-import", json={

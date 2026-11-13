@@ -248,10 +248,17 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
         return {"ok": False, "error": (
             f"profile '{profile.slug}' has no captured session and cannot be logged in automatically "
             "(needs a browser + a username/secret + auth_url on the profile). Capture a session first.")}
+    # TOTP (2FA) auto-fill — only for test accounts (the guard refuses otherwise).
+    from dast.profiles.totp import may_use_totp
+    totp_secret = (cred.totp_secret
+                   if getattr(cred, "totp_secret", "")
+                   and may_use_totp(getattr(profile, "test_account", False), cred.username)
+                   else "")
     try:
         from dast.browser.login_cascade import adaptive_login
         result = await adaptive_login(
             browser, auth_url, cred.username, cred.secret,
+            totp_secret=totp_secret or None,
             in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine)
     except Exception as exc:
         return {"ok": False, "error": f"login error for profile '{profile.slug}': {str(exc)[:160]}"}
@@ -291,6 +298,8 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
             if simple and isinstance(sc, dict):
                 sc.update(simple)
             engine._last_login = {"url": auth_url, "email": cred.username, "password": cred.secret}
+            if totp_secret:
+                engine._last_login["totp_secret"] = totp_secret
             if hasattr(engine, "session_name"):
                 engine.session_name = profile.slug
     except Exception as exc:
@@ -367,6 +376,10 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
         if auth_url and creds and getattr(creds[0], "username", "") and getattr(creds[0], "secret", ""):
             engine._last_login = {"url": auth_url, "email": creds[0].username,
                                   "password": creds[0].secret}
+            from dast.profiles.totp import may_use_totp
+            if getattr(creds[0], "totp_secret", "") and may_use_totp(
+                    getattr(profile, "test_account", False), creds[0].username):
+                engine._last_login["totp_secret"] = creds[0].totp_secret
         if hasattr(engine, "reset_dedup"):
             engine.reset_dedup("activate_login_profile")
     return {"ok": True, "slug": slug, "named_session": profile.slug,

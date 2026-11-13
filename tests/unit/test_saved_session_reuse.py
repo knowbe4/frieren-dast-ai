@@ -33,7 +33,7 @@ class _ReuseBrowser:
     async def api_get(self, url, headers=None):
         return self._probe
 
-    async def login(self, url, email, password):
+    async def login(self, url, email, password, totp_secret=None):
         self.logged_in = True
         return {"logged_in": True, "url": "https://app.x/dashboard"}
 

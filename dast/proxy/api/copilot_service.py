@@ -1263,9 +1263,20 @@ class CopilotService:
             auth_url = (getattr(profile, "auth_url", "") or "").strip()
             engine = session.get("engine")
             if engine is not None and auth_url and creds and creds[0].username and creds[0].secret:
-                engine._last_login = {
+                last_login = {
                     "url": auth_url, "email": creds[0].username, "password": creds[0].secret,
                 }
+                # Seed the TOTP (2FA) code generator ONLY for test accounts — the
+                # guard refuses otherwise. The model never receives the seed.
+                from dast.profiles.totp import may_use_totp
+                if creds[0].totp_secret:
+                    if may_use_totp(getattr(profile, "test_account", False), creds[0].username):
+                        last_login["totp_secret"] = creds[0].totp_secret
+                        logger.info("autonomous run armed TOTP auto-fill from profile", slug=slug)
+                    else:
+                        logger.warning("autonomous run: TOTP seed present but profile is not "
+                                       "a test account — ignoring the seed", slug=slug)
+                engine._last_login = last_login
                 logger.info("autonomous run seeded relogin credentials from profile", slug=slug)
             elif engine is not None:
                 logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
@@ -1364,6 +1375,7 @@ class CopilotService:
             from dast.browser.login_cascade import adaptive_login
             result = await adaptive_login(
                 browser, creds["url"], creds["email"], creds["password"],
+                totp_secret=creds.get("totp_secret"),
                 in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
                 saved_session=None if force_fresh else saved_session,
             )

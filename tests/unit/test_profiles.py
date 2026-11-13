@@ -74,6 +74,41 @@ def test_public_dict_hides_secrets(profiles_env):
     assert pub["session_set"] is False
 
 
+def test_totp_seed_encrypted_and_test_account_persist(profiles_env, tmp_path):
+    _, models_mod, store_mod, _ = profiles_env
+    profile = models_mod.LoginProfile(
+        name="Test App",
+        test_account=True,
+        credentials=[models_mod.Credential(
+            label="default", username="qa@test.example", secret="p4ss",
+            totp_secret="JBSWY3DPEHPK3PXP")],
+    )
+    store_mod.save_profile(profile)
+
+    raw = (tmp_path / ".dast-ai" / "profiles" / "test-app.json").read_text()
+    # The base32 seed must never hit disk in the clear.
+    assert "JBSWY3DPEHPK3PXP" not in raw
+    assert json.loads(raw)["credentials"][0]["totp_secret_enc"]
+    assert json.loads(raw)["test_account"] is True
+
+    loaded = store_mod.load_profile("test-app")
+    assert loaded is not None
+    assert loaded.test_account is True
+    assert loaded.credentials[0].totp_secret == "JBSWY3DPEHPK3PXP"
+
+
+def test_public_dict_hides_totp_seed(profiles_env):
+    _, models_mod, _, _ = profiles_env
+    profile = models_mod.LoginProfile(
+        name="X", test_account=True,
+        credentials=[models_mod.Credential(secret="top", totp_secret="JBSWY3DPEHPK3PXP")],
+    )
+    pub = profile.to_public_dict()
+    assert "JBSWY3DPEHPK3PXP" not in json.dumps(pub)
+    assert pub["credentials"][0]["totp_set"] is True
+    assert pub["test_account"] is True
+
+
 def test_host_matching(profiles_env):
     _, models_mod, _, _ = profiles_env
     wild = models_mod.LoginProfile(name="w", host_pattern="*.example.com")

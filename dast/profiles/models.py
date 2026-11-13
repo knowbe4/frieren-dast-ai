@@ -31,16 +31,22 @@ def slugify(name: str) -> str:
 
 @dataclass
 class Credential:
-    """A single username + secret pair. ``secret`` is plaintext in memory only."""
+    """A single username + secret pair. ``secret`` and ``totp_secret`` are plaintext
+    in memory only; both are encrypted at rest and never exposed by the public dict.
+
+    ``totp_secret`` is a base32 TOTP (2FA) seed used — ONLY for test accounts — to
+    generate the login OTP automatically. See dast.profiles.totp.may_use_totp."""
     label: str = "default"
     username: str = ""
     secret: str = ""
+    totp_secret: str = ""
 
     def to_public_dict(self) -> Dict[str, Any]:
         return {
             "label": self.label,
             "username": self.username,
             "secret_set": bool(self.secret),
+            "totp_set": bool(self.totp_secret),
         }
 
     def to_storage_dict(self) -> Dict[str, Any]:
@@ -48,6 +54,7 @@ class Credential:
             "label": self.label,
             "username": self.username,
             "secret_enc": crypto.encrypt(self.secret) if self.secret else "",
+            "totp_secret_enc": crypto.encrypt(self.totp_secret) if self.totp_secret else "",
         }
 
     @classmethod
@@ -56,6 +63,7 @@ class Credential:
             label=str(d.get("label", "default")),
             username=str(d.get("username", "")),
             secret=crypto.decrypt(d.get("secret_enc", "")),
+            totp_secret=crypto.decrypt(d.get("totp_secret_enc", "")),
         )
 
 
@@ -72,6 +80,7 @@ class LoginProfile:
     login_flow: Optional[Dict[str, Any]] = None  # Phase 2: inline recorded LoginFlow dict
     saved_session: Optional[Dict[str, Any]] = None  # Playwright storage_state
     privilege_level: str = ""  # e.g. "unauthenticated", "low", "medium", "high", "admin"
+    test_account: bool = False  # disposable test account — gates TOTP-seed use
     # Per-profile opt-in: on an AI safety-classifier refusal, retry the copilot decision once with
     # `downgrade_model`. OFF by default and scoped to THIS profile — it is NOT a global/tool-wide
     # rule, so another operator's profiles never inherit it. Only honored under --authorized.
@@ -116,6 +125,7 @@ class LoginProfile:
             "flow_step_count": len((self.login_flow or {}).get("steps", [])),
             "session_set": bool(self.saved_session),
             "privilege_level": self.privilege_level,
+            "test_account": self.test_account,
             "allow_model_downgrade": self.allow_model_downgrade,
             "downgrade_model": self.downgrade_model,
             "created_at": self.created_at,
@@ -141,6 +151,7 @@ class LoginProfile:
             "login_flow": self.login_flow,
             "saved_session_enc": session_enc,
             "privilege_level": self.privilege_level,
+            "test_account": self.test_account,
             "allow_model_downgrade": self.allow_model_downgrade,
             "downgrade_model": self.downgrade_model,
             "created_at": self.created_at,
@@ -169,6 +180,7 @@ class LoginProfile:
             login_flow=d.get("login_flow"),
             saved_session=saved_session,
             privilege_level=str(d.get("privilege_level", "")),
+            test_account=bool(d.get("test_account", False)),
             allow_model_downgrade=bool(d.get("allow_model_downgrade", False)),
             downgrade_model=str(d.get("downgrade_model", "")),
             created_at=float(d.get("created_at", time.time())),

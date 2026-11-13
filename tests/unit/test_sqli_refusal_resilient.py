@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 import ast
 import os
 
@@ -35,6 +37,25 @@ def test_sqli_probe_registered():
     from dast.tools import base
     assert "sqli_probe" in base._REGISTRY
     assert base._REGISTRY["sqli_probe"].input_schema["required"] == ["url", "injection_point"]
+
+
+def test_inject_path_nested_and_toplevel():
+    from dast.tools.sqli_probe_tools import _inject_path
+    body = {"query": "m", "variables": {"v": {"purchasedCourseId": 1, "contentTitle": "orig"}}}
+    out = _inject_path(body, "v.contentTitle", "PAYLOAD")
+    assert out["variables"]["v"]["contentTitle"] == "PAYLOAD"
+    assert out["variables"]["v"]["purchasedCourseId"] == 1          # sibling preserved
+    assert body["variables"]["v"]["contentTitle"] == "orig"          # template not mutated
+    # missing intermediate is created; plain (no dot) sets a top-level variable
+    assert _inject_path({}, "a.b", "x")["variables"]["a"]["b"] == "x"
+    assert _inject_path({"variables": {}}, "top", "y")["variables"]["top"] == "y"
+
+
+def test_extract_duckdb_version():
+    from dast.tools.sqli_probe_tools import _extract_duckdb_version
+    assert _extract_duckdb_version('{"errors":[{"message":"Invalid Input Error: v1.4.2"}]}') == "v1.4.2"
+    assert _extract_duckdb_version('{"data":{"ok":true}}') is None
+    assert _extract_duckdb_version("not json") is None
 
 
 class _FakeResp:
@@ -157,6 +178,47 @@ async def test_sqli_probe_attaches_subapp_bearer_and_xrw(monkeypatch):
     assert hdrs.get("authorization") == "Bearer subapp.jwt.token"
     assert hdrs.get("x-requested-with") == "XMLHttpRequest"
     assert "cookie" in hdrs  # jar cookie still attached
+
+
+@pytest.mark.asyncio
+async def test_sqli_probe_nested_graphql_var_with_duckdb_version(monkeypatch):
+    """Inject into a NESTED variable (v.contentTitle) and extract the DuckDB version() leak."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    class _BodyAwareClient:
+        def __init__(self, *a, **k):
+            self.sent = []
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def request(self, method, url, headers=None, content=None):
+            body = json.loads((content or b"{}").decode("utf-8"))
+            injected = ((body.get("variables") or {}).get("v") or {}).get("contentTitle", "")
+            self.sent.append(injected)
+            if "sqli_probe_baseline" in injected:
+                return _FakeResp('{"data":{"exportCsvReport":{"errors":[]}}}', 200)
+            if "error(version())" in injected:          # the DuckDB version-leak payload
+                return _FakeResp('{"data":null,"errors":[{"message":"Invalid Input Error: v1.4.2"}]}', 200)
+            # any other (quote-breaking) payload: a NEW DuckDB parse error, no version
+            return _FakeResp('{"data":null,"errors":[{"message":"Parser Error: syntax error"}]}', 200)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _BodyAwareClient)
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/reports/graphql",
+        "injection_point": "v.contentTitle",
+        "injection_location": "graphql_var",
+        "body": '{"query":"mutation($v:InteractionsInput!){exportCsvReport(input:$v){errors}}",'
+                '"variables":{"v":{"purchasedCourseId":1,"sortDirection":"ASC","contentTitle":"x"}}}',
+    })
+    assert result["ok"] and result["confirmed"] is True
+    assert result["facts"].get("version") == "v1.4.2"
+    assert "DuckDB version leak" in result["technique"]
+    # finding recorded with the injection point + extracted version
+    assert store.recorded and store.recorded[0][0]["parameter"] == "v.contentTitle"
+    assert store.recorded[0][0]["extracted_data"]["version"] == "v1.4.2"
 
 
 @pytest.mark.asyncio

@@ -41,9 +41,15 @@ logger = get_logger(__name__)
 # action="reply" is the primary turn boundary; this only fires if it never
 # replies (a bug, not normal dialogue).
 _MAX_TOOL_CALLS_PER_TURN = 20
-# Watchdog: how many times the SAME normalized call (same tool+method+url+body, ignoring
-# volatile headers) may repeat before the coordinator kills the looping turn.
-_MAX_NORMALIZED_REPEATS = 3
+# Watchdog: a looping turn is killed based on LACK OF PROGRESS, not a fixed repeat count. The
+# SAME normalized call (same tool+method+url+body, ignoring volatile headers) is only counted
+# against this budget when it returns the SAME outcome as before (no new status/data); a repeat
+# that yields a new result resets the streak. So a productive sequence that revisits an endpoint
+# and keeps learning is never killed, while a genuine no-progress spin is caught fast.
+_MAX_NOPROGRESS_REPEATS = 2
+# Absolute safety cap: even if every repeat somehow looks like "progress", never let one
+# normalized call run away unbounded within a turn.
+_MAX_NORMALIZED_REPEATS = 8
 # Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
@@ -96,6 +102,24 @@ def _normalized_call_sig(tool_name: str, args: Dict[str, Any]) -> str:
     rest = {k: v for k, v in a.items() if k not in ("method", "url", "target", "base_url", "body", "data")}
     if rest:
         parts.append(_canonical(rest))
+    return "|".join(parts)
+
+
+def _outcome_fingerprint(result: Dict[str, Any]) -> str:
+    """A cheap, stable fingerprint of a tool result, so the loop watchdog can tell a repeat
+    that made PROGRESS (new status/data) from one that returned the same thing again. Uses the
+    coarse shape (ok/status/count/length + a short body prefix), not the full body, so trivial
+    volatility (timestamps deep in a payload) does not mask a genuine no-progress spin."""
+    if not isinstance(result, dict):
+        return repr(result)[:80]
+    body = result.get("text") or result.get("body") or result.get("data") or ""
+    body_s = body if isinstance(body, str) else _canonical(body)
+    parts = [
+        str(result.get("ok")),
+        str(result.get("status")),
+        str(result.get("count") if result.get("count") is not None else len(body_s)),
+        body_s[:200],
+    ]
     return "|".join(parts)
 
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
@@ -532,8 +556,11 @@ def _build_user_prompt(
     )
 
 
-async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
-    """One schema-forced step decision. Returns None on LLM failure."""
+async def _llm_step(system: str, user: str,
+                    model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """One schema-forced step decision. Returns None on LLM failure. ``model_override`` forces a
+    specific model for THIS call only (used for the per-profile refusal downgrade); it never
+    mutates global model state, so other sessions are unaffected."""
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -541,7 +568,7 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
             lambda: bedrock_client.invoke_json(
                 system=system,
                 user=user,
-                model_id=bedrock_client.get_copilot_model(),
+                model_id=model_override or bedrock_client.get_copilot_model(),
                 max_tokens=1024,
                 temperature=0,
                 schema=COPILOT_STEP_SCHEMA,
@@ -610,6 +637,11 @@ class CopilotSession:
         # volatile headers) so the exact-dedup miss — the model pasting a different Cookie/
         # CSRF literal each call — is still caught and the looping turn can be killed.
         self._repeat_sigs: Dict[str, int] = {}
+        # Progress-aware loop watchdog: the last outcome fingerprint seen for each normalized
+        # signature, and the consecutive count of repeats that produced the SAME outcome. The
+        # kill decision reads the no-progress streak, not the raw repeat count.
+        self._sig_outcomes: Dict[str, str] = {}
+        self._sig_noprogress: Dict[str, int] = {}
         # Cross-endpoint watchdog: how many times we had to STRIP a model-pasted session
         # header (Cookie/CSRF). The per-call watchdog misses this when it happens on
         # different URLs, so count it URL-independently and break the run once it is clear
@@ -617,6 +649,10 @@ class CopilotSession:
         self._stripped_header_count: int = 0
         self._header_strip_warned: bool = False
         self._session_cookies: Dict[str, str] = {}
+        # Per-profile opt-in refusal downgrade: when set (by the autonomous run from a profile that
+        # enabled it), a safety-classifier block on the decision model is retried ONCE with this
+        # model. Empty = disabled (the default); never set globally, so other sessions are unaffected.
+        self._downgrade_model: str = ""
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
         self._last_relogin_ts: float = 0.0
@@ -653,6 +689,8 @@ class CopilotSession:
         track model behaviour, which a fresh session does not change."""
         self._seen_calls.clear()
         self._repeat_sigs.clear()
+        self._sig_outcomes.clear()
+        self._sig_noprogress.clear()
         logger.info("copilot dedup reset", session_id=self.session_id, reason=reason)
 
     def _auth_flip(self, host: str, endpoint: str, status: Any) -> bool:
@@ -759,6 +797,21 @@ class CopilotSession:
             rec = await self._tier_wait_spa(store, host, path, browser, timeout_s)
             if self._rec_is_fresh(rec):
                 return RefreshOutcome(rec, RefreshTier.WAIT_SPA, False)
+
+        # Tier 1b — ACTIVATE: navigate to the sub-app's feature so the SPA mints its Bearer, then
+        # capture it from history. Central-less (no /spa/session), proactive (runs pre-flight at the
+        # WAIT_SPA cap used by send_request/sqli_probe), and only when a learned/known activation nav
+        # exists — bounded to one nav per (host, app) per run. This is what lets a Bearer-authed
+        # sub-app (e.g. a reports GraphQL endpoint) be reached by navigating to the feature instead
+        # of relying on a central token index.
+        if max_tier >= RefreshTier.WAIT_SPA and browser is not None:
+            from dast.session import site_map
+            from dast.session.auth_provider import _derived_subapp, subapp_for_path
+            app = subapp_for_path(path, site_map.site_for_host(host) or "") or _derived_subapp(path)
+            if app and await self._activate_subapp(store, host, app, browser, probe_hint=path):
+                rec = self._select_bearer(host, path)
+                if self._rec_is_fresh(rec):
+                    return RefreshOutcome(rec, RefreshTier.WAIT_SPA, True)
 
         now = _time.time
         # Tier 2 — REFETCH: re-fetch the auth endpoint through the browser (15s cooldown).
@@ -1108,16 +1161,29 @@ class CopilotSession:
                 try:
                     decision = await _llm_step(_system_prompt(), user)
                 except bedrock_client.AiContentBlockedError:
-                    logger.warning("Copilot: decision model blocked by safety classifier")
-                    reply = _finalize(
-                        "The safety classifier blocked this request, so I can't plan "
-                        "the next step this turn. Try rephrasing the objective, or "
-                        "switch the AI provider for this run.",
-                        blocked_reason="safety_blocked",
-                    )
-                    await on_event({"type": "reply", "message": reply.message,
-                                    "blocked_reason": reply.blocked_reason})
-                    return reply
+                    # Per-profile opt-in: retry ONCE with the operator's downgrade model before
+                    # giving up. Only fires when this session's profile enabled it (never global).
+                    decision = None
+                    if self._downgrade_model:
+                        logger.warning("Copilot: decision model safety-blocked — retrying once "
+                                       "with per-profile downgrade model",
+                                       session_id=self.session_id, model=self._downgrade_model)
+                        try:
+                            decision = await _llm_step(_system_prompt(), user,
+                                                       model_override=self._downgrade_model)
+                        except bedrock_client.AiContentBlockedError:
+                            decision = None
+                    if decision is None:
+                        logger.warning("Copilot: decision model blocked by safety classifier")
+                        reply = _finalize(
+                            "The safety classifier blocked this request, so I can't plan "
+                            "the next step this turn. Try rephrasing the objective, or "
+                            "switch the AI provider for this run.",
+                            blocked_reason="safety_blocked",
+                        )
+                        await on_event({"type": "reply", "message": reply.message,
+                                        "blocked_reason": reply.blocked_reason})
+                        return reply
 
                 if decision is None:
                     consecutive_failures += 1
@@ -1278,16 +1344,26 @@ class CopilotSession:
                     # blocked_reason='stuck_loop'.
                     _norm_sig = _normalized_call_sig(tool_name, tool_args)
                     self._repeat_sigs[_norm_sig] = self._repeat_sigs.get(_norm_sig, 0) + 1
-                    if self._repeat_sigs[_norm_sig] >= _MAX_NORMALIZED_REPEATS:
+                    _noprogress = self._sig_noprogress.get(_norm_sig, 0)
+                    # Kill from LACK OF PROGRESS (the same call kept returning the same outcome),
+                    # or from the absolute safety cap — never from a plain repeat count, so a
+                    # call that keeps producing NEW results is allowed to repeat as needed.
+                    _repeats = self._repeat_sigs[_norm_sig]
+                    if _noprogress >= _MAX_NOPROGRESS_REPEATS \
+                            or _repeats >= _MAX_NORMALIZED_REPEATS:
+                        reason_n = ("returned the same result "
+                                    f"{_noprogress + 1} times with no progress"
+                                    if _noprogress >= _MAX_NOPROGRESS_REPEATS
+                                    else f"was issued {_repeats} times")
                         self._repeat_sigs[_norm_sig] = 0  # don't instantly re-trip on resume
+                        self._sig_noprogress[_norm_sig] = 0
                         logger.warning("copilot watchdog: killing looping turn",
                                        session_id=self.session_id, tool=tool_name,
-                                       count=_MAX_NORMALIZED_REPEATS)
+                                       no_progress=_noprogress, repeats=_repeats)
                         return _finalize(
                             f"Stopped: the same request ({tool_name} "
                             f"{str(tool_args.get('method', '')).upper()} "
-                            f"{tool_args.get('url', '')}) was issued "
-                            f"{_MAX_NORMALIZED_REPEATS} times with no new outcome. The tool "
+                            f"{tool_args.get('url', '')}) {reason_n}. The tool "
                             "manages the session — do NOT paste Cookie or X-CSRF-Token headers. "
                             "Change the endpoint, parameter, or tool, or conclude.",
                             blocked_reason="stuck_loop",
@@ -1337,6 +1413,18 @@ class CopilotSession:
                         continue
 
                     result = await run_tool(tool_ctx, tool_name, tool_args)
+
+                    # Progress-aware loop tracking: compare this call's outcome to the last one
+                    # for the same normalized signature. A new outcome resets the no-progress
+                    # streak (productive repeat); the same outcome grows it so the watchdog
+                    # trips on genuine spinning, not on a fixed repeat count.
+                    _oc = _outcome_fingerprint(result)
+                    if self._sig_outcomes.get(_norm_sig) == _oc:
+                        self._sig_noprogress[_norm_sig] = \
+                            self._sig_noprogress.get(_norm_sig, 0) + 1
+                    else:
+                        self._sig_noprogress[_norm_sig] = 0
+                    self._sig_outcomes[_norm_sig] = _oc
 
                     if await self._auth_gate(
                         result, tool_args, entry, wait_for_human, _observe,
@@ -1713,6 +1801,39 @@ class CopilotSession:
                    " Continuing to invent hosts will end this turn.")
         return msg
 
+    async def _activate_subapp(self, store: Any, host: str, app: str, browser: Any,
+                               *, probe_hint: str = "") -> bool:
+        """Navigate to a sub-app's feature so the SPA mints its working Bearer, then capture it from
+        proxy history — the central-less token acquisition (no /spa/session needed). The activation
+        URL is a LEARNED recipe (the Referer of the SPA's own authed call to this sub-app, per
+        site), else learned-from-history now, else a configured prime.nav. Bounded to one nav per
+        (host, app) per run. Returns True once a fresh token is captured. Best-effort; never raises.
+        Shared by the proactive bearer refresh and the reactive 401 recovery."""
+        if browser is None or not host or not app:
+            return False
+        try:
+            from dast.session import activation_recipe, subapp_map
+            nav = (activation_recipe.activation_nav(host, app)
+                   or activation_recipe.learn_from_history(store, host, app)
+                   or (subapp_map.prime_for_app(app) or {}).get("nav"))
+            if not nav:
+                return False
+            key = (host, app)
+            if key in self._primed_subapps:
+                return False
+            self._primed_subapps.add(key)
+            nav_url = nav if "://" in nav else f"https://{host}{nav if nav.startswith('/') else '/' + nav}"
+            await browser.navigate(nav_url)
+            # Learn the recipe from the SPA's own request now (independent of the capture race).
+            activation_recipe.learn_from_history(store, host, app)
+            captured = await self._await_subapp_bearer(store, host, app, probe_hint=probe_hint)
+            if captured:
+                activation_recipe.record_activation(host, app, nav, source="activate")
+            return captured
+        except Exception as exc:  # noqa: BLE001 — activation is best-effort, never break the caller
+            logger.debug("sub-app activation nav failed", host=host, app=app, error=str(exc)[:160])
+            return False
+
     async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
                                   tool_args: Dict[str, Any], result: Dict[str, Any],
                                   run_tool: Any) -> Optional[Dict[str, Any]]:
@@ -1802,13 +1923,16 @@ class CopilotSession:
             return None
 
     async def _await_subapp_bearer(self, store: Any, host: str, app: str,
-                                   *, tries: int = 20, interval: float = 0.5) -> bool:
+                                   *, probe_hint: str = "",
+                                   tries: int = 20, interval: float = 0.5) -> bool:
         """Bounded poll for the sub-app's working Bearer to appear in proxy history after a browser
         activation nav (the SPA mints it asynchronously). Returns True once a fresh token is
-        captured so the retry can ride it instead of racing the mint. Best-effort; never raises."""
+        captured so the retry can ride it instead of racing the mint. Best-effort; never raises.
+        ``probe_hint`` (the request path) is used when the sub-app has no configured probe — so an
+        UNMAPPED sub-app can still be awaited/captured without a hand-written subapp_map entry."""
         from dast.session import subapp_map
         from dast.session.auth_provider import scan_history_bearer
-        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "")
+        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "") or probe_hint
         if store is None or not probe:
             return False
         for _ in range(max(1, tries)):

@@ -97,6 +97,16 @@ error_signatures:
   - "com.mysql.jdbc"
   - "org.postgresql"
   - "System.Data.SqlClient"
+  # DuckDB — its exception categories surface as "<Category> Error: ..." when an injected
+  # quote breaks the query (seen on a DuckDB-backed reporting engine: a broken string field
+  # leaked version() as "Invalid Input Error: <ver>"). Previously unmatched.
+  - "Binder Error"
+  - "Catalog Error"
+  - "Conversion Error"
+  - "Invalid Input Error"
+  - "Parser Error"
+  - "Out of Range Error"
+  - "duckdb"
 
 time_threshold_ms: 4500
 max_sleep_seconds: 5

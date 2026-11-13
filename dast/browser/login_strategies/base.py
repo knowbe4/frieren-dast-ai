@@ -80,6 +80,10 @@ class LoginContext:
     decide: Optional[AuthDecider] = None
     max_llm_steps: int = _MAX_LLM_STEPS
     prior: List[LoginResult] = field(default_factory=list)
+    # A previously persisted Playwright storage_state ({"cookies": [...], ...}) for this
+    # profile, if any. The SavedSessionStrategy seeds these and probes BEFORE any real login
+    # so the cascade REUSES a still-valid session instead of always creating a new one.
+    saved_session: Optional[Dict[str, Any]] = None
     # Forward hooks (unused in Phase 1): a future recorded-flow / SSO strategy joins by
     # reading these instead of changing the protocol.
     flow: Any = None

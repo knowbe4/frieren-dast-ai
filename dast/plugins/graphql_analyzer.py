@@ -45,6 +45,23 @@ _INTERNAL_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# SQL-error signatures (incl. DuckDB) reused from the one source of truth in sqli.yaml, so a SQL
+# error surfaced in a GraphQL errors[] message is flagged as a possible SQL injection. Compiled
+# lazily (the loader caches the YAML). The fragments are regexes — join unescaped, like the agent.
+_SQL_ERROR_SIG_RE: Optional[re.Pattern] = None
+
+
+def _sql_error_re() -> re.Pattern:
+    global _SQL_ERROR_SIG_RE
+    if _SQL_ERROR_SIG_RE is None:
+        try:
+            from dast.payloads.loader import get_signatures
+            sigs = get_signatures("sqli", "error_signatures") or []
+        except Exception:
+            sigs = []
+        _SQL_ERROR_SIG_RE = re.compile("|".join(sigs) if sigs else r"(?!x)x", re.IGNORECASE)
+    return _SQL_ERROR_SIG_RE
+
 # A `/graphql` path *segment*: /graphql, /graphql/, /graphql/<suffix>, /api/graphql.
 # Deliberately a segment match, not a bare substring, so /graphql-docs and the like
 # do not false-positive.
@@ -187,6 +204,29 @@ def _analyze(entry: "ProxyEntry") -> List[dict]:
             "confirmed": True,
             "validated_by": ["passive"],
         })
+
+    # ── 4b. SQL error in a GraphQL errors[] message (possible SQL injection) ──
+    # A raw DBMS error (incl. DuckDB) surfaced in an errors[].message is high-signal: the SPA's
+    # own input reached the SQL parser. Scoped to errors[].message (not the whole body) to keep
+    # the broad passive stream's false-positive rate down.
+    if isinstance(resp_data, dict):
+        err_list = resp_data.get("errors") or []
+        for err in (err_list if isinstance(err_list, list) else []):
+            msg = err.get("message", "") if isinstance(err, dict) else ""
+            if isinstance(msg, str) and _sql_error_re().search(msg):
+                findings.append({
+                    "title": "SQL error disclosed in GraphQL response (possible SQL injection)",
+                    "severity": "high",
+                    "cwe": "CWE-89",
+                    "attack_type": "sqli",
+                    "evidence": (
+                        "A GraphQL errors[] message contains a database error signature, which "
+                        "means user input reached the SQL layer. Message: " + msg[:300]
+                    ),
+                    "confirmed": True,
+                    "validated_by": ["passive"],
+                })
+                break
 
     # ── 5. Verbose error extensions ──────────────────────────────────────
     if isinstance(resp_data, dict):

@@ -10,9 +10,9 @@ from dast.browser import login_cascade
 from dast.browser.login_strategies import registry
 
 
-def test_default_registry_has_the_three_strategies_in_order():
+def test_default_registry_has_the_strategies_in_order():
     names = [s.name for s in registry.ordered_strategies()]
-    assert names == ["deterministic", "spa_api", "llm"]
+    assert names == ["saved_session", "deterministic", "spa_api", "llm"]
 
 
 def test_reorder_moves_winner_to_front():
@@ -70,12 +70,13 @@ def test_ordered_strategies_learns_winner_from_journal():
     host = "learned.example.com"
     # No history -> default order.
     assert [s.name for s in registry.ordered_strategies(host)] == \
-        ["deterministic", "spa_api", "llm"]
-    # Record a spa_api win -> it is tried first next time, the rest keep default order.
+        ["saved_session", "deterministic", "spa_api", "llm"]
+    # Record a spa_api win -> among the LOGIN strategies it is tried first next time, but the
+    # saved_session reuse short-circuit always stays pinned ahead of any fresh-login winner.
     login_journal.record(f"https://{host}/login", "success", strategy="spa_api",
                          endpoint=f"https://{host}/spa/auth/login")
     assert [s.name for s in registry.ordered_strategies(host)] == \
-        ["spa_api", "deterministic", "llm"]
+        ["saved_session", "spa_api", "deterministic", "llm"]
     # An unknown host is unaffected (still default).
     assert [s.name for s in registry.ordered_strategies("other.example.com")] == \
-        ["deterministic", "spa_api", "llm"]
+        ["saved_session", "deterministic", "spa_api", "llm"]

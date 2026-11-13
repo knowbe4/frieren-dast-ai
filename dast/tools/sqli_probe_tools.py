@@ -69,6 +69,41 @@ def _inject_path(body: dict, dotted: str, value: Any) -> dict:
     return injected
 
 
+def _path_exists(body: dict, dotted: str) -> bool:
+    """True if ``dotted`` (relative to variables, e.g. ``v.contentTitle`` or a plain top-level name)
+    resolves to an EXISTING leaf in the operation's variables. A payload injected at a path the op
+    does not have goes nowhere and yields a silent false-negative, so the caller validates first."""
+    variables = body.get("variables") if isinstance(body, dict) else None
+    if not isinstance(variables, dict):
+        return False
+    node: Any = variables
+    for key in [p for p in dotted.split(".") if p]:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+
+def _string_var_paths(body: dict) -> List[str]:
+    """Dotted paths (relative to variables) of every STRING-valued leaf in the operation's
+    variables — the candidate injection points to suggest when the requested one is absent."""
+    out: List[str] = []
+
+    def _descend(node: Any, prefix: str) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                child = f"{prefix}.{key}" if prefix else key
+                if isinstance(val, str):
+                    out.append(child)
+                elif isinstance(val, dict):
+                    _descend(val, child)
+
+    variables = body.get("variables") if isinstance(body, dict) else None
+    if isinstance(variables, dict):
+        _descend(variables, "")
+    return out
+
+
 # DuckDB error(expr) embeds the expression's value in "Invalid Input Error: <value>" (also
 # "Conversion Error: ..."), so a `(SELECT error(version()))` payload leaks version() in the
 # GraphQL errors[] message. Parse that out as read-only impact proof.
@@ -284,6 +319,18 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         if gql_body is None:
             return {"ok": False, "error": "no GraphQL body given and none captured for this URL — "
                     "pass 'body' as {query, variables, operationName} JSON"}
+        # Guard against a silent false-negative: if the injection_point does not exist in THIS
+        # operation's variables, a payload injected there goes nowhere and the probe would report a
+        # misleading NOT CONFIRMED. Fail loudly instead, naming the operation and its string fields,
+        # so the caller targets a real field (or captures the right operation).
+        if not _path_exists(gql_body, point):
+            candidates = _string_var_paths(gql_body)
+            op_name = gql_body.get("operationName") if isinstance(gql_body, dict) else None
+            return {"ok": False, "error": f"injection_point '{point}' is not a variable of the "
+                    f"captured operation{f' {op_name!r}' if op_name else ''} — probing it would be "
+                    "a false negative. Target one of this operation's string variables, or capture "
+                    "the operation that actually carries the field.",
+                    "operation": op_name, "available_string_fields": candidates}
 
     source_label = getattr(ctx, "source_label", None)
     # Resolve cookies + sub-app Bearer + CSRF once (same machinery as send_request), applied to

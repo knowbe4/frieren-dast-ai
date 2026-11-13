@@ -221,6 +221,42 @@ async def test_sqli_probe_nested_graphql_var_with_duckdb_version(monkeypatch):
     assert store.recorded[0][0]["extracted_data"]["version"] == "v1.4.2"
 
 
+def test_path_exists_and_string_var_paths():
+    from dast.tools.sqli_probe_tools import _path_exists, _string_var_paths
+    body = {"operationName": "Rpt",
+            "variables": {"v": {"contentTitle": "x", "purchasedCourseId": 1},
+                          "reportConfig": {"filters": {"createdAtStart": "2026"}}}}
+    assert _path_exists(body, "v.contentTitle") is True
+    assert _path_exists(body, "v.purchasedCourseId") is True   # exists (non-string still "exists")
+    assert _path_exists(body, "v.missing") is False
+    assert _path_exists(body, "contentTitle") is False          # wrong depth
+    # Only STRING leaves are suggested as candidates (not the int field).
+    paths = _string_var_paths(body)
+    assert "v.contentTitle" in paths
+    assert "reportConfig.filters.createdAtStart" in paths
+    assert "v.purchasedCourseId" not in paths
+
+
+@pytest.mark.asyncio
+async def test_sqli_probe_rejects_absent_injection_path(monkeypatch):
+    """A false-negative guard: injecting a graphql_var path the operation does not have must fail
+    loudly (naming the op + its string fields), not return a misleading NOT CONFIRMED."""
+    from dast.tools import sqli_probe_tools as spt
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/reports/graphql",
+        "injection_point": "v.contentTitle",            # absent in this op
+        "injection_location": "graphql_var",
+        "body": '{"operationName":"RiskScore","query":"query RiskScore($reportConfig:C!){r}",'
+                '"variables":{"reportConfig":{"filters":{"createdAtStart":"2026"}}}}',
+    })
+    assert result["ok"] is False
+    assert "false negative" in result["error"]
+    assert result["operation"] == "RiskScore"
+    assert "reportConfig.filters.createdAtStart" in result["available_string_fields"]
+    assert store.recorded == []
+
+
 @pytest.mark.asyncio
 async def test_sqli_probe_not_confirmed_on_clean_responses(monkeypatch):
     from dast.tools import sqli_probe_tools as spt

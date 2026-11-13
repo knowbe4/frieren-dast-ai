@@ -139,6 +139,39 @@ def _transport_capability_block(host: str) -> str:
             f"- {sub_app}: prefer {rec.get('prefer')} (works: {rec.get('auth')}){reason}")
 
 
+def _token_inventory_block(store: Any, host: str) -> str:
+    """The credentials Frieren has OBSERVED for this host (session cookies, per-sub-app JWT
+    bearers, custom auth headers, query tokens), redacted to type/location/claims only — so the
+    copilot can reason about which credential an endpoint needs. Returns "" when none seen."""
+    try:
+        from dast.session.token_inventory import build_token_inventory
+        inv = build_token_inventory(store, host)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context brief: token-inventory build failed", host=host, error=str(exc))
+        return ""
+    bearers, cookies, headers, qs = (inv["bearers"], inv["cookies"],
+                                     inv["headers"], inv["query_tokens"])
+    if not (bearers or cookies or headers or qs):
+        return ""
+    lines = [f"## Token inventory — {host}"]
+    if bearers:
+        parts = []
+        for b in bearers[:8]:
+            scope = b["claims"].get("scope") or b["claims"].get("scp") or b["claims"].get("roles")
+            tag = b["app"] + (f" scope={scope}" if scope else "") + ("" if b["fresh"] else " EXPIRED")
+            parts.append(tag)
+        lines.append("- JWT bearers (per sub-app): " + "; ".join(parts))
+    if cookies:
+        lines.append("- cookies: " + ", ".join(
+            c["name"] + ("(jwt)" if c["type"] == "cookie+jwt" else "")
+            + ("(httpOnly)" if c["httpOnly"] else "") for c in cookies[:12]))
+    if headers:
+        lines.append("- header tokens: " + ", ".join(h["name"] for h in headers[:8]))
+    if qs:
+        lines.append("- query tokens: " + ", ".join(q["param"] for q in qs[:8]))
+    return "\n".join(lines)
+
+
 def build_context_brief(
     store: Any,
     hosts: Sequence[str],
@@ -178,6 +211,10 @@ def build_context_brief(
     # Locally-learned per-host transport preference (API vs browser session).
     transport_blocks = [b for b in (_transport_capability_block(host) for host in ordered) if b]
     blocks.extend(transport_blocks)
+
+    # Credentials observed in traffic (redacted) — the multi-token landscape per host.
+    token_blocks = [b for b in (_token_inventory_block(store, host) for host in ordered) if b]
+    blocks.extend(token_blocks)
 
     sessions_block = _named_sessions_block()
     if sessions_block:

@@ -41,9 +41,15 @@ logger = get_logger(__name__)
 # action="reply" is the primary turn boundary; this only fires if it never
 # replies (a bug, not normal dialogue).
 _MAX_TOOL_CALLS_PER_TURN = 20
-# Watchdog: how many times the SAME normalized call (same tool+method+url+body, ignoring
-# volatile headers) may repeat before the coordinator kills the looping turn.
-_MAX_NORMALIZED_REPEATS = 3
+# Watchdog: a looping turn is killed based on LACK OF PROGRESS, not a fixed repeat count. The
+# SAME normalized call (same tool+method+url+body, ignoring volatile headers) is only counted
+# against this budget when it returns the SAME outcome as before (no new status/data); a repeat
+# that yields a new result resets the streak. So a productive sequence that revisits an endpoint
+# and keeps learning is never killed, while a genuine no-progress spin is caught fast.
+_MAX_NOPROGRESS_REPEATS = 2
+# Absolute safety cap: even if every repeat somehow looks like "progress", never let one
+# normalized call run away unbounded within a turn.
+_MAX_NORMALIZED_REPEATS = 8
 # Cross-endpoint watchdog: after this many model-pasted session headers are stripped, warn
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
@@ -96,6 +102,24 @@ def _normalized_call_sig(tool_name: str, args: Dict[str, Any]) -> str:
     rest = {k: v for k, v in a.items() if k not in ("method", "url", "target", "base_url", "body", "data")}
     if rest:
         parts.append(_canonical(rest))
+    return "|".join(parts)
+
+
+def _outcome_fingerprint(result: Dict[str, Any]) -> str:
+    """A cheap, stable fingerprint of a tool result, so the loop watchdog can tell a repeat
+    that made PROGRESS (new status/data) from one that returned the same thing again. Uses the
+    coarse shape (ok/status/count/length + a short body prefix), not the full body, so trivial
+    volatility (timestamps deep in a payload) does not mask a genuine no-progress spin."""
+    if not isinstance(result, dict):
+        return repr(result)[:80]
+    body = result.get("text") or result.get("body") or result.get("data") or ""
+    body_s = body if isinstance(body, str) else _canonical(body)
+    parts = [
+        str(result.get("ok")),
+        str(result.get("status")),
+        str(result.get("count") if result.get("count") is not None else len(body_s)),
+        body_s[:200],
+    ]
     return "|".join(parts)
 
 # Consecutive non-productive steps (an LLM call failure, or a step that commits to
@@ -532,8 +556,11 @@ def _build_user_prompt(
     )
 
 
-async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
-    """One schema-forced step decision. Returns None on LLM failure."""
+async def _llm_step(system: str, user: str,
+                    model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """One schema-forced step decision. Returns None on LLM failure. ``model_override`` forces a
+    specific model for THIS call only (used for the per-profile refusal downgrade); it never
+    mutates global model state, so other sessions are unaffected."""
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -541,7 +568,7 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
             lambda: bedrock_client.invoke_json(
                 system=system,
                 user=user,
-                model_id=bedrock_client.get_copilot_model(),
+                model_id=model_override or bedrock_client.get_copilot_model(),
                 max_tokens=1024,
                 temperature=0,
                 schema=COPILOT_STEP_SCHEMA,
@@ -610,6 +637,11 @@ class CopilotSession:
         # volatile headers) so the exact-dedup miss — the model pasting a different Cookie/
         # CSRF literal each call — is still caught and the looping turn can be killed.
         self._repeat_sigs: Dict[str, int] = {}
+        # Progress-aware loop watchdog: the last outcome fingerprint seen for each normalized
+        # signature, and the consecutive count of repeats that produced the SAME outcome. The
+        # kill decision reads the no-progress streak, not the raw repeat count.
+        self._sig_outcomes: Dict[str, str] = {}
+        self._sig_noprogress: Dict[str, int] = {}
         # Cross-endpoint watchdog: how many times we had to STRIP a model-pasted session
         # header (Cookie/CSRF). The per-call watchdog misses this when it happens on
         # different URLs, so count it URL-independently and break the run once it is clear
@@ -617,6 +649,10 @@ class CopilotSession:
         self._stripped_header_count: int = 0
         self._header_strip_warned: bool = False
         self._session_cookies: Dict[str, str] = {}
+        # Per-profile opt-in refusal downgrade: when set (by the autonomous run from a profile that
+        # enabled it), a safety-classifier block on the decision model is retried ONCE with this
+        # model. Empty = disabled (the default); never set globally, so other sessions are unaffected.
+        self._downgrade_model: str = ""
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
         self._last_relogin_ts: float = 0.0
@@ -653,6 +689,8 @@ class CopilotSession:
         track model behaviour, which a fresh session does not change."""
         self._seen_calls.clear()
         self._repeat_sigs.clear()
+        self._sig_outcomes.clear()
+        self._sig_noprogress.clear()
         logger.info("copilot dedup reset", session_id=self.session_id, reason=reason)
 
     def _auth_flip(self, host: str, endpoint: str, status: Any) -> bool:
@@ -1108,16 +1146,29 @@ class CopilotSession:
                 try:
                     decision = await _llm_step(_system_prompt(), user)
                 except bedrock_client.AiContentBlockedError:
-                    logger.warning("Copilot: decision model blocked by safety classifier")
-                    reply = _finalize(
-                        "The safety classifier blocked this request, so I can't plan "
-                        "the next step this turn. Try rephrasing the objective, or "
-                        "switch the AI provider for this run.",
-                        blocked_reason="safety_blocked",
-                    )
-                    await on_event({"type": "reply", "message": reply.message,
-                                    "blocked_reason": reply.blocked_reason})
-                    return reply
+                    # Per-profile opt-in: retry ONCE with the operator's downgrade model before
+                    # giving up. Only fires when this session's profile enabled it (never global).
+                    decision = None
+                    if self._downgrade_model:
+                        logger.warning("Copilot: decision model safety-blocked — retrying once "
+                                       "with per-profile downgrade model",
+                                       session_id=self.session_id, model=self._downgrade_model)
+                        try:
+                            decision = await _llm_step(_system_prompt(), user,
+                                                       model_override=self._downgrade_model)
+                        except bedrock_client.AiContentBlockedError:
+                            decision = None
+                    if decision is None:
+                        logger.warning("Copilot: decision model blocked by safety classifier")
+                        reply = _finalize(
+                            "The safety classifier blocked this request, so I can't plan "
+                            "the next step this turn. Try rephrasing the objective, or "
+                            "switch the AI provider for this run.",
+                            blocked_reason="safety_blocked",
+                        )
+                        await on_event({"type": "reply", "message": reply.message,
+                                        "blocked_reason": reply.blocked_reason})
+                        return reply
 
                 if decision is None:
                     consecutive_failures += 1
@@ -1278,16 +1329,26 @@ class CopilotSession:
                     # blocked_reason='stuck_loop'.
                     _norm_sig = _normalized_call_sig(tool_name, tool_args)
                     self._repeat_sigs[_norm_sig] = self._repeat_sigs.get(_norm_sig, 0) + 1
-                    if self._repeat_sigs[_norm_sig] >= _MAX_NORMALIZED_REPEATS:
+                    _noprogress = self._sig_noprogress.get(_norm_sig, 0)
+                    # Kill from LACK OF PROGRESS (the same call kept returning the same outcome),
+                    # or from the absolute safety cap — never from a plain repeat count, so a
+                    # call that keeps producing NEW results is allowed to repeat as needed.
+                    _repeats = self._repeat_sigs[_norm_sig]
+                    if _noprogress >= _MAX_NOPROGRESS_REPEATS \
+                            or _repeats >= _MAX_NORMALIZED_REPEATS:
+                        reason_n = ("returned the same result "
+                                    f"{_noprogress + 1} times with no progress"
+                                    if _noprogress >= _MAX_NOPROGRESS_REPEATS
+                                    else f"was issued {_repeats} times")
                         self._repeat_sigs[_norm_sig] = 0  # don't instantly re-trip on resume
+                        self._sig_noprogress[_norm_sig] = 0
                         logger.warning("copilot watchdog: killing looping turn",
                                        session_id=self.session_id, tool=tool_name,
-                                       count=_MAX_NORMALIZED_REPEATS)
+                                       no_progress=_noprogress, repeats=_repeats)
                         return _finalize(
                             f"Stopped: the same request ({tool_name} "
                             f"{str(tool_args.get('method', '')).upper()} "
-                            f"{tool_args.get('url', '')}) was issued "
-                            f"{_MAX_NORMALIZED_REPEATS} times with no new outcome. The tool "
+                            f"{tool_args.get('url', '')}) {reason_n}. The tool "
                             "manages the session — do NOT paste Cookie or X-CSRF-Token headers. "
                             "Change the endpoint, parameter, or tool, or conclude.",
                             blocked_reason="stuck_loop",
@@ -1337,6 +1398,18 @@ class CopilotSession:
                         continue
 
                     result = await run_tool(tool_ctx, tool_name, tool_args)
+
+                    # Progress-aware loop tracking: compare this call's outcome to the last one
+                    # for the same normalized signature. A new outcome resets the no-progress
+                    # streak (productive repeat); the same outcome grows it so the watchdog
+                    # trips on genuine spinning, not on a fixed repeat count.
+                    _oc = _outcome_fingerprint(result)
+                    if self._sig_outcomes.get(_norm_sig) == _oc:
+                        self._sig_noprogress[_norm_sig] = \
+                            self._sig_noprogress.get(_norm_sig, 0) + 1
+                    else:
+                        self._sig_noprogress[_norm_sig] = 0
+                    self._sig_outcomes[_norm_sig] = _oc
 
                     if await self._auth_gate(
                         result, tool_args, entry, wait_for_human, _observe,

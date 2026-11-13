@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dast.ai.prompt_safety import wrap_untrusted
+from dast.session.account_state import session_is_provisioned as _session_is_provisioned
 from dast.tools.context import AgentToolContext
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
@@ -155,44 +156,35 @@ _SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
 # Soft escalations auto-nudged before a real human pause, per no-progress streak.
 _MAX_AUTO_GUIDANCE_NUDGES = 3
 
+# Phrases that mark a plain-text SAFETY REFUSAL — the model declined the objective itself
+# (no API-level block, so blocked_reason is empty). The coordinator must NOT auto-continue
+# past a refusal with a generic message (that pivots to whatever the proxy history holds —
+# the wrong target); it escalates to the operator to rephrase or drop the objective.
+_REFUSAL_MARKERS = (
+    "prompt-injection", "prompt injection", "i can't help", "i cannot help",
+    "i can't assist", "i cannot assist", "i won't", "i will not", "i refuse",
+    "i'm not able to help", "i am not able to help", "against policy",
+    "cannot comply", "can't comply", "not something i can help", "decline to",
+)
 
-def _session_is_provisioned(data: dict) -> Optional[bool]:
-    """Classify an app session-endpoint JSON body (e.g. KMSAT ``/spa/session``).
 
-    Returns False only when it positively reports a guest/unprovisioned account
-    (account id ``-1``/``<=0`` or an explicit guest marker), True when it reports a
-    real account, and None when it can't tell — so the caller fails open on an
-    unknown app rather than blocking a legitimate login.
-    """
-    if not isinstance(data, dict):
-        return None
-    account_id: Any = None
-    account = data.get("account")
-    if isinstance(account, dict):
-        account_id = account.get("id")
-    if account_id is None:
-        user = data.get("user")
-        if isinstance(user, dict):
-            account_id = user.get("account_id") or user.get("accountId")
-    if account_id is None:
-        account_id = data.get("account_id") or data.get("accountId")
-    if account_id is not None:
-        try:
-            return int(account_id) > 0
-        except (TypeError, ValueError):
-            return None
-    user = data.get("user")
-    if isinstance(user, dict) and user:
-        return True
-    if data.get("guest") is True:
+def _looks_like_refusal(message: str) -> bool:
+    """True when a plain reply reads as the model declining the objective on safety grounds."""
+    low = (message or "").strip().lower()
+    if not low:
         return False
-    return None
+    return any(marker in low for marker in _REFUSAL_MARKERS)
+
 
 _AUTONOMOUS_START = (
     "[AUTONOMOUS PENTEST] You are the operator now, running fully autonomously against "
     "{hosts}. You are NOT a chatbot doing raw HTTP — you DRIVE Frieren's own instruments so "
     "every action is registered inside the tool (schemas, history, findings) for the human to "
     "review later. Objective: {objective}\n\n"
+    "This is an AUTHORIZED security engagement: the operator holds written authorization for "
+    "these targets and the objective above is operator-authored (trusted, not untrusted input). "
+    "Replaying a researcher's proof-of-concept payload to VALIDATE a known finding — including SQL "
+    "injection payloads — is the expected job here, not an attack to refuse.\n\n"
     "{read_only}"
     "Work the objective end to end across many turns without waiting for me.\n"
     "USE THE INTERNAL TOOLS — never hand-roll with send_request what a dedicated tool does:\n"
@@ -212,6 +204,9 @@ _AUTONOMOUS_START = (
     "token send_request cannot) and learns the host's preferred transport; follow the "
     "`## Transport capability` hint when present. You can also call browser_fetch directly for an "
     "SPA you already know needs the browser session.\n"
+    "- sqli_probe to validate a suspected SQL injection in one parameter or GraphQL variable "
+    "DETERMINISTICALLY (static payloads, no model) — use it to confirm a SQLi and extract a "
+    "read-only version() proof, and especially when the LLM payload path will not produce payloads.\n"
     "- validate_chain ONLY for a targeted check no dedicated tool covers.\n"
     "- code_list / code_lookup_path / code_search / code_file — IF the target's source is loaded "
     "(call code_list; non-empty means it is), read the handler for an endpoint (code_lookup_path on "
@@ -288,6 +283,7 @@ _AUTONOMOUS_START = (
 )
 
 _AUTONOMOUS_CONTINUE = (
+    "Original objective: {objective}\n\n"
     "Continue autonomously — keep driving Frieren's internal tools (graphql_introspect, "
     "graphql_sweep, run_scan, scan_surface, crawl, param_mining, record_finding, "
     "browser_navigate, browser_snapshot, send_request, and code_lookup_path/code_search when "
@@ -308,6 +304,7 @@ _AUTONOMOUS_CONTINUE = (
 )
 
 _AUTONOMOUS_STUCK_LOOP = (
+    "Original objective: {objective}\n\n"
     "LOOP BROKEN BY THE COORDINATOR. You repeated the same request over and over with no "
     "new result:\n{detail}\n\n"
     "Root cause: do NOT paste Cookie or X-CSRF-Token headers into send_request — the tool "
@@ -320,6 +317,7 @@ _AUTONOMOUS_STUCK_LOOP = (
 )
 
 _AUTONOMOUS_SELF_PROCEED = (
+    "Original objective: {objective}\n\n"
     "You set blocked_reason='{reason}', but this is NOT a genuine blocker — you do not need my "
     "permission to run safe, in-scope next steps you have already planned. Proceed autonomously "
     "right now: execute your plan with the internal tools (run_scan, scan_surface, idor_probe, "
@@ -333,6 +331,7 @@ _AUTONOMOUS_SELF_PROCEED = (
 )
 
 _AUTONOMOUS_COVERAGE_GATE = (
+    "Original objective: {objective}\n\n"
     "You set 'complete', but you have NOT tested the whole attack surface — that is premature. "
     "Do not stop yet.\n\n"
     "{coverage}\n\n"
@@ -1268,6 +1267,22 @@ class CopilotService:
                 logger.info("autonomous run: profile has no credentials for auto-relogin", slug=slug)
         except Exception as exc:
             logger.warning("autonomous run: relogin-credential seed failed", slug=slug, error=str(exc))
+        # Per-profile opt-in: arm the decision-model refusal downgrade for THIS run only (never a
+        # global model switch), so another operator's profiles never inherit it. Only under
+        # --authorized; off by default on the profile.
+        try:
+            from dast import authorization
+            engine = session.get("engine")
+            authorized = authorization.is_full_authorization()
+            if engine is not None and getattr(profile, "allow_model_downgrade", False) and authorized:
+                engine._downgrade_model = (getattr(profile, "downgrade_model", "")
+                                           or "claude-opus-4-6")
+                logger.info("autonomous run: armed per-profile model downgrade on refusal",
+                            slug=slug, model=engine._downgrade_model)
+            elif engine is not None:
+                engine._downgrade_model = ""
+        except Exception as exc:
+            logger.debug("autonomous run: downgrade arm failed", slug=slug, error=str(exc)[:120])
 
     async def _breaker_reauth(self, sid: str, session: dict) -> Optional[bool]:
         """One re-login attempt per run for the uniform-failure breaker. Returns True on
@@ -1314,17 +1329,56 @@ class CopilotService:
             if browser is None:
                 logger.warning("autonomous run: no browser for proactive login", session_id=sid)
                 return
+            # REUSE-FIRST: when the profile carries a persisted session, _activate_profile has
+            # already seeded it into this run's browser context. Confirm it with the app's
+            # authoritative session gate-check (e.g. /spa/session) and SKIP the login entirely
+            # when it is still a real provisioned account — no form re-drive, no MFA wait, no
+            # re-login every run. Only when the probe can positively tell the session is valid
+            # (True) do we skip; guest/unknown/stale falls through to a fresh login.
+            saved_session = self._load_saved_session(auto.get("profile"))
+            force_fresh = bool(auto.get("_force_fresh_login"))
+            if saved_session and not force_fresh:
+                try:
+                    await browser.seed_saved_session(saved_session.get("cookies") or [])
+                except Exception as exc:
+                    logger.debug("autonomous run: saved-session seed failed",
+                                 session_id=sid, error=str(exc)[:120])
+                if await self._gate_check_account_state(browser, creds["url"]) is True:
+                    auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
+                                      "(reused saved session)")
+                    logger.info("autonomous run: reused a stored session, skipped login",
+                                session_id=sid, profile=auto.get("profile"))
+                    if hasattr(engine, "_session_cookies"):
+                        try:
+                            engine._session_cookies.update(await browser.export_cookies())
+                        except Exception:
+                            pass
+                    await self._broadcast_autonomous(sid, "authenticated", {
+                        "profile": auto.get("profile"), "engine": "saved_session",
+                    })
+                    return
             from dast.browser.login_cascade import adaptive_login
             result = await adaptive_login(
                 browser, creds["url"], creds["email"], creds["password"],
                 in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
+                saved_session=None if force_fresh else saved_session,
             )
+            reused = getattr(result, "engine", "") == "saved_session"
+            if reused:
+                logger.info("autonomous run: reused a stored session via cascade, skipped login",
+                            session_id=sid, profile=auto.get("profile"))
             if getattr(result, "ok", False):
-                # Gate-check: a login that "succeeds" can still land on an
-                # onboarding/guest session (a freshly-created, unprovisioned
-                # account). Confirm a real account before declaring the run
-                # authenticated; fail open on unknown apps.
+                # Gate-check: a login (or a reused session) that "succeeds" can still be an
+                # onboarding/guest or an expired SPA shell. Confirm a real account before
+                # declaring the run authenticated; fail open on unknown apps.
                 provisioned = await self._gate_check_account_state(browser, creds["url"])
+                if provisioned is False and reused and not force_fresh:
+                    # The reused session is dead/guest — drop reuse and log in fresh, once.
+                    logger.info("autonomous run: reused session failed gate-check; forcing a "
+                                "fresh login", session_id=sid)
+                    auto["_force_fresh_login"] = True
+                    auto["_proactive_login_done"] = False
+                    return await self._ensure_profile_login(sid, session)
                 if provisioned is False:
                     auto["detail"] = ("account not provisioned / onboarding incomplete — "
                                       "login succeeded but the session is a guest account")
@@ -1353,6 +1407,9 @@ class CopilotService:
                             self._ctx.store.save_named_session_from_playwright(
                                 name=name, role=name, playwright_cookies=full,
                             )
+                            # Persist the session onto the PROFILE too, so the NEXT run reuses
+                            # it (SavedSessionStrategy / probe-skip) instead of re-logging in.
+                            self._persist_profile_session(auto.get("profile"), full)
                     except Exception as exc:
                         logger.debug("autonomous run: named-session save failed",
                                      session_id=sid, error=str(exc)[:160])
@@ -1376,6 +1433,42 @@ class CopilotService:
             auto["detail"] = f"profile login error: {str(exc)[:150]}"
             logger.warning("autonomous run: proactive profile login error",
                            session_id=sid, error=str(exc)[:200])
+
+    def _load_saved_session(self, slug: Optional[str]) -> Optional[dict]:
+        """Load a profile's persisted ``saved_session`` by slug (None if absent/unknown).
+        Never raises."""
+        if not slug:
+            return None
+        try:
+            from dast.profiles.store import load_profile
+            profile = load_profile(slug)
+        except Exception as exc:
+            logger.debug("autonomous run: saved-session load failed", slug=slug,
+                         error=str(exc)[:120])
+            return None
+        saved = getattr(profile, "saved_session", None) if profile else None
+        return saved if isinstance(saved, dict) and saved.get("cookies") else None
+
+    def _persist_profile_session(self, slug: Optional[str], cookies: list) -> None:
+        """Persist freshly-captured cookies onto the profile's ``saved_session`` so the next
+        run can reuse the session (flips ``session_set`` true). Best-effort; never raises and
+        never logs cookie values."""
+        if not slug or not cookies:
+            return
+        try:
+            from dast.profiles.store import load_profile, save_profile
+            profile = load_profile(slug)
+            if profile is None:
+                return
+            import time as _time
+            profile.saved_session = {"cookies": cookies, "origins": []}
+            profile.updated_at = _time.time()
+            save_profile(profile)
+            logger.info("autonomous run: persisted session to profile", slug=slug,
+                        cookies=len(cookies))
+        except Exception as exc:
+            logger.debug("autonomous run: profile session persist failed", slug=slug,
+                         error=str(exc)[:120])
 
     async def _gate_check_account_state(self, browser: Any, base_url: str) -> Optional[bool]:
         """Best-effort post-login check that the session is a real provisioned account.
@@ -1556,7 +1649,24 @@ class CopilotService:
         )
         return result if isinstance(result, dict) else {"action": "abort", "answer": ""}
 
-    def _effective_hosts(self, focus_hosts: List[str]) -> List[str]:
+    def _profile_host_matcher(self, profile_slug: Optional[str]):
+        """Return a ``host -> bool`` matcher for the active profile's ``host_pattern`` (the
+        engagement boundary), or None when there is no profile / no pattern. Used to keep
+        stale proxy history from a PREVIOUS engagement out of this run's host set."""
+        if not profile_slug:
+            return None
+        try:
+            from dast.profiles.store import load_profile
+            profile = load_profile(profile_slug)
+        except Exception:
+            return None
+        if profile is None or not getattr(profile, "host_pattern", "") \
+                or not hasattr(profile, "matches_host"):
+            return None
+        return lambda host: profile.matches_host(host)
+
+    def _effective_hosts(self, focus_hosts: List[str],
+                         profile_slug: Optional[str] = None) -> List[str]:
         """Expand the operator's focus hosts to every in-scope host actually observed
         in captured traffic.
 
@@ -1575,7 +1685,8 @@ class CopilotService:
         every other host depends on, so they must be tested only after the rest of
         the surface is covered — a dead session at the end costs nothing, a dead
         session at the start wastes the whole run."""
-        hosts = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        seed = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        hosts = set(seed)
         store = self._ctx.store
         if store is None:
             return _order_hosts(hosts)
@@ -1586,6 +1697,12 @@ class CopilotService:
                     hosts.add(host)
         except Exception as exc:  # noqa: BLE001 — best-effort expansion, never crash the run
             logger.debug("effective host expansion failed", error=str(exc))
+        # Scope the traffic-expanded set to the active engagement's profile boundary so leads
+        # /router/coverage from a PREVIOUS engagement's stale proxy history cannot leak into
+        # this run. The operator's own focus hosts are always kept.
+        matcher = self._profile_host_matcher(profile_slug)
+        if matcher is not None:
+            hosts = {h for h in hosts if h in seed or matcher(h)}
         return _order_hosts(hosts)
 
     def _leads_label(self, hosts: List[str]) -> str:
@@ -1663,7 +1780,8 @@ class CopilotService:
         if store is not None:
             store.defer_identity_hosts = False  # lift the deferral for the IdP pass
         identity_hosts = {
-            h for h in self._effective_hosts(auto.get("hosts") or []) if is_identity_host(h)
+            h for h in self._effective_hosts(auto.get("hosts") or [], auto.get("profile"))
+            if is_identity_host(h)
         }
         if not identity_hosts or auto.get("read_only") or store is None:
             return
@@ -1822,7 +1940,7 @@ class CopilotService:
         from dast.tools import run_tool
 
         auto = session["autonomous"]
-        hosts = self._effective_hosts(auto.get("hosts") or [])
+        hosts = self._effective_hosts(auto.get("hosts") or [], auto.get("profile"))
         if not hosts:
             return
         read_only = bool(auto.get("read_only"))
@@ -2016,7 +2134,7 @@ class CopilotService:
         validation_note = (
             _AUTONOMOUS_VALIDATION_PLAYBOOK if auto.get("validation_only") else ""
         )
-        start_hosts = self._effective_hosts(auto["hosts"])
+        start_hosts = self._effective_hosts(auto["hosts"], auto.get("profile"))
         prompt = validation_note + breadth_note + _AUTONOMOUS_START.format(
             objective=auto["objective"], hosts=hosts_label,
             leads=self._leads_label(start_hosts),
@@ -2088,7 +2206,7 @@ class CopilotService:
                 session["updated_at"] = time.time()
                 # Recomputed each turn: traffic grows as the run crawls, so sibling
                 # in-scope hosts surface over time and must enter grounding/targeting.
-                effective_hosts = self._effective_hosts(auto["hosts"])
+                effective_hosts = self._effective_hosts(auto["hosts"], auto.get("profile"))
                 tool_ctx = self._build_tool_ctx(session)
                 try:
                     reply = await session["engine"].send(
@@ -2108,6 +2226,7 @@ class CopilotService:
                         await self._broadcast_autonomous(sid, "finished", {"status": "error"})
                         return
                     prompt = _AUTONOMOUS_CONTINUE.format(
+                        objective=auto.get("objective", ""),
                         progress=self._progress_label(last_progress),
                         budget=self._budget_label(auto, cfg, deadline),
                         leads=self._leads_label(effective_hosts),
@@ -2218,6 +2337,7 @@ class CopilotService:
                     except Exception as exc:
                         logger.debug("stuck_loop: could not clear engine dedup", error=str(exc))
                     prompt = _AUTONOMOUS_STUCK_LOOP.format(
+                        objective=auto.get("objective", ""),
                         detail=(reply.message or "")[:400],
                         budget=self._budget_label(auto, cfg, deadline),
                         coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
@@ -2286,6 +2406,7 @@ class CopilotService:
                         if mode == "complete":
                             await self._deterministic_recon_scan_sweep(sid, session)
                         prompt = _AUTONOMOUS_COVERAGE_GATE.format(
+                            objective=auto.get("objective", ""),
                             coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
                             budget=self._budget_label(auto, cfg, deadline),
                         )
@@ -2307,6 +2428,7 @@ class CopilotService:
                         if identity_pending:
                             await self._final_identity_phase(sid, session)
                             prompt = _AUTONOMOUS_CONTINUE.format(
+                                objective=auto.get("objective", ""),
                                 progress=self._progress_label(last_progress),
                                 budget=self._budget_label(auto, cfg, deadline),
                                 leads=self._leads_label(effective_hosts),
@@ -2362,6 +2484,7 @@ class CopilotService:
                             "blocked_reason": blocked_reason, "nudge": nudges + 1,
                         })
                         prompt = _AUTONOMOUS_SELF_PROCEED.format(
+                            objective=auto.get("objective", ""),
                             reason=blocked_reason,
                             progress=self._progress_label(last_progress),
                             budget=self._budget_label(auto, cfg, deadline),
@@ -2385,8 +2508,35 @@ class CopilotService:
                     )
                     continue
 
+                # ── Plain-text safety refusal → escalate, do NOT auto-continue ──────
+                # The model declined the objective itself (blocked_reason empty). Auto-
+                # continuing here would feed it a generic "keep going" that pivots to
+                # whatever the proxy history holds — the wrong target. Surface the refusal
+                # to the operator to rephrase or drop the objective. Once per run.
+                if (not blocked_reason and not auto.get("_refusal_escalated")
+                        and _looks_like_refusal(reply.message)):
+                    auto["_refusal_escalated"] = True
+                    logger.warning("autonomous run: copilot refused the objective; escalating "
+                                   "to operator", session_id=sid,
+                                   objective=str(auto.get("objective", ""))[:160])
+                    guidance = await self._guidance_pause(sid, session, reply, deadline)
+                    if stop_event.is_set() or guidance.get("action") == "abort":
+                        self._finish_autonomous(session, "stopped",
+                                                "aborted after copilot refused the objective")
+                        await self._broadcast_autonomous(sid, "finished", {"status": "stopped"})
+                        return
+                    if guidance.get("action") == "pause":
+                        pause_gate.clear()
+                        auto["paused_at"] = time.time()
+                        auto["status"] = "paused"
+                    prompt = _AUTONOMOUS_GUIDANCE.format(
+                        answer=str(guidance.get("answer", "")).strip() or "(no answer provided)"
+                    )
+                    continue
+
                 # Plain reply (or error/need_direction/ceiling): a checkpoint — keep going.
                 prompt = _AUTONOMOUS_CONTINUE.format(
+                    objective=auto.get("objective", ""),
                     progress=self._progress_label(last_progress),
                     budget=self._budget_label(auto, cfg, deadline),
                     leads=self._leads_label(effective_hosts),

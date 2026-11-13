@@ -270,6 +270,17 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
             store.save_named_session_from_playwright(
                 name=profile.slug, role=profile.name, playwright_cookies=full, auth_headers={})
             imported = store.import_playwright_cookies(full)
+            # Persist onto the profile so a later activate reuses this session instead of
+            # re-driving the login (flips session_set true). Best-effort.
+            try:
+                from dast.profiles.store import save_profile
+                import time as _time
+                profile.saved_session = {"cookies": full, "origins": []}
+                profile.updated_at = _time.time()
+                save_profile(profile)
+            except Exception as exc:
+                logger.debug("activate_login_profile: profile session persist failed",
+                             slug=profile.slug, error=str(exc)[:120])
     except Exception as exc:
         logger.warning("activate_login_profile: session persist failed", slug=profile.slug,
                        error=str(exc)[:160])
@@ -322,6 +333,31 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
     except Exception as exc:
         return {"ok": False, "error": f"activate failed: {str(exc)[:160]}"}
     logger.info("activate_login_profile: activated", slug=slug, cookies_imported=imported)
+
+    # A saved session goes stale — there is no live session between tests, so the persisted
+    # cookies are usually expired. Reusing them strands the copilot in an expired/guest session.
+    # When the profile also carries a credential, VALIDATE the reused session and, if it is
+    # stale/guest, log in FRESH from the saved credential instead (self-heal — mirrors the
+    # autonomous run's gate-check backstop). A genuinely valid session is kept (fast path).
+    creds0 = getattr(profile, "credentials", None) or []
+    auth_url0 = (getattr(profile, "auth_url", "") or "").strip()
+    has_creds = bool(auth_url0 and creds0 and getattr(creds0[0], "username", "")
+                     and getattr(creds0[0], "secret", ""))
+    browser = getattr(ctx, "browser", None)
+    if has_creds and browser is not None:
+        try:
+            from dast.session.account_state import session_is_authenticated
+            await browser.resync_cookies()  # pull the just-imported jar into the browser context
+            verdict = await session_is_authenticated(browser, auth_url0)
+        except Exception as exc:
+            verdict = None
+            logger.debug("activate_login_profile: session validity probe failed",
+                         slug=slug, error=str(exc)[:120])
+        if verdict is False:
+            logger.info("activate_login_profile: saved session stale/guest — logging in fresh "
+                        "from the saved credential", slug=slug)
+            return await _login_profile_with_credentials(ctx, store, profile)
+
     engine = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     if engine is not None:
         # Arm the expiry auto-relogin: a saved session goes stale, and without these the

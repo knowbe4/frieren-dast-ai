@@ -798,6 +798,21 @@ class CopilotSession:
             if self._rec_is_fresh(rec):
                 return RefreshOutcome(rec, RefreshTier.WAIT_SPA, False)
 
+        # Tier 1b — ACTIVATE: navigate to the sub-app's feature so the SPA mints its Bearer, then
+        # capture it from history. Central-less (no /spa/session), proactive (runs pre-flight at the
+        # WAIT_SPA cap used by send_request/sqli_probe), and only when a learned/known activation nav
+        # exists — bounded to one nav per (host, app) per run. This is what lets a Bearer-authed
+        # sub-app (e.g. a reports GraphQL endpoint) be reached by navigating to the feature instead
+        # of relying on a central token index.
+        if max_tier >= RefreshTier.WAIT_SPA and browser is not None:
+            from dast.session import site_map
+            from dast.session.auth_provider import _derived_subapp, subapp_for_path
+            app = subapp_for_path(path, site_map.site_for_host(host) or "") or _derived_subapp(path)
+            if app and await self._activate_subapp(store, host, app, browser, probe_hint=path):
+                rec = self._select_bearer(host, path)
+                if self._rec_is_fresh(rec):
+                    return RefreshOutcome(rec, RefreshTier.WAIT_SPA, True)
+
         now = _time.time
         # Tier 2 — REFETCH: re-fetch the auth endpoint through the browser (15s cooldown).
         if (max_tier >= RefreshTier.REFETCH and browser is not None
@@ -1786,6 +1801,39 @@ class CopilotSession:
                    " Continuing to invent hosts will end this turn.")
         return msg
 
+    async def _activate_subapp(self, store: Any, host: str, app: str, browser: Any,
+                               *, probe_hint: str = "") -> bool:
+        """Navigate to a sub-app's feature so the SPA mints its working Bearer, then capture it from
+        proxy history — the central-less token acquisition (no /spa/session needed). The activation
+        URL is a LEARNED recipe (the Referer of the SPA's own authed call to this sub-app, per
+        site), else learned-from-history now, else a configured prime.nav. Bounded to one nav per
+        (host, app) per run. Returns True once a fresh token is captured. Best-effort; never raises.
+        Shared by the proactive bearer refresh and the reactive 401 recovery."""
+        if browser is None or not host or not app:
+            return False
+        try:
+            from dast.session import activation_recipe, subapp_map
+            nav = (activation_recipe.activation_nav(host, app)
+                   or activation_recipe.learn_from_history(store, host, app)
+                   or (subapp_map.prime_for_app(app) or {}).get("nav"))
+            if not nav:
+                return False
+            key = (host, app)
+            if key in self._primed_subapps:
+                return False
+            self._primed_subapps.add(key)
+            nav_url = nav if "://" in nav else f"https://{host}{nav if nav.startswith('/') else '/' + nav}"
+            await browser.navigate(nav_url)
+            # Learn the recipe from the SPA's own request now (independent of the capture race).
+            activation_recipe.learn_from_history(store, host, app)
+            captured = await self._await_subapp_bearer(store, host, app, probe_hint=probe_hint)
+            if captured:
+                activation_recipe.record_activation(host, app, nav, source="activate")
+            return captured
+        except Exception as exc:  # noqa: BLE001 — activation is best-effort, never break the caller
+            logger.debug("sub-app activation nav failed", host=host, app=app, error=str(exc)[:160])
+            return False
+
     async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
                                   tool_args: Dict[str, Any], result: Dict[str, Any],
                                   run_tool: Any) -> Optional[Dict[str, Any]]:
@@ -1875,13 +1923,16 @@ class CopilotSession:
             return None
 
     async def _await_subapp_bearer(self, store: Any, host: str, app: str,
-                                   *, tries: int = 20, interval: float = 0.5) -> bool:
+                                   *, probe_hint: str = "",
+                                   tries: int = 20, interval: float = 0.5) -> bool:
         """Bounded poll for the sub-app's working Bearer to appear in proxy history after a browser
         activation nav (the SPA mints it asynchronously). Returns True once a fresh token is
-        captured so the retry can ride it instead of racing the mint. Best-effort; never raises."""
+        captured so the retry can ride it instead of racing the mint. Best-effort; never raises.
+        ``probe_hint`` (the request path) is used when the sub-app has no configured probe — so an
+        UNMAPPED sub-app can still be awaited/captured without a hand-written subapp_map entry."""
         from dast.session import subapp_map
         from dast.session.auth_provider import scan_history_bearer
-        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "")
+        probe = (subapp_map.app_map().get(app, {}) or {}).get("probe", "") or probe_hint
         if store is None or not probe:
             return False
         for _ in range(max(1, tries)):

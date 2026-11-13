@@ -111,7 +111,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if sid and not service.has(sid):
             return JSONResponse({"error": "session not found"}, status_code=404)
         if not sid:
-            sid = service.new_session()
+            # Optional per-profile binding: scope the run to the profile's host(s) and arm its
+            # opt-in refusal downgrade. Validate the slug up front so a typo fails loudly.
+            profile_slug = (body.get("profile_slug") or "").strip() or None
+            if profile_slug:
+                from dast.profiles.store import load_profile
+                if load_profile(profile_slug) is None:
+                    return JSONResponse({"error": f"login profile '{profile_slug}' not found"},
+                                        status_code=404)
+            sid = service.new_session(profile_slug=profile_slug)
 
         session = service.get(sid)
         running = session.get("_task")

@@ -41,7 +41,10 @@ _TIMING_EVIDENCE_RE = re.compile(
 _SQL_ERROR_RE = re.compile(
     r"(sql syntax|sqlstate|ora-\d{3,}|mysql_fetch|psql:|unclosed quotation|"
     r"native client|odbc|syntax error near|you have an error in your sql|"
-    r"warning:\s*mysql|unterminated|pg::|sqlite3::)",
+    r"warning:\s*mysql|unterminated|pg::|sqlite3::|"
+    # DuckDB exception categories ("<Category> Error: ...") — e.g. a DuckDB-backed reporting engine.
+    r"binder error|catalog error|conversion error|invalid input error|"
+    r"parser error|out of range error|duckdb)",
     re.IGNORECASE,
 )
 

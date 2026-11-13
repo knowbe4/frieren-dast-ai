@@ -263,6 +263,7 @@ def build_app(
     from dast.proxy.api.interactions_routes import make_router as interactions_router
     from dast.proxy.api.fedramp_routes import make_router as fedramp_router
     from dast.proxy.api.jwt_routes import make_router as jwt_router
+    from dast.proxy.api.token_inventory_routes import make_router as token_inventory_router
     from dast.proxy.api.profiles_routes import make_router as profiles_router
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
     from dast.proxy.api.login_adaptive_routes import make_router as login_adaptive_router
@@ -343,6 +344,7 @@ def build_app(
     app.include_router(interactions_router(ctx))
     app.include_router(fedramp_router(ctx))
     app.include_router(jwt_router(ctx))
+    app.include_router(token_inventory_router(ctx))
     app.include_router(profiles_router(ctx))
     app.include_router(login_flow_router(ctx))
     app.include_router(login_adaptive_router(ctx))

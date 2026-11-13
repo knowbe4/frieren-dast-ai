@@ -1670,7 +1670,7 @@ class _FakeLoginBrowser:
         self._login_result = login_result
         self._url = login_result.get("url", "")
 
-    async def login(self, url: str, email: str, password: str) -> dict:
+    async def login(self, url: str, email: str, password: str, totp_secret=None) -> dict:
         return self._login_result
 
     async def snapshot(self) -> dict:
@@ -1723,7 +1723,7 @@ class _FakeSpaBrowser:
     """AgentBrowser stand-in where the deterministic form-fill finds no reachable
     field but the SPA JSON auth endpoint accepts credentials (training-app shape)."""
 
-    async def login(self, url: str, email: str, password: str) -> dict:
+    async def login(self, url: str, email: str, password: str, totp_secret=None) -> dict:
         return {"logged_in": False, "url": url, "error": "no email field found on the page"}
 
     async def navigate(self, url: str) -> dict:

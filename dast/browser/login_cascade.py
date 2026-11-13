@@ -17,7 +17,7 @@ schema-forced action and prompt-injection fencing.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from dast.browser.login_strategies.base import (
@@ -63,6 +63,7 @@ async def adaptive_login(
     in_scope: Optional[Callable[[str], bool]] = None,
     store: Optional[Any] = None,
     session: Optional[Any] = None,
+    saved_session: Optional[Dict[str, Any]] = None,
 ) -> LoginCascadeResult:
     """Log in by driving the registered login strategies in order (deterministic form ->
     SPA JSON-API -> LLM by default), stopping at the first success or a terminal human wall
@@ -76,6 +77,7 @@ async def adaptive_login(
         totp_secret=totp_secret,
         success_url_suffix=success_url_suffix, in_scope=in_scope,
         store=store, session=session, decide=decide, max_llm_steps=max_llm_steps,
+        saved_session=saved_session,
     )
     host = urlparse(url).hostname
     last = LoginResult(ok=False, engine="none", url=url, error="login not completed")

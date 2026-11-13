@@ -15,9 +15,45 @@ from dast.ai import bedrock_client
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import PAYLOAD_GEN_SCHEMA, PAYLOAD_MUTATION_SCHEMA
 from dast.models import AttackAttempt, AttackPayload, Endpoint
+from dast.payloads.loader import get_all_payloads
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Per-type ceiling for the deterministic fallback so a seed×param cross-product stays bounded.
+_SEED_PAYLOAD_CAP = 8
+
+
+def _deterministic_seeds(endpoint: Endpoint, attack_types: List[str]) -> List[AttackPayload]:
+    """Static payloads from the YAML wordlists, cross-producted with the endpoint's parameters.
+
+    Used as the refusal-proof fallback when the LLM payload generator is blocked by the gateway's
+    content-safety layer (AiContentBlockedError): detection must not depend on a model that can be
+    refused. Only attack types that have a payload YAML (sqli/xss/ssti/lfi/...) contribute."""
+    params = endpoint.parameters or []
+    out: List[AttackPayload] = []
+    for attack_type in attack_types:
+        try:
+            seeds = get_all_payloads(attack_type)[:_SEED_PAYLOAD_CAP]
+        except Exception:
+            seeds = []
+        if not seeds:
+            continue
+        if params:
+            for p in params:
+                for value in seeds:
+                    out.append(AttackPayload(
+                        value=value, attack_type=attack_type,
+                        injection_point=p.name, injection_location=p.location,
+                        rationale="deterministic YAML seed (LLM payload generation unavailable)"))
+        else:
+            # No declared params (e.g. a GET with a single query value): place in the query.
+            for value in seeds:
+                out.append(AttackPayload(
+                    value=value, attack_type=attack_type,
+                    injection_point="q", injection_location="query",
+                    rationale="deterministic YAML seed (LLM payload generation unavailable)"))
+    return out
 
 _SYSTEM_PAYLOAD_GEN = """\
 You are an expert web application penetration tester.
@@ -82,6 +118,13 @@ Generate up to 10 payloads, prioritized by likelihood of success."""
                 rationale=str(item.get("rationale", "")),
             ))
         return payloads
+    except bedrock_client.AiContentBlockedError:
+        # The gateway refused the payload-generation content. Detection must not depend on a model
+        # that can be refused — fall back to the static YAML seeds so the scan still runs.
+        seeds = _deterministic_seeds(endpoint, attack_types)
+        logger.warning("AI payload generation blocked by safety classifier — using "
+                       "deterministic YAML seeds", seed_count=len(seeds))
+        return seeds
     except Exception as exc:
         logger.warning("AI payload generation failed", error=str(exc))
         return []

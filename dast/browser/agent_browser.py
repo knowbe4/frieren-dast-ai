@@ -302,6 +302,37 @@ class AgentBrowser:
             logger.debug("AgentBrowser: export_cookies_full failed", error=str(exc))
             return []
 
+    async def seed_saved_session(self, cookies: List[dict]) -> int:
+        """Seed the context with a profile's persisted session cookies (Playwright dicts from
+        a saved ``storage_state``), so a run can REUSE a still-valid session instead of logging
+        in again. Returns the count added. Normalizes the domain/path/flags exactly like
+        ``_seed_cookies`` and drops any cookie without a name/domain."""
+        if self._context is None:
+            await self._ensure_page()
+        if self._context is None or not cookies:
+            return 0
+        pw_cookies: List[dict] = []
+        for c in cookies:
+            name, domain = c.get("name"), (c.get("domain") or "").lstrip(".")
+            if not name or not domain:
+                continue
+            pw_cookies.append({
+                "name": name, "value": c.get("value", ""), "domain": domain,
+                "path": c.get("path", "/"), "secure": bool(c.get("secure", True)),
+                "httpOnly": bool(c.get("httpOnly", False)),
+            })
+        if not pw_cookies:
+            return 0
+        try:
+            await self._context.add_cookies(pw_cookies)
+            self._last_cookie_sync = _time.time()
+            logger.info("AgentBrowser seeded saved-session cookies", count=len(pw_cookies))
+            return len(pw_cookies)
+        except Exception as exc:
+            logger.warning("AgentBrowser: seed_saved_session add_cookies failed",
+                           error=str(exc)[:160])
+            return 0
+
     async def api_post(self, url: str, headers: Optional[Dict[str, str]] = None,
                        body: Optional[str] = None) -> Dict[str, Any]:
         """Network-level POST through the browser context (carries its cookies, bypasses
@@ -315,10 +346,77 @@ class AgentBrowser:
         try:
             resp = await page.request.fetch(url, **fetch_kwargs)
             text = await resp.text()
+            # A login POST via page.request.fetch does NOT drive a document navigation, so its
+            # Set-Cookie responses do not reliably land in context.cookies() — leaving the SPA
+            # login with 0 synced cookies. Capture them explicitly into the context so
+            # export_cookies_full() (and the jar/profile sync that follows) sees the session.
+            await self._capture_set_cookies(resp, url)
             return {"ok": True, "status": resp.status, "text": text[:20000],
                     "headers": {k: v for k, v in resp.headers.items()}}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:200], "status": None, "text": ""}
+
+    async def _capture_set_cookies(self, resp: Any, request_url: str) -> int:
+        """Parse a response's Set-Cookie headers and add them to the browser context so a
+        page.request.fetch login persists its session into context.cookies(). Best-effort:
+        never raises. Returns the count added."""
+        if self._context is None:
+            return 0
+        try:
+            header_pairs = await resp.headers_array()
+        except Exception:
+            header_pairs = []
+        raw = [h.get("value", "") for h in header_pairs
+               if (h.get("name", "") or "").lower() == "set-cookie"]
+        if not raw:
+            return 0
+        from urllib.parse import urlparse as _urlparse
+        req_host = (_urlparse(request_url).hostname or "").lower()
+        pw_cookies: List[dict] = []
+        for line in raw:
+            parsed = self._parse_set_cookie(line, req_host)
+            if parsed:
+                pw_cookies.append(parsed)
+        if not pw_cookies:
+            return 0
+        try:
+            await self._context.add_cookies(pw_cookies)
+            self._last_cookie_sync = _time.time()
+            logger.info("AgentBrowser captured Set-Cookie into context",
+                        count=len(pw_cookies))
+            return len(pw_cookies)
+        except Exception as exc:
+            logger.warning("AgentBrowser: capture Set-Cookie add failed", error=str(exc)[:160])
+            return 0
+
+    @staticmethod
+    def _parse_set_cookie(line: str, default_host: str) -> Optional[dict]:
+        """Parse one Set-Cookie header value into a Playwright cookie dict. Falls back to the
+        request host when the cookie sets no Domain (so the jar import, which keys by domain,
+        does not drop it). Returns None for a malformed/empty line."""
+        parts = [p.strip() for p in (line or "").split(";") if p.strip()]
+        if not parts or "=" not in parts[0]:
+            return None
+        name, _, value = parts[0].partition("=")
+        name = name.strip()
+        if not name:
+            return None
+        domain, path, secure, http_only = default_host, "/", True, False
+        for attr in parts[1:]:
+            key, _, val = attr.partition("=")
+            key = key.strip().lower()
+            if key == "domain" and val.strip():
+                domain = val.strip().lstrip(".").lower()
+            elif key == "path" and val.strip():
+                path = val.strip()
+            elif key == "secure":
+                secure = True
+            elif key == "httponly":
+                http_only = True
+        if not domain:
+            return None
+        return {"name": name, "value": value.strip(), "domain": domain,
+                "path": path, "secure": secure, "httpOnly": http_only}
 
     async def api_get(self, url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """Network-level GET through the browser context (carries its cookies/bearer,

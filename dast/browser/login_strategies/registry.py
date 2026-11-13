@@ -15,9 +15,10 @@ from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Default try-order: the cheap token-free form first, the DOM-independent JSON path next,
-# the LLM last. Learned ordering only moves a known winner to the front of this.
-_DEFAULT_ORDER = ("deterministic", "spa_api", "llm")
+# Default try-order: REUSE a persisted session first (no login at all when it is still valid),
+# then the cheap token-free form, the DOM-independent JSON path, and the LLM last. Learned
+# ordering only moves a known winner to the front of this.
+_DEFAULT_ORDER = ("saved_session", "deterministic", "spa_api", "llm")
 
 _REGISTRY: Dict[str, LoginStrategy] = {}
 
@@ -47,13 +48,19 @@ def ordered_strategies(host: Optional[str] = None) -> List[LoginStrategy]:
         except Exception as exc:  # noqa: BLE001 — a journal read must never break login
             logger.debug("login registry: journal read failed", error=str(exc)[:120])
     order = reorder(_DEFAULT_ORDER, winner)
+    # saved_session is a REUSE short-circuit, not a login — it must always be tried first,
+    # even when the journal learned a fresh-login winner (otherwise the winner logs in before
+    # reuse is ever attempted, defeating the whole point).
+    if "saved_session" in order:
+        order = ["saved_session", *[n for n in order if n != "saved_session"]]
     return [_REGISTRY[name] for name in order if name in _REGISTRY]
 
 
 # Register the built-in strategies on import (stateless singletons).
 from dast.browser.login_strategies.form import FormStrategy  # noqa: E402
 from dast.browser.login_strategies.llm import LlmStrategy  # noqa: E402
+from dast.browser.login_strategies.saved_session import SavedSessionStrategy  # noqa: E402
 from dast.browser.login_strategies.spa_api import SpaApiStrategy  # noqa: E402
 
-for _strategy in (FormStrategy(), SpaApiStrategy(), LlmStrategy()):
+for _strategy in (SavedSessionStrategy(), FormStrategy(), SpaApiStrategy(), LlmStrategy()):
     register(_strategy)

@@ -81,6 +81,11 @@ class LoginProfile:
     saved_session: Optional[Dict[str, Any]] = None  # Playwright storage_state
     privilege_level: str = ""  # e.g. "unauthenticated", "low", "medium", "high", "admin"
     test_account: bool = False  # disposable test account — gates TOTP-seed use
+    # Per-profile opt-in: on an AI safety-classifier refusal, retry the copilot decision once with
+    # `downgrade_model`. OFF by default and scoped to THIS profile — it is NOT a global/tool-wide
+    # rule, so another operator's profiles never inherit it. Only honored under --authorized.
+    allow_model_downgrade: bool = False
+    downgrade_model: str = ""  # fallback model id; defaults to claude-opus-4-6 when blank + enabled
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -121,6 +126,8 @@ class LoginProfile:
             "session_set": bool(self.saved_session),
             "privilege_level": self.privilege_level,
             "test_account": self.test_account,
+            "allow_model_downgrade": self.allow_model_downgrade,
+            "downgrade_model": self.downgrade_model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -145,6 +152,8 @@ class LoginProfile:
             "saved_session_enc": session_enc,
             "privilege_level": self.privilege_level,
             "test_account": self.test_account,
+            "allow_model_downgrade": self.allow_model_downgrade,
+            "downgrade_model": self.downgrade_model,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -172,6 +181,8 @@ class LoginProfile:
             saved_session=saved_session,
             privilege_level=str(d.get("privilege_level", "")),
             test_account=bool(d.get("test_account", False)),
+            allow_model_downgrade=bool(d.get("allow_model_downgrade", False)),
+            downgrade_model=str(d.get("downgrade_model", "")),
             created_at=float(d.get("created_at", time.time())),
             updated_at=float(d.get("updated_at", time.time())),
         )

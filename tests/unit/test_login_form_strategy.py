@@ -18,7 +18,7 @@ class _Browser:
         self._result = result
         self._exc = exc
 
-    async def login(self, url, email, password):
+    async def login(self, url, email, password, totp_secret=None):
         if self._exc is not None:
             raise self._exc
         return self._result

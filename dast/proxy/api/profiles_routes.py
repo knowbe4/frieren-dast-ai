@@ -53,6 +53,10 @@ class ProfileIn(BaseModel):
     selector_overrides: Dict[str, str] = {}
     privilege_level: str = ""
     test_account: bool = False  # disposable test account — required to arm a TOTP seed
+    # Per-profile opt-in: on an AI safety refusal, retry the copilot decision with downgrade_model
+    # (default claude-opus-4-6). Off by default; NOT global. Only honored under --authorized.
+    allow_model_downgrade: bool = False
+    downgrade_model: str = ""
 
 
 class SessionImportIn(BaseModel):
@@ -147,6 +151,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         )
         profile.privilege_level = req.privilege_level
         profile.test_account = req.test_account
+        profile.allow_model_downgrade = bool(req.allow_model_downgrade)
+        profile.downgrade_model = req.downgrade_model
         try:
             save_profile(profile)
         except Exception as exc:

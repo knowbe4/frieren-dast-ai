@@ -36,6 +36,34 @@ def subapp_for_path(path: str, site: str = "") -> Optional[str]:
     return None
 
 
+# Generic path segments that are NOT a sub-app name (SPA shell, static, central session, API
+# version markers), so a path-derived key is never minted for them.
+_NON_SUBAPP_SEGMENTS = frozenset({
+    "", "spa", "app", "static", "assets", "public", "_next", "cdn", "favicon.ico", "api",
+})
+
+
+def _derived_subapp(path: str) -> Optional[str]:
+    """Best-effort sub-app key for a GraphQL path with NO ``subapp_map`` entry: the segment right
+    before ``graphql`` (e.g. ``/reports/graphql`` -> ``reports``). Scoped to GraphQL so it is a
+    high-signal sub-app marker (won't mis-fire on page/version routes like ``/v1/dashboard``).
+
+    Deliberately NOT wired into ``subapp_for_path`` (that would change the global bearer-index /
+    transport-capability keying contract); it is consulted ONLY by the activation path to label an
+    unmapped GraphQL sub-app for its learned-recipe key. Returns None when not applicable."""
+    import re as _re
+    segs = [s for s in (path or "").lower().split("/") if s]
+    if "graphql" not in segs:
+        return None
+    i = segs.index("graphql")
+    if i == 0:
+        return None
+    cand = segs[i - 1]
+    if cand in _NON_SUBAPP_SEGMENTS or _re.fullmatch(r"v\d+", cand):
+        return None
+    return cand
+
+
 def decode_jwt_exp(token: str) -> Optional[float]:
     """Extract the ``exp`` claim from a JWT without verifying the signature. None if the
     token is not a JWT, has no ``exp``, or cannot be parsed."""

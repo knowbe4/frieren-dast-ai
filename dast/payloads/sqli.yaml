@@ -116,5 +116,15 @@ error_signatures:
   - "Out of Range Error"
   - "duckdb"
 
+# Deterministic DuckDB impact facts (read-only metadata only — schema + counts, NEVER column
+# values / PII). The sqli_probe tool wraps each inner SELECT in error(CONCAT('LABEL=', (...))) and
+# parses the leaked value from the DuckDB error message. {table}/{where} are substituted by the
+# tool from the target_table / scope_where args.
+duckdb_fact_sql:
+  tables: "SELECT string_agg(table_name, ',') FROM information_schema.tables"
+  columns: "SELECT string_agg(column_name, ',') FROM information_schema.columns WHERE table_name='{table}'"
+  row_count: "SELECT CAST(COUNT(*) AS VARCHAR) FROM {table}"
+  scoped_count: "SELECT CAST(COUNT(*) AS VARCHAR) FROM {table} WHERE {where}"
+
 time_threshold_ms: 4500
 max_sleep_seconds: 5

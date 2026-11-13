@@ -245,6 +245,148 @@ async def test_sqli_probe_not_confirmed_on_clean_responses(monkeypatch):
     assert store.recorded == []
 
 
+# ── Part 1b: DBMS-aware impact facts + scope-bypass + severity (Unit 1) ──────
+
+def test_detect_dbms():
+    from dast.tools.sqli_probe_tools import _detect_dbms
+    assert _detect_dbms("Parser Error: syntax error at or near \"'\"") == "DuckDB"
+    assert _detect_dbms("Invalid Input Error: v1.4.2") == "DuckDB"
+    assert _detect_dbms("error at com.mysql.jdbc.Driver near syntax") == "MySQL"
+    assert _detect_dbms("totally benign response") == "unknown"
+
+
+def test_severity_for():
+    from dast.tools.sqli_probe_tools import _severity_for
+    assert _severity_for("DuckDB", "true")[0] == "high"       # read beyond scope
+    assert _severity_for("DuckDB", "unknown")[0] == "medium"  # embedded, scope unproven
+    assert _severity_for("DuckDB", "false")[0] == "low"       # only in-scope data
+    assert _severity_for("SQLite", "false")[0] == "low"       # embedded too
+    assert _severity_for("MySQL", "unknown")[0] == "high"     # networked RDBMS
+    assert _severity_for("unknown", "unknown")[0] == "medium"
+
+
+def test_extract_labeled_leak():
+    from dast.tools.sqli_probe_tools import _extract_labeled_leak
+    body = '{"errors":[{"message":"Invalid Input Error: COLS=id,email,name"}]}'
+    assert _extract_labeled_leak(body, "COLS") == "id,email,name"
+    assert _extract_labeled_leak(body, "RC") is None
+    assert _extract_labeled_leak("not json", "COLS") is None
+
+
+class _DuckFactsClient:
+    """Body-aware fake: confirms via a DuckDB parser error, then answers each labeled fact leak.
+    `scoped` is the SRC (in-scope) count returned for the scope differential."""
+    def __init__(self, *a, scoped="10", **k):
+        self.scoped = scoped
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def request(self, method, url, headers=None, content=None):
+        body = json.loads((content or b"{}").decode("utf-8"))
+        injected = ((body.get("variables") or {}).get("v") or {}).get("contentTitle", "")
+        if "sqli_probe_baseline" in injected:
+            return _FakeResp('{"data":{"exportCsvReport":{"errors":[]}}}', 200)
+        if "error(version())" in injected:
+            return _FakeResp('{"errors":[{"message":"Invalid Input Error: v1.4.2"}]}', 200)
+        if "TBLS=" in injected:
+            return _FakeResp('{"errors":[{"message":"Invalid Input Error: '
+                             'TBLS=users,accounts,courses"}]}', 200)
+        if "SRC=" in injected:   # must precede the RC check ("RC=" is a substring of "SRC=")
+            return _FakeResp('{"errors":[{"message":"Invalid Input Error: SRC=%s"}]}' % self.scoped, 200)
+        if "RC=" in injected:
+            return _FakeResp('{"errors":[{"message":"Invalid Input Error: RC=49"}]}', 200)
+        if "COLS=" in injected:
+            return _FakeResp('{"errors":[{"message":"Invalid Input Error: COLS=id,email,name"}]}', 200)
+        return _FakeResp('{"errors":[{"message":"Parser Error: syntax error"}]}', 200)
+
+
+@pytest.mark.asyncio
+async def test_sqli_probe_facts_and_scope_bypass_true(monkeypatch):
+    """With target_table + scope_where, the probe leaks schema/count metadata (NO PII values),
+    decides scope_bypass=true when total > scoped, and calibrates severity to high."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _DuckFactsClient(scoped="10"))
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/reports/graphql",
+        "injection_point": "v.contentTitle",
+        "injection_location": "graphql_var",
+        "target_table": "users",
+        "scope_where": "account_id=1",
+        "body": '{"query":"mutation($v:In!){exportCsvReport(input:$v){errors}}",'
+                '"variables":{"v":{"purchasedCourseId":1,"contentTitle":"x"}}}',
+    })
+    assert result["ok"] and result["confirmed"] is True
+    assert result["dbms"] == "DuckDB"
+    facts = result["facts"]
+    assert facts["reachable_tables"] == "users,accounts,courses"
+    assert facts["row_count"] == "49"
+    assert facts["columns"] == "id,email,name"       # NAMES only — no column values
+    assert facts["scoped_row_count"] == "10"
+    assert result["scope_bypass"] == "true"          # 10 in-scope < 49 total => reads beyond scope
+    assert result["severity"] == "high"
+    # No PII leaked: every fact value is a name list or an integer count.
+    assert "@" not in json.dumps(facts)
+    rec = store.recorded[0][0]
+    assert rec["severity"] == "high" and rec["dbms"] == "DuckDB" and rec["scope_bypass"] == "true"
+
+
+@pytest.mark.asyncio
+async def test_sqli_probe_scope_bypass_false_lowers_severity(monkeypatch):
+    """When the in-scope count equals the total, the read stays within scope => low severity."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _DuckFactsClient(scoped="49"))
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/reports/graphql",
+        "injection_point": "v.contentTitle",
+        "injection_location": "graphql_var",
+        "target_table": "users",
+        "scope_where": "account_id=1",
+        "body": '{"query":"q","variables":{"v":{"contentTitle":"x"}}}',
+    })
+    assert result["scope_bypass"] == "false"
+    assert result["severity"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_sqli_probe_severity_override_respected(monkeypatch):
+    """An explicit severity arg still wins over the DBMS/scope calibration."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _DuckFactsClient(scoped="49"))
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/reports/graphql",
+        "injection_point": "v.contentTitle",
+        "injection_location": "graphql_var",
+        "severity": "critical",
+        "body": '{"query":"q","variables":{"v":{"contentTitle":"x"}}}',
+    })
+    assert result["severity"] == "critical"
+
+
 # ── Part 2: deterministic seed fallback ──────────────────────────────────────
 
 def test_generate_payloads_falls_back_to_seeds_on_safety_block(monkeypatch):

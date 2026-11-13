@@ -19,17 +19,22 @@ def test_subapp_for_path_contract_unchanged():
     assert subapp_for_path("/billing/graphql") is None
 
 
-def test_derived_subapp_is_graphql_scoped():
-    # Derives the segment before 'graphql' for an unmapped GraphQL sub-app.
+def test_derived_subapp_graphql_and_rest():
+    # GraphQL: the segment before 'graphql'.
     assert _derived_subapp("/billing/graphql") == "billing"
     assert _derived_subapp("/orders/graphql") == "orders"
     assert _derived_subapp("/reports/graphql/") == "reports"
-    # Does not mis-fire on page/version/shell/static or non-graphql paths.
-    assert _derived_subapp("/v1/dashboard") is None
-    assert _derived_subapp("/api/graphql") is None   # 'api' is a generic segment
-    assert _derived_subapp("/v2/graphql") is None     # version marker
+    # REST: the first segment of a multi-segment API path.
+    assert _derived_subapp("/accounts/session") == "accounts"
+    assert _derived_subapp("/orders/v2/list") == "orders"
+    # Does not mis-fire on shell/static/version/central-session/single-segment paths.
+    assert _derived_subapp("/v1/dashboard") is None   # version marker first segment
+    assert _derived_subapp("/api/graphql") is None    # 'api' is a generic segment
+    assert _derived_subapp("/v2/graphql") is None     # version marker before graphql
     assert _derived_subapp("/graphql") is None        # nothing before it
-    assert _derived_subapp("/app/reporting") is None  # no graphql segment
+    assert _derived_subapp("/app/reporting") is None  # 'app' shell segment (stoplist)
+    assert _derived_subapp("/spa/session") is None    # central session (stoplist)
+    assert _derived_subapp("/login") is None          # single segment
 
 
 @pytest.mark.asyncio

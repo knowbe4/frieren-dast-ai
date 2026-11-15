@@ -206,6 +206,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             if result.get("storage_state"):
                 profile.saved_session = result["storage_state"]
                 save_profile(profile)
+        if result.get("success"):
+            from dast.proxy.api.session_state_routes import reset_refresh_breaker
+            # A verified-or-legacy-success replay landed fresh session material —
+            # the re-auth breaker's "credentials stale" premise no longer holds.
+            reset_refresh_breaker(ctx, f"login-flow replay for '{profile.slug}' succeeded")
         await ctx.broadcast_login(
             {"type": "replay_done", "slug": req.slug,
              "success": bool(result.get("success")),

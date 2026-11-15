@@ -266,6 +266,7 @@ def build_app(
     from dast.proxy.api.token_inventory_routes import make_router as token_inventory_router
     from dast.proxy.api.profiles_routes import make_router as profiles_router
     from dast.proxy.api.login_flow_routes import make_router as login_flow_router
+    from dast.proxy.api.session_state_routes import make_router as session_state_router
     from dast.proxy.api.login_adaptive_routes import make_router as login_adaptive_router
     from dast.proxy.api.mcp_approval_routes import make_router as mcp_approval_router
     from dast.proxy.api.copilot_routes import make_router as copilot_router
@@ -347,6 +348,7 @@ def build_app(
     app.include_router(token_inventory_router(ctx))
     app.include_router(profiles_router(ctx))
     app.include_router(login_flow_router(ctx))
+    app.include_router(session_state_router(ctx))
     app.include_router(login_adaptive_router(ctx))
     app.include_router(mcp_approval_router(ctx))
     app.include_router(copilot_router(ctx))

@@ -219,6 +219,10 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         )
         imported = ctx.store.import_playwright_cookies(cookies)
         logger.info("login profile activated", slug=slug, cookies=imported)
+        # A fresh session just landed — the re-auth breaker's premise (credentials
+        # stale) no longer holds, so re-arm automatic re-auth.
+        from dast.proxy.api.session_state_routes import reset_refresh_breaker
+        reset_refresh_breaker(ctx, f"profile '{slug}' activated")
         return {"activated": True, "cookies_imported": imported, "named_session": profile.slug}
 
     @router.post("/api/profiles/{slug}/capture-from-proxy")

@@ -17,11 +17,16 @@ from dast.ai.bedrock_client import AiUnavailableError
 @pytest.fixture
 def chain(monkeypatch):
     # validation chain m1 -> m2 -> m3; keep the rest of _invoke_raw pure.
+    # The PROVIDER dimension is pinned to a single member so these tests pin
+    # the MODEL-chain semantics only (provider failover has its own suite in
+    # test_provider_failover.py — otherwise a configured fallback provider on
+    # the dev machine's .env would join the walk and double every call count).
     monkeypatch.setattr(bc, "_tier_chain",
                         lambda tier: ["m1", "m2", "m3"] if tier == "validation" else [])
     monkeypatch.setattr(bc, "_resolve_model", lambda mid: mid or "m1")
     monkeypatch.setattr(bc, "get_active_provider", lambda: "gateway")
     monkeypatch.setattr(bc, "_build_body", lambda *a, **k: {"body": True})
+    monkeypatch.setattr(bc, "_failover_chain", lambda active: [active])
 
 
 def _patch_invoke_one(monkeypatch, behavior):

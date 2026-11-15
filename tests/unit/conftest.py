@@ -132,3 +132,15 @@ def _seed_site_map(tmp_path, monkeypatch):
     site_map._reset_cache()
     yield
     site_map._reset_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_health():
+    """Reset the LLM provider-health registry around every test. Tests that
+    exercise the real ``_invoke_raw`` walk (model fallback, failover) record
+    real failures into it; without the reset a cooldown leaked into later
+    tests and silently reordered their failover chain."""
+    from dast.ai import provider_health  # noqa: PLC0415
+    provider_health.reset()
+    yield
+    provider_health.reset()

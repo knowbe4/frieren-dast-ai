@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     # for cloud providers.
     ai_max_concurrency: int = 0
 
+    # Failover chain for LLM providers, best first (comma-separated names:
+    # bedrock | anthropic | openai | glm | gateway). When the active provider
+    # fails at the PROVIDER level (expired AWS SSO, throttling exhaustion,
+    # auth, network), the next healthy member is tried and — on success —
+    # promoted to active until it fails in turn (see dast.ai.provider_health).
+    # Members without credentials are skipped; a content-policy block never
+    # triggers failover. Empty = auto: bedrock,anthropic,glm.
+    ai_failover_chain: str = ""
+
     # Claude apps gateway — the base URL is an INTERNAL hostname, so it has NO
     # default here (this repo is public). Set GATEWAY_BASE_URL in .env. Auth is
     # an OAuth JWT reused from the Claude Code CLI session (macOS Keychain), or

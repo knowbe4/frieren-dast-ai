@@ -199,8 +199,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     @router.get("/api/ai/availability")
     async def ai_availability():
         from dast.ai import bedrock_client as _bc
+        from dast.ai import provider_health as _ph
         paused = ctx.scan_queue_state.paused if ctx.scan_queue_state else False
-        return {"available": _bc.is_ai_available(), "scan_queue_paused": paused}
+        return {
+            "available": _bc.is_ai_available(),
+            "scan_queue_paused": paused,
+            # Which provider is serving (failover may have promoted a fallback)
+            # plus per-provider health/cooldown state, so the UI can show a
+            # failover in progress without a separate polling endpoint.
+            "provider": _bc.get_active_provider(),
+            "failover_health": _ph.snapshot(),
+        }
 
     @router.get("/api/ai/models")
     async def ai_models():

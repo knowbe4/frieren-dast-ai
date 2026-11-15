@@ -775,8 +775,24 @@ dast/
   `QueueFull` so a backed-up queue never stalls proxy ingestion
 - Probe-concurrency semaphore (`_PROBE_SEM`) is aligned to `max(probe_concurrency, workers)`
   at scan-worker startup — more workers with a tiny probe budget yields little throughput
-- Session refresh worker gives up after `_MAX_REAUTH_FAILURES` (3) consecutive failures
-  (stale credentials); a success resets the counter — recover via a fresh Browse-tab login
+- Session refresh worker trips a breaker after `_MAX_REAUTH_FAILURES` (3) consecutive
+  failures (stale credentials). The breaker is RECOVERABLE: `reset()` fires via
+  `POST /api/session/reauth/reset` and automatically when a profile activation or a
+  successful login-flow replay lands fresh session material; state is readable at
+  `GET /api/session/state`
+- The re-auth trigger is probe-aware: entries from `source="agent"`/`"copilot"` (the
+  scanners run their own handling) and any entry carrying a `probe_payload` never count
+  as session expiry; cooldown-window signals are coalesced into one deferred re-check,
+  the cooldown is measured from the attempt's END, and a successful re-auth syncs the
+  fresh cookies into the shared proxy jar too (not only the scan pool)
+- Login success is VERIFIED, not inferred: `dast/session/account_state.verify_authenticated()`
+  returns a tri-state structural verdict (probe origin root + the profile's probe endpoint
+  + session-cookie heuristic; auth wall/guest = contradicted). The flow replayer, spa_api
+  probe-confirm, the LLM strategy fallback and the copilot gate-check all consume it;
+  login profiles can pin expectations via `probe_url`/`probe_expect_json_path`/
+  `probe_expect_cookie`. `dast/triage/auth_wall.py` classifies 200 bodies on STRONG
+  phrases or concrete captcha markers only — weak tokens ("login", "auth") need
+  login-form evidence
 
 ### Copilot Turn Wrap-Up (salvage before a forced kill)
 - When a copilot turn is ended by the SUPERVISOR — the loop watchdog (`stuck_loop`), a

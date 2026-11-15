@@ -5,6 +5,42 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (login round 2-A)
+- **Shared login verification (`verify_authenticated`).** Tri-state structural verdict
+  (verified / contradicted / indeterminate, with evidence) in `dast/session/account_state.py`
+  replaces the lying success signals: the flow replayer's `bool(cookies)` (any cookie —
+  analytics included — read as "authenticated"), the "URL has no /login" heuristic (a failed
+  login landing on /welcome read as OK; a hash-routed SPA could never "succeed"), and
+  spa_api's clean-200 body sniffing. Login profiles gain optional probe config
+  (`probe_url` / `probe_expect_json_path` / `probe_expect_cookie`, full storage/API
+  round-trip); the flow replayer, spa_api probe-confirm, the LLM strategy and the copilot
+  gate-check all consume the same verdict.
+- **`GET /api/session/state` + `POST /api/session/reauth/reset`.** The re-auth breaker is
+  observable and recoverable from the dashboard; profile activation and a successful
+  login-flow replay reset the breaker automatically (fresh session material invalidates
+  its "credentials stale" premise).
+
+### Fixed (login round 2-A)
+- **Scan-time automatic re-auth never fired at all.** The refresh worker read
+  `entry.status_code`; the `ProxyEntry` field is `response_status`. The AttributeError died
+  inside the store listener task, so a session expiring mid-scan ran to 401-per-request
+  with no recovery (unit tests missed it — they fed MagicMock entries).
+- **The re-auth breaker was unrecoverable and deaf.** `_gave_up` had no reset path (only a
+  process restart cleared it); signals arriving during the cooldown were silently dropped;
+  the cooldown was stamped *before* the attempt; and the copilot's own 401/403 probes
+  re-triggered scan-time logins on top of the copilot's relogin ladder. The worker is now
+  probe-aware (`copilot` source and `probe_payload` entries excluded), coalesces bursts
+  into one deferred re-check, measures the cooldown from the attempt's end, exposes
+  `reset()` + `state_snapshot()`, and syncs refreshed cookies into the shared proxy jar
+  (before, a re-auth left the copilot's `send_request` 401ing with a perfectly fresh pool).
+- **auth_wall read nav-bar "Login" links and Cloudflare script tags as "session expired".**
+  The old regex matched `auth`/`sso`/`login`/`cloudflare`/`challenge` anywhere in a 200
+  body. Strong phrases and concrete captcha/challenge markers now decide; weak tokens need
+  login-form evidence in the snippet (first direct tests for the module).
+- **spa_api journaled poisoned winners.** A success-shaped response ("MFA pending" 200s,
+  empty 204s) was accepted and promoted to the front of the next cascade's journal; a
+  positively-contradicted probe now skips the candidate.
+
 ### Security (project review)
 - **Dashboard could be driven by any website open in the operator's browser.** No Host or
   Origin check, `request.json()` accepted cross-site `text/plain` POSTs, and `/ws` streamed

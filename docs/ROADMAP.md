@@ -12,11 +12,11 @@ parte dos ataques (limitação aceita). Prioridade máxima: **copilot e login**.
 
 ---
 
-## 1. Estado da rodada 1 (2026-11-15) — entregue, NÃO commitado
+## 1. Estado da rodada 1 (2026-11-15) — ✅ COMMITADA
 
-Na árvore de trabalho no branch `develop` (verificar `git status` antes de
-trabalhar). Verificação: **2393 unit tests passando + ruff limpo**. Split de
-commits sugerido, no padrão do repo: `feat(copilot)`, `feat(ai)`, `docs`+`test`.
+Commitada no branch `develop` no split planejado: `444f868` feat(copilot) wrap-up,
+`029df0d` feat(ai) provider failover, `9ca3223` docs (drift + este roadmap +
+.gitignore `.zcode/`). Verificação da época: 2393 unit tests + ruff limpo.
 
 | Mudança | Arquivos |
 |---|---|
@@ -200,17 +200,24 @@ limit, plaintext creds no Postgres, sem multi-user.
 
 | Rodada | Escopo | Arquivos-alvo principais |
 |---|---|---|
-| **2-A Login núcleo** | `verify_authenticated()` compartilhado + checks estruturais + auth_wall menos agressivo + breaker recuperável/probe-aware + estado via API | `dast/session/flow_replayer.py`, `dast/session/account_state.py`, `dast/browser/login_strategies/*`, `dast/triage/auth_wall.py`, `dast/session/refresh_worker.py`, `dast/proxy/api/*routes*` |
+| **2-A Login núcleo** — ✅ FEITA (2026-11-15): `96a20d8` (gatilho de re-auth morto: `status_code`→`response_status`), `d51700e` (`verify_authenticated` tri-state + probe config por perfil + replayer/spa_api/llm/gate-check), `8ce6c43` (auth_wall por evidência forte), `d353935` (breaker recuperável/probe-aware + sync do jar), `184e5f9` (`/api/session/state` + reset). Adiado p/ 2-B: auto-reset do breaker no caminho do tool `activate_login_profile` do copilot (sem handle do runner — espera o coordinator) | `verify_authenticated()` compartilhado + checks estruturais + auth_wall menos agressivo + breaker recuperável/probe-aware + estado via API | `dast/session/flow_replayer.py`, `dast/session/account_state.py`, `dast/browser/login_strategies/*`, `dast/triage/auth_wall.py`, `dast/session/refresh_worker.py`, `dast/proxy/api/*routes*` |
 | **2-B Login robustez** | spa_api sem spray + CSRF multi-convenção + journal que expira; crypto/storage ruidoso + atômico + totp sempre armado; login coordinator único (lock, roles, relogin armado) | `dast/browser/login_strategies/spa_api.py`, `dast/profiles/*`, `dast/session/refresh_worker.py`, `dast/ai/copilot/session.py`, `copilot_service.py`, `session_tools.py`, `profiles_routes.py` |
 | **2-C Agents quick wins** | bug XXE; regras determinísticas para os 8 órfãos; canaries blind (time SLEEP vs zero-control + OOB); SSTI body/multipart via injector compartilhado; oracle booleano SQLi | `dast/agents/xxe_agent.py`, `dast/ai/coordinator.py`, `dast/agents/ssti_agent.py`, `dast/agents/sqli_agent.py`, novo `dast/agents/probe_common.py` |
 | **2-D Agentless auth-bypass (ARTEX)** | three auth gates no JS + hook/stub das APIs de auth no browser → pós-login sem credenciais, gravando o tráfego de API — novo modo do browse/spa_explorer | `dast/proxy/spa_explorer.py`, `dast/browser/*`, novo módulo de auth-gates |
 | **3-E Novos agents** | request smuggling ativo (CL.TE/TE.CL com o time-oracle existente, disparado pelos hints de `dast/plugins/request_smuggling_hints.py`) + JWT como VulnAgent registrado | novo `dast/agents/smuggling_agent.py`, `dast/agents/jwt_agent.py`, `dast/agents/__init__.py`, `dast/ai/coordinator.py` |
 | **3-F Gravador de LLM** | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
 
-**Ordem recomendada:** commitar rodada 1 → 2-A → 2-C (rápidos e desacoplados)
-→ 2-B → 2-D → 3-E → 3-F.
+**Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → 2-C (rápidos e
+desacoplados) → 2-B → 2-D → 3-E → 3-F.
+
+**Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
+(`copilot_service._gate_check_account_state`) agora delega para
+`account_state.session_endpoint_state`, e o breaker tem API de estado/reset —
+o "login coordinator único" da 2-B deve nascer em cima dessas peças
+(`reset_refresh_breaker` em `session_state_routes.py` já é um ponto de
+integração natural).
 
 ---
 
-*Última atualização: 2026-11-15. Manter este documento vivo: marcar itens como
-feitos com referência ao commit.*
+*Última atualização: 2026-11-15 (rodada 2-A entregue). Manter este documento
+vivo: marcar itens como feitos com referência ao commit.*

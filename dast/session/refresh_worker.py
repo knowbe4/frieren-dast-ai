@@ -59,7 +59,7 @@ def _is_expiry_signal(entry: "ProxyEntry") -> bool:
     """Return True if the entry carries a session-expiry signal."""
     if entry.source == "agent":
         return False
-    status = entry.status_code or 0
+    status = entry.response_status or 0
 
     # Explicit auth failure
     if status in (401, 403):
@@ -145,13 +145,13 @@ class SessionRefreshWorker:
             self._last_reauth = now
             log_event(
                 "session_refresh", "warning",
-                f"Session expiry detected ({entry.status_code}) on {entry.url} — re-authenticating",
+                f"Session expiry detected ({entry.response_status}) on {entry.url} — re-authenticating",
                 url=entry.url, source="plugin",
             )
             logger.info(
                 "Session expiry signal — triggering re-auth",
                 url=entry.url,
-                status=entry.status_code,
+                status=entry.response_status,
             )
 
             await self._reauth()

@@ -4,7 +4,7 @@ Proxy runner — starts proxy + dashboard + scan worker together.
 Three concurrent tasks:
   1. ProxyServer   — asyncio TCP server on :8080
   2. Dashboard     — uvicorn/FastAPI on :8088, WebSocket push
-  3. Scan worker   — drains scan_queue, runs AttackEngine per entry
+  3. Scan worker   — drains scan_queue, runs the Coordinator per entry
 """
 
 import asyncio

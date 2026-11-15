@@ -1,7 +1,5 @@
 # Frieren DAST-AI Architecture
 
-> For Claude Code conventions, commands, and key files see [CLAUDE.md](../CLAUDE.md).
-
 **Version:** 0.9.0
 **Last Updated:** 2026-11-10
 
@@ -780,6 +778,21 @@ dast/
 - Session refresh worker gives up after `_MAX_REAUTH_FAILURES` (3) consecutive failures
   (stale credentials); a success resets the counter — recover via a fresh Browse-tab login
 
+### Copilot Turn Wrap-Up (salvage before a forced kill)
+- When a copilot turn is ended by the SUPERVISOR — the loop watchdog (`stuck_loop`), a
+  failure breaker, or the tool-call ceiling (both `need_direction`) — anything the model
+  proved but never committed via `record_finding` would be lost with the turn
+- `dast/ai/copilot/wrapup.py` runs one bounded salvage exchange BEFORE the ending lands
+  (`≤3` LLM steps, 20s/step, fast-tier model): the model may only call `record_finding`
+  (through the same gates as the live loop — dedup, silent scope check, deterministic FP
+  guard) or answer DONE
+- Fail-open by contract: any wrap-up failure leaves the forced reply exactly as it would
+  have been; a model-initiated reply, `error`, or `safety_blocked` ending never triggers it
+  (the LLM itself is usually what's failing there). Salvaged findings and refusals are
+  annotated on the operator-facing reply and appear in the turn trace
+- `dast/ai/triage_agent.py` needs no equivalent: its kill path already persists a
+  `needs_manual` verdict owned by the caller
+
 ### Service Graph
 - `ServiceGraph` lives on `SessionStore` — access via `store.service_graph`
 - `SessionStore.complete_entry()` calls `service_graph.observe()` automatically
@@ -876,7 +889,7 @@ dast/
   callers and the schema-forced tool-use path are provider-agnostic. Select at runtime via
   `bedrock_client.set_provider(provider, keys...)` or `POST /api/scan-config` (`ai_provider`,
   `anthropic_api_key`, `openai_api_key`, `glm_api_key`, `*_base_url`, `gateway_base_url`).
-  Defaults via `.env` (see Environment Variables in CLAUDE.md). For non-Bedrock providers
+  Defaults via `.env` (see `dast/config.py` for every setting and its default). For non-Bedrock providers
   `model_id` is a plain model name (e.g. `claude-opus-4-8`, `gpt-4o`, `glm-4.6`), not an ARN.
   API keys are never echoed back by `GET /api/scan-config` (only `*_set` booleans). Local models
   (Qwen via Ollama/vLLM, LM Studio, `llama.cpp`) run through this same `openai` path — point
@@ -902,6 +915,15 @@ dast/
 - The `/api/ai/status` badge probes the ACTIVE provider (STS for bedrock; API-key presence for
   anthropic/openai/glm; `gateway_auth.credentials_available()` for gateway). The status is cached
   5 min; `POST /api/scan-config` clears that cache on a provider switch so the badge re-probes.
+- Provider failover (`_failover_chain` + `dast/ai/provider_health.py`): when a call fails at the
+  PROVIDER level (expired AWS SSO, throttling exhaustion, auth, network), the gateway walks the
+  next healthy member of `ai_failover_chain` (default auto: `bedrock,anthropic,glm`; members
+  without credentials are skipped) and — on success — promotes it to active until it fails in
+  turn (sticky; runtime credentials are preserved, the Bedrock-ARN model is auto-healed).
+  Content-policy blocks (`AiContentBlockedError`) and caller ValueErrors NEVER trigger failover.
+  Consecutive provider failures start a widening cooldown (3 failures → 60s, doubling to a 5-min
+  cap) so a hard-down provider stops costing every call; one success fully restores it.
+  `GET /api/ai/availability` exposes the active provider and per-provider health snapshot.
 
 ## Dashboard / UI Layout
 

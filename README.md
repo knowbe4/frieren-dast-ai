@@ -44,7 +44,7 @@ Browser / tool (configured to use proxy :8080)
 [Session Store]            Every request/response stored in memory
     |
     +---> [Passive Scanner]    Zero-request checks fire on every response
-    |     (YAML rule engine)   47 rules: headers, cookies, CORS, secrets,
+    |     (YAML rule engine)   91 rules: headers, cookies, CORS, secrets,
     |                          error pages, LLM endpoints, OWASP Top 10
     |
     +---> [Scan Queue]         In-scope entries queued for active scanning
@@ -53,10 +53,11 @@ Browser / tool (configured to use proxy :8080)
          [Coordinator]         LLM planner → agents → LLM validator
               |
               v
-         [VulnAgents]          10 agents run in parallel per endpoint:
-              |                xss, sqli, ssrf, file_read, auth_bypass,
-              |                secrets, discovery, llm_injection,
-              |                business_logic, blazor
+         [VulnAgents]          25 agents run in parallel per endpoint (the
+              |                planner selects per endpoint): xss, sqli,
+              |                ssrf, file_read, auth_bypass, idor, secrets,
+              |                discovery, llm_injection, business_logic,
+              |                blazor, graphql, mfa, race_condition, ...
               v
          [Findings]            Real-time push to dashboard via WebSocket
 ```
@@ -154,20 +155,38 @@ by the LLM planner based on endpoint characteristics.
 | Agent | Checks | Payload file |
 |-------|--------|-------------|
 | `xss_agent` | Reflected/stored XSS, DOM XSS, bypass variants; Playwright browser confirmation | `xss.yaml` |
-| `sqli_agent` | Error-based, boolean-blind, time-based blind SQLi (5 s max) | `sqli.yaml` |
+| `sqli_agent` | Error-based, boolean-blind, time-based blind SQLi (5 s max), WAF-bypass mutations | `sqli.yaml` |
 | `ssrf_agent` | OOB HTTP callbacks, internal probes, cloud metadata, sibling-host probing | `ssrf.yaml` |
-| `file_read_agent` | Path traversal, LFI, PHP wrappers, null byte injection | `lfi.yaml` |
+| `file_read_agent` | Path traversal, LFI, PHP wrappers, adaptive encoding bypass | `lfi.yaml` |
 | `auth_agent` | Auth header stripping, 9 header-based bypass combinations per endpoint | — |
-| `secrets_agent` | AWS keys, GitHub/Slack tokens, private keys, JWTs, credit cards | — |
+| `idor_agent` | IDOR probing across query params, POST body fields, GraphQL variables, URL path segments | — |
+| `cross_session_idor_agent` | Horizontal privilege escalation replaying Session A requests with Session B credentials (needs two named sessions) | — |
+| `secrets_agent` | AWS keys, GitHub/Slack tokens, private keys, JWTs, credit cards, PII in responses | — |
 | `discovery_agent` | SSTI, open redirect, CRLF injection, HTTP method tampering | `ssti.yaml` |
-| `llm_injection_agent` | Prompt injection, jailbreak, system prompt leakage | `llm_injection.yaml` |
+| `ssti_agent` | SSTI with engine fingerprinting and WAF evasion | — |
+| `open_redirect_agent` | Unvalidated redirects to attacker-controlled hosts via URL/path params | — |
+| `llm_injection_agent` | Prompt injection, jailbreak, indirect injection, system prompt leakage | `llm_injection.yaml` |
 | `business_logic_agent` | Numeric boundary abuse, privilege escalation, workflow bypass, mass assignment | — |
-| `blazor_agent` | Blazor WASM assembly enumeration, SignalR hub enumeration, unauthenticated negotiate, circuit exhaustion, exposed debug artefacts | `blazor.yaml` |
+| `blazor_agent` | Blazor WASM DLL exposure, appsettings secrets, SignalR hub enumeration, unauthenticated negotiate, circuit exhaustion | `blazor.yaml` |
+| `csrf_agent` | Missing/bypassable CSRF protection via token removal, token swap, cross-origin Origin | — |
+| `cmdi_agent` | OS command injection via output reflection, time-based blind, error disclosure | — |
+| `xxe_agent` | XML External Entity: file read, OOB exfiltration, SSRF | — |
+| `nosql_agent` | MongoDB operator injection, `$where` JavaScript injection | — |
+| `graphql_agent` | GraphQL object ID manipulation in query variables (BOLA/IDOR) | — |
+| `mfa_agent` | MFA/OTP rate-limit bypass, OTP reuse, backup-code brute-force, parameter removal | — |
+| `host_header_agent` | Host / X-Forwarded-Host injection: password-reset poisoning (OOB), absolute-link reflection | — |
+| `cache_poisoning_agent` | Unkeyed request headers reflected into cacheable responses | — |
+| `race_condition_agent` | TOCTOU/double-spend races via concurrent replay + outcome diffing | — |
+| `prototype_pollution_agent` | Prototype pollution via `__proto__` / `constructor.prototype` | — |
+| `password_reset_agent` | Reset token validation bypass, email-token binding, parameter removal | — |
+
+25 agent modules are registered in `dast/agents/__init__.py`; the LLM planner
+selects which ones run for each endpoint.
 
 ## Passive scanner rules
 
 Rules live in `dast/passive_rules/` as YAML files. Adding a new check requires only a
-new YAML file — no code changes needed. 62 rules loaded at startup.
+new YAML file — no code changes needed. 91 rules loaded at startup.
 
 ```
 dast/passive_rules/

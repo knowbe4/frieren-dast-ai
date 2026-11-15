@@ -219,8 +219,8 @@ files = ['xss','sqli','ssrf','lfi','ssti','llm_injection','cmdi','xxe','jwt','no
 	uv run python -c "import dns.resolver; print('dnspython OK')"
 
 # ---- Versioning ------------------------------------------------------------
-# The version is duplicated in pyproject.toml, desktop/package.json, CLAUDE.md,
-# and docs/ARCHITECTURE.md — this bumps all 4 atomically instead of by hand.
+# The version is duplicated in pyproject.toml, desktop/package.json, and
+# docs/ARCHITECTURE.md — this bumps all 3 atomically instead of by hand.
 # Usage: make bump-version VERSION=0.9.0
 bump-version:
 	@if [ -z "$(VERSION)" ]; then \

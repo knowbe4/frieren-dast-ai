@@ -63,7 +63,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   observed being sent to a live target — a direct violation of the project's no-destructive-
   payloads safety policy. Removed from `dast/payloads/graphql.yaml`; added a regression
   test (`test_graphql_variable_fuzzer.py`) asserting no payload in that file ever classifies
-  as destructive via `dast/hackerone/payload_safety.classify()`.
+  as destructive via `dast/triage/payload_safety.classify()`.
 - **A finding could show an "AI validated" badge while the AI provider was disconnected.**
   `passive_scanner._ai_validate_finding()` swallowed LLM-call exceptions and returned a
   fabricated `True` confirmation. It now returns a distinct `None` ("AI did not run") on

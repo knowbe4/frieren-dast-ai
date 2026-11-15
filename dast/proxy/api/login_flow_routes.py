@@ -158,6 +158,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         cred = _pick_credential(profile, req.credential_label)
         username = cred.username if cred else ""
         password = cred.secret if cred else ""
+        from dast.session.account_state import AuthProbeConfig
+        probe = AuthProbeConfig.from_profile(profile)
 
         # Arm the shared resume gate for this replay's human-in-loop pause.
         ctx.login_resume_event.clear()
@@ -182,6 +184,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             "on_pause": on_pause,
             "resume_event": ctx.login_resume_event,
             "result_cb": result_cb,
+            "probe": probe,
         })
         try:
             await asyncio.wait_for(done.wait(), timeout=_REPLAY_TIMEOUT_S)
@@ -205,10 +208,16 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 save_profile(profile)
         await ctx.broadcast_login(
             {"type": "replay_done", "slug": req.slug,
-             "success": bool(result.get("success")), "error": result.get("error", "")}
+             "success": bool(result.get("success")),
+             "verified": result.get("verified"),
+             "error": result.get("error", "")}
         )
         return {
             "success": bool(result.get("success")),
+            # None = probe was inconclusive (legacy behavior applied); True/False =
+            # structural verification actually decided.
+            "verified": result.get("verified"),
+            "verify_reason": result.get("verify_reason", ""),
             "error": result.get("error", ""),
             "needed_human": bool(result.get("needed_human")),
             "cookies_imported": cookies_imported,

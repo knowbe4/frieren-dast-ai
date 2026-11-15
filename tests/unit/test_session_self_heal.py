@@ -69,7 +69,7 @@ async def test_activate_relogins_on_stale_guest(monkeypatch):
     monkeypatch.setattr(store_mod, "load_profile", lambda slug: _Profile())
 
     # The reused session is guest.
-    async def _guest(browser, base_url):
+    async def _guest(browser, base_url, probe=None):
         return False
     monkeypatch.setattr(st, "_login_profile_with_credentials",
                         _mk_async_return({"ok": True, "slug": "p", "logged_in": True,

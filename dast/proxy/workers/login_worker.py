@@ -101,11 +101,13 @@ async def run_login_worker(runner: "ProxyRunner", login_queue: asyncio.Queue) ->
                     headless=job.get("headless", False),
                     on_pause=job.get("on_pause"),
                     resume_event=job.get("resume_event"),
+                    probe=job.get("probe"),
                 )
                 log_event(
                     "browser",
                     "info" if result.get("success") else "warn",
                     f"Login-flow replay {'succeeded' if result.get('success') else 'failed'}"
+                    + (f" (verified={result.get('verified')})" if result.get("success") else "")
                     + (f": {result.get('error')}" if result.get("error") else ""),
                     source="browser",
                 )

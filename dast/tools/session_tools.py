@@ -256,10 +256,12 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
                    else "")
     try:
         from dast.browser.login_cascade import adaptive_login
+        from dast.session.account_state import AuthProbeConfig
         result = await adaptive_login(
             browser, auth_url, cred.username, cred.secret,
             totp_secret=totp_secret or None,
-            in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine)
+            in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine,
+            probe=AuthProbeConfig.from_profile(profile))
     except Exception as exc:
         return {"ok": False, "error": f"login error for profile '{profile.slug}': {str(exc)[:160]}"}
     if not getattr(result, "ok", False):
@@ -355,9 +357,10 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
     browser = getattr(ctx, "browser", None)
     if has_creds and browser is not None:
         try:
-            from dast.session.account_state import session_is_authenticated
+            from dast.session.account_state import AuthProbeConfig, session_is_authenticated
             await browser.resync_cookies()  # pull the just-imported jar into the browser context
-            verdict = await session_is_authenticated(browser, auth_url0)
+            verdict = await session_is_authenticated(browser, auth_url0,
+                                                     AuthProbeConfig.from_profile(profile))
         except Exception as exc:
             verdict = None
             logger.debug("activate_login_profile: session validity probe failed",

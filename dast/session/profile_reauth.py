@@ -39,6 +39,7 @@ async def reauth_from_profile(host: str, proxy_port: int) -> Optional[dict]:
     if profile.login_flow and profile.login_flow.get("steps"):
         try:
             from dast.profiles.flow import LoginFlow
+            from dast.session.account_state import AuthProbeConfig
             from dast.session.flow_replayer import replay_login_flow
 
             cred = profile.credentials[0] if profile.credentials else None
@@ -50,6 +51,7 @@ async def reauth_from_profile(host: str, proxy_port: int) -> Optional[dict]:
                 headless=True,
                 on_pause=None,      # unattended — a captcha simply fails this path
                 resume_event=None,
+                probe=AuthProbeConfig.from_profile(profile),
             )
             if result.get("success") and result.get("storage_state"):
                 logger.info("profile re-auth succeeded via flow replay",

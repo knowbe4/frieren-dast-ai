@@ -8,7 +8,15 @@ the flow. When a captcha / bot-wall is detected the replayer calls ``on_pause``
 and blocks on ``resume_event`` until the analyst solves it and clicks Continue,
 then proceeds (the "call the analyst in, then continue" requirement).
 
-Returns a dict: {success, error, cookies, auth_headers, storage_state, needed_human}.
+Success is VERIFIED, not inferred: after the steps run, the fresh session is
+probed (``dast/session/account_state.verify_authenticated`` — origin root + the
+profile's probe endpoint + session-cookie heuristic). A contradicted verdict
+(auth wall / guest) yields ``success=False`` so stale state is never persisted;
+an inconclusive probe keeps the legacy cookie-presence behavior and surfaces
+``verified=None``.
+
+Returns a dict: {success, verified, verify_reason, verify_evidence,
+success_url_matched, error, cookies, auth_headers, storage_state, needed_human}.
 Never raises to the caller — failures are captured in ``error``.
 """
 
@@ -19,11 +27,37 @@ import re
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from dast.profiles.flow import LoginFlow, has_captcha, resolve_value
+from dast.session.account_state import AuthProbeConfig, verify_authenticated
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _AUTH_HEADER_KEYS = ("authorization", "x-auth-token", "x-api-key")
+_VERIFY_BODY_CAP = 20000  # same body cap AgentBrowser.api_get applies
+
+
+def _page_fetch(page) -> Callable[[str], Awaitable[Dict[str, Any]]]:
+    """Adapt a Playwright page (``page.request`` shares the context's cookies) into
+    the transport-agnostic fetch shape ``verify_authenticated`` expects."""
+    async def _fetch(url: str) -> Dict[str, Any]:
+        resp = await page.request.get(
+            url, headers={"X-Requested-With": "XMLHttpRequest"}, timeout=10000)
+        try:
+            text = (await resp.text())[:_VERIFY_BODY_CAP]
+        except Exception:
+            text = ""
+        return {"ok": bool(resp.ok), "status": resp.status, "text": text}
+    return _fetch
+
+
+def _first_navigate_target(flow: LoginFlow) -> str:
+    """The flow's start URL, or the first navigate step's target, or ''."""
+    if flow.start_url:
+        return flow.start_url
+    for step in flow.steps:
+        if step.action == "navigate" and step.value:
+            return step.value
+    return ""
 
 
 async def _maybe_pause_for_human(
@@ -83,8 +117,10 @@ async def replay_login_flow(
     on_pause: Optional[Callable[[str], Awaitable[None]]] = None,
     resume_event: Optional[asyncio.Event] = None,
     pause_timeout: float = 300.0,
+    probe: Optional[AuthProbeConfig] = None,
 ) -> Dict[str, Any]:
-    """Replay ``flow`` and return the resulting session."""
+    """Replay ``flow`` and return the resulting session. ``probe`` (from the login
+    profile) overrides the verification endpoint/expectations."""
     from playwright.async_api import async_playwright
 
     result: Dict[str, Any] = {
@@ -130,11 +166,13 @@ async def replay_login_flow(
                     )
                 await _run_step(page, step, username, password)
 
-            # Optional explicit success check.
+            # Explicit success-URL signal — advisory only, folded into the evidence below.
+            url_regex_matched = bool(flow.success_url_regex)
             if flow.success_url_regex:
                 try:
                     await page.wait_for_url(re.compile(flow.success_url_regex), timeout=10000)
                 except Exception as exc:
+                    url_regex_matched = False
                     logger.debug("success URL check did not match after login flow", error=str(exc))
 
             cookies = await context.cookies()
@@ -142,8 +180,34 @@ async def replay_login_flow(
                 storage_state = await context.storage_state()
             except Exception:
                 storage_state = {"cookies": cookies, "origins": []}
+
+            # Structural verification. The old `bool(cookies)` read ANY cookie — an
+            # analytics/CDN cookie set by the login page itself declared a failed login
+            # "authenticated", and the stale storage_state then fed re-auth loops.
+            verified: Optional[bool] = None
+            verify_reason = ""
+            verify_evidence: Dict[str, Any] = {}
+            base_url = _first_navigate_target(flow)
+            if base_url:
+                try:
+                    verdict = await verify_authenticated(
+                        _page_fetch(page), base_url=base_url, probe=probe,
+                        session_cookies=cookies,
+                    )
+                    verified = verdict.authenticated
+                    verify_reason = verdict.reason
+                    verify_evidence = dict(verdict.evidence, success_url_matched=url_regex_matched)
+                except Exception as exc:
+                    logger.debug("flow replay verification skipped", error=str(exc)[:120])
+
             result.update({
-                "success": bool(cookies),
+                # Contradicted → failure (no stale persistence downstream);
+                # verified or indeterminate → legacy cookie-presence behavior.
+                "success": bool(cookies) if verified is None else verified,
+                "verified": verified,
+                "verify_reason": verify_reason,
+                "verify_evidence": verify_evidence,
+                "success_url_matched": url_regex_matched,
                 "cookies": cookies,
                 "auth_headers": auth_headers,
                 "storage_state": storage_state,

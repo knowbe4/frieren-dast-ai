@@ -57,6 +57,11 @@ class ProfileIn(BaseModel):
     # (default claude-opus-4-6). Off by default; NOT global. Only honored under --authorized.
     allow_model_downgrade: bool = False
     downgrade_model: str = ""
+    # Optional session-probe config (see LoginProfile): when set, login success is
+    # confirmed by fetching this endpoint with the fresh session.
+    probe_url: str = ""
+    probe_expect_json_path: str = ""
+    probe_expect_cookie: str = ""
 
 
 class SessionImportIn(BaseModel):
@@ -153,6 +158,9 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         profile.test_account = req.test_account
         profile.allow_model_downgrade = bool(req.allow_model_downgrade)
         profile.downgrade_model = req.downgrade_model
+        profile.probe_url = req.probe_url.strip()
+        profile.probe_expect_json_path = req.probe_expect_json_path.strip()
+        profile.probe_expect_cookie = req.probe_expect_cookie.strip()
         try:
             save_profile(profile)
         except Exception as exc:

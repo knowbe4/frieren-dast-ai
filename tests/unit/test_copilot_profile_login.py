@@ -159,7 +159,9 @@ async def test_ensure_profile_login_flags_guest_session_as_not_provisioned(monke
 
 
 def test_session_is_provisioned_classification():
-    from dast.proxy.api.copilot_service import _session_is_provisioned
+    # Delegation note: copilot_service._gate_check_account_state now delegates to
+    # account_state.session_endpoint_state, so the classifier is tested at its home.
+    from dast.session.account_state import session_is_provisioned as _session_is_provisioned
 
     assert _session_is_provisioned({"account": {"id": 42}, "user": {"id": 5}}) is True
     assert _session_is_provisioned({"account": {"id": -1}, "user": None}) is False

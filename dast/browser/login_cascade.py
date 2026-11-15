@@ -31,6 +31,7 @@ from dast.browser.login_strategies.llm import (
     make_llm_decider,  # noqa: F401 — re-exported; evals/tools import it from this module
 )
 from dast.browser.login_strategies.registry import ordered_strategies
+from dast.session.account_state import AuthProbeConfig
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -64,10 +65,15 @@ async def adaptive_login(
     store: Optional[Any] = None,
     session: Optional[Any] = None,
     saved_session: Optional[Dict[str, Any]] = None,
+    probe: Optional[AuthProbeConfig] = None,
 ) -> LoginCascadeResult:
     """Log in by driving the registered login strategies in order (deterministic form ->
     SPA JSON-API -> LLM by default), stopping at the first success or a terminal human wall
     (MFA/CAPTCHA).
+
+    ``probe`` carries the login profile's session-probe expectations (dast/session/
+    account_state.AuthProbeConfig) so success-shaped responses get structurally confirmed
+    instead of being taken at face value.
 
     Returns a :class:`LoginCascadeResult` recording which engine succeeded and the actions the
     LLM took (if any). Never raises - failures degrade to ok=False.
@@ -77,7 +83,7 @@ async def adaptive_login(
         totp_secret=totp_secret,
         success_url_suffix=success_url_suffix, in_scope=in_scope,
         store=store, session=session, decide=decide, max_llm_steps=max_llm_steps,
-        saved_session=saved_session,
+        saved_session=saved_session, probe=probe,
     )
     host = urlparse(url).hostname
     last = LoginResult(ok=False, engine="none", url=url, error="login not completed")

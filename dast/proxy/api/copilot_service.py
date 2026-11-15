@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dast.ai.prompt_safety import wrap_untrusted
-from dast.session.account_state import session_is_provisioned as _session_is_provisioned
+from dast.session.account_state import AuthProbeConfig
 from dast.tools.context import AgentToolContext
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
@@ -1373,6 +1373,17 @@ class CopilotService:
         if not creds or not creds.get("url") or not creds.get("email") or not creds.get("password"):
             return  # no credentials to use — the model will report any auth wall itself
         auto["_proactive_login_done"] = True
+        # Per-profile session-probe config: sharpens both the reuse gate-check and the
+        # post-login gate-check (endpoint + JSON expectations instead of the default).
+        probe: Optional[AuthProbeConfig] = None
+        try:
+            from dast.profiles.store import load_profile
+            _profile = load_profile(auto.get("profile") or "")
+            if _profile is not None:
+                probe = AuthProbeConfig.from_profile(_profile)
+        except Exception as exc:
+            logger.debug("autonomous run: probe config unavailable",
+                         session_id=sid, error=str(exc)[:120])
         try:
             tool_ctx = self._build_tool_ctx(session)
             browser = getattr(tool_ctx, "browser", None)
@@ -1393,7 +1404,7 @@ class CopilotService:
                 except Exception as exc:
                     logger.debug("autonomous run: saved-session seed failed",
                                  session_id=sid, error=str(exc)[:120])
-                if await self._gate_check_account_state(browser, creds["url"]) is True:
+                if await self._gate_check_account_state(browser, creds["url"], probe) is True:
                     auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
                                       "(reused saved session)")
                     logger.info("autonomous run: reused a stored session, skipped login",
@@ -1413,6 +1424,7 @@ class CopilotService:
                 totp_secret=creds.get("totp_secret"),
                 in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
                 saved_session=None if force_fresh else saved_session,
+                probe=probe,
             )
             reused = getattr(result, "engine", "") == "saved_session"
             if reused:
@@ -1422,7 +1434,7 @@ class CopilotService:
                 # Gate-check: a login (or a reused session) that "succeeds" can still be an
                 # onboarding/guest or an expired SPA shell. Confirm a real account before
                 # declaring the run authenticated; fail open on unknown apps.
-                provisioned = await self._gate_check_account_state(browser, creds["url"])
+                provisioned = await self._gate_check_account_state(browser, creds["url"], probe)
                 if provisioned is False and reused and not force_fresh:
                     # The reused session is dead/guest — drop reuse and log in fresh, once.
                     logger.info("autonomous run: reused session failed gate-check; forcing a "
@@ -1521,29 +1533,20 @@ class CopilotService:
             logger.debug("autonomous run: profile session persist failed", slug=slug,
                          error=str(exc)[:120])
 
-    async def _gate_check_account_state(self, browser: Any, base_url: str) -> Optional[bool]:
+    async def _gate_check_account_state(self, browser: Any, base_url: str,
+                                        probe: Optional[AuthProbeConfig] = None) -> Optional[bool]:
         """Best-effort post-login check that the session is a real provisioned account.
 
-        Fetches ``<origin>/spa/session`` in-browser (carrying the session's cookies)
-        and classifies the body with :func:`_session_is_provisioned`. Returns False
-        only on a positively guest/unprovisioned session, True on a real account, and
-        None when it can't tell (non-KMSAT app, non-JSON, non-200, or error) so the
-        caller treats the login as authenticated. Never raises."""
-        import json as _json
-        from urllib.parse import urlparse
+        Delegates to :func:`dast.session.account_state.session_endpoint_state` — the shared
+        classifier this method used to duplicate inline. ``probe`` (from the bound login
+        profile) overrides the default ``/spa/session`` endpoint and adds JSON-path
+        expectations. Returns False only on a positively guest/unprovisioned session (or an
+        auth wall), True on a real account, and None when it can't tell (non-KMSAT app,
+        non-JSON, non-200, or error) so the caller treats the login as authenticated.
+        Never raises."""
+        from dast.session.account_state import api_get_fetch, session_endpoint_state
         try:
-            parsed = urlparse(base_url)
-            if not parsed.scheme or not parsed.netloc:
-                return None
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            resp = await browser.api_get(f"{origin}/spa/session",
-                                         headers={"X-Requested-With": "XMLHttpRequest"})
-            if not resp.get("ok") or resp.get("status") != 200:
-                return None
-            data = _json.loads(resp.get("text") or "")
-            return _session_is_provisioned(data)
-        except (ValueError, TypeError):
-            return None
+            return await session_endpoint_state(api_get_fetch(browser), base_url, probe)
         except Exception as exc:
             logger.debug("autonomous run: account gate-check skipped", error=str(exc)[:160])
             return None

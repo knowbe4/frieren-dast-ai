@@ -18,6 +18,7 @@ import asyncio
 import time as _time
 from typing import Any, Dict, List, Optional
 
+from dast.browser.login_strategies.base import LOGIN_PATHS as _SHARED_LOGIN_PATHS
 from dast.browser.sso_domains import sso_domains as _sso_domains
 from dast.utils.logger import get_logger
 
@@ -603,8 +604,9 @@ class AgentBrowser:
                 continue
         return None
 
-    _LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
-                    "/auth/login", "/u/login", "/authorize")
+    # Shared with the login strategies (base.py) so every component classifies a
+    # "login page" identically — the two tuples used to drift as separate literals.
+    _LOGIN_PATHS = _SHARED_LOGIN_PATHS
 
     async def _login_success_result(self, page: Any) -> Dict[str, Any]:
         """Build the login result dict from the current page: logged_in is true when
@@ -999,10 +1001,8 @@ class AgentBrowser:
         # Re-read the current URL (may have changed during MFA polling)
         current_url = page.url.lower()
         final_path = current_url.split("?")[0]
-        login_paths = ("/login", "/signin", "/sign_in", "/sign-in",
-                        "/auth/login", "/u/login", "/authorize")
         on_login_page = any(final_path.endswith(p) or f"{p}/" in final_path
-                           for p in login_paths)
+                           for p in self._LOGIN_PATHS)
         on_sso_domain = any(d in current_url for d in self._SSO_DOMAINS)
         logged_in = not on_login_page and not on_sso_domain
 
@@ -1029,7 +1029,7 @@ class AgentBrowser:
                     final_path = current_url.split("?")[0]
                     on_login_page = any(
                         final_path.endswith(p) or f"{p}/" in final_path
-                        for p in login_paths)
+                        for p in self._LOGIN_PATHS)
                     logged_in = not on_login_page
                 except Exception as exc:
                     logger.debug("browser_login: root navigation failed",

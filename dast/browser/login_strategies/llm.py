@@ -23,9 +23,32 @@ from dast.browser.login_strategies.base import (
     current_url,
     looks_authenticated,
 )
+from dast.session.account_state import api_get_fetch, verify_authenticated
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+async def _confirmed_authenticated(ctx: LoginContext, url: str) -> bool:
+    """URL heuristic first; on an inconclusive URL, the structural verdict.
+
+    The old check also required ``url != ctx.url`` — a hash-routed SPA (or one that
+    renders the dashboard at the same path) NEVER left the login URL, so a working
+    login read as failed and the cascade burned its LLM steps for nothing. Now an
+    unchanged URL just falls through to the probe: root wall check + the profile's
+    probe endpoint + session-cookie heuristic.
+    """
+    if looks_authenticated(url, ctx.success_url_suffix):
+        return True
+    try:
+        cookies = await ctx.browser.export_cookies()
+        verdict = await verify_authenticated(
+            api_get_fetch(ctx.browser), base_url=ctx.url, probe=ctx.probe,
+            session_cookies=cookies)
+        return verdict.authenticated is True
+    except Exception as exc:  # noqa: BLE001 — the probe is a guard, not a requirement
+        logger.debug("llm login: verification skipped", error=str(exc)[:120])
+        return False
 
 
 class LlmStrategy:
@@ -48,7 +71,7 @@ class LlmStrategy:
         history: List[Dict[str, Any]] = []
         for step in range(ctx.max_llm_steps):
             current = await current_url(ctx.browser)
-            if looks_authenticated(current, ctx.success_url_suffix) and current != ctx.url:
+            if await _confirmed_authenticated(ctx, current):
                 logger.info("llm login: solved", url=current, steps=step)
                 return LoginResult(ok=True, engine="llm", url=current,
                                    llm_steps=step, actions=history)
@@ -76,7 +99,7 @@ class LlmStrategy:
                              action=action.get("action"), selector=action.get("selector"))
 
         final = await current_url(ctx.browser)
-        authenticated = looks_authenticated(final, ctx.success_url_suffix) and final != ctx.url
+        authenticated = await _confirmed_authenticated(ctx, final)
         engine = "llm" if history else "none"
         logger.info("llm login: finished", ok=authenticated, engine=engine,
                     url=final, llm_steps=len(history))

@@ -170,3 +170,29 @@ def test_session_import_auth_token_normalized(profiles_env):
 def test_session_import_empty(profiles_env):
     _, _, _, import_mod = profiles_env
     assert import_mod.build_session().is_empty
+
+
+def test_probe_config_roundtrip(profiles_env):
+    """The session-probe fields survive the storage round-trip, and a profile saved
+    before the fields existed loads with empty defaults (no crash)."""
+    _, models_mod, store_mod, _ = profiles_env
+    profile = models_mod.LoginProfile(
+        name="Probe App",
+        host_pattern="app.example.com",
+        auth_url="https://app.example.com/login",
+        probe_url="/api/me",
+        probe_expect_json_path="user.id",
+        probe_expect_cookie="app_session",
+    )
+    store_mod.save_profile(profile)
+    loaded = store_mod.load_profile("probe-app")
+    assert loaded is not None
+    assert loaded.probe_url == "/api/me"
+    assert loaded.probe_expect_json_path == "user.id"
+    assert loaded.probe_expect_cookie == "app_session"
+    assert loaded.to_public_dict()["probe_url"] == "/api/me"
+
+    legacy = models_mod.LoginProfile.from_storage_dict({"slug": "old", "name": "Old"})
+    assert legacy.probe_url == ""
+    assert legacy.probe_expect_json_path == ""
+    assert legacy.probe_expect_cookie == ""

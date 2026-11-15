@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
 from dast.browser.login_strategies.base import LoginContext, LoginResult
+from dast.session.account_state import AuthProbeConfig, api_get_fetch, verify_authenticated
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -70,6 +71,21 @@ async def _csrf_headers(browser: Any) -> Dict[str, str]:
     return headers
 
 
+async def _confirm_session(
+    browser: Any, url: str, probe: Optional[AuthProbeConfig],
+) -> Optional[bool]:
+    """Structural confirm that the context now holds a real session (tri-state).
+    Never raises — a probe transport error returns None (fail-open to legacy behavior)."""
+    try:
+        cookies = await browser.export_cookies()
+        verdict = await verify_authenticated(
+            api_get_fetch(browser), base_url=url, probe=probe, session_cookies=cookies)
+        return verdict.authenticated
+    except Exception as exc:  # noqa: BLE001 — the probe is a guard, not a requirement
+        logger.debug("spa_api: probe-confirm skipped", error=str(exc)[:120])
+        return None
+
+
 async def attempt(
     browser: Any,
     url: str,
@@ -81,6 +97,7 @@ async def attempt(
     endpoints: Optional[List[str]] = None,
     in_scope: Optional[Callable[[str], bool]] = None,
     timezone: str = "America/Fortaleza",
+    probe: Optional[AuthProbeConfig] = None,
 ) -> Dict[str, Any]:
     """Try to log in via the SPA JSON auth endpoint. Returns a result dict with
     ``ok``/``logged_in``/``engine='spa_api'``/``endpoint``; syncs cookies on success."""
@@ -110,16 +127,29 @@ async def attempt(
             if not resp.get("ok"):
                 continue
             if _looks_success(resp.get("status"), resp.get("text", "")):
+                # PROBE-CONFIRM before declaring victory: a success-shaped 2xx is not a
+                # session — "MFA pending" 200s and empty-204 bodies read as success here
+                # (and a false success is WORSE than a failure: the journal promotes it
+                # to the front of the next cascade). A positively-contradicted verdict
+                # (auth wall / guest / no session) skips this candidate and keeps trying;
+                # an inconclusive probe falls back to the legacy behavior.
+                confirmed = await _confirm_session(browser, url, probe)
+                if confirmed is False:
+                    logger.info("spa_api: endpoint looked successful but the session "
+                                "probes as unauthenticated — trying next candidate",
+                                endpoint=endpoint)
+                    continue
                 synced = await _sync_session(browser, store, session, url, email, password)
                 logger.info("spa_api: login succeeded", endpoint=endpoint,
-                            status=resp.get("status"), cookies=synced)
+                            status=resp.get("status"), cookies=synced,
+                            verified=confirmed)
                 # Journal the reproducible shape (endpoint + body keys), never secrets.
                 login_journal.record(url, "success", strategy="spa_api", endpoint=endpoint,
                                      body_shape=",".join(sorted(body.keys())), success_url=url)
                 return {
                     "ok": True, "logged_in": True, "engine": "spa_api",
                     "endpoint": endpoint, "url": url, "cookies": synced,
-                    "status": resp.get("status"),
+                    "status": resp.get("status"), "verified": confirmed,
                 }
     logger.info("spa_api: no JSON auth endpoint accepted the credentials",
                 tried=len(candidates))
@@ -171,7 +201,8 @@ class SpaApiStrategy:
         # Bare ``attempt`` resolves to the module-level function below, so a test that
         # monkeypatches ``spa_api.attempt`` still drives this strategy.
         result = await attempt(ctx.browser, ctx.url, ctx.email, ctx.password,
-                               store=ctx.store, session=ctx.session, in_scope=ctx.in_scope)
+                               store=ctx.store, session=ctx.session, in_scope=ctx.in_scope,
+                               probe=ctx.probe)
         return LoginResult(
             ok=bool(result.get("ok") and result.get("logged_in")),
             engine="spa_api",

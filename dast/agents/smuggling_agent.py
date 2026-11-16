@@ -37,7 +37,6 @@ from urllib.parse import urlparse
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
-from dast.proxy.plugin_manager import log_event
 from dast.scanners.active_checks import is_host_dead
 from dast.utils.logger import get_logger
 
@@ -230,41 +229,23 @@ class SmugglingAgent(VulnAgent):
                 continue
             results.append((payload, responses, control))
 
-        for payload, responses, control in results:
-            if len(responses) <= len(control):
-                continue
-            # Desync: the probe connection answered MORE requests than the control
-            # — the smuggled request was parsed server-side.
-            statuses = " then ".join(str(r.status) for r in responses)
-            raw_probe = payload.decode("latin-1", errors="replace")
-            log_event("agent", "finding",
-                      f"Request smuggling confirmed on {target.url}",
-                      url=target.url, finding="HTTP Request Smuggling", source="agent")
-            findings.append(AgentFinding(
-                title="HTTP Request Smuggling (CL.TE/TE.CL desync)",
-                severity="critical",
-                cwe="CWE-444",
-                attack_type="request_smuggling",
-                evidence=(
-                    f"A deliberately framed probe (duplicate Content-Length + "
-                    f"Transfer-Encoding) produced {len(responses)} responses "
-                    f"({statuses}) where the consistently framed control produced "
-                    f"{len(control)} — the backend parsed a smuggled second request "
-                    f"from the probe body. An attacker could similarly smuggle "
-                    f"requests to other users' connections.\n\n"
-                    f"Probe request:\n{raw_probe}"
-                ),
-                confirmed=True,
-                payload=raw_probe[:200],
-                parameter="Content-Length / Transfer-Encoding",
-                url=target.url,
-                request_method=target.method,
-                bypass_validation=True,
-            ))
-            return findings
-
-        if not findings:
-            logger.info("smuggling: no desync confirmed on %s (probes sent ≤%d)",
+        # The count-only differential (probe connection yields MORE raw responses
+        # than the control) is NOT a reliable desync signal and no longer emits a
+        # finding. The control sends ``Connection: close`` so it always reads
+        # exactly one response, while the probe stays keep-alive; a normal
+        # single-origin server merely pipelines leftover bytes as a second
+        # response — benign keep-alive behaviour, not a desync. On any single
+        # origin with no proxy chain this produced false CONFIRMED-critical
+        # findings, so the count-only verdict is dropped (fail-safe). Confirming a
+        # true desync needs a response-content differential the raw count cannot
+        # provide.
+        if any(len(responses) > len(control) for _, responses, control in results):
+            logger.info(
+                "smuggling: count-only response differential on %s is unverified "
+                "(benign pipelining can explain it) — not emitting a finding",
+                target.url)
+        else:
+            logger.info("smuggling: no probe differential on %s (probes sent ≤%d)",
                         target.url, sent)
         return findings
 

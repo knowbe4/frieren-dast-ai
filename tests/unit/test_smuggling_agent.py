@@ -45,17 +45,16 @@ def _raw(statuses):
 
 
 @pytest.mark.asyncio
-async def test_desync_confirmed_when_probe_yields_more_responses():
+async def test_count_only_differential_does_not_confirm_a_finding():
+    """Fail-safe: a probe connection yielding MORE raw responses than the
+    Connection: close control is NOT a reliable desync signal (benign keep-alive
+    pipelining explains it on a single origin), so the count-only verdict must
+    NOT emit any finding — and never a confirmed critical."""
     target = _target()
     with patch.object(sm, "_send_raw_probe", new=_raw([200, 404])), \
          patch.object(sm, "is_host_dead", return_value=False):
         findings = await sm.SmugglingAgent().run(target, __import__("unittest").mock.MagicMock())
-    assert len(findings) == 1
-    assert findings[0].attack_type == "request_smuggling"
-    assert findings[0].cwe == "CWE-444"
-    assert findings[0].confirmed is True
-    assert findings[0].bypass_validation is True
-    assert "smuggled" in findings[0].evidence.lower()
+    assert findings == []
 
 
 @pytest.mark.asyncio

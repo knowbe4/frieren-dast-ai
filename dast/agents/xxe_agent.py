@@ -51,6 +51,10 @@ _XXE_ERROR_RE = re.compile(
 _XML_CONTENT_TYPES = ("application/xml", "text/xml", "application/soap+xml",
                       "application/xhtml+xml", "application/atom+xml")
 
+# Settle time before the token-scoped collaborator check (the parser must fetch the
+# external DTD over the network before the callback lands).
+_OOB_SETTLE_SECONDS = 3.0
+
 
 def _is_xml_endpoint(target: "CheckTarget") -> bool:
     """Check if the endpoint accepts XML (from request Content-Type or body shape)."""
@@ -177,22 +181,33 @@ class XxeAgent(VulnAgent):
                     raw_response=raw_resp[:2000],
                 ))
 
-        # Phase 2: OOB exfiltration via collaborator
-        if collaborator and collaborator.url:
-            collab_url = collaborator.url
+        # Phase 2: OOB exfiltration via collaborator — token-scoped per payload (the
+        # ssrf_agent pattern: issue → embed → send → settle → was_hit(token)). The old
+        # phase called `collaborator.url` / `await collaborator.poll()` — attributes and
+        # methods that do not exist on CollaboratorService — so run_safe swallowed the
+        # AttributeError and EVERY blind-XXE finding died with it.
+        if collaborator is not None and oob_payloads:
+            import asyncio
+
             for payload_template in oob_payloads[:6]:
+                token = collaborator.issue_token()
+                collab_url = f"http://{collaborator.host}:{collaborator.port}/{token}"
                 payload = str(payload_template).replace("CALLBACK_URL", collab_url)
                 if collab_url not in payload:
                     continue
 
-                resp = await _send(client, target.method, target.url, _headers, payload, payload=payload[:100])
+                resp = await _send(client, target.method, target.url, _headers, payload,
+                                   payload=payload[:100])
                 if not resp:
                     continue
 
-            # Check for OOB hit
-            import asyncio
-            await asyncio.sleep(3)
-            if await collaborator.poll():
+                # Give the target's parser a moment to resolve the external DTD, then
+                # check THIS payload's token (sub-paths like /<token>/xxe.dtd count —
+                # see CollaboratorService.was_hit).
+                await asyncio.sleep(_OOB_SETTLE_SECONDS)
+                if not collaborator.was_hit(token):
+                    continue
+
                 log_event("agent", "finding",
                           f"XXE OOB exfiltration confirmed on {target.url}",
                           url=target.url, finding="XXE OOB", source="agent")
@@ -203,11 +218,12 @@ class XxeAgent(VulnAgent):
                     attack_type="xxe",
                     evidence=(
                         f"XXE payload with external DTD pointing to {collab_url} triggered "
-                        f"an OOB callback. The XML parser fetches external resources, "
-                        f"confirming blind XXE. Data exfiltration is possible via parameter entities."
+                        f"an OOB callback (collaborator token {token!r} was hit). The XML "
+                        f"parser fetches external resources, confirming blind XXE. Data "
+                        f"exfiltration is possible via parameter entities."
                     ),
                     confirmed=True,
-                    payload="[OOB DTD payload]",
+                    payload=payload[:200],
                     parameter="XML body",
                     url=target.url,
                     request_method=target.method,

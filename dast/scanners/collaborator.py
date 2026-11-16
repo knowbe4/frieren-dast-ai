@@ -46,7 +46,16 @@ class CollaboratorService:
         return f"dast{random.randint(100000, 999999)}"
 
     def was_hit(self, token: str) -> bool:
-        return token in self._hits
+        """True when a callback carrying ``token`` arrived.
+
+        Matches the exact path OR any sub-path under it: XXE payload templates fetch
+        resources BENEATH the callback URL (``CALLBACK_URL/xxe.dtd``), which the
+        listener records as ``<token>/xxe.dtd`` — exact membership would silently
+        miss every such hit. SSRF-style tokens (whole path) still match exactly."""
+        if token in self._hits:
+            return True
+        prefix = f"{token}/"
+        return any(path.startswith(prefix) for path in self._hits)
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(

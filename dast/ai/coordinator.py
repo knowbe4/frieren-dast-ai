@@ -398,12 +398,15 @@ _CONTEXTUAL_TYPES = frozenset({
 _PARAM_ATTACK_MAP: Dict[str, List[str]] = {
     "numeric_id": ["sqli", "idor", "business_logic"],
     "uuid":       ["idor", "business_logic"],
-    "path":       ["lfi", "ssrf", "cmdi"],
-    "search":     ["sqli", "xss", "ssrf", "lfi"],
-    "string":     ["sqli", "xss", "ssrf", "lfi", "ssti", "cmdi"],
-    "json":       ["sqli", "nosql", "business_logic"],
-    "token":      [],   # cryptographic token — skip injection
-    "boolean":    [],   # boolean fields have no injection surface
+    "path":       ["lfi", "ssrf", "cmdi", "open_redirect"],
+    "search":     ["sqli", "xss", "ssrf", "lfi", "open_redirect"],
+    "string":     ["sqli", "xss", "ssrf", "lfi", "ssti", "cmdi", "open_redirect"],
+    "json":       ["sqli", "nosql", "business_logic", "prototype_pollution"],
+    "token":      [],   # cryptographic token — no injection surface (the JWT VulnAgent
+                        # that tests `?token=<jwt>` lands with round 3-E)
+    "boolean":    ["prototype_pollution"],  # value flips ARE the pollution surface —
+                        # injection classes genuinely don't apply, but flipping a
+                        # boolean while polluting Object.prototype is a real pattern
     "empty":      ["sqli", "xss"],  # try basic canaries on empty params
 }
 
@@ -618,12 +621,44 @@ def _select_attack_types_for_params(
     # canary; the agent bails fast on static content and reflects nothing.
     if _LINK_ENDPOINT_RE.search(target.url):
         candidate_types.add("host_header")
+        # The same link/email-shape endpoints get the dedicated password-reset-flow
+        # agent (token generation / poisoning semantics) — it self-gates on JSON
+        # + a token param being present.
+        candidate_types.add("password_reset")
+
+    # XML surfaces are XXE candidates (XML content-type or XML-shaped body). The
+    # canary pass already carries an xxe payload — it was dead code until this rule
+    # existed, because nothing ever added "xxe" to the candidates (the agent
+    # re-gates on the same shape itself, so a coarse rule is safe).
+    _ct_lower = (target.headers or {}).get("content-type", "").lower()
+    _body_head = (target.body or "")[:200].lstrip().lower()
+    _xml_shaped = _body_head.startswith(("<?xml", "<!doctype")) or (
+        _body_head.startswith("<") and ">" in _body_head)
+    if any(x in _ct_lower for x in ("application/xml", "text/xml", "application/soap+xml")) \
+            or _xml_shaped:
+        candidate_types.add("xxe")
+
+    # GraphQL endpoints (or any request carrying GraphQL-variable params) are
+    # candidates for the dedicated GraphQL IDOR agent — it hard-requires
+    # body_graphql-located ID-shaped params and bails otherwise.
+    if is_graphql or any(p.get("location") == "body_graphql" for p in (target.params or [])):
+        candidate_types.add("graphql_idor")
+
+    # Cross-session IDOR needs TWO named sessions to replay between — the agent
+    # hard-gates on the same prerequisite; adding it when the prerequisite exists
+    # lights up the cross-tenant coverage dimension deterministically.
+    if len(getattr(target, "named_sessions", None) or []) >= 2:
+        candidate_types.add("cross_session_idor")
 
     # GET endpoints are candidates for cache poisoning — an unkeyed request
     # header reflected into a cacheable response. Header-based, no param canary;
     # the agent itself bails fast if the response is not cacheable.
     if target.method == "GET":
         candidate_types.add("cache_poisoning")
+        # Discovery sweeps (SSTI/open-redirect/CRLF/method-tampering subchecks,
+        # each self-gating) and Blazor (the agent probes base-URL assets and bails
+        # fast when the app is not Blazor) are cheap GET-side additions.
+        candidate_types.update(["discovery", "blazor"])
 
     # MFA/OTP verification endpoints — dedicated agent for rate-limit and bypass tests
     if _is_mfa_endpoint(target.url):
@@ -1899,8 +1934,9 @@ class Coordinator:
             if no_canary:
                 restrict_note = (
                     f"\nNo canary signals detected. Restrict agents to: {', '.join(no_canary)}."
-                    f" Do NOT select injection-type agents (sqli, xss, lfi, ssrf, cmdi, ssti, nosql)"
-                    f" unless the endpoint structure strongly justifies it.\n"
+                    f" Do NOT select injection-type agents (sqli, xss, lfi, ssrf, cmdi, ssti, nosql, xxe)"
+                    f" unless the endpoint structure strongly justifies it. Blind variants still"
+                    f" confirm without echo signal: sqli/cmdi time-based, ssrf/xxe out-of-band.\n"
                 )
             else:
                 restrict_note = (

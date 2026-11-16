@@ -402,8 +402,9 @@ _PARAM_ATTACK_MAP: Dict[str, List[str]] = {
     "search":     ["sqli", "xss", "ssrf", "lfi", "open_redirect"],
     "string":     ["sqli", "xss", "ssrf", "lfi", "ssti", "cmdi", "open_redirect"],
     "json":       ["sqli", "nosql", "business_logic", "prototype_pollution"],
-    "token":      [],   # cryptographic token — no injection surface (the JWT VulnAgent
-                        # that tests `?token=<jwt>` lands with round 3-E)
+    "token":      ["jwt"],  # cryptographic token — the JWT VulnAgent (round 3-E)
+                            # tests verification bypasses on `?token=<jwt>` params;
+                            # injection classes still don't apply
     "boolean":    ["prototype_pollution"],  # value flips ARE the pollution surface —
                         # injection classes genuinely don't apply, but flipping a
                         # boolean while polluting Object.prototype is a real pattern
@@ -735,11 +736,17 @@ def _select_attack_types_for_params(
         candidate_types.add("password_reset")
 
     # Framing-ambiguity candidates: requests carrying BOTH Content-Length and
-    # Transfer-Encoding (and JWT-bearing endpoints, see below) — the smuggling
-    # agent is otherwise only dispatched via the hints plugin's focus list.
+    # Transfer-Encoding — the smuggling agent is otherwise only dispatched via the
+    # hints plugin's focus list.
     _lower_headers = {k.lower() for k in (target.headers or {})}
     if "content-length" in _lower_headers and "transfer-encoding" in _lower_headers:
         candidate_types.add("request_smuggling")
+
+    # JWT-bearing requests (Authorization/cookie/param) are candidates for the
+    # JWT verification agent; it self-gates via _find_jwts on the same detector.
+    from dast.agents.jwt_agent import has_jwt_target
+    if has_jwt_target(target):
+        candidate_types.add("jwt")
 
     # XML surfaces are XXE candidates (XML content-type or XML-shaped body). The
     # canary pass already carries an xxe payload — it was dead code until this rule

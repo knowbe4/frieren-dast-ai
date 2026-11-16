@@ -19,7 +19,8 @@ Deliberately NOT migrated (diverging semantics, documented):
   location;
 - the per-agent response-similarity helpers (the ratio bands are intentional
   per-agent decisions, not drift);
-- JWT tooling (consolidates with the JWT VulnAgent, roadmap round 3-E).
+- jwt tooling internals of the passive plugins (the JwtAgent — round 3-E — uses
+  probe_common for its transport and dast/utils/jwt for the primitives).
 """
 
 from __future__ import annotations

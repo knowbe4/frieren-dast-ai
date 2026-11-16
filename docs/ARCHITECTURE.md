@@ -1,7 +1,5 @@
 # Frieren DAST-AI Architecture
 
-> For Claude Code conventions, commands, and key files see [CLAUDE.md](../CLAUDE.md).
-
 **Version:** 0.9.0
 **Last Updated:** 2026-11-10
 
@@ -56,7 +54,11 @@ Browser (or automated crawler)
        attack types via _PARAM_ATTACK_MAP.
        Auth-token params (nonce, state, code, id_token, …) skipped entirely.
        _run_canary_probe() sends one cheap payload per (attack_type, param)
-       and checks the response against _SIGNAL_PATTERNS.
+       and checks the response against _SIGNAL_PATTERNS. Blind canaries
+       (_run_blind_canary_probe) then give the classes that by definition have
+       no echo — SQLi/CMDi time-based (SLEEP vs zero-delay control), SSRF/XXE
+       out-of-band (tokened collaborator callback) — their own signal path
+       (capped: ≤2 params per type, only when the echo canary missed).
        signal_map: {attack_type → [param_names_with_signal]} passed to planner.
   1. LLM Planner: sees canary results + param classifications — selects agents
      for types with signal; can extend to non-signal types when warranted
@@ -74,6 +76,12 @@ Browser (or automated crawler)
   Each agent targets one vulnerability class.
   All agents call get_filtered_payloads(attack_type, target) from
   dast/agents/payload_filter.py — only tech-relevant payload groups are sent.
+  Probe plumbing is shared (dast/agents/probe_common.py): the param-location
+  injection dispatch, the sqlmap-style time differential (candidate vs
+  zero-delay control + delay-scaling confirmation), and the token-scoped OOB
+  confirmation. business_logic (own injectors + source tagging) and
+  llm_injection (body_raw JSON prompt-key location) intentionally keep their
+  own dispatch.
   - xss_agent            — reflected/stored XSS + DOM + obfuscation/bypass; blind XSS
                            only for CMS/admin/messaging apps
   - sqli_agent           — error-based + boolean + time-based blind (5s max);
@@ -90,6 +98,15 @@ Browser (or automated crawler)
   - business_logic_agent — numeric boundary abuse, privilege escalation via param
                            injection, workflow bypass, mass assignment
   - csrf_agent           — token removal, swap, header bypass, cross-origin
+  - request_smuggling_agent — CL.TE/TE.CL desync confirmation via direct raw
+                           sockets (response differential; dispatched by the
+                           framing-ambiguity hints plugin)
+  - jwt_agent            — alg:none, weak HMAC re-sign, claim escalation, kid
+                           injection; probes proxy-routed via probe_common
+  - open_redirect_agent / prototype_pollution_agent / graphql_idor_agent /
+    cross_session_idor_agent / password_reset_agent / host_header_agent /
+    cache_poisoning_agent / race_condition_agent / mfa_bypass_agent — see
+    docs/ROADMAP.md rounds 2-C/2-D and the dispatch rules section
     |
     v
 [Findings]                    SessionStore.add_finding()
@@ -124,12 +141,23 @@ Browser (or automated crawler)
 |-------------|----------------------|
 | `numeric_id` | sqli, idor, business_logic |
 | `uuid` | idor, business_logic |
-| `path` | lfi, ssrf, xxe |
-| `search` | sqli, xss, ssrf, lfi |
-| `string` | sqli, xss, ssrf, lfi, cmdi, ssti |
-| `json` | sqli, nosql, xxe, business_logic |
-| `token`, `jwt`, `boolean` | *(skipped)* |
+| `path` | lfi, ssrf, cmdi, open_redirect |
+| `search` | sqli, xss, ssrf, lfi, open_redirect |
+| `string` | sqli, xss, ssrf, lfi, ssti, cmdi, open_redirect |
+| `json` | sqli, nosql, business_logic, prototype_pollution |
+| `token` | *(skipped — the JWT VulnAgent that tests `?token=<jwt>` is roadmap 3-E)* |
+| `boolean` | prototype_pollution (value flips) |
 | `empty` | sqli, xss |
+
+Structural rules add candidates beyond the param map: XML content-type/body →
+`xxe`; GraphQL URL or `body_graphql` params → `graphql_idor`; ≥2 named sessions
+→ `cross_session_idor`; reset/verify/invite-shaped URLs → `password_reset`
+(plus `host_header`); GET → `cache_poisoning`, `discovery`, `blazor`;
+POST/PUT/PATCH/DELETE → `csrf`, `business_logic`; race-shaped params →
+`race_condition`; MFA endpoints → `mfa_bypass`; always `sensitive_data`, and
+`auth_bypass` when Authorization/Cookie present. Agents self-gate on their own
+prerequisites (blazor probes base-URL assets; cross_session_idor hard-requires
+2 sessions; graphql_idor requires body_graphql ID params).
 
 Auth-token params (`_AUTH_TOKEN_PARAMS`: nonce, state, code, id_token, access_token, refresh_token, …) are excluded from all probing entirely.
 
@@ -777,8 +805,58 @@ dast/
   `QueueFull` so a backed-up queue never stalls proxy ingestion
 - Probe-concurrency semaphore (`_PROBE_SEM`) is aligned to `max(probe_concurrency, workers)`
   at scan-worker startup — more workers with a tiny probe budget yields little throughput
-- Session refresh worker gives up after `_MAX_REAUTH_FAILURES` (3) consecutive failures
-  (stale credentials); a success resets the counter — recover via a fresh Browse-tab login
+- Session refresh worker trips a breaker after `_MAX_REAUTH_FAILURES` (3) consecutive
+  failures (stale credentials). The breaker is RECOVERABLE: `reset()` fires via
+  `POST /api/session/reauth/reset` and automatically when a profile activation or a
+  successful login-flow replay lands fresh session material; state is readable at
+  `GET /api/session/state`
+- The re-auth trigger is probe-aware: entries from `source="agent"`/`"copilot"` (the
+  scanners run their own handling) and any entry carrying a `probe_payload` never count
+  as session expiry; cooldown-window signals are coalesced into one deferred re-check,
+  the cooldown is measured from the attempt's END, and a successful re-auth syncs the
+  fresh cookies into the shared proxy jar too (not only the scan pool)
+- Login success is VERIFIED, not inferred: `dast/session/account_state.verify_authenticated()`
+  returns a tri-state structural verdict (probe origin root + the profile's probe endpoint
+  + session-cookie heuristic; auth wall/guest = contradicted). The flow replayer, spa_api
+  probe-confirm, the LLM strategy fallback and the copilot gate-check all consume it;
+  login profiles can pin expectations via `probe_url`/`probe_expect_json_path`/
+  `probe_expect_cookie`. `dast/triage/auth_wall.py` classifies 200 bodies on STRONG
+  phrases or concrete captcha markers only — weak tokens ("login", "auth") need
+  login-form evidence
+- AGENTLESS auth-bypass (`dast/browser/auth_gates.py`): with no credentials for a
+  login-walled SPA, the explorer's `bypass_auth` mode detects client-side auth gates
+  in the JS bundles (storage keys / isLogin checks / interceptors / permission routes),
+  seeds the storage and stubs auth-API requests client-side so the post-login shell
+  renders — real outbound API traffic then flows through the proxy into discovery.
+  Scope: client-side gates only; stubs never leave the browser; forged token is a
+  fixed `dast-bypass` marker
+- All login paths serialize on the process-wide login coordinator
+  (`dast/session/login_coordinator.py`): one per-site lock acquired by the refresh
+  worker, the copilot reactive ladder, autonomous logins, the dashboard route, replay
+  jobs, and model tools — a validation batch can no longer fire concurrent
+  same-credential logins. The runner registers the live refresh worker into it, so any
+  in-process login resets the re-auth breaker after landing a fresh session. The lock
+  only serializes; cooldowns/breakers stay component-local. Named-session roles are
+  canonical via `LoginProfile.session_role` (privilege_level or name); relogin cookie
+  sync is domain-scoped to the login host; learned journal wins expire (7-day TTL) and
+  are failure-invalidated; spa_api stops spraying on credential rejection (401/403 from
+  a real login endpoint), sends the three CSRF header conventions, and caps itself at
+  10 POSTs per attempt
+
+### Copilot Turn Wrap-Up (salvage before a forced kill)
+- When a copilot turn is ended by the SUPERVISOR — the loop watchdog (`stuck_loop`), a
+  failure breaker, or the tool-call ceiling (both `need_direction`) — anything the model
+  proved but never committed via `record_finding` would be lost with the turn
+- `dast/ai/copilot/wrapup.py` runs one bounded salvage exchange BEFORE the ending lands
+  (`≤3` LLM steps, 20s/step, fast-tier model): the model may only call `record_finding`
+  (through the same gates as the live loop — dedup, silent scope check, deterministic FP
+  guard) or answer DONE
+- Fail-open by contract: any wrap-up failure leaves the forced reply exactly as it would
+  have been; a model-initiated reply, `error`, or `safety_blocked` ending never triggers it
+  (the LLM itself is usually what's failing there). Salvaged findings and refusals are
+  annotated on the operator-facing reply and appear in the turn trace
+- `dast/ai/triage_agent.py` needs no equivalent: its kill path already persists a
+  `needs_manual` verdict owned by the caller
 
 ### Service Graph
 - `ServiceGraph` lives on `SessionStore` — access via `store.service_graph`
@@ -876,7 +954,7 @@ dast/
   callers and the schema-forced tool-use path are provider-agnostic. Select at runtime via
   `bedrock_client.set_provider(provider, keys...)` or `POST /api/scan-config` (`ai_provider`,
   `anthropic_api_key`, `openai_api_key`, `glm_api_key`, `*_base_url`, `gateway_base_url`).
-  Defaults via `.env` (see Environment Variables in CLAUDE.md). For non-Bedrock providers
+  Defaults via `.env` (see `dast/config.py` for every setting and its default). For non-Bedrock providers
   `model_id` is a plain model name (e.g. `claude-opus-4-8`, `gpt-4o`, `glm-4.6`), not an ARN.
   API keys are never echoed back by `GET /api/scan-config` (only `*_set` booleans). Local models
   (Qwen via Ollama/vLLM, LM Studio, `llama.cpp`) run through this same `openai` path — point
@@ -902,6 +980,15 @@ dast/
 - The `/api/ai/status` badge probes the ACTIVE provider (STS for bedrock; API-key presence for
   anthropic/openai/glm; `gateway_auth.credentials_available()` for gateway). The status is cached
   5 min; `POST /api/scan-config` clears that cache on a provider switch so the badge re-probes.
+- Provider failover (`_failover_chain` + `dast/ai/provider_health.py`): when a call fails at the
+  PROVIDER level (expired AWS SSO, throttling exhaustion, auth, network), the gateway walks the
+  next healthy member of `ai_failover_chain` (default auto: `bedrock,anthropic,glm`; members
+  without credentials are skipped) and — on success — promotes it to active until it fails in
+  turn (sticky; runtime credentials are preserved, the Bedrock-ARN model is auto-healed).
+  Content-policy blocks (`AiContentBlockedError`) and caller ValueErrors NEVER trigger failover.
+  Consecutive provider failures start a widening cooldown (3 failures → 60s, doubling to a 5-min
+  cap) so a hard-down provider stops costing every call; one success fully restores it.
+  `GET /api/ai/availability` exposes the active provider and per-provider health snapshot.
 
 ## Dashboard / UI Layout
 

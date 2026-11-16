@@ -256,15 +256,25 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
                    else "")
     try:
         from dast.browser.login_cascade import adaptive_login
-        result = await adaptive_login(
-            browser, auth_url, cred.username, cred.secret,
-            totp_secret=totp_secret or None,
-            in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine)
+        from dast.session.account_state import AuthProbeConfig
+        from dast.session.login_coordinator import get_login_coordinator
+        coord = get_login_coordinator()
+        # Shared login lock: a model-triggered login must not race the scan-time
+        # refresh worker / copilot ladder / dashboard logins for the same host.
+        async with coord.lock_for(coord.site_key_for(auth_url)):
+            result = await adaptive_login(
+                browser, auth_url, cred.username, cred.secret,
+                totp_secret=totp_secret or None,
+                in_scope=getattr(ctx, "is_in_scope", None), store=store, session=engine,
+                probe=AuthProbeConfig.from_profile(profile))
     except Exception as exc:
         return {"ok": False, "error": f"login error for profile '{profile.slug}': {str(exc)[:160]}"}
     if not getattr(result, "ok", False):
         return {"ok": False, "error": (
             f"login failed for profile '{profile.slug}': {getattr(result, 'error', '') or 'unknown'}")}
+    # A fresh verified session just landed: re-arm the scan-time re-auth breaker
+    # (the 2-A deferral — tools have no runner handle, the coordinator is the bridge).
+    coord.reset_refresh_breaker(f"profile '{profile.slug}' logged in via copilot tool")
     # Persist the freshly-logged-in session: named-session jar + global jar, and seed the engine so
     # the inline 401/expiry auto-relogin keeps working. Best-effort; a persist failure is logged, not fatal.
     imported = 0
@@ -275,7 +285,8 @@ async def _login_profile_with_credentials(ctx: ToolContext, store: Any, profile:
     try:
         if full:
             store.save_named_session_from_playwright(
-                name=profile.slug, role=profile.name, playwright_cookies=full, auth_headers={})
+                name=profile.slug, role=profile.session_role,
+                playwright_cookies=full, auth_headers={})
             imported = store.import_playwright_cookies(full)
             # Persist onto the profile so a later activate reuses this session instead of
             # re-driving the login (flips session_set true). Best-effort.
@@ -336,7 +347,7 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
         return await _login_profile_with_credentials(ctx, store, profile)
     try:
         store.save_named_session_from_playwright(
-            name=profile.slug, role=profile.name,
+            name=profile.slug, role=profile.session_role,
             playwright_cookies=cookies, auth_headers=state.get("_auth_headers") or {})
         imported = store.import_playwright_cookies(cookies)
     except Exception as exc:
@@ -355,9 +366,10 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
     browser = getattr(ctx, "browser", None)
     if has_creds and browser is not None:
         try:
-            from dast.session.account_state import session_is_authenticated
+            from dast.session.account_state import AuthProbeConfig, session_is_authenticated
             await browser.resync_cookies()  # pull the just-imported jar into the browser context
-            verdict = await session_is_authenticated(browser, auth_url0)
+            verdict = await session_is_authenticated(browser, auth_url0,
+                                                     AuthProbeConfig.from_profile(profile))
         except Exception as exc:
             verdict = None
             logger.debug("activate_login_profile: session validity probe failed",

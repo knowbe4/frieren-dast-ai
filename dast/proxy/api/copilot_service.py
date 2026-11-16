@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dast.ai.prompt_safety import wrap_untrusted
-from dast.session.account_state import session_is_provisioned as _session_is_provisioned
+from dast.session.account_state import AuthProbeConfig
 from dast.tools.context import AgentToolContext
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
@@ -124,6 +124,7 @@ _ATTACK_TYPE_DIMENSION = {
     "idor": "access_control", "bfla": "access_control", "auth": "access_control",
     "auth_bypass": "access_control",
     "mfa_bypass": "access_control", "jwt": "access_control", "sensitive_data": "access_control",
+    "request_smuggling": "injection",
     # cross-tenant (multi-user replay) — only applicable with >=2 named sessions
     "cross_session_idor": "cross_tenant",
     # business logic (incl. mass assignment + race conditions)
@@ -512,6 +513,9 @@ class CopilotService:
             # refusal downgrade (armed on the first turn). None = unbound (today's default).
             "profile_slug": slug,
             "_downgrade_armed": False,
+            # Seeded once (interactive, profile-bound) by the first start_turn so the
+            # engine carries the profile's cookies + relogin credentials.
+            "_profile_activated": False,
             "_pause_event": asyncio.Event(),
             "_pause_result": None,
             "approved_hosts": set(),
@@ -689,9 +693,21 @@ class CopilotService:
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
-        # Profile-bound interactive session: arm the per-profile refusal downgrade once, so an
-        # authorized objective survives a gateway content refusal (per-profile, never global).
         slug = (session.get("profile_slug") or "").strip()
+        # Profile-bound interactive session: seed the engine's auth ONCE (cookies +
+        # relogin credentials) via the SAME _activate_profile the autonomous path uses.
+        # Without this the engine had no _last_login, so an auth wall paused for the
+        # operator instead of auto-relogging in with the profile's credentials.
+        if slug and not session.get("_profile_activated"):
+            try:
+                self._activate_profile(slug, session)
+            except Exception as exc:
+                logger.debug("interactive profile activation failed", slug=slug,
+                             error=str(exc)[:120])
+            session["_profile_activated"] = True
+        # Arm the per-profile refusal downgrade once, INDEPENDENTLY of activation: activation
+        # can bail before its own arm (no proxy store, partial profile), and an authorized
+        # objective must still survive a gateway content refusal (per-profile, never global).
         if slug and not session.get("_downgrade_armed"):
             try:
                 from dast.profiles.store import load_profile
@@ -1339,7 +1355,7 @@ class CopilotService:
                 # (import_playwright_cookies), which is last-writer-wins and leaks across
                 # concurrent profile activations.
                 store.save_named_session_from_playwright(
-                    name=profile.slug, role=profile.name,
+                    name=profile.slug, role=profile.session_role,
                     playwright_cookies=cookies, auth_headers=auth_headers,
                 )
                 # Also seed the cookies onto THIS engine session (per-session) so the very
@@ -1425,6 +1441,18 @@ class CopilotService:
         if not creds or not creds.get("url") or not creds.get("email") or not creds.get("password"):
             return  # no credentials to use — the model will report any auth wall itself
         auto["_proactive_login_done"] = True
+        # Per-profile session-probe config: sharpens both the reuse gate-check and the
+        # post-login gate-check (endpoint + JSON expectations instead of the default).
+        probe: Optional[AuthProbeConfig] = None
+        _profile = None
+        try:
+            from dast.profiles.store import load_profile
+            _profile = load_profile(auto.get("profile") or "")
+            if _profile is not None:
+                probe = AuthProbeConfig.from_profile(_profile)
+        except Exception as exc:
+            logger.debug("autonomous run: probe config unavailable",
+                         session_id=sid, error=str(exc)[:120])
         try:
             tool_ctx = self._build_tool_ctx(session)
             browser = getattr(tool_ctx, "browser", None)
@@ -1445,7 +1473,7 @@ class CopilotService:
                 except Exception as exc:
                     logger.debug("autonomous run: saved-session seed failed",
                                  session_id=sid, error=str(exc)[:120])
-                if await self._gate_check_account_state(browser, creds["url"]) is True:
+                if await self._gate_check_account_state(browser, creds["url"], probe) is True:
                     auto["detail"] = (f"authenticated via profile '{auto.get('profile')}' "
                                       "(reused saved session)")
                     logger.info("autonomous run: reused a stored session, skipped login",
@@ -1460,12 +1488,20 @@ class CopilotService:
                     })
                     return
             from dast.browser.login_cascade import adaptive_login
-            result = await adaptive_login(
-                browser, creds["url"], creds["email"], creds["password"],
-                totp_secret=creds.get("totp_secret"),
-                in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
-                saved_session=None if force_fresh else saved_session,
-            )
+            from dast.session.login_coordinator import get_login_coordinator
+            coord = get_login_coordinator()
+            # Shared login lock: run_validation_batch launches several concurrent
+            # runs with the SAME profile — without the lock they fired concurrent
+            # adaptive_login calls with identical credentials against the same host,
+            # invalidating each other's server-side sessions (login flood).
+            async with coord.lock_for(coord.site_key_for(creds["url"])):
+                result = await adaptive_login(
+                    browser, creds["url"], creds["email"], creds["password"],
+                    totp_secret=creds.get("totp_secret"),
+                    in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
+                    saved_session=None if force_fresh else saved_session,
+                    probe=probe,
+                )
             reused = getattr(result, "engine", "") == "saved_session"
             if reused:
                 logger.info("autonomous run: reused a stored session via cascade, skipped login",
@@ -1474,7 +1510,7 @@ class CopilotService:
                 # Gate-check: a login (or a reused session) that "succeeds" can still be an
                 # onboarding/guest or an expired SPA shell. Confirm a real account before
                 # declaring the run authenticated; fail open on unknown apps.
-                provisioned = await self._gate_check_account_state(browser, creds["url"])
+                provisioned = await self._gate_check_account_state(browser, creds["url"], probe)
                 if provisioned is False and reused and not force_fresh:
                     # The reused session is dead/guest — drop reuse and log in fresh, once.
                     logger.info("autonomous run: reused session failed gate-check; forcing a "
@@ -1507,8 +1543,11 @@ class CopilotService:
                     try:
                         full = await browser.export_cookies_full()
                         if full:
+                            # Canonical role (privilege_level or name) — the slug is
+                            # not a role.
+                            _role = _profile.session_role if _profile is not None else name
                             self._ctx.store.save_named_session_from_playwright(
-                                name=name, role=name, playwright_cookies=full,
+                                name=name, role=_role, playwright_cookies=full,
                             )
                             # Persist the session onto the PROFILE too, so the NEXT run reuses
                             # it (SavedSessionStrategy / probe-skip) instead of re-logging in.
@@ -1573,29 +1612,20 @@ class CopilotService:
             logger.debug("autonomous run: profile session persist failed", slug=slug,
                          error=str(exc)[:120])
 
-    async def _gate_check_account_state(self, browser: Any, base_url: str) -> Optional[bool]:
+    async def _gate_check_account_state(self, browser: Any, base_url: str,
+                                        probe: Optional[AuthProbeConfig] = None) -> Optional[bool]:
         """Best-effort post-login check that the session is a real provisioned account.
 
-        Fetches ``<origin>/spa/session`` in-browser (carrying the session's cookies)
-        and classifies the body with :func:`_session_is_provisioned`. Returns False
-        only on a positively guest/unprovisioned session, True on a real account, and
-        None when it can't tell (non-KMSAT app, non-JSON, non-200, or error) so the
-        caller treats the login as authenticated. Never raises."""
-        import json as _json
-        from urllib.parse import urlparse
+        Delegates to :func:`dast.session.account_state.session_endpoint_state` — the shared
+        classifier this method used to duplicate inline. ``probe`` (from the bound login
+        profile) overrides the default ``/spa/session`` endpoint and adds JSON-path
+        expectations. Returns False only on a positively guest/unprovisioned session (or an
+        auth wall), True on a real account, and None when it can't tell (non-KMSAT app,
+        non-JSON, non-200, or error) so the caller treats the login as authenticated.
+        Never raises."""
+        from dast.session.account_state import api_get_fetch, session_endpoint_state
         try:
-            parsed = urlparse(base_url)
-            if not parsed.scheme or not parsed.netloc:
-                return None
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            resp = await browser.api_get(f"{origin}/spa/session",
-                                         headers={"X-Requested-With": "XMLHttpRequest"})
-            if not resp.get("ok") or resp.get("status") != 200:
-                return None
-            data = _json.loads(resp.get("text") or "")
-            return _session_is_provisioned(data)
-        except (ValueError, TypeError):
-            return None
+            return await session_endpoint_state(api_get_fetch(browser), base_url, probe)
         except Exception as exc:
             logger.debug("autonomous run: account gate-check skipped", error=str(exc)[:160])
             return None

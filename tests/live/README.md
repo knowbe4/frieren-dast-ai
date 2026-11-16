@@ -8,9 +8,9 @@ This is the empirical counterpart to [`tests/evals/`](../evals/README.md): the
 eval harness scores individual LLM decisions in isolation; this harness scores
 the *whole pipeline* (proxy interception -> coordinator -> agents -> validation
 -> dashboard) against ground truth. It is the deliverable that answers the
-CLAUDE.md bar — "does the tool find real, exploitable vulns with a low false
-positive rate" — and makes per-class generalization something you can *measure*
-rather than guess at.
+project's core bar — "does the tool find real, exploitable vulns with a low
+false positive rate" — and makes per-class generalization something you can
+*measure* rather than guess at.
 
 **Opt-in.** It needs a running proxy, a configured AI provider, and a live
 target, so it is NOT part of `uv run pytest`.

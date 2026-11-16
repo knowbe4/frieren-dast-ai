@@ -131,6 +131,10 @@ class UiRouteGraph:
         with self._lock:
             return self._routes.get(route_key)
 
+    def failed(self) -> List[UiRoute]:
+        with self._lock:
+            return [r for r in self._routes.values() if r.state == FAILED]
+
     def frontier(self) -> List[UiRoute]:
         with self._lock:
             return [r for r in self._routes.values() if r.state == FRONTIER]

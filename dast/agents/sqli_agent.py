@@ -11,13 +11,15 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.agents.sqli_exploit import ExploitProof, extract_db_facts
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_path, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
+from dast.proxy.plugin_manager import log_event
+from dast.scanners.active_checks import _fmt_http_pair, _send, prepend_import_payloads, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -118,11 +120,107 @@ class SqliAgent(VulnAgent):
             finding = await self._probe_error_based(target, client, param, error_re, tech_context)
             if finding:
                 return [finding]
+            finding = await self._probe_boolean_based(target, client, param)
+            if finding:
+                return [finding]
             finding = await self._probe_time_based(target, client, param, time_threshold, tech_context)
             if finding:
                 return [finding]
 
         return findings
+
+    async def _probe_boolean_based(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+    ) -> Optional[AgentFinding]:
+        """Boolean differential oracle — the cheap middle blind detector (no sleeps).
+
+        The yaml boolean pairs are tautology/contradiction SQL: both are VALID SQL,
+        so the true-pair response should look like the clean baseline while the
+        false-pair empties or changes the result set. A real injection shows
+        true ≈ baseline (anchored) AND false ≢ true (differential), REPRODUCED on a
+        second send so a non-deterministic page cannot manufacture the signal. The
+        comparison is structural — probe_diff.ResponseAttrs (status / length-noise
+        ≥32B / HTML-skeleton hash) — never byte equality, and reflection deltas are
+        excluded (the two payloads' echoes trivially differ)."""
+        from dast.agents.probe_diff import _extract_attrs
+
+        entries = get_payloads("sqli", "boolean_based") or []
+        pairs = [(str(entries[i]), str(entries[i + 1]))
+                 for i in range(0, len(entries) - 1, 2)][:2]
+        if not pairs:
+            return None
+
+        clean_value = str(param.get("value", "") or "1")
+        try:
+            baseline_resp = await self._send_probe(target, client, param, clean_value)
+        except Exception as exc:
+            logger.debug("SQLi boolean probe: baseline send failed", error=str(exc))
+            return None
+        if baseline_resp is None:
+            return None
+        baseline_attrs = _extract_attrs(baseline_resp, clean_value)
+
+        for true_payload, false_payload in pairs:
+            true_resp = await self._send_probe(target, client, param, true_payload)
+            false_resp = await self._send_probe(target, client, param, false_payload)
+            if true_resp is None or false_resp is None:
+                continue
+            true_attrs = _extract_attrs(true_resp, true_payload)
+            false_attrs = _extract_attrs(false_resp, false_payload)
+
+            # Anchor: the true-pair page must look exactly like the clean page.
+            if true_attrs.differs_from(baseline_attrs):
+                continue
+            # Differential: only content-level divergence counts (reflection is
+            # excluded — the payloads themselves echo differently).
+            divergent = [d for d in false_attrs.differs_from(true_attrs)
+                         if d in ("status", "length", "structure")]
+            if not divergent:
+                continue
+
+            # Reproduce: the relation must hold again on a fresh send pair.
+            true_resp2 = await self._send_probe(target, client, param, true_payload)
+            false_resp2 = await self._send_probe(target, client, param, false_payload)
+            if true_resp2 is None or false_resp2 is None:
+                continue
+            if true_attrs.differs_from(_extract_attrs(true_resp2, true_payload)):
+                continue  # the "true" page itself is unstable — no anchor
+            divergent2 = [d for d in _extract_attrs(false_resp2, false_payload)
+                          .differs_from(true_attrs)
+                          if d in ("status", "length", "structure")]
+            if not divergent2:
+                continue
+
+            raw_req, raw_resp = _fmt_http_pair(false_resp2)
+            log_event("agent", "finding",
+                      f"SQLi boolean-blind confirmed on {target.url} ({param['name']})",
+                      url=target.url, finding="Boolean-blind SQLi", source="agent")
+            return AgentFinding(
+                title="SQL Injection — Boolean-Based Blind",
+                severity="high",
+                cwe="CWE-89",
+                attack_type="sqli",
+                evidence=(
+                    f"Parameter '{param['name']}' is boolean-injectable: "
+                    f"'{true_payload}' returned a page identical to the clean baseline, "
+                    f"while '{false_payload}' changed {', '.join(divergent)} — and the "
+                    f"relation reproduced on a second send. The response body is a "
+                    f"controllable true/false oracle.\n\n"
+                    f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                ),
+                confirmed=True,
+                payload=false_payload,
+                parameter=param["name"],
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=raw_req,
+                raw_response=raw_resp[:2000],
+            )
+        return None
 
     async def _probe_error_based(
         self,
@@ -141,9 +239,8 @@ class SqliAgent(VulnAgent):
         # SQL that returns rows rather than raising an error, so they can never
         # match an error signature — sending them through the error-signature probe
         # is wasted budget that (under load) starves the time-based blind probe of
-        # the per-endpoint budget it needs to confirm blind injection. Boolean-based
-        # detection would need its own differential-response oracle, which this probe
-        # is not; until then these payloads add cost with zero error-based signal.
+        # the per-endpoint budget it needs to confirm blind injection. They are
+        # handled by _probe_boolean_based's differential-response oracle instead.
         boolean_payloads = set(get_payloads("sqli", "boolean_based"))
         seed = [p for p in seed if p not in boolean_payloads]
         payloads_to_try = prepend_import_payloads(list(seed), param["name"], "sqli", target)
@@ -290,8 +387,10 @@ class SqliAgent(VulnAgent):
             # only a control + one shorter SLEEP, and only when a candidate is
             # found, so the extra hold is bounded and rare.
             async with serialize_time_probe():
-                control_ms, _ = await self._timed_send(target, client, param, control_value)
-                probe_ms, resp = await self._timed_send(target, client, param, payload)
+                control_ms, probe_ms, resp = await probe_common.time_candidate_pair(
+                    self._send_probe, target, client, param, payload, control_value,
+                    _TIME_PROBE_TIMEOUT_S,
+                )
 
                 delta_ms = probe_ms - control_ms
                 # The delay must show up both as a delta over the control AND in
@@ -411,21 +510,19 @@ class SqliAgent(VulnAgent):
             )
 
         # Delay-scaling confirmation (caller holds the time-probe lock).
-        control_ms, _ = await self._timed_send(target, client, param, control_value)
-        confirm_ms, resp = await self._timed_send(target, client, param, confirm_payload)
-        confirm_delta_ms = confirm_ms - control_ms
         confirm_floor_ms = _CONFIRM_DELAY_S * _CONFIRM_FLOOR_RATIO
-        scaled = (
-            resp is not None
-            and confirm_delta_ms >= confirm_floor_ms          # shorter sleep clearly delayed
-            and confirm_ms >= confirm_floor_ms
-            and (primary_delta_ms - confirm_delta_ms) >= _SCALING_MARGIN_MS  # longer sleep added more
+        scaled, confirm_delta_ms, resp = await probe_common.time_confirm_scaling(
+            self._send_probe, target, client, param, payload, control_value,
+            primary_delta_ms,
+            confirm_delay_s=_CONFIRM_DELAY_S,
+            confirm_floor_ms=confirm_floor_ms,
+            scaling_margin_ms=_SCALING_MARGIN_MS,
+            timeout_s=_TIME_PROBE_TIMEOUT_S,
         )
         logger.debug(
             "SQLi time-based re-confirm (scaling)",
             param=param["name"], payload=payload, confirm_payload=confirm_payload,
-            confirm_delay_s=_CONFIRM_DELAY_S, control_ms=round(control_ms),
-            confirm_ms=round(confirm_ms), confirm_delta_ms=round(confirm_delta_ms),
+            confirm_delay_s=_CONFIRM_DELAY_S, confirm_delta_ms=round(confirm_delta_ms),
             primary_delta_ms=round(primary_delta_ms), confirmed=scaled,
         )
         if not scaled:
@@ -533,10 +630,9 @@ class SqliAgent(VulnAgent):
         timeout it is discarded (resp=None) and the delay we were measuring is never
         observed. The paired-adjacent-control delta cancels the ambient component,
         but only when the probe actually returns."""
-        resp = await self._send_probe(
-            target, client, param, payload, timeout=_TIME_PROBE_TIMEOUT_S
+        return await probe_common.timed_probe_ms(
+            self._send_probe, target, client, param, payload, _TIME_PROBE_TIMEOUT_S
         )
-        return response_elapsed_ms(resp), resp
 
     async def _send_probe(
         self,
@@ -546,29 +642,12 @@ class SqliAgent(VulnAgent):
         payload: str,
         timeout: "Optional[float]" = None,
     ):
-        if param["location"] == "query":
-            url = _inject_query(target.url, param["name"], payload)
-            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
-        elif param["location"] in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=param["location"],
-            )
-            return await _send(client, target.method, target.url, target.headers, body, timeout=timeout)
-        elif param["location"].startswith("multipart_"):
-            raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-            return await _send(client, target.method, target.url, target.headers, raw, timeout=timeout)
-        elif param["location"] == "path":
-            url = _inject_path(target.url, param.get("path_index", 0), payload)
-            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
-        elif param["location"] == "header":
-            headers = _inject_header(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body, timeout=timeout)
-        elif param["location"] == "cookie":
-            headers = _inject_cookie(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body, timeout=timeout)
-        return None
+        # Full-superset dispatch (query/body/graphql/multipart/path/header/cookie)
+        # via the shared injector; `send=self-module _send` keeps per-module test
+        # patches working.
+        return await probe_common.send_probe(
+            target, client, param, payload, timeout=timeout, send=_send,
+        )
 
 
 from dast.ai.coordinator import Coordinator

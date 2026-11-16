@@ -99,11 +99,20 @@ def spa_server():
 def _patched_launcher(monkeypatch):
     """Replace the proxied launcher with a plain local Chromium (no proxy)."""
     @asynccontextmanager
-    async def _ctx(store, proxy_port, session_id, *, read_only=False, headless=True, log_cb=None):
+    async def _ctx(store, proxy_port, session_id, *, read_only=False, headless=True,
+                   log_cb=None, auth_bypass=None):
         async with playwright.async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             try:
                 context = await browser.new_context()
+                if auth_bypass is not None:
+                    from dast.browser.auth_gates import init_script, make_route_guard
+
+                    async def _forward(route):
+                        await route.continue_()
+
+                    await context.add_init_script(init_script(auth_bypass))
+                    await context.route("**/*", make_route_guard(auth_bypass, forward=_forward))
                 page = await context.new_page()
                 yield context, page, [0]
             finally:
@@ -111,11 +120,12 @@ def _patched_launcher(monkeypatch):
     monkeypatch.setattr(spa_explorer, "proxied_browser_context", _ctx)
 
 
-async def _run_explorer(server_url, *, submit_forms):
+async def _run_explorer(server_url, *, submit_forms, bypass_auth=False):
     store = SessionStore()
     stop = asyncio.Event()
     explorer = spa_explorer.SpaExplorer(store, lambda m: None, stop, proxy_port=0)
-    await explorer.run(server_url, read_only=False, submit_forms=submit_forms, headless=True)
+    await explorer.run(server_url, read_only=False, submit_forms=submit_forms,
+                       headless=True, bypass_auth=bypass_auth)
     return store
 
 
@@ -247,3 +257,77 @@ async def test_vision_not_used_when_flag_off(canvas_server, monkeypatch):
     explorer = spa_explorer.SpaExplorer(store, lambda m: None, asyncio.Event(), proxy_port=0)
     await explorer.run(url, read_only=False, headless=True, vision=False)  # vision OFF
     assert called["n"] == 0, "vision must not run unless explicitly enabled"
+
+
+# ── agentless auth-bypass (round 2-D, ARTEX three-gates) ─────────────────────
+
+_GUARDED_ADMIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>guarded</title></head>
+<body>
+  <div id="app">checking auth...</div>
+  <script>
+    // Client-side login guard — the ARTEX target shape: no token in storage and
+    // the router bounces to the login view; a seeded token renders the shell.
+    if (!localStorage.getItem("token")) {
+      location.replace("/login");
+    } else {
+      document.getElementById("app").innerHTML =
+        '<nav><a href="/admin-panel">Admin Panel</a><a href="/audit-log">Audit Log</a></nav>';
+    }
+  </script>
+</body></html>"""
+
+
+class _GuardedHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/login":
+            body = b"<!doctype html><html><body><form><input name=u><input name=p></form></body></html>"
+        else:
+            # EVERY route serves the guarded shell: the auth decision is purely
+            # client-side (the server has no session concept at all).
+            body = _GUARDED_ADMIN_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+@pytest.fixture
+def guarded_server():
+    server = HTTPServer(("127.0.0.1", 0), _GuardedHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server, f"http://127.0.0.1:{server.server_port}/"
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agentless_bypass_explores_client_guarded_spa(guarded_server, monkeypatch):
+    """WITHOUT the bypass: the guard bounces every route to /login and they fail.
+    WITH bypass_auth: the storage hook seeds the token before the guard script
+    runs, the post-login shell renders, and its links are explored."""
+    _server, url = guarded_server
+    _patched_launcher(monkeypatch)
+
+    store = await _run_explorer(url, submit_forms=False, bypass_auth=False)
+    graph = store.ui_route_graph
+    failed_keys = {r.route_key for r in graph.failed()}
+    assert failed_keys, "without the bypass, routes must fail on the login wall"
+    assert not any("admin-panel" in k for k in
+                   {r.route_key for r in graph.visited()})
+
+    store = await _run_explorer(url, submit_forms=False, bypass_auth=True)
+    graph = store.ui_route_graph
+    visited_keys = {r.route_key for r in graph.visited()}
+    host = normalise_route_key(url).split("/")[0]
+    # The bypass round reopened the wall-blocked routes; the seeded token made the
+    # guard pass and the post-login shell's links were explored.
+    assert f"{host}/admin-panel" in visited_keys
+    assert f"{host}/audit-log" in visited_keys

@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from dast.ai import bedrock_client
 from dast.ai.copilot.context_brief import build_context_brief
+from dast.ai.copilot.wrapup import WRAPUP_BLOCKED_REASONS, run_wrapup
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.authorization import AUTHORIZED_ENGAGEMENT_DIRECTIVE, is_full_authorization
 from dast.ai.schemas import COPILOT_STEP_SCHEMA
@@ -511,6 +512,19 @@ def _is_placeholder_url(url: str) -> bool:
     if not host:
         return True
     return host in _PLACEHOLDER_FINDING_HOSTS or host.startswith("unknown")
+
+
+def _cookie_in_host_scope(cookie: Dict[str, Any], host: str) -> bool:
+    """Whether a Playwright cookie belongs to ``host``'s domain: the cookie's
+    Domain attribute (leading dot = parent-domain cookie) must equal the host or
+    be a suffix of it. Used to stop a relogin to an SSO identity host from
+    flattening its cookies onto app-host requests."""
+    if not host:
+        return True
+    domain = str(cookie.get("domain", "")).lower().lstrip(".")
+    if not domain:
+        return True  # host-only cookie set by the login page itself
+    return host == domain or host.endswith("." + domain)
 
 
 def _last_in_scope_url(tool_ctx: Any, focus_hosts: Any) -> Optional[str]:
@@ -1035,19 +1049,37 @@ class CopilotSession:
             # cascade syncs the jar on spa_api success; the browser cookies are folded in
             # below so every engine path updates the session.
             from dast.browser.login_cascade import adaptive_login
-            cascade = await adaptive_login(
-                browser,
-                self._last_login["url"],
-                self._last_login["email"],
-                self._last_login["password"],
-                totp_secret=self._last_login.get("totp_secret"),
-                in_scope=getattr(tool_ctx, "is_in_scope", None),
-                store=getattr(tool_ctx, "store", None),
-                session=self,
-            )
+            from dast.session.login_coordinator import get_login_coordinator
+            coord = get_login_coordinator()
+            login_url = self._last_login["url"]
+            # The shared login lock: two copilot sessions (or this + the scan-time
+            # refresh worker) re-logging the same host concurrently invalidate each
+            # other's server-side session. Per-host — different products never block.
+            async with coord.lock_for(coord.site_key_for(login_url)):
+                cascade = await adaptive_login(
+                    browser,
+                    login_url,
+                    self._last_login["email"],
+                    self._last_login["password"],
+                    totp_secret=self._last_login.get("totp_secret"),
+                    in_scope=getattr(tool_ctx, "is_in_scope", None),
+                    store=getattr(tool_ctx, "store", None),
+                    session=self,
+                )
             if cascade.ok:
                 try:
-                    self._session_cookies.update(await browser.export_cookies())
+                    # DOMAIN-SCOPED sync: export_cookies() used to flatten every cookie
+                    # of the whole browser context into _session_cookies (name→value,
+                    # domains discarded), so an SSO relogin leaked IdP cookies onto app
+                    # requests and same-named cookies across subdomains collapsed to
+                    # the last one. Only cookies in scope of the login host are synced.
+                    full = await browser.export_cookies_full()
+                    login_host = (urlparse(login_url).hostname or "").lower()
+                    in_scope_cookies = {
+                        c["name"]: c["value"] for c in full
+                        if _cookie_in_host_scope(c, login_host)
+                    }
+                    self._session_cookies.update(in_scope_cookies)
                 except Exception as exc:
                     logger.debug("auto-relogin: cookie sync failed", error=str(exc)[:120])
                 logger.info("auto-relogin: succeeded via %s, retrying request",
@@ -1147,6 +1179,58 @@ class CopilotSession:
                 message=message, blocked_reason=blocked_reason, transcript=turn_transcript
             )
 
+        async def _wrapup_record(args: Dict[str, Any]) -> Dict[str, Any]:
+            """Execute a wrap-up ``record_finding`` through the SAME gates as the
+            live loop: host defaulting, anti-repeat dedup, and a SILENT scope
+            check. Never pauses for a human — an out-of-scope host is refused
+            outright, since the operator pause makes no sense in a salvage pass
+            that must finish before the forced ending lands."""
+            url = str(args.get("url", "")).strip()
+            if url and _is_placeholder_url(url):
+                backfill = _last_in_scope_url(tool_ctx, self._focus_hosts)
+                if backfill:
+                    args["url"] = backfill
+            call_key = f"record_finding:{_canonical(args)}"
+            if call_key in self._seen_calls:
+                return {"ok": False,
+                        "error": "duplicate of a call already issued this session"}
+            for candidate in _candidate_urls(args):
+                host = (urlparse(candidate).hostname or "").lower()
+                if host and host not in approved_hosts:
+                    in_focus = _host_in_focus(host, self._focus_hosts)
+                    if not (tool_ctx.is_in_scope(candidate)
+                            and (not self._focus_hosts or in_focus)):
+                        return {"ok": False,
+                                "error": f"out of scope: host {host} is not in "
+                                         "scope/focus for this run"}
+            self._seen_calls.add(call_key)
+            return await run_tool(tool_ctx, "record_finding", args)
+
+        async def _finalize_forced(message: str, blocked_reason: str) -> CopilotReply:
+            """Finalize a SUPERVISOR-forced ending — watchdog kill, failure
+            breaker, or the tool-call ceiling. Before the ending lands, one
+            bounded wrap-up pass (``dast/ai/copilot/wrapup.py``) lets the model
+            record any finding it proved but never committed, so the kill cannot
+            discard proven work. The pass is fail-open: any error leaves the
+            reply exactly as it would have been without it."""
+            if blocked_reason in WRAPUP_BLOCKED_REASONS:
+                note = await run_wrapup(
+                    llm_step=_llm_step,
+                    model=bedrock_client.get_fast_model()
+                    or bedrock_client.get_copilot_model(),
+                    execute_record=_wrapup_record,
+                    render_transcript=_render_turn_transcript,
+                    transcript=turn_transcript,
+                    on_event=on_event,
+                    base_step=len(turn_transcript) + 1,
+                )
+                if note:
+                    message = message + note
+            reply = _finalize(message, blocked_reason)
+            await on_event({"type": "reply", "message": reply.message,
+                            "blocked_reason": reply.blocked_reason})
+            return reply
+
         def _build_spin_context_hint(recent_observation: str) -> str:
             """Build a pattern-aware hint from the most recent tool failure observation."""
             obs = recent_observation.lower()
@@ -1236,13 +1320,10 @@ class CopilotSession:
                 logger.warning("Copilot: too many failed tool calls this turn",
                                session_id=self.session_id,
                                failures=consecutive_tool_failures)
-                reply = _finalize(
+                return await _finalize_forced(
                     _build_spin_context_hint(observation),
                     blocked_reason="need_direction",
                 )
-                await on_event({"type": "reply", "message": reply.message,
-                                "blocked_reason": reply.blocked_reason})
-                return reply
             return None
 
         try:
@@ -1476,7 +1557,7 @@ class CopilotSession:
                         logger.warning("copilot watchdog: killing looping turn",
                                        session_id=self.session_id, tool=tool_name,
                                        no_progress=_noprogress, repeats=_repeats)
-                        return _finalize(
+                        return await _finalize_forced(
                             f"Stopped: the same request ({tool_name} "
                             f"{str(tool_args.get('method', '')).upper()} "
                             f"{tool_args.get('url', '')}) {reason_n}. The tool "
@@ -1510,7 +1591,7 @@ class CopilotSession:
                         if self._stripped_header_count >= _MAX_HEADER_STRIPS * 2:
                             self._stripped_header_count = 0
                             self._header_strip_warned = False
-                            return _finalize(
+                            return await _finalize_forced(
                                 "Stopped: you keep setting Cookie / X-CSRF-Token headers on your "
                                 "requests. They are IGNORED — the tool injects the active session "
                                 "automatically. Stop setting them and switch endpoint, parameter, "
@@ -1545,6 +1626,7 @@ class CopilotSession:
                     if await self._auth_gate(
                         result, tool_args, entry, wait_for_human, _observe,
                         _looks_like_auth_wall, _sanitise_cookies, call_key,
+                        tool_ctx,
                     ):
                         consecutive_tool_failures = 0  # session applied — progress made
                         continue  # session applied — retry allowed
@@ -1675,29 +1757,23 @@ class CopilotSession:
                                "action=call_tool (and set tool_name) or action=reply "
                                "(and set message).")
                 if consecutive_failures >= _MAX_CONSECUTIVE_LLM_FAILURES:
-                    reply = _finalize(
+                    return await _finalize_forced(
                         "I couldn't settle on a next step this turn."
                         + _last_steps_summary(turn_transcript)
                         + "\n\nTell me how you'd like me to proceed.",
                         blocked_reason="need_direction",
                     )
-                    await on_event({"type": "reply", "message": reply.message,
-                                    "blocked_reason": reply.blocked_reason})
-                    return reply
 
             # Ceiling reached without the LLM replying.
             logger.warning("Copilot: tool-call ceiling reached this turn",
                            calls=_MAX_TOOL_CALLS_PER_TURN)
-            reply = _finalize(
+            return await _finalize_forced(
                 "I ran the maximum number of tool calls this turn without reaching a "
                 "conclusion."
                 + _last_steps_summary(turn_transcript)
                 + "\n\nTell me how you'd like me to proceed.",
                 blocked_reason="need_direction",
             )
-            await on_event({"type": "reply", "message": reply.message,
-                            "blocked_reason": reply.blocked_reason})
-            return reply
 
         except asyncio.CancelledError:
             raise
@@ -2123,9 +2199,15 @@ class CopilotSession:
         looks_like_auth_wall: Callable[..., bool],
         sanitise_cookies: Callable[..., Dict[str, str]],
         call_key: str,
+        tool_ctx: Any = None,
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
-        collected and the identical call should be allowed to retry."""
+        collected and the identical call should be allowed to retry.
+
+        Before handing off to a human, a profile-bound session (``_last_login`` seeded)
+        tries a credential re-login through the EXISTING refresh ladder: this catches the
+        SOFT auth wall (200 login page, no 302/401) that the inline session-expired ladder
+        misses, so an autonomous/profile-bound run auto-relogins instead of pausing."""
         try:
             status_code = int(result.get("status", 0) or 0)
         except (TypeError, ValueError):
@@ -2156,6 +2238,29 @@ class CopilotSession:
                     return True
             except Exception:
                 pass
+        # SOFT auth wall: the inline ladder in send() owns 302→login / 401 / 403 auth-flip
+        # (incl. its "403 on a never-2xx endpoint is NOT expiry" IDOR/forbidden-file rule),
+        # but a target that serves a 2xx login page never trips it. ONLY for that 2xx case,
+        # and only when the profile seeded relogin credentials, escalate through the
+        # EXISTING refresh ladder (which owns the relogin cooldown + reentrancy + per-host
+        # login lock) before pausing. Non-2xx walls are left to the inline ladder untouched.
+        if self._last_login is not None and 200 <= status_code < 300:
+            try:
+                request_path = urlparse(final_url).path or "/"
+                outcome = await self.refresh_bearer(
+                    getattr(tool_ctx, "store", None), host, request_path,
+                    browser=getattr(tool_ctx, "browser", None),
+                    tool_ctx=tool_ctx,
+                    max_tier=RefreshTier.RELOGIN,
+                    reason="auth-wall",
+                )
+            except Exception:
+                outcome = None
+            if outcome is not None and outcome.acted:
+                self.reset_dedup("auth_wall")
+                await observe(entry, f"Auth wall (HTTP {status_code}); re-authenticated via "
+                              "the bound profile credentials. Retrying.")
+                return True
         self._auth_prompted_hosts.add(host)
         auth = await wait_for_human("auth", {"url": final_url, "host": host,
                                              "status": status_code})

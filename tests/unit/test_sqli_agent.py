@@ -334,3 +334,107 @@ async def test_body_location_injection_detects_error():
 
     assert len(findings) == 1
     assert findings[0].parameter == "accountId"
+
+
+# ── boolean differential oracle ──────────────────────────────────────────────
+
+def _boolean_fake(pages, calls):
+    """Fake transport scripted per injected value: `pages` maps payload ->
+    (status, text). The injected value is read from the URL query string (sqli
+    probes historically do NOT forward the x-dast-payload kwarg — the payload
+    travels in the target parameter); every call is recorded so the reproduction
+    check sees fresh sends."""
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        from urllib.parse import parse_qs, urlparse
+        injected = (parse_qs(urlparse(url).query).get("id") or [""])[0]
+        calls.append(injected)
+        status, text = pages.get(injected, pages.get("__clean__", (200, "static page content here")))
+        m = MagicMock()
+        m.status_code = status
+        m.text = text
+        m.content = text.encode()
+        m.elapsed = timedelta(seconds=0.01)
+        return m
+
+    return fake_send
+
+
+@pytest.mark.asyncio
+async def test_boolean_blind_detected_when_false_differs_and_true_anchors():
+    pages = {
+        "__clean__": (200, "item list: A" + "x" * 100),
+        "' AND 1=1-- -": (200, "item list: A" + "x" * 100),     # anchored to baseline
+        "' AND 1=2-- -": (200, "no results"),                    # differential
+        "1 AND 1=1-- -": (200, "item list: A" + "x" * 100),
+        "1 AND 1=2-- -": (200, "no results"),
+    }
+    calls = []
+    target = _target()
+    with patch("dast.agents.sqli_agent._send",
+               side_effect=_boolean_fake(pages, calls)):
+        findings = await SqliAgent().run(target, MagicMock())
+
+    assert len(findings) == 1
+    assert findings[0].title == "SQL Injection — Boolean-Based Blind"
+    assert findings[0].confirmed is True
+    assert findings[0].bypass_validation is True
+    assert findings[0].parameter == "id"
+    # The relation must have been reproduced (both pairs sent twice).
+    assert calls.count("' AND 1=2-- -") == 2
+
+
+@pytest.mark.asyncio
+async def test_boolean_blind_ignores_unstable_pages():
+    """If the TRUE page doesn't reproduce (dynamic content), there is no anchor
+    and no finding — a non-deterministic page cannot manufacture the signal.
+    The quote-pair's true page renders differently on every send; the numeric
+    pair never diverges at all."""
+    pages = {
+        "__clean__": (200, "item list: A" + "x" * 100),
+        "' AND 1=1-- -": (200, "item list: A" + "x" * 100),
+        "' AND 1=2-- -": (200, "no results"),
+        "1 AND 1=1-- -": (200, "no results"),  # true == false: no differential
+        "1 AND 1=2-- -": (200, "no results"),
+    }
+    calls = []
+    true_sends = {"n": 0}
+
+    base_fake = _boolean_fake(pages, calls)
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        from urllib.parse import parse_qs, urlparse
+        injected = (parse_qs(urlparse(url).query).get("id") or [""])[0]
+        if injected == "' AND 1=1-- -":
+            true_sends["n"] += 1
+            m = MagicMock()
+            m.status_code = 200
+            m.text = f"render {true_sends['n']}: " + "y" * (60 * true_sends["n"])
+            m.content = m.text.encode()
+            m.elapsed = timedelta(seconds=0.01)
+            return m
+        return await base_fake(client, method, url, headers, body, payload, timeout)
+
+    target = _target()
+    with patch("dast.agents.sqli_agent._send", side_effect=fake_send):
+        findings = await SqliAgent().run(target, MagicMock())
+
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_boolean_blind_ignores_reflection_only_pages():
+    """A page that merely echoes input (payloads differ in their echoes) but is
+    structurally identical for true/false must NOT be a finding."""
+    pages = {
+        "__clean__": (200, "you searched: VALUE"),
+        "' AND 1=1-- -": (200, "you searched: ' AND 1=1-- -"),
+        "' AND 1=2-- -": (200, "you searched: ' AND 1=2-- -"),
+    }
+    calls = []
+    target = _target()
+    with patch("dast.agents.sqli_agent._send",
+               side_effect=_boolean_fake(pages, calls)):
+        findings = await SqliAgent().run(target, MagicMock())
+
+    assert findings == []

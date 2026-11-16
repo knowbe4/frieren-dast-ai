@@ -151,6 +151,12 @@ class LoginFlow:
     def is_empty(self) -> bool:
         return not self.steps
 
+    def uses_password(self) -> bool:
+        """Whether any step substitutes the credential's password — the guard for
+        refusing a replay when the decrypted secret came back empty (wrong/rotated
+        crypto key): a flow that never references the password is still replayable."""
+        return any(s.value_ref == REF_PASSWORD for s in self.steps)
+
 
 def resolve_value(step: LoginStep, username: str, password: str) -> str:
     """Return the concrete value for a fill step from the chosen credential."""

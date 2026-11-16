@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from dast.browser.sso_domains import sso_domains
+from dast.session.account_state import AuthProbeConfig
 
 # A decider maps (page_snapshot, context) -> one action dict, or None to stop.
 # context carries: email, password, target_url, history (prior actions).
@@ -27,8 +28,12 @@ AuthDecider = Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]
 
 _MAX_LLM_STEPS = 8
 
-_LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
-                "/auth/login", "/u/login", "/authorize")
+# Public: the shared login-page path list. AgentBrowser imports THIS tuple so every
+# component classifies a "login page" identically (they used to be duplicate literals
+# that drifted).
+LOGIN_PATHS = ("/login", "/signin", "/sign_in", "/sign-in",
+               "/auth/login", "/u/login", "/authorize")
+_LOGIN_PATHS = LOGIN_PATHS  # historical private alias
 _SSO_DOMAINS = sso_domains()
 
 
@@ -86,6 +91,10 @@ class LoginContext:
     # profile, if any. The SavedSessionStrategy seeds these and probes BEFORE any real login
     # so the cascade REUSES a still-valid session instead of always creating a new one.
     saved_session: Optional[Dict[str, Any]] = None
+    # Per-profile session-probe expectations (dast/session/account_state): when set,
+    # strategies CONFIRM a success-shaped response against this config (spa_api
+    # probe-confirm) or fall back to it when the URL heuristic is inconclusive (llm).
+    probe: Optional[AuthProbeConfig] = None
     # Forward hooks (unused in Phase 1): a future recorded-flow / SSO strategy joins by
     # reading these instead of changing the protocol.
     flow: Any = None
@@ -117,7 +126,7 @@ def looks_authenticated(url: str, success_url_suffix: Optional[str]) -> bool:
     if success_url_suffix:
         return low.split("?")[0].rstrip("/").endswith(success_url_suffix.rstrip("/"))
     path = low.split("?")[0]
-    on_login = any(path.endswith(p) or f"{p}/" in path for p in _LOGIN_PATHS)
+    on_login = any(path.endswith(p) or f"{p}/" in path for p in LOGIN_PATHS)
     on_sso = any(d in low for d in _SSO_DOMAINS)
     return not on_login and not on_sso
 

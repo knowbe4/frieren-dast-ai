@@ -50,3 +50,6 @@ poc_*.sh
 # CLAUDE.md (AI guidance) kept local-only at any level — not published to the
 # remote. Matches the root file and every nested per-directory CLAUDE.md.
 CLAUDE.md
+
+# Assistant session state (same policy as .claude/)
+.zcode/

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -345,12 +344,20 @@ class TestPassiveScannerConfirmed:
 
 class TestSessionRefreshWorker:
     def _make_entry(self, status=200, location="", body="", source="proxy"):
-        e = MagicMock()
-        e.source = source
-        e.status_code = status
-        e.response_headers = {"location": location} if location else {}
-        e.response_body = body.encode() if body else b""
-        return e
+        # A REAL ProxyEntry, not a MagicMock: MagicMock accepts any attribute,
+        # which is exactly how the old `entry.status_code` read (the dataclass
+        # field is `response_status`) survived its suite while silently killing
+        # every real expiry signal in production.
+        from dast.proxy.session_store import ProxyEntry
+        return ProxyEntry(
+            id="e1", method="GET", url="https://app.example.com/api/things",
+            host="app.example.com", path="/api/things",
+            request_headers={}, request_body=None,
+            response_status=status,
+            response_headers={"location": location} if location else {},
+            response_body=body.encode() if body else None,
+            source=source,
+        )
 
     def test_detects_401(self):
         from dast.session.refresh_worker import _is_expiry_signal

@@ -4,7 +4,7 @@ Proxy runner — starts proxy + dashboard + scan worker together.
 Three concurrent tasks:
   1. ProxyServer   — asyncio TCP server on :8080
   2. Dashboard     — uvicorn/FastAPI on :8088, WebSocket push
-  3. Scan worker   — drains scan_queue, runs AttackEngine per entry
+  3. Scan worker   — drains scan_queue, runs the Coordinator per entry
 """
 
 import asyncio
@@ -45,6 +45,13 @@ def _find_free_port(preferred_port: int, host: str = "127.0.0.1", max_attempts: 
     )
 
 class ProxyRunner:
+    @property
+    def refresh_worker(self):
+        """The SessionRefreshWorker (None until run() wires it, or without auth
+        credentials) — the dashboard's session-state routes read/reset the breaker
+        through this."""
+        return self._refresh_worker
+
     def __init__(
         self,
         proxy_port: int = 8080,
@@ -109,6 +116,10 @@ class ProxyRunner:
         from dast.proxy.scan_queue_state import ScanQueueState
         self._scan_queue_state = ScanQueueState()
         self._pool = None
+        # SessionRefreshWorker instance (set in run(); None when no auth credentials).
+        # Exposed as `refresh_worker` for the dashboard's session-state routes — the old
+        # code kept it a run() local, unreachable for state/reset.
+        self._refresh_worker = None
         # Shared mutable config — dashboard reads/writes this same dict at runtime
         self._engine_config: dict = {
             "workers": workers,
@@ -250,7 +261,9 @@ class ProxyRunner:
                 else:
                     logger.warning("Proxy auth failed — scanning unauthenticated")
 
-            # Wire session refresh: watch for 401/redirect-to-login in the entry stream
+            # Wire session refresh: watch for 401/redirect-to-login in the entry stream.
+            # Retained on self (not a run() local) so the dashboard can read the breaker
+            # state and reset it — GET/POST /api/session/*.
             from dast.session.refresh_worker import SessionRefreshWorker
             refresh_worker = SessionRefreshWorker(
                 auth_url=self._auth_url,
@@ -259,7 +272,14 @@ class ProxyRunner:
                 pool=self._pool,
                 session_manager=session_mgr,
                 proxy_port=self._proxy_port,
+                store=self._store,  # re-auth also syncs the shared jar (copilot reads it)
             )
+            self._refresh_worker = refresh_worker
+            # Register into the process-wide login coordinator so ANY component
+            # (copilot tools, adaptive login route, replay worker) can reset the
+            # re-auth breaker after landing a fresh session.
+            from dast.session.login_coordinator import get_login_coordinator
+            get_login_coordinator().register_refresh_worker(refresh_worker)
 
             async def _refresh_listener(entry) -> None:
                 refresh_worker.on_entry(entry)

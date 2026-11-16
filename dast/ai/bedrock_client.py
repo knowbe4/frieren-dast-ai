@@ -2,8 +2,8 @@
 AWS Bedrock Claude client for AI-driven attack analysis.
 
 All LLM calls in the pipeline go through this module.
-Handles credential refresh (SSO token expiry), throttling backoff, and
-structured output.
+Handles credential refresh (SSO token expiry), throttling backoff, provider
+failover with health tracking, and structured output.
 
 Credential priority (matches orchestrator-ai):
   1. AWS_PROFILE — SSO or named profile; run 'aws sso login --profile <name>'
@@ -17,9 +17,9 @@ import json
 import re
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from dast.ai import response_cache
+from dast.ai import provider_health, response_cache
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -253,22 +253,30 @@ def set_provider(
     active_provider = get_active_provider()
     logger.info("AI provider configured", provider=active_provider)
 
-    # Auto-heal the active model on switch: a Bedrock ARN (the Bedrock default,
-    # often carried over) is meaningless to a non-Bedrock provider and would make
-    # every LLM call fail. Eagerly resolve a provider-appropriate default NAME
-    # (preferring Sonnet) from the provider's live catalogue so the model badge,
-    # scans, and copilot all work without the operator re-picking a model.
-    if active_provider != "bedrock":
-        from dast.config import settings
-        current = _active_model_id or settings.ai_model_id
-        if not current or _is_bedrock_arn(current):
-            healed = _resolve_default_model(active_provider)
-            if healed:
-                _active_model_id = healed
-                logger.info(
-                    "Reset active model to provider default (was empty or a Bedrock ARN)",
-                    provider=active_provider, model=healed,
-                )
+    # Auto-heal the active model on switch (see _heal_active_model).
+    _heal_active_model(active_provider)
+
+
+def _heal_active_model(provider: str) -> None:
+    """Auto-heal the active model after a provider switch/promotion: a Bedrock
+    ARN (the Bedrock default, often carried over) is meaningless to a non-Bedrock
+    provider and would make every LLM call fail. Eagerly resolve a
+    provider-appropriate default NAME (preferring Sonnet) from the provider's
+    live catalogue so the model badge, scans, and copilot all work without the
+    operator re-picking a model."""
+    global _active_model_id
+    if provider == "bedrock":
+        return
+    from dast.config import settings
+    current = _active_model_id or settings.ai_model_id
+    if not current or _is_bedrock_arn(current):
+        healed = _resolve_default_model(provider)
+        if healed:
+            _active_model_id = healed
+            logger.info(
+                "Reset active model to provider default (was empty or a Bedrock ARN)",
+                provider=provider, model=healed,
+            )
 
 
 def get_active_provider() -> str:
@@ -326,17 +334,18 @@ def _provider_slot():
         return _concurrency_semaphore
 
 
-def provider_api_key_present() -> bool:
+def provider_ready(provider: str) -> bool:
     """
-    Whether the active non-Bedrock provider has an API key configured (runtime
-    override or settings/env fallback). Meaningless for the bedrock provider,
-    which authenticates via AWS credentials — callers should branch on
-    get_active_provider() first. Used by the status endpoint so the dashboard
-    reports AI reachability for the provider that actually serves LLM calls,
-    instead of always probing AWS STS.
+    Whether ``provider`` has usable credentials configured (runtime override or
+    settings/env fallback). Parameterized form of provider_api_key_present() so
+    the failover chain (see _failover_chain) can skip members that were never
+    configured. bedrock is always considered ready — its credential failures
+    surface at call time (the boto3 chain) and are tracked by the health
+    registry instead.
     """
     from dast.config import settings
-    provider = get_active_provider()
+    if provider == "bedrock":
+        return True
     if provider == "anthropic":
         return bool(_anthropic_api_key or settings.anthropic_api_key)
     if provider == "openai":
@@ -355,6 +364,21 @@ def provider_api_key_present() -> bool:
         from dast.ai import gateway_auth
         return gateway_auth.credentials_available()
     return False
+
+
+def provider_api_key_present() -> bool:
+    """
+    Whether the active non-Bedrock provider has an API key configured (runtime
+    override or settings/env fallback). Meaningless for the bedrock provider,
+    which authenticates via AWS credentials — callers should branch on
+    get_active_provider() first. Used by the status endpoint so the dashboard
+    reports AI reachability for the provider that actually serves LLM calls,
+    instead of always probing AWS STS.
+    """
+    provider = get_active_provider()
+    if provider == "bedrock":
+        return False
+    return provider_ready(provider)
 
 
 def list_models() -> Dict[str, Any]:
@@ -830,31 +854,64 @@ def _invoke_one(provider: str, body: Dict[str, Any], model: str) -> Dict[str, An
     raise AiUnavailableError("AWS credentials expired — run 'aws sso login' then click Resume")
 
 
-def _invoke_raw(
-    system: str,
-    user: str,
-    model_id: Optional[str],
-    max_tokens: int,
-    temperature: Optional[float],
-    cache_system: bool,
-    schema: Optional[Dict[str, Any]],
-    image_b64: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Send one request to the active provider and return the parsed response
-    envelope (always Anthropic-shaped, regardless of provider). Handles
-    throttling and credential expiry automatically, and — when the resolved model
-    sits in a configured tier fallback chain (ai_fast_models/ai_validation_models)
-    — falls through to the next model on an API failure/block.
-    """
-    model = _resolve_model(model_id)
-    provider = get_active_provider()
-    if image_b64 and provider in ("openai", "glm"):
-        raise ValueError(f"image input is not supported for provider '{provider}' "
-                         "(use the bedrock/anthropic/gateway provider for vision)")
-    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
+def _failover_chain(active: str) -> List[str]:
+    """Ordered providers for one LLM call (inspired by ARTEX's llmpool): the
+    active one first, then the configured failover chain.
 
-    candidates = _fallback_models(model) or [model]
+    Order source: ``ai_failover_chain`` (.env, comma-separated, best first);
+    empty means the auto default ``bedrock,anthropic,glm`` — the two fallbacks
+    most installs can actually authenticate to. Members without credentials and
+    unknown names are dropped; a member in a health cooldown (see
+    ``dast.ai.provider_health``) is pushed behind healthy ones so a call doesn't
+    re-pay a hard-down provider's full retry+backoff cost. Fail-open: when EVERY
+    member is cooling down, the chain collapses to the active provider so the
+    call still attempts the primary instead of refusing outright.
+    """
+    from dast.config import settings
+    raw = (getattr(settings, "ai_failover_chain", "") or "").strip()
+    configured = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    if not configured:
+        configured = ["bedrock", "anthropic", "glm"]
+
+    chain: List[str] = []
+    for name in [active] + [p for p in configured if p != active]:
+        if name not in chain and (name == active or provider_ready(name)):
+            chain.append(name)
+
+    healthy = [p for p in chain if provider_health.is_healthy(p)]
+    if healthy and active not in healthy:
+        # The active provider is cooling down — lead with a healthy member.
+        return healthy + [p for p in chain if p not in healthy]
+    if not healthy:
+        return [active]
+    return chain
+
+
+def _provider_candidates(provider: str, model: str) -> List[str]:
+    """Model candidates for one provider in the failover walk. The ACTIVE
+    provider keeps its configured tier fallback chain; a failed-over provider
+    cannot share it (tier entries may be names its catalogue doesn't serve), so
+    it gets the requested model — when provider-usable — plus its own catalogue
+    default (resolved once and cached). Bedrock-only ARNs are dropped for
+    non-Bedrock providers instead of guaranteeing a 400."""
+    if provider == get_active_provider():
+        return _fallback_models(model) or [model]
+    candidates: List[str] = []
+    for name in (model, _resolve_default_model(provider)):
+        if not name or (provider != "bedrock" and _is_bedrock_arn(name)):
+            continue
+        if name not in candidates:
+            candidates.append(name)
+    return candidates or [model]
+
+
+def _invoke_provider(provider: str, body: Dict[str, Any], model: str) -> Dict[str, Any]:
+    """Walk one provider's model fallback chain and return the first success;
+    raise the last error when every candidate fails. A credential/SSO
+    exhaustion (AiUnavailableError) is not model-specific — raised immediately
+    so the PROVIDER-level walk in _invoke_raw can fail over instead of burning
+    the remaining candidates."""
+    candidates = _provider_candidates(provider, model)
     last_exc: Optional[Exception] = None
     for index, candidate in enumerate(candidates):
         try:
@@ -873,8 +930,8 @@ def _invoke_raw(
             if index < len(candidates) - 1:
                 logger.warning(
                     "Model call failed/blocked; falling back to next model in chain",
-                    failed_model=candidate, next_model=candidates[index + 1],
-                    error=str(exc)[:200],
+                    provider=provider, failed_model=candidate,
+                    next_model=candidates[index + 1], error=str(exc)[:200],
                 )
                 continue
             raise
@@ -882,6 +939,89 @@ def _invoke_raw(
     if last_exc:
         raise last_exc
     raise RuntimeError("no model candidates to invoke")
+
+
+def _promote_active_provider(provider: str) -> None:
+    """Sticky failover (see _failover_chain): make ``provider`` the active one
+    until IT fails. Unlike set_provider() — which wipes runtime credentials not
+    passed again — promotion reuses whatever runtime credentials are already
+    configured, so a dashboard-configured key survives the switch. Re-enables
+    AI (the failed provider may have marked it unavailable) and heals a
+    Bedrock-ARN model the new provider cannot use."""
+    global _active_provider
+    _active_provider = provider.strip().lower()
+    _reset_client()
+    mark_ai_available()
+    _heal_active_model(_active_provider)
+    logger.warning("AI provider failed over — active provider changed",
+                   provider=_active_provider)
+
+
+def _invoke_raw(
+    system: str,
+    user: str,
+    model_id: Optional[str],
+    max_tokens: int,
+    temperature: Optional[float],
+    cache_system: bool,
+    schema: Optional[Dict[str, Any]],
+    image_b64: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Send one request and return the parsed response envelope (always
+    Anthropic-shaped, regardless of provider). Resilience is layered:
+
+    1. MODEL chain — when the resolved model sits in a configured tier fallback
+       chain, falls through to the next model on an API failure/block (see
+       _invoke_provider).
+    2. PROVIDER chain — when the whole active provider fails at the PROVIDER
+       level (expired AWS SSO, throttling exhaustion, auth, network), fails over
+       to the next healthy member of ``ai_failover_chain`` and, on success,
+       promotes it to active until it fails in turn (see _failover_chain).
+
+    Never fails over on a content-policy block (AiContentBlockedError —
+    content-based, not provider-based) or on a caller/config ValueError.
+    """
+    model = _resolve_model(model_id)
+    provider = get_active_provider()
+    if image_b64 and provider in ("openai", "glm"):
+        raise ValueError(f"image input is not supported for provider '{provider}' "
+                         "(use the bedrock/anthropic/gateway provider for vision)")
+    body = _build_body(system, user, max_tokens, temperature, cache_system, schema, image_b64)
+
+    chain = _failover_chain(provider)
+    last_exc: Optional[Exception] = None
+    for index, candidate_provider in enumerate(chain):
+        try:
+            result = _invoke_provider(candidate_provider, body, model)
+        except AiContentBlockedError:
+            # Content policy refusal — content-based, not provider-based: another
+            # provider's verdict on identical content proves nothing about health,
+            # and failing over would only dodge safety classifiers. Surface it.
+            raise
+        except ValueError:
+            # Caller/config misuse (e.g. an unsupported input shape) — failing
+            # over would mask the bug instead of surfacing it.
+            raise
+        except Exception as exc:
+            provider_health.record_failure(candidate_provider, str(exc))
+            last_exc = exc
+            if index < len(chain) - 1:
+                logger.warning(
+                    "Provider failed; failing over to next provider in chain",
+                    failed_provider=candidate_provider,
+                    next_provider=chain[index + 1], error=str(exc)[:200],
+                )
+                continue
+            raise
+        provider_health.record_success(candidate_provider)
+        if candidate_provider != provider:
+            _promote_active_provider(candidate_provider)
+        return result
+    # Unreachable (loop either returns or raises), but keeps type-checkers happy.
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("no provider candidates to invoke")
 
 
 def _extract_text(result: Dict[str, Any]) -> str:

@@ -31,6 +31,7 @@ class _Profile:
     def __init__(self, slug="p", creds=True, saved_cookies=True):
         self.slug = slug
         self.name = slug
+        self.session_role = slug  # canonical role computation on the real model
         self.auth_url = "https://app.example.com/login" if creds else ""
         self.credentials = [_Cred()] if creds else []
         self.privilege_level = ""
@@ -69,7 +70,7 @@ async def test_activate_relogins_on_stale_guest(monkeypatch):
     monkeypatch.setattr(store_mod, "load_profile", lambda slug: _Profile())
 
     # The reused session is guest.
-    async def _guest(browser, base_url):
+    async def _guest(browser, base_url, probe=None):
         return False
     monkeypatch.setattr(st, "_login_profile_with_credentials",
                         _mk_async_return({"ok": True, "slug": "p", "logged_in": True,

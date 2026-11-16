@@ -5,6 +5,159 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (new agents round 3-E)
+- **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
+  framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours
+  them additively) and a structural rule keys on CL+TE requests; the agent
+  CONFIRMS desync with direct raw-socket probes (the MITM and `_send` re-frame
+  requests, destroying the experiment): a chunked-terminator body followed by a
+  benign smuggled `GET /dast-smuggled-<rand>` — if the backend honours the other
+  framing header, the SAME connection answers twice (original + bogus path);
+  a consistently framed control answers once. Mirror probes for TE.CL and
+  CL.TE; ≤6 connections, benign GET to a random path (nothing mutated or
+  poisoned for other users).
+- **JWT VulnAgent** (`jwt_agent`) — the jwt.yaml attacks became a registered,
+  dispatchable agent: token discovery across Authorization/cookie/params
+  (`_PARAM_ATTACK_MAP["token"]` now dispatches token params to it, fulfilling
+  the 2-C note), enforcement precheck, and forgery variants (alg:none,
+  weak-HMAC re-sign, claim escalation, kid injection) replayed through
+  probe_common — proxy-routed and recorded, fixing the jwt_tester plugin's
+  MITM bypass. Bearer scheme preserved on re-injection.
+
+### Added (agentless bypass round 2-D)
+- **Agentless auth-bypass for login-walled SPAs** (ARTEX "three auth gates",
+  `dast/browser/auth_gates.py` + `bypass_auth` mode): with NO saved credentials, the
+  client-side auth gates are fooled so the SPA renders its post-login shell — static
+  detection of token storage keys, login-state checks, axios interceptors and
+  permission/dynamic-route markers in the app's bundles; a pre-navigation init script
+  seeds the storage with a clearly-synthetic `dast-bypass` token and short-circuits
+  fetch/XHR to auth URLs; a composed Playwright route guard fulfils auth-API requests
+  with a generic admin-identity JSON (both `{code,data}` and `{user,roles,permissions}`
+  shapes). The SPA's real outbound API calls then cross the MITM into the existing
+  discovery/scan pipeline (stubs never leave the browser, so only real traffic is
+  recorded; the backend still 401s — a server trusting the forged identity surfaces as
+  findings through the normal scan). Wired into SpaExplorer (`bypass_auth`, two-round
+  plan build: wall hit -> bundle scan -> stub round re-exploring the blocked routes)
+  and the `explore` tool. Client-side gates only — server-side redirects stay failed.
+
+### Added (login robustness round 2-B)
+- **spa_api anti-spray** — a failed SPA login used to spray 5 endpoints × 5 body
+  shapes = 25 credential POSTs per attempt. A 401/403 from a real login endpoint now
+  stops the whole attempt (the credentials are wrong; more endpoints add nothing and
+  feed lockout counters), 404 skips the endpoint, 429 stops everything, and a global
+  10-POST budget caps the worst case. The journal's learned body shape is replayed
+  first on the learned endpoint.
+- **Multi-convention CSRF headers** — `X-CSRF-Token` (Spring), `X-XSRF-TOKEN`
+  (Angular/Laravel) and `X-CSRFToken` (Django; `csrftoken` wasn't even scanned before)
+  are emitted together, removing the single-convention 403-forever failure mode.
+- **Login journal expires and fail-invalidates** — records carry `ts_epoch` and wins
+  older than 7 days (or predating the epoch) are ignored; a winner is not promoted
+  when the newest record is an error; a learned endpoint targeted by a newer error is
+  skipped. Cascade heuristic wins are probe-verified (`verify_authenticated`) before
+  journaling — a contradicted win is journaled as an error instead of being learned.
+- **Process-wide login coordinator** (`dast/session/login_coordinator.py`) — one
+  per-site login lock for all ~10 login paths (scan refresh worker, copilot ladder,
+  autonomous proactive/breaker logins, dashboard route, replay jobs, model tools),
+  which until now each had only private guards: `run_validation_batch(max_concurrency=3)`
+  fired concurrent adaptive logins with identical credentials against the same host.
+  The runner registers the live refresh worker so in-process copilot-tool logins reset
+  the re-auth breaker (closing the 2-A deferral). Deliberately asymmetric: the lock
+  serializes, cooldowns/breakers stay component-local.
+- **Canonical session roles** — `LoginProfile.session_role` (privilege_level or name)
+  replaces four drifted computations (privilege-or-name / bare name / slug) across
+  every named-session write site.
+- **Profile secrets unreadable surfaced** — `crypto.decrypt` failures are counted and
+  `GET /api/profiles` reports `secrets_unreadable` + failure stats instead of the
+  silent-"" behavior that manifested as ghost login failures.
+
+### Fixed (login robustness round 2-B)
+- **Auto-relogin of MFA accounts died at the OTP step when the login came via
+  spa_api** — `_last_login` was armed without `totp_secret`; the strategy now
+  forwards the (upstream `may_use_totp`-gated) seed.
+- **browser_timezone was hardcoded "America/Fortaleza"** on every SPA login from
+  every machine — now the local TZ name.
+- **An SSO relogin leaked IdP cookies onto app requests** — `_tier_relogin` flattened
+  the whole browser cookie jar (name→value, domains discarded) into the session;
+  cookies are now scoped to the login host's domain.
+- **Crash during a profile save lost the profile** — `save_profile` writes atomically
+  (tmp + fsync + os.replace) now.
+- **"Staging App" and "staging/app" silently overwrote each other** — a derived slug
+  belonging to a differently-named profile is now a 409 (explicit slug stays an
+  intentional update).
+- **Empty decrypted passwords were submitted to login forms** — when a credential
+  exists but its secret decrypts to "" (wrong/rotated `DAST_PROFILES_KEY`), the
+  replay route returns 422 and the unattended re-auth skips to the saved-session
+  fallback instead of guaranteed-failure replays (passwordless flows unaffected).
+
+### Added (agents round 2-C)
+- **Blind injection classes got their own canary signal.** The echo canary pass only
+  fires when a target replays an error/reflection — blind SQLi/CMDi (time-based) and
+  SSRF/XXE (out-of-band) were gated out of no-LLM dispatch on every endpoint. Capped
+  blind canaries now probe the delay differential (SLEEP vs zero-delay control, under
+  the global time-probe lock) and tokened collaborator callbacks, feeding the same
+  `signal_map` as echo signals.
+- **Deterministic dispatch for the 8 orphan agents** (open_redirect, xxe,
+  prototype_pollution, graphql_idor, cross_session_idor, password_reset, discovery,
+  blazor) — registered but never selected by the deterministic rules, so their
+  coverage dimensions were permanently empty. Param-map entries (open_redirect,
+  prototype_pollution incl. boolean flips) plus structural rules (XML → xxe, GraphQL
+  → graphql_idor, ≥2 named sessions → cross_session_idor, reset-shaped URLs →
+  password_reset, GET → discovery/blazor).
+- **Shared probe plumbing (`dast/agents/probe_common.py`)** — the param-location
+  injection dispatch and the sqlmap-style time differential lived as drifted copies
+  across seven agents (cmdi had silently lost header/cookie/multipart injection).
+  SSTI now injects into body/JSON/multipart too (it hardcoded query injection and
+  missed those surfaces entirely).
+- **SQLi boolean differential oracle** — boolean tautologies were deliberately
+  dropped ("needs its own differential-response oracle"); the agent now anchors the
+  true-pair to the clean baseline (structural attrs), requires the false-pair to
+  diverge on status/length/structure, and reproduces the relation before confirming.
+
+### Fixed (agents round 2-C)
+- **Every blind-XXE finding was discarded.** The XXE agent's OOB phase called
+  `collaborator.url` and `await collaborator.poll()` — attributes/methods that do not
+  exist on `CollaboratorService` — and issued no tokens; the `AttributeError` died in
+  `run_safe`, dropping the Phase 1 findings too. Rewritten on the ssrf pattern
+  (token per payload, sync `was_hit(token)` inside the loop); `was_hit` also gained
+  sub-path prefix matching (XXE templates fetch `CALLBACK_URL/xxe.dtd`, which exact
+  membership never matched).
+
+### Added (login round 2-A)
+- **Shared login verification (`verify_authenticated`).** Tri-state structural verdict
+  (verified / contradicted / indeterminate, with evidence) in `dast/session/account_state.py`
+  replaces the lying success signals: the flow replayer's `bool(cookies)` (any cookie —
+  analytics included — read as "authenticated"), the "URL has no /login" heuristic (a failed
+  login landing on /welcome read as OK; a hash-routed SPA could never "succeed"), and
+  spa_api's clean-200 body sniffing. Login profiles gain optional probe config
+  (`probe_url` / `probe_expect_json_path` / `probe_expect_cookie`, full storage/API
+  round-trip); the flow replayer, spa_api probe-confirm, the LLM strategy and the copilot
+  gate-check all consume the same verdict.
+- **`GET /api/session/state` + `POST /api/session/reauth/reset`.** The re-auth breaker is
+  observable and recoverable from the dashboard; profile activation and a successful
+  login-flow replay reset the breaker automatically (fresh session material invalidates
+  its "credentials stale" premise).
+
+### Fixed (login round 2-A)
+- **Scan-time automatic re-auth never fired at all.** The refresh worker read
+  `entry.status_code`; the `ProxyEntry` field is `response_status`. The AttributeError died
+  inside the store listener task, so a session expiring mid-scan ran to 401-per-request
+  with no recovery (unit tests missed it — they fed MagicMock entries).
+- **The re-auth breaker was unrecoverable and deaf.** `_gave_up` had no reset path (only a
+  process restart cleared it); signals arriving during the cooldown were silently dropped;
+  the cooldown was stamped *before* the attempt; and the copilot's own 401/403 probes
+  re-triggered scan-time logins on top of the copilot's relogin ladder. The worker is now
+  probe-aware (`copilot` source and `probe_payload` entries excluded), coalesces bursts
+  into one deferred re-check, measures the cooldown from the attempt's end, exposes
+  `reset()` + `state_snapshot()`, and syncs refreshed cookies into the shared proxy jar
+  (before, a re-auth left the copilot's `send_request` 401ing with a perfectly fresh pool).
+- **auth_wall read nav-bar "Login" links and Cloudflare script tags as "session expired".**
+  The old regex matched `auth`/`sso`/`login`/`cloudflare`/`challenge` anywhere in a 200
+  body. Strong phrases and concrete captcha/challenge markers now decide; weak tokens need
+  login-form evidence in the snippet (first direct tests for the module).
+- **spa_api journaled poisoned winners.** A success-shaped response ("MFA pending" 200s,
+  empty 204s) was accepted and promoted to the front of the next cascade's journal; a
+  positively-contradicted probe now skips the candidate.
+
 ### Security (project review)
 - **Dashboard could be driven by any website open in the operator's browser.** No Host or
   Origin check, `request.json()` accepted cross-site `text/plain` POSTs, and `/ws` streamed
@@ -63,7 +216,7 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   observed being sent to a live target — a direct violation of the project's no-destructive-
   payloads safety policy. Removed from `dast/payloads/graphql.yaml`; added a regression
   test (`test_graphql_variable_fuzzer.py`) asserting no payload in that file ever classifies
-  as destructive via `dast/hackerone/payload_safety.classify()`.
+  as destructive via `dast/triage/payload_safety.classify()`.
 - **A finding could show an "AI validated" badge while the AI provider was disconnected.**
   `passive_scanner._ai_validate_finding()` swallowed LLM-call exceptions and returned a
   fabricated `True` confirmation. It now returns a distinct `None` ("AI did not run") on

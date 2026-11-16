@@ -33,5 +33,10 @@ jobs:
       - name: Ruff lint gate (F/E9)
         run: uv run ruff check .
 
+      # test_spa_explorer.py is excluded on purpose: it drives a real
+      # Playwright/Chromium SPA session against a local HTTP server and takes
+      # ~2 minutes for 4 tests (measured locally; it PASSES, it is just slow
+      # for the per-push unit gate). It self-skips when Playwright/Chromium is
+      # missing, so run it locally via `make test` after `make setup`.
       - name: Unit tests
         run: uv run pytest tests/unit/ -q --ignore=tests/unit/test_spa_explorer.py

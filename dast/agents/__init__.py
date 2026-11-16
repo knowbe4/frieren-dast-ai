@@ -15,6 +15,7 @@ from dast.agents import (  # noqa: F401
     file_read_agent,
     graphql_agent,
     host_header_agent,
+    smuggling_agent,
     idor_agent,
     llm_injection_agent,
     mfa_agent,

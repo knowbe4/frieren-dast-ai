@@ -137,3 +137,32 @@ async def test_no_injectable_params_no_op():
     findings = await SstiAgent().run(target, MagicMock())
 
     assert findings == []
+
+
+# ── body/JSON param injection (the multi-location fix) ───────────────────────
+
+@pytest.mark.asyncio
+async def test_body_param_injection_reaches_body_not_query(monkeypatch):
+    """The agent hardcoded _inject_query — a body/JSON param's SSTI surface was
+    never tested. The shared dispatch must inject into the body instead."""
+    seen = []
+
+    async def fake_send(client, method, url, headers, body, payload=None, timeout=None):
+        seen.append((url, body))
+        return _resp(200, "79032091")
+
+    monkeypatch.setattr("dast.agents.ssti_agent._send", fake_send)
+
+    target = CheckTarget(
+        method="POST", url="https://app.test/api/report",
+        headers={"content-type": "application/json"},
+        body='{"template": "greeting"}',
+        params=[{"name": "template", "location": "body", "value": "greeting"}],
+    )
+    findings = await SstiAgent().run(target, MagicMock())
+
+    assert findings, "body-param SSTI must be detected"
+    url, body = seen[0]
+    assert url == "https://app.test/api/report"          # URL untouched
+    assert "8887*8893" in (body or "")                    # payload went into the body
+    assert "8887*8893" not in url

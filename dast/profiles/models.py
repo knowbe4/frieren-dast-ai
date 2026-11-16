@@ -86,10 +86,27 @@ class LoginProfile:
     # rule, so another operator's profiles never inherit it. Only honored under --authorized.
     allow_model_downgrade: bool = False
     downgrade_model: str = ""  # fallback model id; defaults to claude-opus-4-6 when blank + enabled
+    # Optional session-probe config (dast/session/account_state.verify_authenticated):
+    # when set, a login is CONFIRMED by fetching this endpoint with the fresh session
+    # (expect_json_path resolves truthy in the JSON body; expect_cookie must be present
+    # in the post-login jar) instead of trusting cookie/URL heuristics. Empty = probe
+    # the classic /spa/session endpoint + session-cookie heuristic.
+    probe_url: str = ""
+    probe_expect_json_path: str = ""
+    probe_expect_cookie: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
     # ── Host matching ──────────────────────────────────────────────────────
+    @property
+    def session_role(self) -> str:
+        """The named-session role this profile's sessions register under — the ONE
+        canonical computation (privilege level, falling back to the profile name).
+        Every save_named_session_from_playwright call site must use this; the
+        historical per-site copies (name / slug / privilege-or-name) drifted, which
+        made any role-based session pairing unreliable."""
+        return (self.privilege_level or "").strip() or self.name
+
     def matches_host(self, host: str) -> bool:
         """True if ``host`` is governed by this profile.
 
@@ -128,6 +145,9 @@ class LoginProfile:
             "test_account": self.test_account,
             "allow_model_downgrade": self.allow_model_downgrade,
             "downgrade_model": self.downgrade_model,
+            "probe_url": self.probe_url,
+            "probe_expect_json_path": self.probe_expect_json_path,
+            "probe_expect_cookie": self.probe_expect_cookie,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -154,6 +174,9 @@ class LoginProfile:
             "test_account": self.test_account,
             "allow_model_downgrade": self.allow_model_downgrade,
             "downgrade_model": self.downgrade_model,
+            "probe_url": self.probe_url,
+            "probe_expect_json_path": self.probe_expect_json_path,
+            "probe_expect_cookie": self.probe_expect_cookie,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -183,6 +206,9 @@ class LoginProfile:
             test_account=bool(d.get("test_account", False)),
             allow_model_downgrade=bool(d.get("allow_model_downgrade", False)),
             downgrade_model=str(d.get("downgrade_model", "")),
+            probe_url=str(d.get("probe_url", "")),
+            probe_expect_json_path=str(d.get("probe_expect_json_path", "")),
+            probe_expect_cookie=str(d.get("probe_expect_cookie", "")),
             created_at=float(d.get("created_at", time.time())),
             updated_at=float(d.get("updated_at", time.time())),
         )

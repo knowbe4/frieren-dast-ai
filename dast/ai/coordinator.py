@@ -426,6 +426,19 @@ _CANARY_PAYLOADS: Dict[str, str] = {
 # Prefix of the _baseline_check() abort reason for a 401/403 auth wall
 _AUTH_WALL_REASON_PREFIX = "[auth-wall]"
 
+# ── Blind canary tuning ────────────────────────────────────────────────────────
+# The echo canaries above only fire when the target REPLAYS the payload's error or
+# reflection — by definition, blind variants (SQLi/CMDi time-based, SSRF/XXE
+# out-of-band) never do. Without the blind probes below, the canary gate silently
+# excluded those classes from no-LLM dispatch on every endpoint. Costs are bounded:
+# a short delay, few params, and OOB probes require a live collaborator.
+_BLIND_TIME_SECONDS = 2
+_BLIND_TIME_MIN_DELTA_MS = 1500.0     # probe must outlast its zero-delay control
+_BLIND_TIME_MIN_PROBE_MS = 1200.0     # and be a real delay, not jitter
+_BLIND_TIME_PROBE_TIMEOUT_S = 15.0
+_BLIND_OOB_SETTLE_SECONDS = 1.5
+_BLIND_CANARY_MAX_PARAMS = 2          # per attack type, per endpoint
+
 # Patterns that indicate signal for each attack type in the canary response
 _SIGNAL_PATTERNS: Dict[str, _re.Pattern] = {
     "sqli": _re.compile(
@@ -480,6 +493,38 @@ def _has_canary_signal(attack_type: str, payload: str, response_text: str, basel
     return not (baseline_text and pattern.search(baseline_text))
 
 
+async def _send_canary_payload(
+    client: "httpx.AsyncClient",
+    target: "CheckTarget",
+    param: dict,
+    payload: str,
+    timeout: "Optional[float]" = None,
+):
+    """Inject ``payload`` into ``param`` at its recorded location and send it.
+    Shared by the echo canary and the blind canary probes. Returns None for
+    locations without an injector (header/cookie — the canary pass is
+    query/body/path-only, matching the historical echo behavior)."""
+    from dast.scanners.active_checks import _inject_body, _inject_path, _inject_query, _send
+    loc = param.get("location", "query")
+    if loc == "query":
+        url = _inject_query(target.url, param["name"], payload)
+        return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
+    if loc in ("body", "body_graphql"):
+        body = _inject_body(
+            target.body or "", param["name"], payload,
+            target.headers.get("content-type", ""),
+            location=loc,
+        )
+        return await _send(client, target.method, target.url, target.headers, body, timeout=timeout)
+    if loc == "path":
+        # REST path parameters (/users/v1/{id}) are injectable too — probe them
+        # so injection signals in the path reach the planner (else the agent is
+        # never selected). See check_target_adapter path-segment enumeration.
+        url = _inject_path(target.url, param.get("path_index", 0), payload)
+        return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
+    return None
+
+
 async def _run_canary_probe(
     client: "httpx.AsyncClient",
     target: "CheckTarget",
@@ -491,39 +536,102 @@ async def _run_canary_probe(
     Send a single canary payload for attack_type into param.
     Returns True if the response contains a signal indicating potential vulnerability
     that is absent from ``baseline_text`` and not just an echo of the payload.
-    Time-based types (sqli blind) return False here — the full agent handles timing.
+    Time-based types (sqli blind) return False here — the full agent handles timing,
+    and _run_blind_canary_probe covers the signal case.
     """
-    from dast.scanners.active_checks import _inject_body, _inject_path, _inject_query, _send
     payload = _CANARY_PAYLOADS.get(attack_type)
     if not payload:
         return False
 
     try:
-        loc = param.get("location", "query")
-        if loc == "query":
-            url = _inject_query(target.url, param["name"], payload)
-            resp = await _send(client, target.method, url, target.headers, target.body)
-        elif loc in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=loc,
-            )
-            resp = await _send(client, target.method, target.url, target.headers, body)
-        elif loc == "path":
-            # REST path parameters (/users/v1/{id}) are injectable too — probe them
-            # so injection signals in the path reach the planner (else the agent is
-            # never selected). See check_target_adapter path-segment enumeration.
-            url = _inject_path(target.url, param.get("path_index", 0), payload)
-            resp = await _send(client, target.method, url, target.headers, target.body)
-        else:
-            return False
-
+        resp = await _send_canary_payload(client, target, param, payload)
         if resp is None:
             return False
         return _has_canary_signal(attack_type, payload, resp.text, baseline_text)
     except Exception as exc:
         logger.debug("Canary probe failed", attack_type=attack_type,
+                     parameter=param.get("name"), error=str(exc))
+        return False
+
+
+async def _run_blind_canary_probe(
+    client: "httpx.AsyncClient",
+    target: "CheckTarget",
+    param: dict,
+    attack_type: str,
+    collaborator: Optional["CollaboratorService"] = None,
+) -> bool:
+    """One capped blind-canary probe: the signal path for classes whose vuln is by
+    definition invisible to the echo canary.
+
+    - sqli / cmdi (time-based): send a SLEEP-bearing seed scaled to
+      ``_BLIND_TIME_SECONDS`` and its zero-delay control back-to-back under the
+      global time-probe lock (same primitives the full agents use); a signal is a
+      real delay that outlasts the control.
+    - ssrf / xxe (out-of-band): embed a tokened collaborator URL (a bare URL for
+      ssrf; an external-DTD parameter-entity wrapper for xxe) and check
+      ``was_hit(token)`` after the settle window.
+
+    Never raises. Only runs when collaborator is available for the OOB types."""
+    from dast.scanners.active_checks import (
+        response_elapsed_ms,
+        scaled_delay_variant,
+        serialize_time_probe,
+        zero_delay_variant,
+    )
+    try:
+        if attack_type in ("sqli", "cmdi"):
+            seed = None
+            try:
+                from dast.payloads.loader import get_payloads
+                group = "time_based" if attack_type == "sqli" else "unix_blind_time"
+                for candidate in (get_payloads(attack_type, group) or []):
+                    if scaled_delay_variant(str(candidate), _BLIND_TIME_SECONDS):
+                        seed = str(candidate)
+                        break
+            except Exception as exc:  # noqa: BLE001 — yaml optional; fallback below
+                logger.debug("Blind canary seed from yaml unavailable",
+                             attack_type=attack_type, error=str(exc)[:120])
+            if seed is None:
+                seed = "' AND SLEEP(3)-- -" if attack_type == "sqli" else "; sleep 3"
+            probe_payload = scaled_delay_variant(seed, _BLIND_TIME_SECONDS) or seed
+            control_payload = zero_delay_variant(probe_payload)
+            async with serialize_time_probe():
+                probe_resp = await _send_canary_payload(
+                    client, target, param, probe_payload,
+                    timeout=_BLIND_TIME_PROBE_TIMEOUT_S)
+                if probe_resp is None:
+                    return False
+                probe_ms = response_elapsed_ms(probe_resp)
+                control_ms = 0.0
+                if control_payload:
+                    control_resp = await _send_canary_payload(
+                        client, target, param, control_payload,
+                        timeout=_BLIND_TIME_PROBE_TIMEOUT_S)
+                    control_ms = response_elapsed_ms(control_resp) if control_resp else 0.0
+            return ((probe_ms - control_ms) >= _BLIND_TIME_MIN_DELTA_MS
+                    and probe_ms >= _BLIND_TIME_MIN_PROBE_MS)
+
+        if attack_type in ("ssrf", "xxe") and collaborator is not None:
+            token = collaborator.issue_token()
+            collab_url = f"http://{collaborator.host}:{collaborator.port}/{token}"
+            if attack_type == "ssrf":
+                payload = collab_url
+            else:
+                # External DTD via parameter entity — the minimal shape that makes a
+                # compliant parser fetch an external resource out-of-band.
+                payload = ('<?xml version="1.0"?><!DOCTYPE r ['
+                           f'<!ENTITY % d SYSTEM "{collab_url}"><!ENTITY % f "%d;">%d;]>')
+            resp = await _send_canary_payload(client, target, param, payload)
+            if resp is None:
+                return False
+            import asyncio as _asyncio_canary
+            await _asyncio_canary.sleep(_BLIND_OOB_SETTLE_SECONDS)
+            return bool(collaborator.was_hit(token))
+
+        return False
+    except Exception as exc:
+        logger.debug("Blind canary probe failed", attack_type=attack_type,
                      parameter=param.get("name"), error=str(exc))
         return False
 
@@ -1004,6 +1112,35 @@ class Coordinator:
                 for (param, at), hit in zip(canary_combos, canary_results):
                     if hit is True:
                         signal_map.setdefault(at, []).append(param.get("name", ""))
+
+        # ── Blind canaries: a signal path for classes the echo canary cannot see ──
+        # A blind vuln (SQLi/CMDi time-based, SSRF/XXE out-of-band) produces NO
+        # in-band echo, so with echo canaries alone the gate excluded these classes
+        # from no-LLM dispatch on every endpoint. Run capped blind probes only for
+        # types that got NO echo signal, and fold hits into signal_map like echoes.
+        if candidate_types and (target.params or []):
+            _blind_candidates = [at for at in ("sqli", "cmdi", "ssrf", "xxe")
+                                 if at in candidate_types and at not in signal_map]
+            if _blind_candidates:
+                _blind_probeable = [p for p in (target.params or [])
+                                    if p.get("name", "").lower() not in _AUTH_TOKEN_PARAMS]
+                blind_combos = []
+                for at in _blind_candidates:
+                    for param in _blind_probeable[:_BLIND_CANARY_MAX_PARAMS]:
+                        if at in ("ssrf", "xxe") and collaborator is None:
+                            break  # OOB probes need a live collaborator
+                        blind_combos.append((param, at))
+                if blind_combos:
+                    blind_results = await asyncio.gather(
+                        *(_run_blind_canary_probe(client, target, param, at, collaborator)
+                          for param, at in blind_combos),
+                        return_exceptions=True,
+                    )
+                    for (param, at), hit in zip(blind_combos, blind_results):
+                        if hit is True:
+                            signal_map.setdefault(at, []).append(param.get("name", ""))
+                            logger.info("Blind canary signal", attack_type=at,
+                                        parameter=param.get("name"))
 
         # Always include non-injectable types (no canary) — they're always worth running
         # if the param classification says they're relevant.

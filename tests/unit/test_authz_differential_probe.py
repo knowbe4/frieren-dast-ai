@@ -227,6 +227,19 @@ async def test_prefers_freshest_history_cookie_over_jar(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sibling_subdomain_cookie_reused(monkeypatch):
+    # target is settings-api.*, the only history entry is on api.* — session
+    # cookies are domain-scoped so the sibling entry's cookie must be reused.
+    store = _Store(entries=[_Entry("api.target.test", "dom=scoped")], jar=[])
+    client = _patch_client(monkeypatch, {CONTROL: _Resp(200, "ok"), TARGET: _Resp(403)})
+    await _authz_differential_probe(_ctx(store=store), {
+        "target_url": "https://settings-api.target.test/x",
+        "control_url": "https://settings-api.target.test/y", "method": "GET"})
+    sent = [h.get("cookie") for (_, _, h, _) in client.calls]
+    assert sent and all(c == "dom=scoped" for c in sent)
+
+
+@pytest.mark.asyncio
 async def test_falls_back_to_jar_when_no_history(monkeypatch):
     store = _Store(entries=[], jar=[{"name": "jarck", "value": "v1"}])
     client = _patch_client(monkeypatch, {CONTROL: _Resp(200, "ok"), TARGET: _Resp(403)})

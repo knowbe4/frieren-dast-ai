@@ -103,10 +103,27 @@ def _is_2xx(status: Optional[int]) -> bool:
     return isinstance(status, int) and 200 <= status < 300
 
 
+def _parent_domain(host: str) -> str:
+    """Everything after the first label, when that leaves a >=2-label domain.
+    api.foo.example.com -> foo.example.com; example.com -> '' (too short)."""
+    labels = host.split(".")
+    parent = ".".join(labels[1:]) if len(labels) >= 3 else ""
+    return parent if parent.count(".") >= 1 else ""
+
+
 def _host_matches(entry_host: str, host: str) -> bool:
+    """Match an entry's host to the target host for cookie reuse. Session cookies
+    are domain-scoped, so besides an exact / parent-child match we also treat
+    SIBLING subdomains that share an immediate parent domain as a match
+    (api.foo.example.com <-> settings-api.foo.example.com)."""
     eh = (entry_host or "").lower()
     h = (host or "").lower()
-    return bool(h) and (eh == h or eh.endswith("." + h) or h.endswith("." + eh))
+    if not h or not eh:
+        return False
+    if eh == h or eh.endswith("." + h) or h.endswith("." + eh):
+        return True
+    parent = _parent_domain(h)
+    return bool(parent) and (eh == parent or eh.endswith("." + parent))
 
 
 def _live_cookie_header(ctx: ToolContext, host: str) -> Optional[str]:

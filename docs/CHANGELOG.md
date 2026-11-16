@@ -5,6 +5,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (agentless bypass round 2-D)
+- **Agentless auth-bypass for login-walled SPAs** (ARTEX "three auth gates",
+  `dast/browser/auth_gates.py` + `bypass_auth` mode): with NO saved credentials, the
+  client-side auth gates are fooled so the SPA renders its post-login shell — static
+  detection of token storage keys, login-state checks, axios interceptors and
+  permission/dynamic-route markers in the app's bundles; a pre-navigation init script
+  seeds the storage with a clearly-synthetic `dast-bypass` token and short-circuits
+  fetch/XHR to auth URLs; a composed Playwright route guard fulfils auth-API requests
+  with a generic admin-identity JSON (both `{code,data}` and `{user,roles,permissions}`
+  shapes). The SPA's real outbound API calls then cross the MITM into the existing
+  discovery/scan pipeline (stubs never leave the browser, so only real traffic is
+  recorded; the backend still 401s — a server trusting the forged identity surfaces as
+  findings through the normal scan). Wired into SpaExplorer (`bypass_auth`, two-round
+  plan build: wall hit -> bundle scan -> stub round re-exploring the blocked routes)
+  and the `explore` tool. Client-side gates only — server-side redirects stay failed.
+
 ### Added (login robustness round 2-B)
 - **spa_api anti-spray** — a failed SPA login used to spray 5 endpoints × 5 body
   shapes = 25 credential POSTs per attempt. A 401/403 from a real login endpoint now

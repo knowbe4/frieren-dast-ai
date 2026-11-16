@@ -814,6 +814,13 @@ dast/
   `probe_expect_cookie`. `dast/triage/auth_wall.py` classifies 200 bodies on STRONG
   phrases or concrete captcha markers only — weak tokens ("login", "auth") need
   login-form evidence
+- AGENTLESS auth-bypass (`dast/browser/auth_gates.py`): with no credentials for a
+  login-walled SPA, the explorer's `bypass_auth` mode detects client-side auth gates
+  in the JS bundles (storage keys / isLogin checks / interceptors / permission routes),
+  seeds the storage and stubs auth-API requests client-side so the post-login shell
+  renders — real outbound API traffic then flows through the proxy into discovery.
+  Scope: client-side gates only; stubs never leave the browser; forged token is a
+  fixed `dast-bypass` marker
 - All login paths serialize on the process-wide login coordinator
   (`dast/session/login_coordinator.py`): one per-site lock acquired by the refresh
   worker, the copilot reactive ladder, autonomous logins, the dashboard route, replay

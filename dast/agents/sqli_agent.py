@@ -18,6 +18,7 @@ from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.agents.sqli_exploit import ExploitProof, extract_db_facts
 from dast.payloads.loader import get_payloads, get_signatures, get_value
+from dast.proxy.plugin_manager import log_event
 from dast.scanners.active_checks import _fmt_http_pair, _send, prepend_import_payloads, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
@@ -119,11 +120,107 @@ class SqliAgent(VulnAgent):
             finding = await self._probe_error_based(target, client, param, error_re, tech_context)
             if finding:
                 return [finding]
+            finding = await self._probe_boolean_based(target, client, param)
+            if finding:
+                return [finding]
             finding = await self._probe_time_based(target, client, param, time_threshold, tech_context)
             if finding:
                 return [finding]
 
         return findings
+
+    async def _probe_boolean_based(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+    ) -> Optional[AgentFinding]:
+        """Boolean differential oracle — the cheap middle blind detector (no sleeps).
+
+        The yaml boolean pairs are tautology/contradiction SQL: both are VALID SQL,
+        so the true-pair response should look like the clean baseline while the
+        false-pair empties or changes the result set. A real injection shows
+        true ≈ baseline (anchored) AND false ≢ true (differential), REPRODUCED on a
+        second send so a non-deterministic page cannot manufacture the signal. The
+        comparison is structural — probe_diff.ResponseAttrs (status / length-noise
+        ≥32B / HTML-skeleton hash) — never byte equality, and reflection deltas are
+        excluded (the two payloads' echoes trivially differ)."""
+        from dast.agents.probe_diff import _extract_attrs
+
+        entries = get_payloads("sqli", "boolean_based") or []
+        pairs = [(str(entries[i]), str(entries[i + 1]))
+                 for i in range(0, len(entries) - 1, 2)][:2]
+        if not pairs:
+            return None
+
+        clean_value = str(param.get("value", "") or "1")
+        try:
+            baseline_resp = await self._send_probe(target, client, param, clean_value)
+        except Exception as exc:
+            logger.debug("SQLi boolean probe: baseline send failed", error=str(exc))
+            return None
+        if baseline_resp is None:
+            return None
+        baseline_attrs = _extract_attrs(baseline_resp, clean_value)
+
+        for true_payload, false_payload in pairs:
+            true_resp = await self._send_probe(target, client, param, true_payload)
+            false_resp = await self._send_probe(target, client, param, false_payload)
+            if true_resp is None or false_resp is None:
+                continue
+            true_attrs = _extract_attrs(true_resp, true_payload)
+            false_attrs = _extract_attrs(false_resp, false_payload)
+
+            # Anchor: the true-pair page must look exactly like the clean page.
+            if true_attrs.differs_from(baseline_attrs):
+                continue
+            # Differential: only content-level divergence counts (reflection is
+            # excluded — the payloads themselves echo differently).
+            divergent = [d for d in false_attrs.differs_from(true_attrs)
+                         if d in ("status", "length", "structure")]
+            if not divergent:
+                continue
+
+            # Reproduce: the relation must hold again on a fresh send pair.
+            true_resp2 = await self._send_probe(target, client, param, true_payload)
+            false_resp2 = await self._send_probe(target, client, param, false_payload)
+            if true_resp2 is None or false_resp2 is None:
+                continue
+            if true_attrs.differs_from(_extract_attrs(true_resp2, true_payload)):
+                continue  # the "true" page itself is unstable — no anchor
+            divergent2 = [d for d in _extract_attrs(false_resp2, false_payload)
+                          .differs_from(true_attrs)
+                          if d in ("status", "length", "structure")]
+            if not divergent2:
+                continue
+
+            raw_req, raw_resp = _fmt_http_pair(false_resp2)
+            log_event("agent", "finding",
+                      f"SQLi boolean-blind confirmed on {target.url} ({param['name']})",
+                      url=target.url, finding="Boolean-blind SQLi", source="agent")
+            return AgentFinding(
+                title="SQL Injection — Boolean-Based Blind",
+                severity="high",
+                cwe="CWE-89",
+                attack_type="sqli",
+                evidence=(
+                    f"Parameter '{param['name']}' is boolean-injectable: "
+                    f"'{true_payload}' returned a page identical to the clean baseline, "
+                    f"while '{false_payload}' changed {', '.join(divergent)} — and the "
+                    f"relation reproduced on a second send. The response body is a "
+                    f"controllable true/false oracle.\n\n"
+                    f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                ),
+                confirmed=True,
+                payload=false_payload,
+                parameter=param["name"],
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=raw_req,
+                raw_response=raw_resp[:2000],
+            )
+        return None
 
     async def _probe_error_based(
         self,
@@ -142,9 +239,8 @@ class SqliAgent(VulnAgent):
         # SQL that returns rows rather than raising an error, so they can never
         # match an error signature — sending them through the error-signature probe
         # is wasted budget that (under load) starves the time-based blind probe of
-        # the per-endpoint budget it needs to confirm blind injection. Boolean-based
-        # detection would need its own differential-response oracle, which this probe
-        # is not; until then these payloads add cost with zero error-based signal.
+        # the per-endpoint budget it needs to confirm blind injection. They are
+        # handled by _probe_boolean_based's differential-response oracle instead.
         boolean_payloads = set(get_payloads("sqli", "boolean_based"))
         seed = [p for p in seed if p not in boolean_payloads]
         payloads_to_try = prepend_import_payloads(list(seed), param["name"], "sqli", target)

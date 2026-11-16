@@ -13,6 +13,14 @@ def test_copilot_system_prompt_reconciled():
     assert "Transport capability" in _SYSTEM_COPILOT
 
 
+def test_copilot_system_prompt_steers_sqli_to_sqli_probe():
+    from dast.ai.copilot.session import _SYSTEM_COPILOT, _system_prompt
+    assert "STOP calling browser_snapshot" in _SYSTEM_COPILOT
+    assert "delegate the deterministic\n  part to sqli_probe" in _SYSTEM_COPILOT
+    # the steering text must survive into the rendered prompt both drivers read
+    assert "STOP calling browser_snapshot" in _system_prompt()
+
+
 def test_autonomous_playbook_reconciled():
     from dast.proxy.api.copilot_service import _AUTONOMOUS_START
     assert "more reliable than" not in _AUTONOMOUS_START

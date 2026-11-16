@@ -418,6 +418,14 @@ Operational notes:
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
+- SQL injection on a parametrized endpoint: once you have located the injectable
+  parameter (via the page or get_history), STOP calling browser_snapshot — switch to
+  sqli_probe (deterministic: confirms the injection and extracts version/database/user;
+  for a GraphQL variable it also lists tables/columns/row-count via target_table/scope_where)
+  or send_request. For multi-step extraction, plan the chain and delegate the deterministic
+  part to sqli_probe rather than hand-driving many browser calls; if you must hand-drive
+  UNION/blind steps and the turn's tool-call budget runs out, say so and continue in the next
+  turn — budget exhaustion is not a dead end.
 - Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
   1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
      testing, confirm the actual route, its parameters and its authz with code_lookup_path

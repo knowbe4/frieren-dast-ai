@@ -152,6 +152,89 @@ def test_no_session_name_sends_request_verbatim(monkeypatch):
     assert captured["cookie"] == "hand=pasted"
 
 
+class _Entry:
+    def __init__(self, host, cookie):
+        self.host = host
+        self.request_headers = {"Cookie": cookie} if cookie else {}
+
+
+class _LiveStore:
+    """Minimal store exposing what freshest_cookie_header_for_host needs."""
+    def __init__(self, entries=None, jar=None):
+        self._entries = entries or []
+        self._jar = jar or []
+        self._order = list(range(len(self._entries)))
+    def entries_newest_first(self):
+        return list(reversed(self._entries))
+    def get_cookies_for_host(self, host):
+        return self._jar
+
+
+def test_live_session_injects_freshest_history_cookie(monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, text="ok")
+
+    class _StoreCtx:
+        store = _LiveStore(entries=[_Entry("app.example.com", "live=fresh")])
+
+    c = _client_with_ctx(monkeypatch, handler, _StoreCtx())
+    # operator-supplied Cookie is replaced by the freshest live one
+    r = c.post("/api/repeater/send", json={
+        "method": "GET", "url": "https://app.example.com/x",
+        "headers": {"Cookie": "stale=old"}, "live_session": True,
+    })
+    assert r.status_code == 200
+    assert captured["cookie"] == "live=fresh"
+
+
+def test_live_session_matches_sibling_subdomain(monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, text="ok")
+
+    class _StoreCtx:
+        # target settings-api.*, only history is on api.* — domain-scoped reuse
+        store = _LiveStore(entries=[_Entry("api.foo.example.com", "dom=scoped")])
+
+    c = _client_with_ctx(monkeypatch, handler, _StoreCtx())
+    r = c.post("/api/repeater/send", json={
+        "method": "GET", "url": "https://settings-api.foo.example.com/x",
+        "headers": {}, "live_session": True,
+    })
+    assert r.status_code == 200
+    assert captured["cookie"] == "dom=scoped"
+
+
+def test_live_session_off_sends_cookie_verbatim(monkeypatch):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["cookie"] = request.headers.get("cookie")
+        return httpx.Response(200, text="ok")
+
+    class _Store:
+        def entries_newest_first(self):
+            raise AssertionError("store must not be consulted when live_session is off")
+        def get_named_session_cookies_for_host(self, name, host):
+            raise AssertionError("store must not be consulted without session_name")
+
+    class _StoreCtx:
+        store = _Store()
+
+    c = _client_with_ctx(monkeypatch, handler, _StoreCtx())
+    r = c.post("/api/repeater/send", json={
+        "method": "GET", "url": "https://app.example.com/x",
+        "headers": {"Cookie": "hand=pasted"},
+    })
+    assert r.status_code == 200
+    assert captured["cookie"] == "hand=pasted"
+
+
 def test_strip_recomputed_headers_is_case_insensitive():
     from dast.proxy.api.http_utils import strip_recomputed_headers
     cleaned = strip_recomputed_headers({"HOST": "a", "Content-Length": "3", "X-Keep": "1", "accept-encoding": "gzip"})

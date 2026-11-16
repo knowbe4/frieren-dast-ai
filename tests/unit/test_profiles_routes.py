@@ -136,3 +136,49 @@ def test_import_empty_rejected(client):
 def test_activate_without_session_rejected(client):
     client.post("/api/profiles", json={"name": "N"})
     assert client.post("/api/profiles/n/activate").status_code == 400
+
+
+def test_capture_from_proxy_prefers_fresh_history_over_stale_jar(client):
+    """After an SSO login the authenticated cookies ride the newest proxy request,
+    but the in-memory jar may still hold the pre-auth value. Capture must save the
+    FRESH cookie that actually transited the proxy, not the stale jar one."""
+    from dast.proxy.session_store import ProxyEntry
+    from dast.profiles.store import load_profile
+
+    client.post("/api/profiles", json={"name": "Cap", "host_pattern": "app.example.com"})
+    store = client.ctx
+    # stale pre-auth cookie sitting in the jar
+    store._ingest_cookies("app.example.com", {"set-cookie": "sid=STALE; Path=/"})
+    # the newest authenticated request that actually transited the proxy
+    store.add_synthetic_entry(ProxyEntry(
+        id="e1", method="GET", url="https://app.example.com/dashboard",
+        host="app.example.com", path="/dashboard",
+        request_headers={"Cookie": "sid=FRESH; extra=1"}, request_body=None))
+
+    r = client.post("/api/profiles/cap/capture-from-proxy", json={"host": "app.example.com"})
+    assert r.status_code == 200
+    assert r.json()["captured"]["cookies"] == 2
+
+    p = load_profile("cap")
+    cookies = {c["name"]: c["value"] for c in p.saved_session["cookies"]}
+    assert cookies["sid"] == "FRESH"   # not the stale jar value
+    assert cookies["extra"] == "1"
+
+
+def test_capture_from_proxy_falls_back_to_jar(client):
+    """With no matching history entry, capture still uses the jar (legacy path)."""
+    from dast.profiles.store import load_profile
+
+    client.post("/api/profiles", json={"name": "Jar", "host_pattern": "app.example.com"})
+    client.ctx._ingest_cookies("app.example.com", {"set-cookie": "sid=jarval; Path=/"})
+
+    r = client.post("/api/profiles/jar/capture-from-proxy", json={"host": "app.example.com"})
+    assert r.status_code == 200
+    p = load_profile("jar")
+    assert {c["name"]: c["value"] for c in p.saved_session["cookies"]} == {"sid": "jarval"}
+
+
+def test_capture_from_proxy_404_when_nothing_seen(client):
+    client.post("/api/profiles", json={"name": "Empty", "host_pattern": "app.example.com"})
+    r = client.post("/api/profiles/empty/capture-from-proxy", json={"host": "app.example.com"})
+    assert r.status_code == 404

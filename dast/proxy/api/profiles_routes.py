@@ -215,11 +215,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
     @router.post("/api/profiles/{slug}/capture-from-proxy")
     async def capture_from_proxy(slug: str, req: CaptureFromProxyIn) -> dict:
-        """Snapshot the current proxy jar into the profile's saved_session.
+        """Snapshot the freshest live session into the profile's saved_session.
 
-        Reads live cookies (and auth headers) for the profile's host from the proxy
-        store and saves them as the profile's session — no browser or login needed,
-        just browse through Frieren's proxy first."""
+        Reads the cookies (and auth headers) that most recently transited the proxy
+        for the profile's host and saves them as the profile's session — no browser
+        or login needed, just browse through Frieren's proxy first. The cookies come
+        from the newest matching proxy-history request (sibling-subdomain aware, so
+        an SSO callback on a sibling host still counts), falling back to the in-memory
+        cookie jar — the jar alone is not reliably refreshed from SSO-callback
+        Set-Cookie responses and would capture pre-auth / stale cookies."""
         profile = load_profile(slug)
         if profile is None:
             return JSONResponse({"error": "profile not found"}, status_code=404)
@@ -235,12 +239,13 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             )
         jar_cookies = []
         try:
-            jar_cookies = ctx.store.get_cookies_for_host(host) or []
+            from dast.proxy.auth_headers import freshest_cookies_for_host
+            jar_cookies = freshest_cookies_for_host(ctx.store, host)
         except Exception as exc:
-            logger.warning("capture-from-proxy: jar lookup failed", slug=slug, host=host, error=str(exc))
+            logger.warning("capture-from-proxy: cookie lookup failed", slug=slug, host=host, error=str(exc))
         if not jar_cookies:
             return JSONResponse(
-                {"error": f"no cookies found in proxy jar for {host}; browse the site first"},
+                {"error": f"no cookies found in proxy history/jar for {host}; browse the site first"},
                 status_code=404,
             )
         # Build auth headers from recent proxy entries for the host
@@ -268,22 +273,25 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     @router.post("/api/profiles/quick-capture")
     async def quick_capture(req: QuickCaptureIn) -> dict:
         """Create (or update) a named session profile and immediately capture the
-        current proxy jar cookies for the given host — all in one step.
+        freshest live session cookies for the given host — all in one step.
 
         Typical flow: log in through the browser (with Frieren's proxy active),
-        then call this with a name, host, and privilege level to save the session."""
+        then call this with a name, host, and privilege level to save the session.
+        Cookies come from the newest matching proxy-history request (not the raw
+        in-memory jar, which may hold pre-auth / stale cookies after an SSO login)."""
         name = req.name.strip()
         host = req.host.strip().lower()
         if not name or not host:
             return JSONResponse({"error": "name and host are required"}, status_code=400)
         jar_cookies = []
         try:
-            jar_cookies = ctx.store.get_cookies_for_host(host) or []
+            from dast.proxy.auth_headers import freshest_cookies_for_host
+            jar_cookies = freshest_cookies_for_host(ctx.store, host)
         except Exception as exc:
-            logger.warning("quick-capture: jar lookup failed", host=host, error=str(exc))
+            logger.warning("quick-capture: cookie lookup failed", host=host, error=str(exc))
         if not jar_cookies:
             return JSONResponse(
-                {"error": f"no cookies found in proxy jar for {host}; browse the site first"},
+                {"error": f"no cookies found in proxy history/jar for {host}; browse the site first"},
                 status_code=404,
             )
         auth_headers: Dict[str, str] = {}

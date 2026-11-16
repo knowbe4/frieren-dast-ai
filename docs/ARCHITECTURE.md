@@ -98,6 +98,15 @@ Browser (or automated crawler)
   - business_logic_agent — numeric boundary abuse, privilege escalation via param
                            injection, workflow bypass, mass assignment
   - csrf_agent           — token removal, swap, header bypass, cross-origin
+  - request_smuggling_agent — CL.TE/TE.CL desync confirmation via direct raw
+                           sockets (response differential; dispatched by the
+                           framing-ambiguity hints plugin)
+  - jwt_agent            — alg:none, weak HMAC re-sign, claim escalation, kid
+                           injection; probes proxy-routed via probe_common
+  - open_redirect_agent / prototype_pollution_agent / graphql_idor_agent /
+    cross_session_idor_agent / password_reset_agent / host_header_agent /
+    cache_poisoning_agent / race_condition_agent / mfa_bypass_agent — see
+    docs/ROADMAP.md rounds 2-C/2-D and the dispatch rules section
     |
     v
 [Findings]                    SessionStore.add_finding()

@@ -5,6 +5,25 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (new agents round 3-E)
+- **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
+  framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours
+  them additively) and a structural rule keys on CL+TE requests; the agent
+  CONFIRMS desync with direct raw-socket probes (the MITM and `_send` re-frame
+  requests, destroying the experiment): a chunked-terminator body followed by a
+  benign smuggled `GET /dast-smuggled-<rand>` — if the backend honours the other
+  framing header, the SAME connection answers twice (original + bogus path);
+  a consistently framed control answers once. Mirror probes for TE.CL and
+  CL.TE; ≤6 connections, benign GET to a random path (nothing mutated or
+  poisoned for other users).
+- **JWT VulnAgent** (`jwt_agent`) — the jwt.yaml attacks became a registered,
+  dispatchable agent: token discovery across Authorization/cookie/params
+  (`_PARAM_ATTACK_MAP["token"]` now dispatches token params to it, fulfilling
+  the 2-C note), enforcement precheck, and forgery variants (alg:none,
+  weak-HMAC re-sign, claim escalation, kid injection) replayed through
+  probe_common — proxy-routed and recorded, fixing the jwt_tester plugin's
+  MITM bypass. Bearer scheme preserved on re-injection.
+
 ### Added (agentless bypass round 2-D)
 - **Agentless auth-bypass for login-walled SPAs** (ARTEX "three auth gates",
   `dast/browser/auth_gates.py` + `bypass_auth` mode): with NO saved credentials, the

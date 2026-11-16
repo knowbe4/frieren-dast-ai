@@ -179,8 +179,10 @@ by the LLM planner based on endpoint characteristics.
 | `race_condition_agent` | TOCTOU/double-spend races via concurrent replay + outcome diffing | — |
 | `prototype_pollution_agent` | Prototype pollution via `__proto__` / `constructor.prototype` | — |
 | `password_reset_agent` | Reset token validation bypass, email-token binding, parameter removal | — |
+| `request_smuggling_agent` | Active CL.TE/TE.CL desync confirmation via direct raw-socket probes (response differential; dispatched by framing-ambiguity hints) | — |
+| `jwt_agent` | JWT verification bypass: alg:none, weak HMAC secrets, claim escalation, kid injection | `jwt.yaml` |
 
-25 agent modules are registered in `dast/agents/__init__.py`; the LLM planner
+27 agent modules are registered in `dast/agents/__init__.py`; the LLM planner
 selects which ones run for each endpoint.
 
 ## Passive scanner rules

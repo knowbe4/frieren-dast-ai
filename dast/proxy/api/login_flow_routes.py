@@ -158,6 +158,19 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         cred = _pick_credential(profile, req.credential_label)
         username = cred.username if cred else ""
         password = cred.secret if cred else ""
+        # A credential that exists but decrypts to "" means the crypto key is
+        # wrong/rotated (crypto.decrypt returns "" silently). Refuse instead of
+        # replaying with an empty password — but only when the flow actually
+        # substitutes it (passwordless flows remain replayable).
+        if cred is not None and not password and any(
+                s.get("value_ref") == "password"
+                for s in (profile.login_flow.get("steps") or [])):
+            return JSONResponse(
+                {"error": "credential secret decrypts to empty — check DAST_PROFILES_KEY "
+                          "(crypto key wrong or rotated); refusing to replay with an "
+                          "empty password"},
+                status_code=422,
+            )
         from dast.session.account_state import AuthProbeConfig
         probe = AuthProbeConfig.from_profile(profile)
 
@@ -198,7 +211,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             cookies = list(result.get("cookies", []))
             auth_headers = dict(result.get("auth_headers", {}))
             ctx.store.save_named_session_from_playwright(
-                name=profile.slug, role=profile.name,
+                name=profile.slug, role=profile.session_role,
                 playwright_cookies=cookies, auth_headers=auth_headers,
             )
             cookies_imported = ctx.store.import_playwright_cookies(cookies)

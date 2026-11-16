@@ -108,6 +108,10 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     async def list_all() -> dict:
         return {
             "crypto_available": crypto.is_available(),
+            # A wrong/rotated DAST_PROFILES_KEY or tampered file makes every secret
+            # decrypt to "" silently — surface it instead of hiding it.
+            "secrets_unreadable": crypto.secrets_unreadable(),
+            "crypto_failures": crypto.decrypt_failure_stats(),
             "profiles": [p.to_public_dict() for p in list_profiles()],
         }
 
@@ -136,6 +140,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if not req.name.strip():
             return JSONResponse({"error": "name is required"}, status_code=400)
         slug = req.slug or slugify(req.name)
+        # Slug-collision guard: when the caller did NOT pin a slug, a derived slug that
+        # already belongs to a DIFFERENTLY-NAMED profile used to silently overwrite it
+        # ("Staging App" vs "staging/app" both slug to "staging-app"). An explicit
+        # req.slug stays an intentional update.
+        existing = load_profile(slug)
+        if existing is not None and not req.slug and existing.name != req.name:
+            return JSONResponse(
+                {"error": f"slug '{slug}' already belongs to profile '{existing.name}'; "
+                          f"choose a different name or pass slug explicitly to update it"},
+                status_code=409,
+            )
         # Reject an obviously-malformed TOTP seed up front (empty/None is fine — it
         # means "no seed" / "leave unchanged"). Keeps a bad base32 out of the store.
         from dast.profiles import totp as _totp
@@ -145,7 +160,6 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                     {"error": f"credential '{c.label}' has an invalid TOTP (base32) seed"},
                     status_code=400,
                 )
-        existing = load_profile(slug)
         profile = existing or LoginProfile(slug=slug, name=req.name)
         profile.name = req.name
         profile.host_pattern = req.host_pattern
@@ -210,11 +224,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             )
         cookies = list(profile.saved_session.get("cookies", []))
         auth_headers = dict(profile.saved_session.get("_auth_headers", {}))
-        # Use the privilege level as the named-session role (what cross-session IDOR
-        # compares on); fall back to the profile name when no privilege level is set.
-        session_role = (profile.privilege_level or "").strip() or profile.name
         ctx.store.save_named_session_from_playwright(
-            name=profile.slug, role=session_role, playwright_cookies=cookies,
+            name=profile.slug, role=profile.session_role, playwright_cookies=cookies,
             auth_headers=auth_headers,
         )
         imported = ctx.store.import_playwright_cookies(cookies)
@@ -306,7 +317,14 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         except Exception as exc:
             logger.warning("quick-capture: auth-header extract failed", host=host, error=str(exc))
         slug = slugify(name)
-        profile = load_profile(slug) or LoginProfile(slug=slug, name=name)
+        existing = load_profile(slug)
+        if existing is not None and existing.name != name:
+            return JSONResponse(
+                {"error": f"slug '{slug}' already belongs to profile '{existing.name}'; "
+                          f"choose a different name"},
+                status_code=409,
+            )
+        profile = existing or LoginProfile(slug=slug, name=name)
         profile.name = name
         if not profile.host_pattern:
             profile.host_pattern = host

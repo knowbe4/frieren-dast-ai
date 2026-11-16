@@ -814,6 +814,18 @@ dast/
   `probe_expect_cookie`. `dast/triage/auth_wall.py` classifies 200 bodies on STRONG
   phrases or concrete captcha markers only — weak tokens ("login", "auth") need
   login-form evidence
+- All login paths serialize on the process-wide login coordinator
+  (`dast/session/login_coordinator.py`): one per-site lock acquired by the refresh
+  worker, the copilot reactive ladder, autonomous logins, the dashboard route, replay
+  jobs, and model tools — a validation batch can no longer fire concurrent
+  same-credential logins. The runner registers the live refresh worker into it, so any
+  in-process login resets the re-auth breaker after landing a fresh session. The lock
+  only serializes; cooldowns/breakers stay component-local. Named-session roles are
+  canonical via `LoginProfile.session_role` (privilege_level or name); relogin cookie
+  sync is domain-scoped to the login host; learned journal wins expire (7-day TTL) and
+  are failure-invalidated; spa_api stops spraying on credential rejection (401/403 from
+  a real login endpoint), sends the three CSRF header conventions, and caps itself at
+  10 POSTs per attempt
 
 ### Copilot Turn Wrap-Up (salvage before a forced kill)
 - When a copilot turn is ended by the SUPERVISOR — the loop watchdog (`stuck_loop`), a

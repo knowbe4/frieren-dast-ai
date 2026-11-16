@@ -463,6 +463,19 @@ def _is_placeholder_url(url: str) -> bool:
     return host in _PLACEHOLDER_FINDING_HOSTS or host.startswith("unknown")
 
 
+def _cookie_in_host_scope(cookie: Dict[str, Any], host: str) -> bool:
+    """Whether a Playwright cookie belongs to ``host``'s domain: the cookie's
+    Domain attribute (leading dot = parent-domain cookie) must equal the host or
+    be a suffix of it. Used to stop a relogin to an SSO identity host from
+    flattening its cookies onto app-host requests."""
+    if not host:
+        return True
+    domain = str(cookie.get("domain", "")).lower().lstrip(".")
+    if not domain:
+        return True  # host-only cookie set by the login page itself
+    return host == domain or host.endswith("." + domain)
+
+
 def _last_in_scope_url(tool_ctx: Any, focus_hosts: Any) -> Optional[str]:
     """The most recent request URL in history whose host is in scope (or in focus). Used to
     default a finding's URL when the model omitted it or used a placeholder host. Never raises."""
@@ -985,19 +998,37 @@ class CopilotSession:
             # cascade syncs the jar on spa_api success; the browser cookies are folded in
             # below so every engine path updates the session.
             from dast.browser.login_cascade import adaptive_login
-            cascade = await adaptive_login(
-                browser,
-                self._last_login["url"],
-                self._last_login["email"],
-                self._last_login["password"],
-                totp_secret=self._last_login.get("totp_secret"),
-                in_scope=getattr(tool_ctx, "is_in_scope", None),
-                store=getattr(tool_ctx, "store", None),
-                session=self,
-            )
+            from dast.session.login_coordinator import get_login_coordinator
+            coord = get_login_coordinator()
+            login_url = self._last_login["url"]
+            # The shared login lock: two copilot sessions (or this + the scan-time
+            # refresh worker) re-logging the same host concurrently invalidate each
+            # other's server-side session. Per-host — different products never block.
+            async with coord.lock_for(coord.site_key_for(login_url)):
+                cascade = await adaptive_login(
+                    browser,
+                    login_url,
+                    self._last_login["email"],
+                    self._last_login["password"],
+                    totp_secret=self._last_login.get("totp_secret"),
+                    in_scope=getattr(tool_ctx, "is_in_scope", None),
+                    store=getattr(tool_ctx, "store", None),
+                    session=self,
+                )
             if cascade.ok:
                 try:
-                    self._session_cookies.update(await browser.export_cookies())
+                    # DOMAIN-SCOPED sync: export_cookies() used to flatten every cookie
+                    # of the whole browser context into _session_cookies (name→value,
+                    # domains discarded), so an SSO relogin leaked IdP cookies onto app
+                    # requests and same-named cookies across subdomains collapsed to
+                    # the last one. Only cookies in scope of the login host are synced.
+                    full = await browser.export_cookies_full()
+                    login_host = (urlparse(login_url).hostname or "").lower()
+                    in_scope_cookies = {
+                        c["name"]: c["value"] for c in full
+                        if _cookie_in_host_scope(c, login_host)
+                    }
+                    self._session_cookies.update(in_scope_cookies)
                 except Exception as exc:
                     logger.debug("auto-relogin: cookie sync failed", error=str(exc)[:120])
                 logger.info("auto-relogin: succeeded via %s, retrying request",

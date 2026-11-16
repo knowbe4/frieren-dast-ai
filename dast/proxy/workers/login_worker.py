@@ -91,18 +91,23 @@ async def run_login_worker(runner: "ProxyRunner", login_queue: asyncio.Queue) ->
         # ── replay a saved flow (headed, human-in-loop on captcha) ──────
         if action == "replay":
             from dast.profiles.flow import LoginFlow
+            from dast.session.login_coordinator import get_login_coordinator
             try:
                 flow = LoginFlow.from_dict(job.get("flow", {}))
-                result = await replay_login_flow(
-                    proxy_port=runner._proxy_port,
-                    flow=flow,
-                    username=job.get("username", ""),
-                    password=job.get("password", ""),
-                    headless=job.get("headless", False),
-                    on_pause=job.get("on_pause"),
-                    resume_event=job.get("resume_event"),
-                    probe=job.get("probe"),
-                )
+                # Shared login lock (the login queue serializes replays against each
+                # other, but not against the copilot/refresh-worker/dashboard logins).
+                coord = get_login_coordinator()
+                async with coord.lock_for(coord.site_key_for(flow.start_url)):
+                    result = await replay_login_flow(
+                        proxy_port=runner._proxy_port,
+                        flow=flow,
+                        username=job.get("username", ""),
+                        password=job.get("password", ""),
+                        headless=job.get("headless", False),
+                        on_pause=job.get("on_pause"),
+                        resume_event=job.get("resume_event"),
+                        probe=job.get("probe"),
+                    )
                 log_event(
                     "browser",
                     "info" if result.get("success") else "warn",

@@ -196,3 +196,48 @@ def test_probe_config_roundtrip(profiles_env):
     assert legacy.probe_url == ""
     assert legacy.probe_expect_json_path == ""
     assert legacy.probe_expect_cookie == ""
+
+
+# ── durable storage + noisy crypto (round 2-B) ───────────────────────────────
+
+def test_save_profile_atomic_survives_midwrite_crash(profiles_env, monkeypatch):
+    """If the process dies between write and replace, the OLD profile file must
+    survive intact (tmp + os.replace, not in-place write_text)."""
+    _, models_mod, store_mod, _ = profiles_env
+    profile = models_mod.LoginProfile(name="Crash Test", host_pattern="app.example.com")
+    store_mod.save_profile(profile)
+
+    real_replace = __import__("os").replace
+
+    def crashing_replace(src, dst):
+        raise RuntimeError("simulated crash mid-write")
+
+    monkeypatch.setattr("dast.profiles.store.os.replace", crashing_replace)
+    updated = models_mod.LoginProfile(name="Crash Test", host_pattern="other.example.com")
+    updated.slug = profile.slug
+    try:
+        store_mod.save_profile(updated)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
+    monkeypatch.setattr("dast.profiles.store.os.replace", real_replace)
+
+    # The on-disk profile is still the ORIGINAL, loadable, uncorrupted.
+    loaded = store_mod.load_profile("crash-test")
+    assert loaded is not None
+    assert loaded.host_pattern == "app.example.com"
+    # No tmp litter left behind.
+    leftovers = [f for f in store_mod.profiles_dir().glob("*.tmp")]
+    assert leftovers == []
+
+
+def test_secrets_unreadable_flag_surfaces_decrypt_failures(profiles_env):
+    """A wrong/rotated key makes decrypt return "" silently; the counter must flip
+    secrets_unreadable() so the dashboard can surface WHY logins fail."""
+    crypto_mod, models_mod, _, _ = profiles_env
+    assert crypto_mod.secrets_unreadable() is False
+    assert crypto_mod.decrypt("not-a-valid-fernet-token") == ""
+    assert crypto_mod.secrets_unreadable() is True
+    stats = crypto_mod.decrypt_failure_stats()
+    assert stats["failures"] >= 1 and stats["last_error"]

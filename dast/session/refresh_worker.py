@@ -250,7 +250,16 @@ class SessionRefreshWorker:
 
     async def _reauth(self) -> None:
         from dast.session.auth_agent import AuthAgent
+        from dast.session.login_coordinator import get_login_coordinator
 
+        # The shared login lock: a copilot/tool/dashboard login for the same host
+        # must not run concurrently with this one (two logins with the same creds
+        # can invalidate each other's server-side session).
+        coord = get_login_coordinator()
+        async with coord.lock_for(coord.site_key_for(self._auth_url)):
+            await self._reauth_locked(AuthAgent)
+
+    async def _reauth_locked(self, auth_agent_cls) -> None:
         # Prefer an encrypted login profile (recorded flow → saved session) when one
         # matches the auth host; only fall back to the single-form AuthAgent heuristic.
         if await self._try_profile_reauth():
@@ -258,7 +267,7 @@ class SessionRefreshWorker:
 
         try:
             async with self._pool.acquire() as ctx:
-                agent = AuthAgent(
+                agent = auth_agent_cls(
                     context=ctx,
                     session_manager=self._session_manager,
                     auth_url=self._auth_url,

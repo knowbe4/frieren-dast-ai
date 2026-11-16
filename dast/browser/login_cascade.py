@@ -51,6 +51,24 @@ def _journal(url: str, outcome: str, **fields: str) -> None:
         logger.debug("adaptive_login: journal write failed", error=str(exc)[:120])
 
 
+async def _verify_cascade_success(ctx: "LoginContext", result: "LoginResult") -> Optional[bool]:
+    """Structural probe of a strategy-reported success (tri-state). The form/llm
+    strategies decide ``ok`` from URL heuristics — a poisoned winner journaled as
+    success gets reordered to the FRONT of every future cascade, so heuristic-only
+    wins are verified before they are learned. Never raises; returns None (fail-open)
+    when the probe cannot decide."""
+    try:
+        from dast.session.account_state import api_get_fetch, verify_authenticated
+        cookies = await ctx.browser.export_cookies()
+        verdict = await verify_authenticated(
+            api_get_fetch(ctx.browser), base_url=ctx.url, probe=ctx.probe,
+            session_cookies=cookies)
+        return verdict.authenticated
+    except Exception as exc:  # noqa: BLE001 — the probe is a guard, not a requirement
+        logger.debug("adaptive_login: success verification skipped", error=str(exc)[:120])
+        return None
+
+
 async def adaptive_login(
     browser: Any,
     url: str,
@@ -98,7 +116,19 @@ async def adaptive_login(
         # a terminal MFA wall, or (below) the final fall-through outcome is.
         if strategy.name != "spa_api":
             if result.ok:
-                _journal(url, "success", strategy=result.engine, success_url=result.url)
+                # Journal only probe-verified successes: a heuristic win that the
+                # structural probe CONTRADICTS must not be learned as a winner.
+                verified = await _verify_cascade_success(ctx, result)
+                if verified is False:
+                    _journal(url, "error", strategy=result.engine,
+                             reason="login heuristic contradicted by structural session probe")
+                    logger.info("adaptive_login: heuristic win not journaling as success "
+                                "(probe contradicted)", strategy=result.engine, url=url)
+                else:
+                    fields = {"strategy": result.engine, "success_url": result.url}
+                    if verified is True:
+                        fields["verified"] = "1"
+                    _journal(url, "success", **fields)
             elif result.terminal:
                 _journal(url, "error", strategy=result.engine,
                          reason=result.error or "login not completed")

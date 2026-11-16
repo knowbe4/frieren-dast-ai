@@ -31,6 +31,7 @@ class _Profile:
     def __init__(self, slug="p", creds=True, saved_cookies=True):
         self.slug = slug
         self.name = slug
+        self.session_role = slug  # canonical role computation on the real model
         self.auth_url = "https://app.example.com/login" if creds else ""
         self.credentials = [_Cred()] if creds else []
         self.privilege_level = ""

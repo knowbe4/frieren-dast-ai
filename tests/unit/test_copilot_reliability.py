@@ -202,7 +202,7 @@ async def test_activate_login_profile_saved_session_resets_dedup():
 
     engine = CopilotSession("s-act")
     engine._seen_calls.add("k")
-    profile = SimpleNamespace(slug="p1", name="Admin", privilege_level="admin",
+    profile = SimpleNamespace(slug="p1", name="Admin", privilege_level="admin", session_role="admin",
                               saved_session={"cookies": [{"name": "session", "value": "v"}]})
     store = MagicMock()
     store.import_playwright_cookies.return_value = 1
@@ -239,7 +239,7 @@ async def test_activate_saved_profile_seeds_relogin_credentials(has_creds):
 
     engine = CopilotSession("s-arm")
     creds = [SimpleNamespace(username="u@x.example", secret="pw")] if has_creds else []
-    profile = SimpleNamespace(slug="p1", name="Admin", privilege_level="admin",
+    profile = SimpleNamespace(slug="p1", name="Admin", privilege_level="admin", session_role="admin",
                               credentials=creds, auth_url="https://in.scope/login",
                               saved_session={"cookies": [{"name": "session", "value": "v"}]})
     store = MagicMock()

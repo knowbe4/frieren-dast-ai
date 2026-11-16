@@ -275,6 +275,11 @@ class ProxyRunner:
                 store=self._store,  # re-auth also syncs the shared jar (copilot reads it)
             )
             self._refresh_worker = refresh_worker
+            # Register into the process-wide login coordinator so ANY component
+            # (copilot tools, adaptive login route, replay worker) can reset the
+            # re-auth breaker after landing a fresh session.
+            from dast.session.login_coordinator import get_login_coordinator
+            get_login_coordinator().register_refresh_worker(refresh_worker)
 
             async def _refresh_listener(entry) -> None:
                 refresh_worker.on_entry(entry)

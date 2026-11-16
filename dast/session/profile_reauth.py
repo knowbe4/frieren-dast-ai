@@ -43,22 +43,33 @@ async def reauth_from_profile(host: str, proxy_port: int) -> Optional[dict]:
             from dast.session.flow_replayer import replay_login_flow
 
             cred = profile.credentials[0] if profile.credentials else None
-            result = await replay_login_flow(
-                proxy_port=proxy_port,
-                flow=LoginFlow.from_dict(profile.login_flow),
-                username=cred.username if cred else "",
-                password=cred.secret if cred else "",
-                headless=True,
-                on_pause=None,      # unattended — a captcha simply fails this path
-                resume_event=None,
-                probe=AuthProbeConfig.from_profile(profile),
-            )
-            if result.get("success") and result.get("storage_state"):
-                logger.info("profile re-auth succeeded via flow replay",
-                            slug=profile.slug, host=host)
-                return result["storage_state"]
-            logger.warning("profile flow replay produced no session",
-                           slug=profile.slug, error=result.get("error", ""))
+            flow = LoginFlow.from_dict(profile.login_flow)
+            # Refuse to replay with an EMPTY decrypted password: a credential that
+            # exists but decrypts to "" means the crypto key is wrong/rotated (crypto
+            # returns "" silently). The old behavior sprayed empty passwords at the
+            # login form and burned re-auth attempts on guaranteed failures.
+            if cred is not None and not cred.secret and flow.uses_password():
+                logger.warning(
+                    "profile re-auth skipped: credential secret decrypts to empty "
+                    "(wrong/rotated DAST_PROFILES_KEY?) — falling back to saved session",
+                    slug=profile.slug, host=host)
+            else:
+                result = await replay_login_flow(
+                    proxy_port=proxy_port,
+                    flow=flow,
+                    username=cred.username if cred else "",
+                    password=cred.secret if cred else "",
+                    headless=True,
+                    on_pause=None,      # unattended — a captcha simply fails this path
+                    resume_event=None,
+                    probe=AuthProbeConfig.from_profile(profile),
+                )
+                if result.get("success") and result.get("storage_state"):
+                    logger.info("profile re-auth succeeded via flow replay",
+                                slug=profile.slug, host=host)
+                    return result["storage_state"]
+                logger.warning("profile flow replay produced no session",
+                               slug=profile.slug, error=result.get("error", ""))
         except Exception as exc:
             logger.warning("profile flow replay failed", slug=profile.slug, error=str(exc))
 

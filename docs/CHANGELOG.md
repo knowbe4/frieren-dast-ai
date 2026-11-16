@@ -5,6 +5,55 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (login robustness round 2-B)
+- **spa_api anti-spray** — a failed SPA login used to spray 5 endpoints × 5 body
+  shapes = 25 credential POSTs per attempt. A 401/403 from a real login endpoint now
+  stops the whole attempt (the credentials are wrong; more endpoints add nothing and
+  feed lockout counters), 404 skips the endpoint, 429 stops everything, and a global
+  10-POST budget caps the worst case. The journal's learned body shape is replayed
+  first on the learned endpoint.
+- **Multi-convention CSRF headers** — `X-CSRF-Token` (Spring), `X-XSRF-TOKEN`
+  (Angular/Laravel) and `X-CSRFToken` (Django; `csrftoken` wasn't even scanned before)
+  are emitted together, removing the single-convention 403-forever failure mode.
+- **Login journal expires and fail-invalidates** — records carry `ts_epoch` and wins
+  older than 7 days (or predating the epoch) are ignored; a winner is not promoted
+  when the newest record is an error; a learned endpoint targeted by a newer error is
+  skipped. Cascade heuristic wins are probe-verified (`verify_authenticated`) before
+  journaling — a contradicted win is journaled as an error instead of being learned.
+- **Process-wide login coordinator** (`dast/session/login_coordinator.py`) — one
+  per-site login lock for all ~10 login paths (scan refresh worker, copilot ladder,
+  autonomous proactive/breaker logins, dashboard route, replay jobs, model tools),
+  which until now each had only private guards: `run_validation_batch(max_concurrency=3)`
+  fired concurrent adaptive logins with identical credentials against the same host.
+  The runner registers the live refresh worker so in-process copilot-tool logins reset
+  the re-auth breaker (closing the 2-A deferral). Deliberately asymmetric: the lock
+  serializes, cooldowns/breakers stay component-local.
+- **Canonical session roles** — `LoginProfile.session_role` (privilege_level or name)
+  replaces four drifted computations (privilege-or-name / bare name / slug) across
+  every named-session write site.
+- **Profile secrets unreadable surfaced** — `crypto.decrypt` failures are counted and
+  `GET /api/profiles` reports `secrets_unreadable` + failure stats instead of the
+  silent-"" behavior that manifested as ghost login failures.
+
+### Fixed (login robustness round 2-B)
+- **Auto-relogin of MFA accounts died at the OTP step when the login came via
+  spa_api** — `_last_login` was armed without `totp_secret`; the strategy now
+  forwards the (upstream `may_use_totp`-gated) seed.
+- **browser_timezone was hardcoded "America/Fortaleza"** on every SPA login from
+  every machine — now the local TZ name.
+- **An SSO relogin leaked IdP cookies onto app requests** — `_tier_relogin` flattened
+  the whole browser cookie jar (name→value, domains discarded) into the session;
+  cookies are now scoped to the login host's domain.
+- **Crash during a profile save lost the profile** — `save_profile` writes atomically
+  (tmp + fsync + os.replace) now.
+- **"Staging App" and "staging/app" silently overwrote each other** — a derived slug
+  belonging to a differently-named profile is now a 409 (explicit slug stays an
+  intentional update).
+- **Empty decrypted passwords were submitted to login forms** — when a credential
+  exists but its secret decrypts to "" (wrong/rotated `DAST_PROFILES_KEY`), the
+  replay route returns 422 and the unattended re-auth skips to the saved-session
+  fallback instead of guaranteed-failure replays (passwordless flows unaffected).
+
 ### Added (agents round 2-C)
 - **Blind injection classes got their own canary signal.** The echo canary pass only
   fires when a target replays an error/reflection — blind SQLi/CMDi (time-based) and

@@ -1287,7 +1287,7 @@ class CopilotService:
                 # (import_playwright_cookies), which is last-writer-wins and leaks across
                 # concurrent profile activations.
                 store.save_named_session_from_playwright(
-                    name=profile.slug, role=profile.name,
+                    name=profile.slug, role=profile.session_role,
                     playwright_cookies=cookies, auth_headers=auth_headers,
                 )
                 # Also seed the cookies onto THIS engine session (per-session) so the very
@@ -1376,6 +1376,7 @@ class CopilotService:
         # Per-profile session-probe config: sharpens both the reuse gate-check and the
         # post-login gate-check (endpoint + JSON expectations instead of the default).
         probe: Optional[AuthProbeConfig] = None
+        _profile = None
         try:
             from dast.profiles.store import load_profile
             _profile = load_profile(auto.get("profile") or "")
@@ -1419,13 +1420,20 @@ class CopilotService:
                     })
                     return
             from dast.browser.login_cascade import adaptive_login
-            result = await adaptive_login(
-                browser, creds["url"], creds["email"], creds["password"],
-                totp_secret=creds.get("totp_secret"),
-                in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
-                saved_session=None if force_fresh else saved_session,
-                probe=probe,
-            )
+            from dast.session.login_coordinator import get_login_coordinator
+            coord = get_login_coordinator()
+            # Shared login lock: run_validation_batch launches several concurrent
+            # runs with the SAME profile — without the lock they fired concurrent
+            # adaptive_login calls with identical credentials against the same host,
+            # invalidating each other's server-side sessions (login flood).
+            async with coord.lock_for(coord.site_key_for(creds["url"])):
+                result = await adaptive_login(
+                    browser, creds["url"], creds["email"], creds["password"],
+                    totp_secret=creds.get("totp_secret"),
+                    in_scope=tool_ctx.is_in_scope, store=self._ctx.store, session=engine,
+                    saved_session=None if force_fresh else saved_session,
+                    probe=probe,
+                )
             reused = getattr(result, "engine", "") == "saved_session"
             if reused:
                 logger.info("autonomous run: reused a stored session via cascade, skipped login",
@@ -1467,8 +1475,11 @@ class CopilotService:
                     try:
                         full = await browser.export_cookies_full()
                         if full:
+                            # Canonical role (privilege_level or name) — the slug is
+                            # not a role.
+                            _role = _profile.session_role if _profile is not None else name
                             self._ctx.store.save_named_session_from_playwright(
-                                name=name, role=name, playwright_cookies=full,
+                                name=name, role=_role, playwright_cookies=full,
                             )
                             # Persist the session onto the PROFILE too, so the NEXT run reuses
                             # it (SavedSessionStrategy / probe-skip) instead of re-logging in.

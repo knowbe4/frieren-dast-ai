@@ -98,6 +98,15 @@ class LoginProfile:
     updated_at: float = field(default_factory=time.time)
 
     # ── Host matching ──────────────────────────────────────────────────────
+    @property
+    def session_role(self) -> str:
+        """The named-session role this profile's sessions register under — the ONE
+        canonical computation (privilege level, falling back to the profile name).
+        Every save_named_session_from_playwright call site must use this; the
+        historical per-site copies (name / slug / privilege-or-name) drifted, which
+        made any role-based session pairing unreliable."""
+        return (self.privilege_level or "").strip() or self.name
+
     def matches_host(self, host: str) -> bool:
         """True if ``host`` is governed by this profile.
 

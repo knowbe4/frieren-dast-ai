@@ -93,12 +93,37 @@ def encrypt(plaintext: str) -> str:
     return _get_fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
 
 
+# Decryption-failure bookkeeping: a wrong/rotated DAST_PROFILES_KEY or a tampered
+# file makes decrypt return "" SILENTLY, which historically surfaced as empty
+# passwords fed to logins and sessions that mysteriously don't authenticate. The
+# counter lets the dashboard surface the condition instead of hiding it.
+_decrypt_failures = 0
+_last_decrypt_error = ""
+
+
 def decrypt(token: str) -> str:
-    """Decrypt a token produced by encrypt(). Returns "" on tamper/failure."""
+    """Decrypt a token produced by encrypt(). Returns "" on tamper/failure — and
+    records the failure (see :func:`secrets_unreadable`) so it is surfaced instead
+    of being silently swallowed."""
+    global _decrypt_failures, _last_decrypt_error
     if not token:
         return ""
     try:
         return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
     except (InvalidToken, ValueError) as exc:
+        _decrypt_failures += 1
+        # Fernet's InvalidToken carries an empty message — keep something human there.
+        _last_decrypt_error = (str(exc) or "InvalidToken (wrong key or tampered token)")[:200]
         logger.error("login-profile secret decrypt failed", error=str(exc))
         return ""
+
+
+def secrets_unreadable() -> bool:
+    """True when any secret decryption has failed in this process (wrong/rotated
+    key, tampered storage). Surfaced by GET /api/profiles so the operator sees
+    WHY logins start failing instead of chasing ghost credential problems."""
+    return _decrypt_failures > 0
+
+
+def decrypt_failure_stats() -> dict:
+    return {"failures": _decrypt_failures, "last_error": _last_decrypt_error}

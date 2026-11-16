@@ -57,12 +57,18 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
         browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store, headless=True)
         try:
-            result = await asyncio.wait_for(
-                adaptive_login(browser, url, email, password,
-                               success_url_suffix=success_url_suffix,
-                               in_scope=settings.is_in_scope),
-                timeout=_ADAPTIVE_LOGIN_TIMEOUT_SECONDS,
-            )
+            from dast.session.login_coordinator import get_login_coordinator
+            coord = get_login_coordinator()
+
+            async def _login():
+                # Shared login lock: an operator-triggered login must not race the
+                # scan-time refresh worker / copilot ladder for the same host.
+                async with coord.lock_for(coord.site_key_for(url)):
+                    return await adaptive_login(browser, url, email, password,
+                                                success_url_suffix=success_url_suffix,
+                                                in_scope=settings.is_in_scope)
+
+            result = await asyncio.wait_for(_login(), timeout=_ADAPTIVE_LOGIN_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             return JSONResponse({"error": "adaptive login timed out"}, status_code=504)
         except Exception as exc:

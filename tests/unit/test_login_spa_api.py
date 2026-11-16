@@ -7,6 +7,8 @@ the jar + arms the session's auto-relogin.
 
 from __future__ import annotations
 
+import json as _json
+
 import pytest
 
 from dast.browser.login_strategies import spa_api
@@ -217,3 +219,170 @@ async def test_spa_api_probe_expect_cookie_gates_success():
                                     store=_FakeStore(), session=_FakeSession(), probe=probe2)
     assert result2.get("ok") is True
     assert result2.get("verified") is True
+
+
+# ── anti-spray: early-stop on credential rejection / 404 / 429 ───────────────
+
+@pytest.mark.asyncio
+async def test_early_stops_when_login_endpoint_rejects_credentials():
+    """A 401 from a real login endpoint means the credentials are wrong — spraying
+    the same credentials at 4 more endpoints only feeds account-lockout counters."""
+    posts_per_endpoint = {}
+
+    def responder(url):
+        posts_per_endpoint[url] = posts_per_endpoint.get(url, 0) + 1
+        return {"ok": True, "status": 401, "text": '{"error": "invalid credentials"}'}
+
+    browser = _FakeBrowser(responder)
+    result = await spa_api.attempt(browser, "https://app.x/login", "e@x", "WRONG",
+                                   store=_FakeStore(), session=_FakeSession())
+    assert result.get("ok") is False
+    assert "credentials rejected" in result.get("error", "")
+    # Only ONE endpoint was sprayed — not the full 5-endpoint grid.
+    assert len(browser.posts) <= 5
+    assert len(posts_per_endpoint) == 1
+
+
+@pytest.mark.asyncio
+async def test_404_skips_endpoint_variants_but_keeps_trying_other_endpoints():
+    """404 means 'not this endpoint': skip remaining shapes for it, still try the
+    next candidate endpoint (which succeeds)."""
+
+    def responder(url):
+        if url.endswith("/spa/auth/login"):
+            return {"ok": True, "status": 404, "text": "not found"}
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/app"}'}
+
+    browser = _FakeBrowser(responder)
+    result = await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                                   store=_FakeStore(), session=_FakeSession())
+    assert result.get("ok") is True
+    # Exactly one POST hit the missing endpoint, then the next endpoint succeeded.
+    assert browser.posts.count("https://app.x/spa/auth/login") == 1
+    assert result.get("endpoint") == "https://app.x/api/auth/login"
+
+
+@pytest.mark.asyncio
+async def test_429_stops_entire_spray():
+    def responder(url):
+        return {"ok": True, "status": 429, "text": "too many attempts"}
+
+    browser = _FakeBrowser(responder)
+    result = await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                                   store=_FakeStore(), session=_FakeSession())
+    assert result.get("ok") is False
+    assert "rate-limited" in result.get("error", "")
+    assert len(browser.posts) == 1
+
+
+@pytest.mark.asyncio
+async def test_post_budget_cap():
+    """A 200-with-error-body endpoint (no early-stop trigger) still cannot exceed
+    the global POST budget."""
+    def responder(url):
+        return {"ok": True, "status": 200, "text": '{"message": "try again"}'}
+
+    browser = _FakeBrowser(responder)
+    await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                          store=_FakeStore(), session=_FakeSession())
+    assert len(browser.posts) <= 10
+
+
+@pytest.mark.asyncio
+async def test_401_on_non_loginish_endpoint_does_not_stop():
+    """A 401 from an endpoint whose path isn't login/auth-shaped only means 'not
+    this endpoint' — the cascade keeps trying (and the login-shaped endpoint
+    succeeds)."""
+
+    def responder(url):
+        if url.endswith("/api/data"):
+            return {"ok": True, "status": 401, "text": "denied"}
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/app"}'}
+
+    browser = _FakeBrowser(responder)
+    result = await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                                   endpoints=["https://app.x/api/data",
+                                              "https://app.x/api/login"],
+                                   store=_FakeStore(), session=_FakeSession())
+    assert result.get("ok") is True
+    assert result.get("endpoint") == "https://app.x/api/login"
+
+
+# ── multi-convention CSRF headers ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_csrf_headers_cover_three_framework_conventions():
+    class _CookieBrowser(_FakeBrowser):
+        async def export_cookies(self):
+            return {"XSRF-TOKEN": "ang123", "csrftoken": "dj456", "CSRF-TOKEN": "kb789"}
+
+    headers = await spa_api._csrf_headers(_CookieBrowser(responder=lambda u: {}))
+    assert headers["X-CSRF-Token"] == "kb789"      # Spring/KnowBe4 style
+    assert headers["X-XSRF-TOKEN"] == "ang123"     # Angular/Laravel style
+    assert headers["X-CSRFToken"] == "dj456"       # Django style
+    assert headers["Content-Type"] == "application/json"
+
+
+# ── timezone + TOTP arming ───────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_default_timezone_is_local_not_fortaleza():
+    import time as _time
+    assert spa_api._local_timezone() == _time.tzname[_time.daylight]
+    variants = spa_api._body_variants("e@x", "p", spa_api._local_timezone())
+    assert all(v.get("browser_timezone") != "America/Fortaleza" for v in variants)
+
+
+@pytest.mark.asyncio
+async def test_totp_secret_is_armed_into_last_login():
+    """MFA accounts: the cascade carries ctx.totp_secret (already may_use_totp-gated
+    upstream); _sync_session must arm it or auto-relogin dies at the OTP step."""
+
+    def responder(url):
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/app"}'}
+
+    browser = _FakeBrowser(responder)
+    session = _FakeSession()
+    result = await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                                   store=_FakeStore(), session=session,
+                                   totp_secret="JBSWY3DPEHPK3PXP")
+    assert result.get("ok") is True
+    assert session._last_login.get("totp_secret") == "JBSWY3DPEHPK3PXP"
+
+
+@pytest.mark.asyncio
+async def test_no_totp_secret_keeps_last_login_shape_unchanged():
+    def responder(url):
+        return {"ok": True, "status": 200, "text": '{"redirectTo":"/app"}'}
+
+    browser = _FakeBrowser(responder)
+    session = _FakeSession()
+    await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                          store=_FakeStore(), session=session)
+    assert set(session._last_login.keys()) == {"url", "email", "password"}
+
+
+@pytest.mark.asyncio
+async def test_learned_body_shape_is_tried_first(monkeypatch):
+    """The journal's body_shape moves the matching variant to the front of the
+    first POST (fast + low-spray learned logins)."""
+    from dast.session import login_journal
+    login_journal.record("https://app.x/login", "success", strategy="spa_api",
+                         endpoint="https://app.x/api/auth/login",
+                         body_shape="password,username", success_url="https://app.x/login")
+
+    posts = []
+
+    def responder(url):
+        return {"ok": True, "status": 200, "text": "empty"}
+
+    class _PostRecorder(_FakeBrowser):
+        async def api_post(self, url, headers=None, body=None):
+            posts.append(body)
+            return await super().api_post(url, headers, body)
+
+    browser = _PostRecorder(responder)
+    await spa_api.attempt(browser, "https://app.x/login", "e@x", "p",
+                          store=_FakeStore(), session=_FakeSession())
+    first_body = _json.loads(posts[0])
+    assert set(first_body.keys()) == {"username", "password"}

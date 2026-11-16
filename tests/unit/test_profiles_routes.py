@@ -136,3 +136,34 @@ def test_import_empty_rejected(client):
 def test_activate_without_session_rejected(client):
     client.post("/api/profiles", json={"name": "N"})
     assert client.post("/api/profiles/n/activate").status_code == 400
+
+
+# ── slug-collision guard (round 2-B) ─────────────────────────────────────────
+
+def test_derived_slug_collision_returns_409(client):
+    """'Staging App' and 'staging/app' both slugify to 'staging-app' — the second
+    create used to silently overwrite the first. A derived slug belonging to a
+    differently-named profile is now a 409."""
+    r1 = client.post("/api/profiles", json={"name": "Staging App", "host_pattern": "stg.example.com"})
+    assert r1.status_code == 200
+    r2 = client.post("/api/profiles", json={"name": "staging/app", "host_pattern": "stg2.example.com"})
+    assert r2.status_code == 409
+    assert "staging-app" in r2.json()["error"]
+    # The original profile survived untouched.
+    profiles = client.get("/api/profiles").json()["profiles"]
+    assert [p["name"] for p in profiles if p["slug"] == "staging-app"] == ["Staging App"]
+
+
+def test_explicit_slug_is_an_intentional_update_not_a_collision(client):
+    r1 = client.post("/api/profiles", json={"name": "Staging App", "host_pattern": "stg.example.com"})
+    assert r1.status_code == 200
+    # Explicit slug + same name = normal update.
+    r2 = client.post("/api/profiles", json={"slug": "staging-app", "name": "Staging App",
+                                            "host_pattern": "stg2.example.com"})
+    assert r2.status_code == 200
+
+
+def test_secrets_unreadable_flag_in_list(client):
+    body = client.get("/api/profiles").json()
+    assert body["secrets_unreadable"] is False
+    assert body["crypto_failures"] == {"failures": 0, "last_error": ""}

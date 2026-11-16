@@ -1965,6 +1965,7 @@ class _CredProfile:
     def __init__(self, saved_session=None):
         self.slug = "tenant_a"
         self.name = "Tenant A"
+        self.session_role = "tenant_a"
         self.auth_url = "https://app.example.com/login"
         self.privilege_level = "tenant_a"
         self.saved_session = saved_session

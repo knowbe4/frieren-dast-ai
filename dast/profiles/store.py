@@ -9,6 +9,8 @@ CRUD never raises to the caller — failures are logged and surfaced as None/Fal
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -25,12 +27,30 @@ def _path_for(slug: str) -> Path:
 
 
 def save_profile(profile: LoginProfile) -> LoginProfile:
-    """Persist a profile (assigning a slug if missing) and return it."""
+    """Persist a profile (assigning a slug if missing) and return it.
+
+    The write is ATOMIC (tmp file + os.replace): a crash mid-write used to leave a
+    truncated <slug>.json that load_profile/list_profiles silently skipped — a lost
+    profile with no trace."""
     if not profile.slug:
         profile.slug = slugify(profile.name)
     profile.updated_at = time.time()
     path = _path_for(profile.slug)
-    path.write_text(json.dumps(profile.to_storage_dict(), indent=2))
+    payload = json.dumps(profile.to_storage_dict(), indent=2)
+    profiles_dir().mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(profiles_dir()), prefix=f".{profile.slug}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     logger.info("login profile saved", slug=profile.slug, host_pattern=profile.host_pattern)
     return profile
 

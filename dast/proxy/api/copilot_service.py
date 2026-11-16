@@ -18,6 +18,7 @@ callable, not this class.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
@@ -93,6 +94,10 @@ _MAX_UNIFORM_FAIL_TURNS = 2
 # authenticated URL so the SSO session cookie is refreshed server-side before it
 # expires. 20 minutes is well within typical 1h SSO windows.
 _SESSION_KEEPALIVE_INTERVAL = 1200.0
+
+# Intra-turn keepalive: pings the focus host DURING a turn (while the AI model is
+# thinking) so short-lived sessions (e.g. console's 5-min sliding window) survive.
+_INTRA_TURN_KEEPALIVE_INTERVAL = 120.0
 
 # How many times the coverage gate may bounce a premature 'complete' before letting the
 # run end anyway (with an honest "coverage incomplete" report). Guards against a loop
@@ -239,7 +244,12 @@ _AUTONOMOUS_START = (
     "Any time delay <= 5s. Reading an endpoint and moving on WITHOUT testing it is a failure.\n"
     "Write requests (POST/PUT/PATCH/DELETE) are expected and authorized for testing — you "
     "cannot test access controls without them. 'Destructive' means mass deletion, DoS, or "
-    "irreversible corruption — not normal CRUD for testing. Always clean up after write tests.\n\n"
+    "irreversible corruption — not normal CRUD for testing. Always clean up after write tests.\n"
+    "SELF-AFFECTING WRITES LAST: a destructive write on the CALLER'S OWN account/session "
+    "(archiving/deleting/disabling your own user) can REVOKE the current session — the next "
+    "request returns 401 'Revoked'. Sequence any self-affecting destructive test LAST, after "
+    "everything else; if the session is revoked, browser_login to re-authenticate before "
+    "continuing.\n\n"
     "RECORDING FINDINGS — when a test confirms a vuln, call record_finding IMMEDIATELY. "
     "Classify access-control bugs precisely (do NOT call a role bypass an IDOR):\n"
     "- 200 PATCHing/GETting ANOTHER tenant's/user's object by changing an id = IDOR/BOLA "
@@ -643,6 +653,40 @@ class CopilotService:
             })
         return cookies > 0
 
+    async def _intra_turn_keepalive(self, sid: str, session: dict,
+                                     interval: float) -> None:
+        """Ping focus host periodically DURING a turn to keep short-lived sessions alive.
+
+        Uses ``page.request.fetch`` (Playwright API context) so the ping carries the
+        browser's real cookies and goes through the proxy without navigating away from
+        the current page. Runs as a concurrent ``asyncio.Task`` alongside
+        ``engine.send()``, cancelled when the turn completes.
+        """
+        browser = session.get("_agent_browser")
+        if browser is None:
+            return
+        auto = session.get("autonomous")
+        hosts: list = (auto.get("hosts") if auto else None) or []
+        if not hosts:
+            engine = session.get("engine")
+            hosts = list(getattr(engine, "_focus_hosts", []))
+        if not hosts:
+            return
+        target = f"https://{hosts[0]}/"
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                page = await browser._ensure_page()
+                await page.request.fetch(target, method="GET")
+                logger.debug("intra-turn keepalive", sid=sid, target=target)
+            except Exception as exc:
+                logger.debug("intra-turn keepalive failed", sid=sid,
+                             error=str(exc)[:120])
+            try:
+                self.refresh_session(sid)
+            except Exception:
+                pass
+
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
@@ -866,9 +910,17 @@ class CopilotService:
             session["status"] = "running"
             session["updated_at"] = time.time()
             tool_ctx = self._build_tool_ctx(session)
-            reply = await session["engine"].send(
-                text, tool_ctx, on_event=on_event, wait_for_human=wait_for_human,
-            )
+            keepalive = asyncio.create_task(
+                self._intra_turn_keepalive(sid, session,
+                                           _INTRA_TURN_KEEPALIVE_INTERVAL))
+            try:
+                reply = await session["engine"].send(
+                    text, tool_ctx, on_event=on_event, wait_for_human=wait_for_human,
+                )
+            finally:
+                keepalive.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await keepalive
             session["last_reply"] = {
                 "message": reply.message,
                 "blocked_reason": reply.blocked_reason,
@@ -2274,6 +2326,9 @@ class CopilotService:
                 # in-scope hosts surface over time and must enter grounding/targeting.
                 effective_hosts = self._effective_hosts(auto["hosts"], auto.get("profile"))
                 tool_ctx = self._build_tool_ctx(session)
+                keepalive = asyncio.create_task(
+                    self._intra_turn_keepalive(sid, session,
+                                               _INTRA_TURN_KEEPALIVE_INTERVAL))
                 try:
                     reply = await session["engine"].send(
                         prompt, tool_ctx, on_event=on_event, wait_for_human=wait_for_human,
@@ -2301,6 +2356,10 @@ class CopilotService:
                         read_only=read_only_note,
                     )
                     continue
+                finally:
+                    keepalive.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await keepalive
 
                 session["last_reply"] = {
                     "message": reply.message,

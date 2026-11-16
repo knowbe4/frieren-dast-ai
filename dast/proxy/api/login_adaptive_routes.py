@@ -46,6 +46,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 {"error": "url is out of scope — add it to the Target scope first"},
                 status_code=400)
         success_url_suffix = (body.get("success_url_suffix") or "").strip() or None
+        totp_secret = (body.get("totp_secret") or "").strip() or None
+        headed = bool(body.get("headed", False))
 
         try:
             from dast.browser.agent_browser import AgentBrowser
@@ -55,7 +57,8 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 {"error": f"browser support unavailable: {str(exc)[:160]}"},
                 status_code=503)
 
-        browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store, headless=True)
+        browser = AgentBrowser(proxy_port=ctx.proxy_port, store=ctx.store,
+                               headless=not headed)
         try:
             from dast.session.login_coordinator import get_login_coordinator
             coord = get_login_coordinator()
@@ -65,6 +68,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                 # scan-time refresh worker / copilot ladder for the same host.
                 async with coord.lock_for(coord.site_key_for(url)):
                     return await adaptive_login(browser, url, email, password,
+                                                totp_secret=totp_secret,
                                                 success_url_suffix=success_url_suffix,
                                                 in_scope=settings.is_in_scope)
 

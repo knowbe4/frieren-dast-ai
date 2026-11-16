@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 
 from dast.proxy.api.http_utils import strip_recomputed_headers
 from dast.proxy.api.context import DashboardContext
-from dast.proxy.auth_headers import apply_cookies
+from dast.proxy.auth_headers import apply_cookies, freshest_cookie_header_for_host
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -31,24 +31,34 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         body    = data.get("body") or None
         follow_redirects = bool(data.get("follow_redirects", False))
         session_name = str(data.get("session_name", "")).strip()
+        live_session = bool(data.get("live_session", False))
 
         headers = strip_recomputed_headers(headers)
 
-        # Opt-in: when a named session is given, inject that session's cookies
-        # (host-scoped) plus the CSRF/XHR headers a cookie-authed SPA needs. Not
-        # applied without session_name so a hand-pasted request (with its own
-        # Cookie header) is sent verbatim.
-        if session_name:
-            store = getattr(ctx, "store", None)
-            host = urlparse(url).hostname or ""
-            if store is not None and host:
-                try:
-                    cookies = store.get_named_session_cookies_for_host(session_name, host) or []
-                    if cookies:
-                        apply_cookies(headers, cookies, refresh=True)
-                except Exception as exc:
-                    logger.warning("repeater: session cookie injection failed",
-                                   session=session_name, host=host, error=str(exc))
+        store = getattr(ctx, "store", None)
+        host = urlparse(url).hostname or ""
+        # Opt-in cookie injection. `live_session` takes precedence: it replaces any
+        # Cookie header with the FRESHEST one that transited the proxy for the host,
+        # so a short-lived session that expired since capture is not replayed stale.
+        # Otherwise `session_name` injects a named session's cookies + CSRF/XHR
+        # headers. With neither, a hand-pasted request is sent verbatim.
+        if live_session and store is not None and host:
+            try:
+                live = freshest_cookie_header_for_host(store, host)
+                if live:
+                    headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+                    headers["Cookie"] = live
+            except Exception as exc:
+                logger.warning("repeater: live-session cookie lookup failed",
+                               host=host, error=str(exc))
+        elif session_name and store is not None and host:
+            try:
+                cookies = store.get_named_session_cookies_for_host(session_name, host) or []
+                if cookies:
+                    apply_cookies(headers, cookies, refresh=True)
+            except Exception as exc:
+                logger.warning("repeater: session cookie injection failed",
+                               session=session_name, host=host, error=str(exc))
 
         t0 = _time.monotonic()
         try:

@@ -168,6 +168,51 @@ def _last_steps_summary(transcript: List[Dict[str, Any]]) -> str:
     return "\n\nWhat I tried this turn:\n" + "\n".join(lines)
 
 
+_AUTH_ERROR_BODY_PATTERNS = (
+    "not authenticated", "not_authorized", "not authorized",
+    "unauthorized", "token expired", "jwt expired", "invalid token",
+    "authentication required", "login required",
+)
+
+
+def _auth_error_hint(result: Dict[str, Any], tool_args: Dict[str, Any]) -> str:
+    """Return a ``[AUTH]`` guidance note when *result* looks like an auth rejection.
+
+    Fires AFTER the coordinator's own recovery layers, so it only annotates
+    responses that were not auto-fixed.  The hint steers the model toward
+    ``get_app_token`` / ``send_request`` instead of the common misclassification
+    "endpoint is WAF-blocked / introspection is disabled."
+    """
+    try:
+        status = int(result.get("status", 0) or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status in (429, 503):
+        return ""
+    body_lower = str(result.get("body", "") or "")[:2000].lower()
+    is_auth_error = (
+        status in (401, 403)
+        or any(p in body_lower for p in _AUTH_ERROR_BODY_PATTERNS)
+    )
+    if not is_auth_error:
+        return ""
+    url = str(tool_args.get("url") or result.get("final_url") or "")
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    from dast.session.auth_provider import subapp_for_path
+    from dast.session.site_map import site_for_host
+    app = subapp_for_path(path, site_for_host(parsed.hostname or "") or "")
+    app_hint = f"get_app_token({app})" if app else "get_app_token for the target sub-app"
+    return (
+        f"[AUTH] HTTP {status}: this is an authentication error, not a WAF or "
+        f"rate-limit block. The request reached the server but was rejected for "
+        f"missing/invalid credentials. Action: call {app_hint} to verify the "
+        f"sub-app Bearer is primed, then re-issue via send_request (which "
+        f"auto-injects auth). Do NOT classify this as 'blocked' or "
+        f"'introspection disabled'.\n\n"
+    )
+
+
 def _summarize_result(result: Any) -> str:
     """Serialize a tool result for the transcript, keeping the decisive signal
     fields ahead of the bulky response body.
@@ -292,6 +337,12 @@ Operational notes:
   remembers that the host prefers the browser. The `## Transport capability` brief tells
   you a host's learned preference up front. Only ask the operator for help if you
   genuinely cannot log in (captcha, no credentials).
+- 401/403 on a sub-app endpoint (e.g. a /reports or /store GraphQL endpoint) usually
+  means the sub-app Bearer token was not attached — NOT that the endpoint is blocked
+  or introspection is disabled. Call get_app_token to check if the token is primed;
+  if not, navigate to the sub-app feature page to mint it, then retry with
+  send_request. Never conclude "blocked" from a 401/403 until you have confirmed the
+  Bearer IS attached and the request still fails.
 - Empty browser snapshots (no forms/buttons/links): this is NOT a WAF block. The SPA
   may need time to render, or the URL may be wrong. Before giving up: (1) check
   get_history for the same host to find URLs that returned real content — the operator's
@@ -1649,7 +1700,7 @@ class CopilotSession:
                     # once through the proxy (prime_session) and re-run — the coordinator's
                     # in-loop decision to recover, mirroring the blocks above. Bounded to one
                     # attempt per (host, app) so a genuine denial cannot loop.
-                    if tool_name == "send_request":
+                    if tool_name in ("send_request", "browser_fetch"):
                         primed = await self._maybe_prime_subapp(
                             tool_ctx, tool_name, tool_args, result, run_tool)
                         if primed is not None:
@@ -1672,7 +1723,12 @@ class CopilotSession:
                                             getattr(tool_ctx, "store", None), nav_host)
                                 except Exception:
                                     pass
-                    await _observe(entry, _strip_guidance + _summarize_result(result))
+                    _auth_note = ""
+                    if tool_name in ("send_request", "browser_fetch",
+                                     "browser_navigate"):
+                        _auth_note = _auth_error_hint(result, tool_args)
+                    await _observe(entry, _auth_note + _strip_guidance
+                                   + _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
                     # dedup keys: the copilot must be able to re-issue a prior read
                     # to observe the NEW state (e.g. GET /load after DELETE). Reset
@@ -1974,12 +2030,34 @@ class CopilotSession:
             logger.debug("sub-app activation nav failed", host=host, app=app, error=str(exc)[:160])
             return False
 
+    @staticmethod
+    def _browser_fetch_as_send_request(args: Dict[str, Any]) -> Dict[str, Any]:
+        """Map ``browser_fetch`` args to ``send_request`` args for a retry.
+
+        After sub-app priming the Bearer is in the proxy's token cache, so
+        ``send_request`` (which auto-injects auth) is the reliable transport.
+        """
+        out: Dict[str, Any] = {"url": args.get("url", "")}
+        method = str(args.get("method", "GET")).upper()
+        if method != "GET":
+            out["method"] = method
+        body = args.get("body") or args.get("data")
+        if body:
+            out["body"] = body
+        hdrs = args.get("headers")
+        if isinstance(hdrs, dict):
+            out["headers"] = {
+                k: v for k, v in hdrs.items()
+                if str(k).lower() not in ("cookie", "authorization")
+            }
+        return out
+
     async def _maybe_prime_subapp(self, tool_ctx: Any, tool_name: str,
                                   tool_args: Dict[str, Any], result: Dict[str, Any],
                                   run_tool: Any) -> Optional[Dict[str, Any]]:
-        """Recover a send_request that failed not_authorized/403 on a sub-app because its session
-        was not established — trying BOTH known login mechanisms, falling back one to the other
-        (different sub-apps authenticate differently):
+        """Recover a send_request/browser_fetch that failed not_authorized/403 on a sub-app
+        because its session was not established — trying BOTH known login mechanisms,
+        falling back one to the other (different sub-apps authenticate differently):
 
         1. COOKIE prime: mint the sub-app's session cookie via ``prime_session`` (authenticated GET
            to the prime endpoint through the proxy), re-apply auth, retry.
@@ -2027,12 +2105,19 @@ class CopilotSession:
 
             current = result
             acted = False
+            # When the original call was browser_fetch, retries go through
+            # send_request (reliable auth auto-injection) instead.
+            retry_name = tool_name
+            retry_args = tool_args
+            if tool_name == "browser_fetch":
+                retry_name = "send_request"
+                retry_args = self._browser_fetch_as_send_request(tool_args)
             # Mechanism 1 — cookie prime (when the descriptor declares endpoint+cookie).
             if has_cookie_mode:
                 pr = await run_tool(tool_ctx, "prime_session", {"host": host, "app": app})
                 if isinstance(pr, dict) and pr.get("ok") and pr.get("verified"):
-                    self._apply_session_auth(tool_ctx, tool_args)
-                    current = await run_tool(tool_ctx, tool_name, tool_args)
+                    self._apply_session_auth(tool_ctx, retry_args)
+                    current = await run_tool(tool_ctx, retry_name, retry_args)
                     acted = True
                     if not _authfail(current):
                         return current
@@ -2051,8 +2136,8 @@ class CopilotSession:
                 # (bounded) for it to land in history so the retry rides it instead of racing the
                 # mint — this makes the activation authenticate in one shot.
                 await self._await_subapp_bearer(store, host, app)
-                self._apply_session_auth(tool_ctx, tool_args)
-                current = await run_tool(tool_ctx, tool_name, tool_args)
+                self._apply_session_auth(tool_ctx, retry_args)
+                current = await run_tool(tool_ctx, retry_name, retry_args)
                 acted = True
                 if not _authfail(current):
                     activation_recipe.record_activation(host, app, nav, source="prime-success")

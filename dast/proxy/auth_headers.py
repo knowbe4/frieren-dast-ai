@@ -6,7 +6,7 @@ session snapshotting, suggestion scanning, and code-validation probing.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from dast.utils.logger import get_logger
 
@@ -93,6 +93,111 @@ def build_cookie_header(cookies) -> str:
     """
     cookie_map = _cookie_value_map(cookies)
     return "; ".join(f"{name}={value}" for name, value in cookie_map.items() if name)
+
+
+def _parent_domain(host: str) -> str:
+    """Everything after the first label, when that leaves a >=2-label domain.
+    ``api.foo.example.com`` -> ``foo.example.com``; ``example.com`` -> ``''`` (too short)."""
+    labels = (host or "").split(".")
+    parent = ".".join(labels[1:]) if len(labels) >= 3 else ""
+    return parent if parent.count(".") >= 1 else ""
+
+
+def host_matches_cookie_scope(entry_host: str, host: str) -> bool:
+    """Match a proxy entry's host to *host* for cookie reuse. Session cookies are
+    domain-scoped, so besides an exact / parent-child match we also treat SIBLING
+    subdomains that share an immediate parent domain as a match
+    (``api.foo.example.com`` <-> ``settings-api.foo.example.com``)."""
+    eh = (entry_host or "").lower()
+    h = (host or "").lower()
+    if not h or not eh:
+        return False
+    if eh == h or eh.endswith("." + h) or h.endswith("." + eh):
+        return True
+    parent = _parent_domain(h)
+    return bool(parent) and (eh == parent or eh.endswith("." + parent))
+
+
+def parse_cookie_header(header: str) -> List[Tuple[str, str]]:
+    """Split a ``Cookie`` request-header value into ``(name, value)`` pairs."""
+    out: List[Tuple[str, str]] = []
+    for seg in (header or "").split(";"):
+        seg = seg.strip()
+        if not seg or "=" not in seg:
+            continue
+        name, value = seg.split("=", 1)
+        name = name.strip()
+        if name:
+            out.append((name, value.strip()))
+    return out
+
+
+def newest_cookie_header_for_host(store, host: str) -> Optional[str]:
+    """Freshest live ``Cookie`` REQUEST header that actually transited the proxy for
+    *host* (sibling-subdomain aware), or ``None``.
+
+    This sidesteps the stale cookie jar: the in-memory jar is not reliably refreshed
+    from SSO-callback ``Set-Cookie`` responses (those land under the callback host,
+    a sibling of the app host, so ``get_cookies_for_host`` misses them), but the
+    ``Cookie`` header the browser actually sent is ground truth for the host."""
+    try:
+        for entry in store.entries_newest_first():
+            if not host_matches_cookie_scope(getattr(entry, "host", ""), host):
+                continue
+            headers = getattr(entry, "request_headers", None) or {}
+            for k, v in headers.items():
+                if k.lower() == "cookie" and v:
+                    return str(v)
+    except Exception as exc:
+        logger.warning("newest_cookie_header_for_host failed", host=host, error=str(exc))
+    return None
+
+
+def freshest_cookie_header_for_host(store, host: str) -> Optional[str]:
+    """Freshest ``Cookie`` header value for *host*: the newest live header that
+    transited the proxy, falling back to one built from the cookie jar."""
+    header = newest_cookie_header_for_host(store, host)
+    if header:
+        return header
+    try:
+        cookies = store.get_cookies_for_host(host) or []
+    except Exception as exc:
+        logger.warning("freshest_cookie_header_for_host jar lookup failed", host=host, error=str(exc))
+        return None
+    return build_cookie_header(cookies) or None
+
+
+def freshest_cookies_for_host(store, host: str) -> List[dict]:
+    """Freshest cookies for *host* as jar-shaped (Playwright-compatible) dicts.
+
+    Values come from the newest live request ``Cookie`` header that transited the
+    proxy (sibling-subdomain aware), with ``domain``/``path``/flags filled in from
+    the jar when the cookie is known there. Falls back to the cookie jar when no
+    live header is present. This is the capture equivalent of
+    :func:`freshest_cookie_header_for_host`: it fixes capture grabbing pre-auth /
+    stale jar cookies after an SSO login."""
+    try:
+        jar = store.get_cookies_for_host(host) or []
+    except Exception as exc:
+        logger.warning("freshest_cookies_for_host jar lookup failed", host=host, error=str(exc))
+        jar = []
+    header = newest_cookie_header_for_host(store, host)
+    pairs = parse_cookie_header(header) if header else []
+    if not pairs:
+        return list(jar)
+    by_name = {c.get("name"): c for c in jar if c.get("name")}
+    result: List[dict] = []
+    for name, value in pairs:
+        meta = by_name.get(name) or {}
+        result.append({
+            "name": name,
+            "value": value,
+            "domain": meta.get("domain") or host,
+            "path": meta.get("path") or "/",
+            "secure": bool(meta.get("secure", True)),
+            "httpOnly": bool(meta.get("httpOnly", False)),
+        })
+    return result
 
 
 def apply_cookies(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:

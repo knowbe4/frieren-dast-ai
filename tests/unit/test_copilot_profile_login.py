@@ -226,3 +226,72 @@ def test_validation_playbook_constant_present():
     from dast.proxy.api.copilot_service import _AUTONOMOUS_VALIDATION_PLAYBOOK
     assert "GROUND THE REAL ROUTE" in _AUTONOMOUS_VALIDATION_PLAYBOOK
     assert "BASELINE on your OWN id" in _AUTONOMOUS_VALIDATION_PLAYBOOK
+
+
+# ── interactive profile-bound start_turn seeds auth once ─────────────────────────
+
+def test_interactive_start_turn_activates_bound_profile_once(monkeypatch):
+    # A profile-bound INTERACTIVE session must seed the engine's auth (cookies +
+    # relogin credentials) the same way the autonomous path does, so an auth wall
+    # auto-relogins instead of pausing for the operator. _activate_profile runs once
+    # (idempotent via session["_profile_activated"]).
+    service = CopilotService(_FakeCtx())
+    profile = LoginProfile(
+        slug="p", name="P", auth_url="https://app.example.com/login",
+        credentials=[Credential(username="u@example.com", secret="pw")],
+        saved_session=None,
+    )
+    monkeypatch.setattr(profiles_store, "load_profile", lambda slug: profile)
+
+    sid = service.new_session(profile_slug="p")
+    session = service.get(sid)
+    engine = session["engine"]
+    assert engine._last_login is None
+    assert session["_profile_activated"] is False
+
+    # Do NOT run the turn: neutralize the task spawn (and close the coroutine so there
+    # is no "never awaited" warning).
+    def _fake_spawn(coro, name=""):
+        coro.close()
+        return None
+    monkeypatch.setattr("dast.proxy.api.copilot_service.spawn_tracked", _fake_spawn)
+
+    # Count real activations while still exercising the real seeding.
+    calls: list = []
+    real_activate = service._activate_profile
+
+    def _spy(slug, sess):
+        calls.append(slug)
+        return real_activate(slug, sess)
+    monkeypatch.setattr(service, "_activate_profile", _spy)
+
+    service.start_turn(sid, "hello")
+    assert engine._last_login == {
+        "url": "https://app.example.com/login",
+        "email": "u@example.com",
+        "password": "pw",
+    }
+    assert session["_profile_activated"] is True
+    assert calls == ["p"]
+
+    # A second turn must NOT re-activate the profile.
+    service.start_turn(sid, "again")
+    assert calls == ["p"]
+
+
+def test_unbound_interactive_start_turn_does_not_activate(monkeypatch):
+    # No bound profile → no activation, no _last_login seeding (preserve old behaviour).
+    service = CopilotService(_FakeCtx())
+    called: list = []
+    monkeypatch.setattr(service, "_activate_profile",
+                        lambda slug, sess: called.append(slug))
+
+    def _fake_spawn(coro, name=""):
+        coro.close()
+        return None
+    monkeypatch.setattr("dast.proxy.api.copilot_service.spawn_tracked", _fake_spawn)
+
+    sid = service.new_session()
+    service.start_turn(sid, "hello")
+    assert called == []
+    assert service.get(sid)["engine"]._last_login is None

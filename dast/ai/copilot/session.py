@@ -1626,6 +1626,7 @@ class CopilotSession:
                     if await self._auth_gate(
                         result, tool_args, entry, wait_for_human, _observe,
                         _looks_like_auth_wall, _sanitise_cookies, call_key,
+                        tool_ctx,
                     ):
                         consecutive_tool_failures = 0  # session applied — progress made
                         continue  # session applied — retry allowed
@@ -2198,9 +2199,15 @@ class CopilotSession:
         looks_like_auth_wall: Callable[..., bool],
         sanitise_cookies: Callable[..., Dict[str, str]],
         call_key: str,
+        tool_ctx: Any = None,
     ) -> bool:
         """Offer a browser handoff on an auth wall. Returns True when a session was
-        collected and the identical call should be allowed to retry."""
+        collected and the identical call should be allowed to retry.
+
+        Before handing off to a human, a profile-bound session (``_last_login`` seeded)
+        tries a credential re-login through the EXISTING refresh ladder: this catches the
+        SOFT auth wall (200 login page, no 302/401) that the inline session-expired ladder
+        misses, so an autonomous/profile-bound run auto-relogins instead of pausing."""
         try:
             status_code = int(result.get("status", 0) or 0)
         except (TypeError, ValueError):
@@ -2231,6 +2238,29 @@ class CopilotSession:
                     return True
             except Exception:
                 pass
+        # SOFT auth wall: the inline ladder in send() owns 302→login / 401 / 403 auth-flip
+        # (incl. its "403 on a never-2xx endpoint is NOT expiry" IDOR/forbidden-file rule),
+        # but a target that serves a 2xx login page never trips it. ONLY for that 2xx case,
+        # and only when the profile seeded relogin credentials, escalate through the
+        # EXISTING refresh ladder (which owns the relogin cooldown + reentrancy + per-host
+        # login lock) before pausing. Non-2xx walls are left to the inline ladder untouched.
+        if self._last_login is not None and 200 <= status_code < 300:
+            try:
+                request_path = urlparse(final_url).path or "/"
+                outcome = await self.refresh_bearer(
+                    getattr(tool_ctx, "store", None), host, request_path,
+                    browser=getattr(tool_ctx, "browser", None),
+                    tool_ctx=tool_ctx,
+                    max_tier=RefreshTier.RELOGIN,
+                    reason="auth-wall",
+                )
+            except Exception:
+                outcome = None
+            if outcome is not None and outcome.acted:
+                self.reset_dedup("auth_wall")
+                await observe(entry, f"Auth wall (HTTP {status_code}); re-authenticated via "
+                              "the bound profile credentials. Retrying.")
+                return True
         self._auth_prompted_hosts.add(host)
         auth = await wait_for_human("auth", {"url": final_url, "host": host,
                                              "status": status_code})

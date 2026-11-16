@@ -628,6 +628,131 @@ async def test_session_auth_strips_model_pasted_stale_cookie():
     assert headers["x-dast-cookies-injected"] == "1"
 
 
+@pytest.mark.asyncio
+async def test_soft_auth_wall_with_profile_creds_relogins_and_retries():
+    # A SOFT auth wall (200 login page, no 302/401) with profile relogin credentials
+    # seeded (engine._last_login) must auto-relogin through the existing refresh ladder
+    # and retry the identical call — never pausing for a human.
+    from dast.ai.copilot.session import RefreshOutcome, RefreshTier
+    session = CopilotSession("s-authrelogin")
+    _, on_event = _collector()
+    session._last_login = {"url": "https://app.example.com/login",
+                           "email": "u@example.com", "password": "pw"}
+
+    auth_wall = {"ok": True, "status": 200, "body": "Please log in to continue.",
+                 "final_url": "https://app.example.com/login"}
+    clean = {"ok": True, "status": 200, "body": "dashboard"}
+    run_tool = AsyncMock(side_effect=[auth_wall, clean])
+
+    relogin = AsyncMock(return_value=RefreshOutcome(None, RefreshTier.RELOGIN, acted=True))
+    session.refresh_bearer = relogin
+
+    human_kinds: List[str] = []
+
+    async def wait_for_human(kind, payload):
+        human_kinds.append(kind)
+        return {"decision": "deny"} if kind == "approve" else {"cookies": {}}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://app.example.com/dashboard"}},
+        {"action": "call_tool", "thought": "retry", "tool_name": "send_request",
+         "tool_args": {"url": "https://app.example.com/dashboard"}},
+        {"action": "reply", "thought": "done", "message": "ok"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", _FakeCtx(in_scope=True), on_event=on_event,
+                           wait_for_human=wait_for_human)
+
+    relogin.assert_awaited()                       # credential relogin was attempted
+    assert "auth" not in human_kinds               # human was NEVER prompted for auth
+    assert run_tool.await_count == 2               # the identical call was retried
+
+
+@pytest.mark.asyncio
+async def test_soft_auth_wall_without_creds_still_pauses():
+    # No profile credentials (engine._last_login is None): the soft auth wall must still
+    # hand off to the operator, and the relogin ladder must NOT be invoked.
+    session = CopilotSession("s-authnopause")
+    _, on_event = _collector()
+    assert session._last_login is None
+
+    auth_wall = {"ok": True, "status": 200, "body": "Please log in to continue.",
+                 "final_url": "https://app.example.com/login"}
+    run_tool = AsyncMock(return_value=auth_wall)
+
+    relogin = AsyncMock()
+    session.refresh_bearer = relogin
+
+    human_kinds: List[str] = []
+
+    async def wait_for_human(kind, payload):
+        human_kinds.append(kind)
+        return {"cookies": {}}
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://app.example.com/dashboard"}},
+        {"action": "reply", "thought": "done", "message": "blocked on auth"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", _FakeCtx(in_scope=True), on_event=on_event,
+                           wait_for_human=wait_for_human)
+
+    relogin.assert_not_awaited()                   # no creds → no relogin
+    assert "auth" in human_kinds                   # still paused for the operator
+
+
+@pytest.mark.asyncio
+async def test_soft_auth_wall_relogin_respects_cooldown():
+    # A relogin that JUST happened (within _RELOGIN_COOLDOWN_S) must NOT be retried on the
+    # next auth wall — the real refresh ladder's tier-4 cooldown gates it, so _tier_relogin
+    # is not called and the gate falls through to the operator.
+    import time as _time
+
+    from dast.ai.copilot.session import _RELOGIN_COOLDOWN_S
+    session = CopilotSession("s-authcooldown")
+    _, on_event = _collector()
+    session._last_login = {"url": "https://app.example.com/login",
+                           "email": "u@example.com", "password": "pw"}
+    # Simulate a relogin that fired moments ago (the "first auth wall" of the run).
+    session._last_relogin_ts = _time.time()
+    assert _RELOGIN_COOLDOWN_S > 0
+
+    tier_relogin = AsyncMock(return_value=True)
+    session._tier_relogin = tier_relogin  # must stay uncalled while in cooldown
+
+    auth_wall = {"ok": True, "status": 200, "body": "Please log in to continue.",
+                 "final_url": "https://app.example.com/login"}
+    run_tool = AsyncMock(return_value=auth_wall)
+
+    human_kinds: List[str] = []
+
+    async def wait_for_human(kind, payload):
+        human_kinds.append(kind)
+        return {"cookies": {}}
+
+    ctx = _FakeCtx(in_scope=True)
+    ctx.browser = object()  # tier-4 requires a browser; cooldown is the only gate left
+
+    steps = [
+        {"action": "call_tool", "thought": "probe", "tool_name": "send_request",
+         "tool_args": {"url": "https://app.example.com/dashboard"}},
+        {"action": "reply", "thought": "done", "message": "blocked on auth"},
+    ]
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        await session.send("go", ctx, on_event=on_event, wait_for_human=wait_for_human)
+
+    tier_relogin.assert_not_awaited()              # cooldown blocked the relogin
+    assert "auth" in human_kinds                   # fell through to the operator
+
+
 def test_render_arg_signature_marks_required_and_anyof():
     from dast.ai.copilot.session import _render_arg_signature
 

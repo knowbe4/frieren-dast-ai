@@ -513,6 +513,9 @@ class CopilotService:
             # refusal downgrade (armed on the first turn). None = unbound (today's default).
             "profile_slug": slug,
             "_downgrade_armed": False,
+            # Seeded once (interactive, profile-bound) by the first start_turn so the
+            # engine carries the profile's cookies + relogin credentials.
+            "_profile_activated": False,
             "_pause_event": asyncio.Event(),
             "_pause_result": None,
             "approved_hosts": set(),
@@ -690,9 +693,21 @@ class CopilotService:
     def start_turn(self, sid: str, text: str) -> None:
         """Schedule a turn on the running event loop."""
         session = self._sessions[sid]
-        # Profile-bound interactive session: arm the per-profile refusal downgrade once, so an
-        # authorized objective survives a gateway content refusal (per-profile, never global).
         slug = (session.get("profile_slug") or "").strip()
+        # Profile-bound interactive session: seed the engine's auth ONCE (cookies +
+        # relogin credentials) via the SAME _activate_profile the autonomous path uses.
+        # Without this the engine had no _last_login, so an auth wall paused for the
+        # operator instead of auto-relogging in with the profile's credentials.
+        if slug and not session.get("_profile_activated"):
+            try:
+                self._activate_profile(slug, session)
+            except Exception as exc:
+                logger.debug("interactive profile activation failed", slug=slug,
+                             error=str(exc)[:120])
+            session["_profile_activated"] = True
+        # Arm the per-profile refusal downgrade once, INDEPENDENTLY of activation: activation
+        # can bail before its own arm (no proxy store, partial profile), and an authorized
+        # objective must still survive a gateway content refusal (per-profile, never global).
         if slug and not session.get("_downgrade_armed"):
             try:
                 from dast.profiles.store import load_profile

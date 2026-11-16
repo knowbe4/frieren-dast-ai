@@ -42,6 +42,13 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         req_headers = entry.request_headers
+        # Any framing-ambiguity hint GUARANTEES the active smuggling agent a
+        # dispatch slot on this endpoint (coordinator unions focus_attack_types
+        # additively — no LLM needed).
+        try:
+            entry.focus_attack_types = ["request_smuggling"]
+        except Exception as exc:  # noqa: BLE001 — entry may be read-only in tests
+            logger.debug("smuggling hints: could not set focus type", error=str(exc))
 
         has_cl  = _has_header(req_headers, "content-length")
         has_te  = _has_header(req_headers, "transfer-encoding")
@@ -55,7 +62,7 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
                     "title": "Potential Request Smuggling: Both Content-Length and Transfer-Encoding Present",
                     "severity": "medium",
                     "cwe": "CWE-444",
-                    "attack_type": "request-smuggling",
+                    "attack_type": "request_smuggling",
                     "evidence": (
                         f"Request contains both Content-Length and Transfer-Encoding: {te_val!r}. "
                         f"Ambiguous message framing can enable CL.TE or TE.CL request smuggling "
@@ -76,7 +83,7 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
                     "title": "Potential Request Smuggling: Obfuscated Transfer-Encoding Header",
                     "severity": "medium",
                     "cwe": "CWE-444",
-                    "attack_type": "request-smuggling",
+                    "attack_type": "request_smuggling",
                     "evidence": (
                         f"Transfer-Encoding header value is {te_val!r} (not plain 'chunked'). "
                         f"Some servers normalise this differently, enabling TE.TE desync attacks."
@@ -99,7 +106,7 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
                     "title": "Potential Request Smuggling: Malformed Content-Length",
                     "severity": "low",
                     "cwe": "CWE-444",
-                    "attack_type": "request-smuggling",
+                    "attack_type": "request_smuggling",
                     "evidence": (
                         f"Content-Length is {cl_val!r}, not a single integer. Front-end and "
                         f"back-end servers may parse it differently (CL.CL desync)."
@@ -120,7 +127,7 @@ class RequestSmugglingHintsPlugin(ProxyPlugin):
                         "title": "Potential Request Smuggling: Content-Length Mismatch and 400 Response",
                         "severity": "low",
                         "cwe": "CWE-444",
-                        "attack_type": "request-smuggling",
+                        "attack_type": "request_smuggling",
                         "evidence": (
                             f"Content-Length header declares {cl_val} bytes but actual body is "
                             f"{len(entry.request_body)} bytes. Server returned 400 — "

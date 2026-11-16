@@ -119,6 +119,7 @@ _ATTACK_TYPE_DIMENSION = {
     "idor": "access_control", "bfla": "access_control", "auth": "access_control",
     "auth_bypass": "access_control",
     "mfa_bypass": "access_control", "jwt": "access_control", "sensitive_data": "access_control",
+    "request_smuggling": "injection",
     # cross-tenant (multi-user replay) — only applicable with >=2 named sessions
     "cross_session_idor": "cross_tenant",
     # business logic (incl. mass assignment + race conditions)

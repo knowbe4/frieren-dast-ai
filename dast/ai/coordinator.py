@@ -734,6 +734,13 @@ def _select_attack_types_for_params(
         # + a token param being present.
         candidate_types.add("password_reset")
 
+    # Framing-ambiguity candidates: requests carrying BOTH Content-Length and
+    # Transfer-Encoding (and JWT-bearing endpoints, see below) — the smuggling
+    # agent is otherwise only dispatched via the hints plugin's focus list.
+    _lower_headers = {k.lower() for k in (target.headers or {})}
+    if "content-length" in _lower_headers and "transfer-encoding" in _lower_headers:
+        candidate_types.add("request_smuggling")
+
     # XML surfaces are XXE candidates (XML content-type or XML-shaped body). The
     # canary pass already carries an xxe payload — it was dead code until this rule
     # existed, because nothing ever added "xxe" to the candidates (the agent

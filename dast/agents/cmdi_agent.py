@@ -15,11 +15,12 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_path, _inject_query, _send, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
+from dast.scanners.active_checks import _fmt_http_pair, _send, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -282,8 +283,10 @@ class CmdiAgent(VulnAgent):
         Uses httpx's `.elapsed` (server round-trip only) rather than wall-clock, so
         time waiting to acquire the shared probe semaphore under concurrent load
         does not pollute timing — see active_checks.response_elapsed_ms."""
-        resp = await self._send_probe(target, client, param, value, timeout=_TIME_PROBE_TIMEOUT_S)
-        return response_elapsed_ms(resp) / 1000.0, resp
+        ms, resp = await probe_common.timed_probe_ms(
+            self._send_probe, target, client, param, value, _TIME_PROBE_TIMEOUT_S,
+        )
+        return ms / 1000.0, resp
 
     async def _send_probe(
         self,
@@ -297,29 +300,13 @@ class CmdiAgent(VulnAgent):
         params (e.g. DVWA /exec/ `ip`, submitted as form fields) MUST be injected
         into the body, not the query string — the server reads them from the body, so
         query injection silently misses the vulnerable code path. Falls back to query
-        injection for locations without a dedicated injector (header/cookie), which
-        preserves prior behavior for those entrypoints."""
-        location = param.get("location", "query")
-        if location in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=location,
-            )
-            return await _send(
-                client, target.method, target.url, target.headers, body,
-                payload=payload, timeout=timeout,
-            )
-        if location == "path":
-            url = _inject_path(target.url, param.get("path_index", 0), payload)
-            return await _send(
-                client, target.method, url, target.headers, target.body,
-                payload=payload, timeout=timeout,
-            )
-        url = _inject_query(target.url, param["name"], payload)
-        return await _send(
-            client, target.method, url, target.headers, target.body,
-            payload=payload, timeout=timeout,
+        injection for locations without a dedicated injector (header/cookie/multipart),
+        which preserves prior behavior for those entrypoints."""
+        return await probe_common.send_probe(
+            target, client, param, payload,
+            timeout=timeout, send=_send,
+            locations=probe_common.LOCATIONS_CMDI, query_fallback=True,
+            forward_payload=True,
         )
 
     async def _probe_time_based(
@@ -359,8 +346,10 @@ class CmdiAgent(VulnAgent):
             delta_s = confirm_delta_s = 0.0
             evidence_tail = ""
             async with serialize_time_probe():
-                control_s, _ = await self._timed_send(target, client, param, control_value)
-                probe_s, resp = await self._timed_send(target, client, param, payload)
+                control_s, probe_s, resp = await probe_common.time_candidate_pair(
+                    self._send_probe, target, client, param, payload, control_value,
+                    _TIME_PROBE_TIMEOUT_S,
+                )
                 delta_s = probe_s - control_s
                 candidate = (
                     resp is not None
@@ -395,15 +384,15 @@ class CmdiAgent(VulnAgent):
                             f"(reproduced) over a matched zero-delay control ('{control_value}')"
                         )
                     else:
-                        control2_s, _ = await self._timed_send(target, client, param, control_value)
-                        confirm_s, resp2 = await self._timed_send(target, client, param, confirm_payload)
-                        confirm_delta_s = confirm_s - control2_s
-                        confirmed = (
-                            resp2 is not None
-                            and confirm_delta_s >= _CONFIRM_FLOOR_S
-                            and confirm_s >= _CONFIRM_FLOOR_S
-                            and (delta_s - confirm_delta_s) >= _SCALING_MARGIN_S
+                        confirmed, confirm_delta_ms, resp2 = await probe_common.time_confirm_scaling(
+                            self._send_probe, target, client, param, payload, control_value,
+                            primary_delta_ms=delta_s * 1000.0,
+                            confirm_delay_s=_CONFIRM_SLEEP_DURATION,
+                            confirm_floor_ms=_CONFIRM_FLOOR_S * 1000.0,
+                            scaling_margin_ms=_SCALING_MARGIN_S * 1000.0,
+                            timeout_s=_TIME_PROBE_TIMEOUT_S,
                         )
+                        confirm_delta_s = confirm_delta_ms / 1000.0  # shared core reports ms
                         evidence_tail = (
                             f"delayed the response {delta_s:.1f}s for a {_SLEEP_DURATION}s sleep versus "
                             f"{confirm_delta_s:.1f}s for a {_CONFIRM_SLEEP_DURATION}s sleep over a matched "
@@ -412,8 +401,8 @@ class CmdiAgent(VulnAgent):
                         )
                     logger.debug(
                         "cmdi time-based re-confirm", param=param_name, payload=payload,
-                        confirm_payload=confirm_payload, control_s=round(control2_s, 2),
-                        confirm_s=round(confirm_s, 2), confirm_delta_s=round(confirm_delta_s, 2),
+                        confirm_payload=confirm_payload,
+                        confirm_delta_s=round(confirm_delta_s, 2),
                         delta_s=round(delta_s, 2), confirmed=confirmed,
                     )
 

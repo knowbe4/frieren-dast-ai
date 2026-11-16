@@ -8,12 +8,13 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_detection_payloads
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_query, _send
+from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
 from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST, is_redirect_to_canary
 from dast.utils.logger import get_logger
 
@@ -287,26 +288,10 @@ class DiscoveryAgent(VulnAgent):
         param: dict,
         payload: str,
     ):
-        if param["location"] == "query":
-            url = _inject_query(target.url, param["name"], payload)
-            return await _send(client, target.method, url, target.headers, target.body)
-        elif param["location"] in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=param["location"],
-            )
-            return await _send(client, target.method, target.url, target.headers, body)
-        elif param["location"].startswith("multipart_"):
-            raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-            return await _send(client, target.method, target.url, target.headers, raw)
-        elif param["location"] == "header":
-            headers = _inject_header(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body)
-        elif param["location"] == "cookie":
-            headers = _inject_cookie(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body)
-        return None
+        return await probe_common.send_probe(
+            target, client, param, payload, send=_send,
+            locations=probe_common.LOCATIONS_NO_PATH,
+        )
 
 
 from dast.ai.coordinator import Coordinator

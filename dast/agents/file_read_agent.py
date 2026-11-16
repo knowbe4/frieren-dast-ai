@@ -8,12 +8,13 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads, get_signatures
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_query, _send
+from dast.scanners.active_checks import _fmt_http_pair, _send
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -75,27 +76,18 @@ class FileReadAgent(VulnAgent):
                 continue
             tried.add(payload)
 
-            if param["location"] == "query":
-                url = _inject_query(target.url, param["name"], payload)
-                resp = await _send(client, "GET", url, target.headers, None)
-            elif param["location"] in ("body", "body_graphql"):
-                body = _inject_body(
-                    target.body or "", param["name"], payload,
-                    target.headers.get("content-type", ""),
-                    location=param["location"],
-                )
-                resp = await _send(client, target.method, target.url, target.headers, body)
-            elif param["location"].startswith("multipart_"):
-                raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-                resp = await _send(client, target.method, target.url, target.headers, raw)
-            elif param["location"] == "header":
-                headers = _inject_header(target.headers, param["name"], payload)
-                resp = await _send(client, target.method, target.url, headers, target.body)
-            elif param["location"] == "cookie":
-                headers = _inject_cookie(target.headers, param["name"], payload)
-                resp = await _send(client, target.method, target.url, headers, target.body)
-            else:
+            # Shared dispatch (NO_PATH preset — historically no path injection).
+            # LFI queries are sent as bare GETs (no body): a traversal probe in a
+            # query param is a GET-shaped request by definition.
+            request = probe_common.build_probe_request(
+                target, param, payload, locations=probe_common.LOCATIONS_NO_PATH)
+            if request is None:
                 continue
+            url, headers, body = request
+            if param.get("location") == "query":
+                resp = await _send(client, "GET", url, headers, None)
+            else:
+                resp = await _send(client, target.method, url, headers, body)
 
             if resp and match_re.search(resp.text):
                 if block_seen:

@@ -15,12 +15,13 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.payloads.loader import get_payloads
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_query, _send, prepend_import_payloads
+from dast.scanners.active_checks import _fmt_http_pair, _send, prepend_import_payloads
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -342,31 +343,14 @@ class XssAgent(VulnAgent):
         param: dict,
         payload: str,
     ):
-        if param["location"] == "query":
-            url = _inject_query(target.url, param["name"], payload)
-            resp = await _send(client, target.method, url, target.headers, target.body)
-            return resp, url
-        elif param["location"] in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=param["location"],
-            )
-            resp = await _send(client, target.method, target.url, target.headers, body)
-            return resp, target.url
-        elif param["location"].startswith("multipart_"):
-            raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-            resp = await _send(client, target.method, target.url, target.headers, raw)
-            return resp, target.url
-        elif param["location"] == "header":
-            headers = _inject_header(target.headers, param["name"], payload)
-            resp = await _send(client, target.method, target.url, headers, target.body)
-            return resp, target.url
-        elif param["location"] == "cookie":
-            headers = _inject_cookie(target.headers, param["name"], payload)
-            resp = await _send(client, target.method, target.url, headers, target.body)
-            return resp, target.url
-        return None, target.url
+        # Returns (resp, injected_url) — the URL matters for reflection analysis.
+        request = probe_common.build_probe_request(
+            target, param, payload, locations=probe_common.LOCATIONS_NO_PATH)
+        if request is None:
+            return None, target.url
+        url, headers, body = request
+        resp = await _send(client, target.method, url, headers, body)
+        return resp, url
 
 
     async def _check_stored_xss(

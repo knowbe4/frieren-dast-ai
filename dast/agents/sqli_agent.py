@@ -11,13 +11,14 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, List, Optional
 
+from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.mutator import build_mutator_context, next_payload
 from dast.agents.block_detector import detect_block
 from dast.agents.payload_filter import get_filtered_payloads
 from dast.agents.sqli_exploit import ExploitProof, extract_db_facts
 from dast.payloads.loader import get_payloads, get_signatures, get_value
-from dast.scanners.active_checks import _fmt_http_pair, _inject_body, _inject_cookie, _inject_header, _inject_multipart, _inject_path, _inject_query, _send, prepend_import_payloads, response_elapsed_ms, scaled_delay_variant, serialize_time_probe, zero_delay_variant
+from dast.scanners.active_checks import _fmt_http_pair, _send, prepend_import_payloads, scaled_delay_variant, serialize_time_probe, zero_delay_variant
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -290,8 +291,10 @@ class SqliAgent(VulnAgent):
             # only a control + one shorter SLEEP, and only when a candidate is
             # found, so the extra hold is bounded and rare.
             async with serialize_time_probe():
-                control_ms, _ = await self._timed_send(target, client, param, control_value)
-                probe_ms, resp = await self._timed_send(target, client, param, payload)
+                control_ms, probe_ms, resp = await probe_common.time_candidate_pair(
+                    self._send_probe, target, client, param, payload, control_value,
+                    _TIME_PROBE_TIMEOUT_S,
+                )
 
                 delta_ms = probe_ms - control_ms
                 # The delay must show up both as a delta over the control AND in
@@ -411,21 +414,19 @@ class SqliAgent(VulnAgent):
             )
 
         # Delay-scaling confirmation (caller holds the time-probe lock).
-        control_ms, _ = await self._timed_send(target, client, param, control_value)
-        confirm_ms, resp = await self._timed_send(target, client, param, confirm_payload)
-        confirm_delta_ms = confirm_ms - control_ms
         confirm_floor_ms = _CONFIRM_DELAY_S * _CONFIRM_FLOOR_RATIO
-        scaled = (
-            resp is not None
-            and confirm_delta_ms >= confirm_floor_ms          # shorter sleep clearly delayed
-            and confirm_ms >= confirm_floor_ms
-            and (primary_delta_ms - confirm_delta_ms) >= _SCALING_MARGIN_MS  # longer sleep added more
+        scaled, confirm_delta_ms, resp = await probe_common.time_confirm_scaling(
+            self._send_probe, target, client, param, payload, control_value,
+            primary_delta_ms,
+            confirm_delay_s=_CONFIRM_DELAY_S,
+            confirm_floor_ms=confirm_floor_ms,
+            scaling_margin_ms=_SCALING_MARGIN_MS,
+            timeout_s=_TIME_PROBE_TIMEOUT_S,
         )
         logger.debug(
             "SQLi time-based re-confirm (scaling)",
             param=param["name"], payload=payload, confirm_payload=confirm_payload,
-            confirm_delay_s=_CONFIRM_DELAY_S, control_ms=round(control_ms),
-            confirm_ms=round(confirm_ms), confirm_delta_ms=round(confirm_delta_ms),
+            confirm_delay_s=_CONFIRM_DELAY_S, confirm_delta_ms=round(confirm_delta_ms),
             primary_delta_ms=round(primary_delta_ms), confirmed=scaled,
         )
         if not scaled:
@@ -533,10 +534,9 @@ class SqliAgent(VulnAgent):
         timeout it is discarded (resp=None) and the delay we were measuring is never
         observed. The paired-adjacent-control delta cancels the ambient component,
         but only when the probe actually returns."""
-        resp = await self._send_probe(
-            target, client, param, payload, timeout=_TIME_PROBE_TIMEOUT_S
+        return await probe_common.timed_probe_ms(
+            self._send_probe, target, client, param, payload, _TIME_PROBE_TIMEOUT_S
         )
-        return response_elapsed_ms(resp), resp
 
     async def _send_probe(
         self,
@@ -546,29 +546,12 @@ class SqliAgent(VulnAgent):
         payload: str,
         timeout: "Optional[float]" = None,
     ):
-        if param["location"] == "query":
-            url = _inject_query(target.url, param["name"], payload)
-            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
-        elif param["location"] in ("body", "body_graphql"):
-            body = _inject_body(
-                target.body or "", param["name"], payload,
-                target.headers.get("content-type", ""),
-                location=param["location"],
-            )
-            return await _send(client, target.method, target.url, target.headers, body, timeout=timeout)
-        elif param["location"].startswith("multipart_"):
-            raw = _inject_multipart(target.raw_body or b"", param["name"], payload)
-            return await _send(client, target.method, target.url, target.headers, raw, timeout=timeout)
-        elif param["location"] == "path":
-            url = _inject_path(target.url, param.get("path_index", 0), payload)
-            return await _send(client, target.method, url, target.headers, target.body, timeout=timeout)
-        elif param["location"] == "header":
-            headers = _inject_header(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body, timeout=timeout)
-        elif param["location"] == "cookie":
-            headers = _inject_cookie(target.headers, param["name"], payload)
-            return await _send(client, target.method, target.url, headers, target.body, timeout=timeout)
-        return None
+        # Full-superset dispatch (query/body/graphql/multipart/path/header/cookie)
+        # via the shared injector; `send=self-module _send` keeps per-module test
+        # patches working.
+        return await probe_common.send_probe(
+            target, client, param, payload, timeout=timeout, send=_send,
+        )
 
 
 from dast.ai.coordinator import Coordinator

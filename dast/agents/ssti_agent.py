@@ -23,7 +23,8 @@ from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
 from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
-from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
+from dast.agents import probe_common
+from dast.scanners.active_checks import _fmt_http_pair, _send
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -144,7 +145,7 @@ class SstiAgent(VulnAgent):
                 if known_engines and engines and not any(e in known_engines for e in engines):
                     continue
 
-                finding = await self._probe(target, client, param_name, payload, expected, engines)
+                finding = await self._probe(target, client, param, payload, expected, engines)
                 if finding:
                     findings.append(finding)
                     return findings
@@ -154,7 +155,7 @@ class SstiAgent(VulnAgent):
                 if known_engines and not any(e in known_engines for e in canary["engines"]):
                     continue
                 finding = await self._probe(
-                    target, client, param_name, canary["payload"], canary["expected"], canary["engines"]
+                    target, client, param, canary["payload"], canary["expected"], canary["engines"]
                 )
                 if finding:
                     findings.append(finding)
@@ -165,7 +166,7 @@ class SstiAgent(VulnAgent):
                 if known_engines and probe["engine"] not in known_engines:
                     continue
                 finding = await self._introspection_probe(
-                    target, client, param_name, probe["payload"], probe["engine"], probe["detect"]
+                    target, client, param, probe["payload"], probe["engine"], probe["detect"]
                 )
                 if finding:
                     findings.append(finding)
@@ -175,10 +176,13 @@ class SstiAgent(VulnAgent):
 
     async def _probe(
         self, target: "CheckTarget", client: "httpx.AsyncClient",
-        param_name: str, payload: str, expected: str, engines: List[str],
+        param: dict, payload: str, expected: str, engines: List[str],
     ) -> Optional[AgentFinding]:
-        url = _inject_query(target.url, param_name, payload)
-        resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+        param_name = param.get("name", "")
+        # Shared dispatch — this agent used to hardcode query injection, so
+        # body/JSON/multipart SSTI surfaces were never tested.
+        resp = await probe_common.send_probe(
+            target, client, param, payload, send=_send, forward_payload=True)
         if not resp:
             return None
 
@@ -252,10 +256,11 @@ class SstiAgent(VulnAgent):
 
     async def _introspection_probe(
         self, target: "CheckTarget", client: "httpx.AsyncClient",
-        param_name: str, payload: str, engine: str, detect_re: re.Pattern,
+        param: dict, payload: str, engine: str, detect_re: re.Pattern,
     ) -> Optional[AgentFinding]:
-        url = _inject_query(target.url, param_name, payload)
-        resp = await _send(client, target.method, url, target.headers, target.body, payload=payload)
+        param_name = param.get("name", "")
+        resp = await probe_common.send_probe(
+            target, client, param, payload, send=_send, forward_payload=True)
         if not resp:
             return None
 

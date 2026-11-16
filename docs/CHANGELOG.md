@@ -5,6 +5,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (agents round 2-C)
+- **Blind injection classes got their own canary signal.** The echo canary pass only
+  fires when a target replays an error/reflection — blind SQLi/CMDi (time-based) and
+  SSRF/XXE (out-of-band) were gated out of no-LLM dispatch on every endpoint. Capped
+  blind canaries now probe the delay differential (SLEEP vs zero-delay control, under
+  the global time-probe lock) and tokened collaborator callbacks, feeding the same
+  `signal_map` as echo signals.
+- **Deterministic dispatch for the 8 orphan agents** (open_redirect, xxe,
+  prototype_pollution, graphql_idor, cross_session_idor, password_reset, discovery,
+  blazor) — registered but never selected by the deterministic rules, so their
+  coverage dimensions were permanently empty. Param-map entries (open_redirect,
+  prototype_pollution incl. boolean flips) plus structural rules (XML → xxe, GraphQL
+  → graphql_idor, ≥2 named sessions → cross_session_idor, reset-shaped URLs →
+  password_reset, GET → discovery/blazor).
+- **Shared probe plumbing (`dast/agents/probe_common.py`)** — the param-location
+  injection dispatch and the sqlmap-style time differential lived as drifted copies
+  across seven agents (cmdi had silently lost header/cookie/multipart injection).
+  SSTI now injects into body/JSON/multipart too (it hardcoded query injection and
+  missed those surfaces entirely).
+- **SQLi boolean differential oracle** — boolean tautologies were deliberately
+  dropped ("needs its own differential-response oracle"); the agent now anchors the
+  true-pair to the clean baseline (structural attrs), requires the false-pair to
+  diverge on status/length/structure, and reproduces the relation before confirming.
+
+### Fixed (agents round 2-C)
+- **Every blind-XXE finding was discarded.** The XXE agent's OOB phase called
+  `collaborator.url` and `await collaborator.poll()` — attributes/methods that do not
+  exist on `CollaboratorService` — and issued no tokens; the `AttributeError` died in
+  `run_safe`, dropping the Phase 1 findings too. Rewritten on the ssrf pattern
+  (token per payload, sync `was_hit(token)` inside the loop); `was_hit` also gained
+  sub-path prefix matching (XXE templates fetch `CALLBACK_URL/xxe.dtd`, which exact
+  membership never matched).
+
 ### Added (login round 2-A)
 - **Shared login verification (`verify_authenticated`).** Tri-state structural verdict
   (verified / contradicted / indeterminate, with evidence) in `dast/session/account_state.py`

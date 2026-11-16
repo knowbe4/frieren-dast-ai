@@ -54,7 +54,11 @@ Browser (or automated crawler)
        attack types via _PARAM_ATTACK_MAP.
        Auth-token params (nonce, state, code, id_token, …) skipped entirely.
        _run_canary_probe() sends one cheap payload per (attack_type, param)
-       and checks the response against _SIGNAL_PATTERNS.
+       and checks the response against _SIGNAL_PATTERNS. Blind canaries
+       (_run_blind_canary_probe) then give the classes that by definition have
+       no echo — SQLi/CMDi time-based (SLEEP vs zero-delay control), SSRF/XXE
+       out-of-band (tokened collaborator callback) — their own signal path
+       (capped: ≤2 params per type, only when the echo canary missed).
        signal_map: {attack_type → [param_names_with_signal]} passed to planner.
   1. LLM Planner: sees canary results + param classifications — selects agents
      for types with signal; can extend to non-signal types when warranted
@@ -72,6 +76,12 @@ Browser (or automated crawler)
   Each agent targets one vulnerability class.
   All agents call get_filtered_payloads(attack_type, target) from
   dast/agents/payload_filter.py — only tech-relevant payload groups are sent.
+  Probe plumbing is shared (dast/agents/probe_common.py): the param-location
+  injection dispatch, the sqlmap-style time differential (candidate vs
+  zero-delay control + delay-scaling confirmation), and the token-scoped OOB
+  confirmation. business_logic (own injectors + source tagging) and
+  llm_injection (body_raw JSON prompt-key location) intentionally keep their
+  own dispatch.
   - xss_agent            — reflected/stored XSS + DOM + obfuscation/bypass; blind XSS
                            only for CMS/admin/messaging apps
   - sqli_agent           — error-based + boolean + time-based blind (5s max);
@@ -122,12 +132,23 @@ Browser (or automated crawler)
 |-------------|----------------------|
 | `numeric_id` | sqli, idor, business_logic |
 | `uuid` | idor, business_logic |
-| `path` | lfi, ssrf, xxe |
-| `search` | sqli, xss, ssrf, lfi |
-| `string` | sqli, xss, ssrf, lfi, cmdi, ssti |
-| `json` | sqli, nosql, xxe, business_logic |
-| `token`, `jwt`, `boolean` | *(skipped)* |
+| `path` | lfi, ssrf, cmdi, open_redirect |
+| `search` | sqli, xss, ssrf, lfi, open_redirect |
+| `string` | sqli, xss, ssrf, lfi, ssti, cmdi, open_redirect |
+| `json` | sqli, nosql, business_logic, prototype_pollution |
+| `token` | *(skipped — the JWT VulnAgent that tests `?token=<jwt>` is roadmap 3-E)* |
+| `boolean` | prototype_pollution (value flips) |
 | `empty` | sqli, xss |
+
+Structural rules add candidates beyond the param map: XML content-type/body →
+`xxe`; GraphQL URL or `body_graphql` params → `graphql_idor`; ≥2 named sessions
+→ `cross_session_idor`; reset/verify/invite-shaped URLs → `password_reset`
+(plus `host_header`); GET → `cache_poisoning`, `discovery`, `blazor`;
+POST/PUT/PATCH/DELETE → `csrf`, `business_logic`; race-shaped params →
+`race_condition`; MFA endpoints → `mfa_bypass`; always `sensitive_data`, and
+`auth_bypass` when Authorization/Cookie present. Agents self-gate on their own
+prerequisites (blazor probes base-URL assets; cross_session_idor hard-requires
+2 sessions; graphql_idor requires body_graphql ID params).
 
 Auth-token params (`_AUTH_TOKEN_PARAMS`: nonce, state, code, id_token, access_token, refresh_token, …) are excluded from all probing entirely.
 

@@ -12,11 +12,14 @@ how they drive the page.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from dast.proxy.session_store import SessionStore
 from dast.utils import read_only as read_only_policy
 from dast.utils.logger import get_logger
+
+if TYPE_CHECKING:
+    from dast.browser.auth_gates import AuthBypassPlan
 
 logger = get_logger(__name__)
 
@@ -60,6 +63,7 @@ async def proxied_browser_context(
     read_only: bool = False,
     headless: bool = True,
     log_cb: Optional[Callable[[str], None]] = None,
+    auth_bypass: Optional["AuthBypassPlan"] = None,
 ):
     """Launch a proxied, authenticated browser context.
 
@@ -67,6 +71,13 @@ async def proxied_browser_context(
     one-element list whose ``[0]`` is the running request total. Closes the
     browser on exit. ``log_cb`` (optional) receives human-readable progress
     lines for the read-only block counter and cookie-injection summary.
+
+    ``auth_bypass`` (optional, agentless mode): an
+    ``dast.browser.auth_gates.AuthBypassPlan`` — the pre-navigation storage hook
+    is installed and requests matching the plan's auth-URL patterns are fulfilled
+    client-side with a fake logged-in body (they never reach the proxy), so a
+    login-walled SPA renders its post-login shell without credentials while all
+    REAL outbound traffic still crosses the MITM and is recorded.
     """
     from playwright.async_api import async_playwright
 
@@ -124,7 +135,16 @@ async def proxied_browser_context(
                 await context.route("**/*", read_only_policy.make_route_guard(
                     "crawler", forward=_inject_header, on_block=_count_block))
             else:
-                await context.route("**/*", _inject_header)
+                if auth_bypass is not None:
+                    from dast.browser.auth_gates import init_script, make_route_guard
+
+                    await context.add_init_script(init_script(auth_bypass))
+                    _log("Agentless auth-bypass active: storage hook installed, "
+                         f"{len(auth_bypass.url_patterns)} auth-URL pattern(s) stubbed")
+                    await context.route(
+                        "**/*", make_route_guard(auth_bypass, forward=_inject_header))
+                else:
+                    await context.route("**/*", _inject_header)
 
             if storage_state:
                 origins = len(storage_state.get("origins") or [])

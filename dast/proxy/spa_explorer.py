@@ -91,6 +91,8 @@ class SpaExplorer:
         self._session_safe = False
         self._vision = False
         self._vision_calls = 0
+        self._bypass_plan = None          # AuthBypassPlan once the wall round built it
+        self._wall_landed_url: Optional[str] = None
 
     def _log(self, msg: str) -> None:
         logger.debug(msg, session_id=self.session_id)
@@ -112,6 +114,7 @@ class SpaExplorer:
         headless: bool = True,
         max_routes: Optional[int] = None,
         vision: bool = False,
+        bypass_auth: bool = False,
     ) -> None:
         self._read_only = read_only
         self._submit_forms = submit_forms and not read_only
@@ -138,35 +141,66 @@ class SpaExplorer:
 
         self._log(f"Explorer {self.session_id} starting → {target_url} "
                   f"(read_only={read_only}, submit_forms={self._submit_forms}, max_routes={max_routes})")
-        self._store.active_crawler_session_id = self.session_id
 
+        # Agentless bypass (ARTEX three-auth-gates): round 0 runs WITHOUT the
+        # bypass. If a route bounced to a client-side login view, the bundles are
+        # scanned for auth-gate markers, a stub plan is built (storage hook +
+        # auth-API fulfilment), and ONE more round runs with the plan installed —
+        # the SPA then renders its post-login shell and the outbound API traffic
+        # flows through the proxy into discovery as usual. Server-side redirects
+        # cannot be bypassed this way; those routes stay FAILED.
+        rounds = 2 if bypass_auth else 1
         visited_count = 0
         try:
-            async with proxied_browser_context(
-                self._store, self._proxy_port, self.session_id,
-                read_only=read_only, headless=headless, log_cb=self._log,
-            ) as (context, page, request_count):
-                from dast.scanners.active_checks import is_host_dead
-                if is_host_dead(parsed.hostname or base_host):
-                    self._log(f"Host unreachable ({base_host}) — skipping explore")
-                    return
-
-                while not self._stop.is_set() and visited_count < max_routes:
-                    frontier = graph.frontier()
-                    if not frontier:
-                        self._log("Frontier drained — exploration complete")
+            for round_index in range(rounds):
+                if round_index > 0:
+                    # Re-open the routes that failed the wall in round 0 — with the
+                    # stub plan installed they should now render.
+                    reopened = 0
+                    for failed_route in graph.failed():
+                        if graph.reopen(failed_route.route_key):
+                            reopened += 1
+                    if not graph.frontier():
                         break
-                    # Shallowest-first so top-level sections are mapped before deep leaves.
-                    route = min(frontier, key=lambda r: r.depth)
-                    await self._visit_route(page, route, graph, _is_allowed_host)
-                    visited_count += 1
+                    self._log(f"Bypass round: re-exploring {reopened} wall-blocked route(s) "
+                              "with the auth-gate stub plan installed")
+                try:
+                    async with proxied_browser_context(
+                        self._store, self._proxy_port, self.session_id,
+                        read_only=read_only, headless=headless, log_cb=self._log,
+                        auth_bypass=self._bypass_plan,
+                    ) as (context, page, request_count):
+                        from dast.scanners.active_checks import is_host_dead
+                        if is_host_dead(parsed.hostname or base_host):
+                            self._log(f"Host unreachable ({base_host}) — skipping explore")
+                            return
 
-                if visited_count >= max_routes:
-                    self._log(f"Reached max-routes safety ceiling ({max_routes}); "
-                              f"{len(graph.frontier())} route(s) still queued — restart to continue")
-        except Exception as exc:  # noqa: BLE001 — never crash the worker on one run
-            logger.error("explorer run failed", session_id=self.session_id, error=str(exc))
-            self._log(f"Explorer error: {exc}")
+                        while not self._stop.is_set() and visited_count < max_routes:
+                            frontier = graph.frontier()
+                            if not frontier:
+                                self._log("Frontier drained — exploration complete")
+                                break
+                            # Shallowest-first so top-level sections are mapped before deep leaves.
+                            route = min(frontier, key=lambda r: r.depth)
+                            await self._visit_route(page, route, graph, _is_allowed_host)
+                            visited_count += 1
+
+                            # Wall hit on round 0 and the bypass was requested but not
+                            # built yet: build the stub plan from the visited bundles and
+                            # restart the context with it installed.
+                            if (bypass_auth and round_index == 0 and self._bypass_plan is None
+                                    and self._wall_landed_url and not self._stop.is_set()):
+                                self._bypass_plan = await self._build_bypass_plan(page, base_host)
+                                if self._bypass_plan is not None:
+                                    break  # next round re-enters the context with the plan
+
+                        if visited_count >= max_routes:
+                            self._log(f"Reached max-routes safety ceiling ({max_routes}); "
+                                      f"{len(graph.frontier())} route(s) still queued — restart to continue")
+                except Exception as exc:  # noqa: BLE001 — never crash the worker on one run
+                    logger.error("explorer run failed", session_id=self.session_id, error=str(exc))
+                    self._log(f"Explorer error: {exc}")
+                    break
         finally:
             self._store.active_crawler_session_id = None
 
@@ -174,6 +208,43 @@ class SpaExplorer:
         self._log(f"Explore complete — visited {stats['visited']}, frontier {stats['frontier']}, "
                   f"failed {stats['failed']}, forms submitted {stats['forms_submitted']}")
         logger.info("Explore finished", session_id=self.session_id, **stats)
+
+    async def _build_bypass_plan(self, page, base_host: str):
+        """Scan the app's JS (proxy-captured bundles first, live script-src fetch as
+        fallback) for client-side auth-gate markers and build the stub plan."""
+        from dast.browser.auth_gates import build_bypass_plan, detect_auth_gates
+
+        sources: List[str] = []
+        try:
+            for entry in self._store.in_scope_entries()[:400]:
+                ctype = (entry.content_type or "").lower()
+                path = (entry.path or "").lower()
+                if "javascript" in ctype or path.endswith(".js"):
+                    body = entry.response_body
+                    if body:
+                        sources.append(body.decode("utf-8", errors="replace")[:200000])
+        except Exception as exc:  # noqa: BLE001 — store read is best-effort
+            logger.debug("explorer: bundle harvest from store failed", error=str(exc)[:120])
+
+        if not sources:
+            try:
+                srcs = await page.evaluate(
+                    "Array.from(document.scripts).map(s => s.src).filter(Boolean)")
+                for src in (srcs or [])[:12]:
+                    if base_host not in (src or ""):
+                        continue
+                    resp = await page.request.get(src, timeout=15000)
+                    if resp is not None and 200 <= resp.status < 300:
+                        sources.append((await resp.text())[:200000])
+            except Exception as exc:  # noqa: BLE001 — bundle fetch is best-effort
+                logger.debug("explorer: bundle fetch failed", error=str(exc)[:120])
+
+        report = detect_auth_gates(sources)
+        plan = build_bypass_plan(report)
+        self._log(f"Agentless bypass: gates={report.gate_kinds or ['defaults']} "
+                  f"storage={plan.storage_keys} stubbing={len(plan.url_patterns)} "
+                  f"auth-URL pattern(s) from {len(sources)} bundle(s)")
+        return plan
 
     async def _visit_route(self, page, route, graph, is_allowed_host) -> None:
         if is_host_dead_url(route.url):
@@ -196,9 +267,13 @@ class SpaExplorer:
 
         landed = page.url
         # A redirect to login means the session wasn't accepted — record and move on.
+        # (The URL is surfaced on the instance so the agentless-bypass round in run()
+        # can build a stub plan from the bundles this visit captured.)
+        self._wall_landed_url = None
         if landed != route.url and any(
             kw in landed.lower() for kw in ("login", "signin", "/sso", "/authorize")
         ):
+            self._wall_landed_url = landed
             self._log(f"Route redirected to auth ({landed}) — not authenticated for {route.url}")
             graph.mark_failed(route.route_key)
             graph.add_discovered(landed, via="nav", parent=route.route_key, depth=route.depth)

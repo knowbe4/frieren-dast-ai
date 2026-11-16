@@ -53,6 +53,15 @@ _EXPLORE_SCHEMA: Dict[str, Any] = {
                            "normal explore of an authenticated app returns no routes (it costs a vision "
                            "LLM call per such page).",
         },
+        "bypass_auth": {
+            "type": "boolean",
+            "description": "Agentless auth-bypass (ARTEX three-gates): when a route bounces to a "
+                           "client-side login view, scan the app's JS bundles for auth-gate markers "
+                           "(token storage, isLogin checks, interceptors, permission routes), pre-seed "
+                           "the storage and stub the auth APIs so the SPA renders its post-login shell "
+                           "WITHOUT credentials, and keep exploring. Client-side gates only — "
+                           "server-side redirects stay failed. Default false.",
+        },
     },
     "required": ["url"],
 }
@@ -74,11 +83,12 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     # Form submission is active-only; read-only runs always map-only regardless of the flag.
     submit_forms = bool(args.get("submit_forms", False)) and not read_only
     vision = bool(args.get("vision", False))
+    bypass_auth = bool(args.get("bypass_auth", False))
 
     before = _in_scope_url_set(store)
     done_event = asyncio.Event()
     logger.info("explore tool: starting", url=url, submit_forms=submit_forms,
-                read_only=read_only, vision=vision)
+                read_only=read_only, vision=vision, bypass_auth=bypass_auth)
     try:
         await crawl_queue.put({
             "mode": "exhaustive",
@@ -88,6 +98,7 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "submit_forms": submit_forms,
             "vision": vision,
             "session_safe": bool(getattr(ctx, "session_safe", False)),
+            "bypass_auth": bypass_auth,
             "done_event": done_event,
         })
     except Exception as exc:

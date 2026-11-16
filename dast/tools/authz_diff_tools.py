@@ -29,7 +29,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from dast.proxy.auth_headers import build_cookie_header
+from dast.proxy.auth_headers import freshest_cookie_header_for_host
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
 from dast.utils.logger import get_logger
@@ -103,53 +103,17 @@ def _is_2xx(status: Optional[int]) -> bool:
     return isinstance(status, int) and 200 <= status < 300
 
 
-def _parent_domain(host: str) -> str:
-    """Everything after the first label, when that leaves a >=2-label domain.
-    api.foo.example.com -> foo.example.com; example.com -> '' (too short)."""
-    labels = host.split(".")
-    parent = ".".join(labels[1:]) if len(labels) >= 3 else ""
-    return parent if parent.count(".") >= 1 else ""
-
-
-def _host_matches(entry_host: str, host: str) -> bool:
-    """Match an entry's host to the target host for cookie reuse. Session cookies
-    are domain-scoped, so besides an exact / parent-child match we also treat
-    SIBLING subdomains that share an immediate parent domain as a match
-    (api.foo.example.com <-> settings-api.foo.example.com)."""
-    eh = (entry_host or "").lower()
-    h = (host or "").lower()
-    if not h or not eh:
-        return False
-    if eh == h or eh.endswith("." + h) or h.endswith("." + eh):
-        return True
-    parent = _parent_domain(h)
-    return bool(parent) and (eh == parent or eh.endswith("." + parent))
-
-
 def _live_cookie_header(ctx: ToolContext, host: str) -> Optional[str]:
     """Freshest live Cookie header for *host* from proxy history, falling back to
     the cookie jar. Reading from the newest entry sidesteps the stale-jar problem
-    (the jar is not always refreshed from SSO-callback Set-Cookie responses)."""
+    (the jar is not always refreshed from SSO-callback Set-Cookie responses).
+
+    Delegates to the shared store-cookie helper so capture-from-proxy and this probe
+    read cookies the same (sibling-subdomain-aware) way."""
     store = getattr(ctx, "store", None)
     if store is None:
         return None
-    try:
-        for entry in store.entries_newest_first():
-            if not _host_matches(getattr(entry, "host", ""), host):
-                continue
-            headers = getattr(entry, "request_headers", None) or {}
-            for k, v in headers.items():
-                if k.lower() == "cookie" and v:
-                    return str(v)
-    except Exception as exc:
-        logger.warning("authz_diff: history cookie lookup failed", host=host, error=str(exc))
-    try:
-        cookies = store.get_cookies_for_host(host) or []
-    except Exception as exc:
-        logger.warning("authz_diff: jar cookie lookup failed", host=host, error=str(exc))
-        return None
-    header = build_cookie_header(cookies)
-    return header or None
+    return freshest_cookie_header_for_host(store, host)
 
 
 async def _authz_differential_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:

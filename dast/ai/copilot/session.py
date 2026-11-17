@@ -55,6 +55,20 @@ _MAX_NORMALIZED_REPEATS = 8
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
 
+# Deterministic, idempotent probe tools do their real HTTP work INTERNALLY and return fresh
+# results on each call, so re-issuing identical args is legitimate (a blind-SQLi binary-search
+# re-run, an OAST re-poll). They are EXEMPT from the exact-identical-call suppression below:
+# that suppression would otherwise permanently block a probe whose earlier identical call was
+# registered in _seen_calls but NEVER actually executed (added pre-execution, then scope-denied
+# / watchdog-killed / errored before it ran), which pushed the model to perturb args with a
+# hand-pasted Cookie header it must never set. The no-progress watchdog still governs them —
+# a probe re-issued that returns the SAME outcome grows the no-progress streak and trips the
+# loop breaker, and the absolute _MAX_NORMALIZED_REPEATS cap still bounds them — so loop
+# protection is unchanged; only the "identical twice" suppression is lifted for these tools.
+_DETERMINISTIC_PROBE_TOOLS = frozenset({
+    "sqli_probe", "idor_probe", "authz_differential_probe", "oob_generate", "oob_poll",
+})
+
 
 class RefreshTier(IntEnum):
     """Bearer-refresh escalation tiers, cheapest -> most expensive. ``refresh_bearer``
@@ -350,6 +364,9 @@ Operational notes:
   selector like "button, input, a" for up to 15s; (3) try a different URL path from
   history. Never classify an empty snapshot as WAF_BLOCK — it is a rendering issue.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
+  Exception: the deterministic probe tools (sqli_probe, idor_probe,
+  authz_differential_probe, oob_generate, oob_poll) may be re-issued with identical args;
+  they do the real work internally and return fresh results each call.
 - Prefer replying as soon as you have something worth the operator's attention; do
   not pad the turn with tool calls.
 - Named sessions and privilege levels: the project context may list named sessions
@@ -426,6 +443,13 @@ Operational notes:
   part to sqli_probe rather than hand-driving many browser calls; if you must hand-drive
   UNION/blind steps and the turn's tool-call budget runs out, say so and continue in the next
   turn — budget exhaustion is not a dead end.
+- BLIND SQLi (no visible data — the response only differs by a true/false marker, a status code,
+  a conditional error, a time delay, or an out-of-band callback): do NOT hand-drive the binary
+  search char-by-char via send_request. Call sqli_probe ONCE with the matching mode —
+  'blind_boolean' (true_marker/false_marker/true_status/error_oracle), 'blind_time', 'error_visible',
+  or 'oast' — passing injection_template (with a {cond} placeholder) and extract_sql; it runs the
+  whole deterministic extraction in one call. Use injection_location 'cookie' when the injectable
+  parameter is a cookie.
 - Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
   1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
      testing, confirm the actual route, its parameters and its authz with code_lookup_path
@@ -1532,7 +1556,12 @@ class CopilotSession:
                             page_url = getattr(browser, "current_url", "") or ""
                             if page_url:
                                 call_key = f"{tool_name}:{page_url}:{_canonical(tool_args)}"
-                    if call_key in self._seen_calls:
+                    # Deterministic probe tools do their work internally and return fresh
+                    # results per call — never suppress a re-issue (the no-progress watchdog
+                    # below still catches a genuine same-outcome spin). All other tools keep
+                    # the exact-identical-call suppression.
+                    if (call_key in self._seen_calls
+                            and tool_name not in _DETERMINISTIC_PROBE_TOOLS):
                         reply = await _record_tool_failure(
                             entry, "Repeat of an earlier identical call — suppressed. "
                             "Try a different request or reply.")

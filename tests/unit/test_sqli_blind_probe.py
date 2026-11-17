@@ -875,3 +875,143 @@ async def test_xml_body_default_probe_extracts_union_leak(monkeypatch):
     assert hit
     inner = hit[0].split("<storeId>", 1)[1].split("</storeId>", 1)[0]
     assert "&#x" in inner and " " not in inner and "'" not in inner
+
+
+# ── boolean-differential confirmation (DEFAULT probe, technique="boolean") ───────
+#
+# The false member of each boolean_pairs entry carries a literal `2` at the end (`...=2`), so the
+# JSON body ends `...2"}`; the true member and the baseline never do. The fakes key off that `2"`
+# marker to decide the false-vs-true/baseline branch. These run ONLY after error-based (no SQL
+# error text is ever returned) and time-based (no delay) both miss.
+
+_BASE_BODY = "welcome user, results below"
+
+
+@pytest.mark.asyncio
+async def test_boolean_differential_confirms_reproducibly(monkeypatch):
+    """error-text + timing both miss; baseline/true -> 200 and false -> 400 REPRODUCIBLY ->
+    CONFIRMED technique="boolean"."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    class _BoolClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            body = (content or b"").decode("utf-8", "ignore")
+            if "sqli_probe_baseline" in body:
+                return _FakeResp(_BASE_BODY, 200)
+            if '2"' in body:              # a false-condition payload -> stable 400
+                return _FakeResp("bad request", 400)
+            return _FakeResp(_BASE_BODY, 200)  # true / error / time payloads -> baseline-like 200
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _BoolClient())
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/filter",
+        "injection_point": "q",
+        "injection_location": "body",
+        "method": "POST",
+    })
+    assert result["ok"] is True and result["confirmed"] is True
+    assert result["technique"] == "boolean"
+    assert "CONFIRMED" in result["verdict"] and "boolean" in result["verdict"]
+    # The confirming payload is a false member (ends in a false boolean, `...2`).
+    assert result["technique"] == "boolean"
+    hit = [s for s in result["steps"] if s.get("label") == "boolean-based hit"]
+    assert hit and hit[0]["false_status"] == 400 and hit[0]["true_status"] == 200
+    # A CONFIRMED finding is recorded through the same store API, keyed off `confirmed`.
+    assert store.recorded and store.recorded[0][0]["confirmed"] is True
+    assert store.recorded[0][0]["evidence"]  # differential summary carried as evidence
+
+
+@pytest.mark.asyncio
+async def test_boolean_differential_non_reproducible_rejected(monkeypatch):
+    """A false-vs-true differential that does NOT reproduce on the re-send must NOT confirm (no
+    false positive). The fake returns 400 the FIRST time a given false payload is sent and 200
+    thereafter, so the reproduce check (same payload re-sent) sees a baseline-like 200 and bails."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    false_seen: dict = {}
+
+    class _FlakyClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            body = (content or b"").decode("utf-8", "ignore")
+            if "sqli_probe_baseline" in body:
+                return _FakeResp(_BASE_BODY, 200)
+            if '2"' in body:
+                n = false_seen.get(body, 0) + 1
+                false_seen[body] = n
+                # First send of THIS false payload differs (400); the re-send looks baseline-like.
+                return _FakeResp("bad request", 400) if n == 1 else _FakeResp(_BASE_BODY, 200)
+            return _FakeResp(_BASE_BODY, 200)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _FlakyClient())
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/filter",
+        "injection_point": "q",
+        "injection_location": "body",
+        "method": "POST",
+    })
+    assert result["ok"] is True and result["confirmed"] is False
+    assert result["technique"] == ""
+    assert "NOT CONFIRMED" in result["verdict"]
+    assert not store.recorded
+    # The reproduce guard actually ran and vetoed a non-reproducible differential.
+    assert any(s.get("label") == "boolean-based not reproducible" for s in result["steps"])
+
+
+@pytest.mark.asyncio
+async def test_boolean_differential_no_difference_rejected(monkeypatch):
+    """A benign endpoint that returns the SAME status/body for the true and false members (and
+    baseline) yields NO differential -> NOT CONFIRMED (no false positive)."""
+    from dast.tools import sqli_probe_tools as spt
+    import httpx
+
+    class _FlatClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def request(self, method, url, headers=None, content=None):
+            # Identical 200 for everything (no SQL error text, no delay, no status/size diff).
+            return _FakeResp(_BASE_BODY, 200)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _FlatClient())
+
+    store = _FakeStore()
+    result = await spt._sqli_probe(_FakeCtx(store), {
+        "url": "https://app.example.com/filter",
+        "injection_point": "q",
+        "injection_location": "body",
+        "method": "POST",
+    })
+    assert result["ok"] is True and result["confirmed"] is False
+    assert result["technique"] == ""
+    assert "NOT CONFIRMED" in result["verdict"]
+    assert not store.recorded

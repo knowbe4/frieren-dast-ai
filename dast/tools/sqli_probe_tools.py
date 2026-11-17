@@ -597,6 +597,75 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                     steps.append({"label": "time-based miss", "payload": payload,
                                   "elapsed_ms": round(elapsed_ms)})
 
+            # Boolean-differential fallback — runs ONLY when error-based AND time-based both missed.
+            # It catches targets whose ONLY signal is a status/size differential with NO SQL-error
+            # text and NO timing delay (e.g. a PortSwigger lab where a true condition -> 200 but a
+            # false condition -> 400). Each pair's true/false members are syntactically identical
+            # except the boolean truth value, so a STABLE differential can only come from the DB
+            # evaluating the condition. FP guards (this project's bar is low FP): (1) two-sided —
+            # the TRUE member must MATCH the baseline (same status + body length within tolerance)
+            # while the FALSE member DIFFERS from BOTH baseline and TRUE; (2) re-send the pair once
+            # and require the same differential both times. A one-sided or non-reproducible
+            # difference does NOT confirm.
+            if not confirmed:
+                base_status = getattr(base, "status_code", None)
+                base_len = len(base_text)
+                len_tol = 32  # bytes; a body-length wobble at/below this is noise, not signal
+
+                def _like_baseline(resp: Optional["httpx.Response"]) -> bool:
+                    return (resp is not None and resp.status_code == base_status
+                            and abs(len(resp.text) - base_len) <= len_tol)
+
+                def _unlike_baseline(resp: Optional["httpx.Response"]) -> bool:
+                    return (resp is not None
+                            and (resp.status_code != base_status
+                                 or abs(len(resp.text) - base_len) > len_tol))
+
+                def _unlike(a: "httpx.Response", b: "httpx.Response") -> bool:
+                    return (a.status_code != b.status_code
+                            or abs(len(a.text) - len(b.text)) > len_tol)
+
+                for pair in (get_value("sqli", "boolean_pairs", []) or []):
+                    tp = str(pair.get("true_payload", ""))
+                    fp = str(pair.get("false_payload", ""))
+                    if not tp or not fp:
+                        continue
+                    t_resp = await _send_value(client, tp)
+                    f_resp = await _send_value(client, fp)
+                    if t_resp is None or f_resp is None:
+                        continue
+                    # TRUE must look like baseline; FALSE must differ from BOTH baseline and TRUE.
+                    if not (_like_baseline(t_resp) and _unlike_baseline(f_resp)
+                            and _unlike(f_resp, t_resp)):
+                        steps.append({"label": "boolean-based miss", "true": tp, "false": fp,
+                                      "baseline_status": base_status,
+                                      "true_status": t_resp.status_code,
+                                      "false_status": f_resp.status_code})
+                        continue
+                    # Reproduce once: re-send the pair; require the SAME differential both times.
+                    t_resp2 = await _send_value(client, tp)
+                    f_resp2 = await _send_value(client, fp)
+                    if not (_like_baseline(t_resp2) and _unlike_baseline(f_resp2)
+                            and _unlike(f_resp2, t_resp2)):
+                        steps.append({"label": "boolean-based not reproducible", "true": tp,
+                                      "false": fp,
+                                      "false_status_1": f_resp.status_code,
+                                      "false_status_2": getattr(f_resp2, "status_code", None)})
+                        continue
+                    confirmed = True
+                    technique = "boolean"
+                    confirming_payload = fp
+                    evidence_snippet = (
+                        f"boolean differential: baseline/true status={base_status}/"
+                        f"{t_resp.status_code} len~{base_len}/{len(t_resp.text)}, "
+                        f"false status={f_resp.status_code} len={len(f_resp.text)} (reproduced)")
+                    steps.append({"label": "boolean-based hit", "true": tp, "false": fp,
+                                  "baseline_status": base_status,
+                                  "true_status": t_resp.status_code,
+                                  "false_status": f_resp.status_code,
+                                  "snippet": evidence_snippet})
+                    break
+
             # Impact proof: best-effort read-only version()/db/user extraction (error-based only).
             facts: Dict[str, str] = {}
             proof_summary = ""

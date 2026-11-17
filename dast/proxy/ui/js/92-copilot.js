@@ -14,6 +14,19 @@ let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (se
 // operator. Drives the persistent top-level pause banner (visible on every tab).
 const _cpPaused = {};
 
+// Stable keys of the <details> the operator has expanded in the session panel
+// (Tool activity, per-observation). The panel rebuilds its innerHTML on every
+// poll/WS tick while a turn runs, which recreates those native <details> closed;
+// we re-apply the `open` attribute from this set so an opened log stays open.
+const cpOpenDetails = new Set();
+
+// Called from the inline ontoggle handler on each <details>. Records whether the
+// operator has it open so the next re-render preserves that state.
+function cpToggleDetails(key, isOpen) {
+  if (isOpen) cpOpenDetails.add(key);
+  else cpOpenDetails.delete(key);
+}
+
 // Friendly label per pause kind for the banner.
 const _CP_PAUSE_LABEL = {
   approve: 'approval needed',
@@ -547,9 +560,12 @@ function cpRenderActivity(session, inProgress) {
        </div>`
     : '';
 
-  const items = trace.map(ev => cpTraceEvent(ev)).filter(Boolean).join('');
+  const sid = session.session_id;
+  const items = trace.map(ev => cpTraceEvent(ev, sid)).filter(Boolean).join('');
+  const actKey = `activity:${sid}`;
+  const actOpen = cpOpenDetails.has(actKey) ? ' open' : '';
   const log = items
-    ? `<details style="font-size:10px;color:var(--txt2)">
+    ? `<details${actOpen} ontoggle="cpToggleDetails(${jsArg(actKey)}, this.open)" style="font-size:10px;color:var(--txt2)">
          <summary style="cursor:pointer;padding:2px 0">Tool activity (${steps.length} step${steps.length === 1 ? '' : 's'})</summary>
          <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px">${items}</div>
        </details>`
@@ -558,7 +574,7 @@ function cpRenderActivity(session, inProgress) {
   return (live || log) ? `<div style="display:flex;flex-direction:column;gap:6px;margin-top:2px">${live}${log}</div>` : '';
 }
 
-function cpTraceEvent(ev) {
+function cpTraceEvent(ev, sid) {
   if (ev.type === 'step') {
     return `<div style="border-left:2px solid var(--orange);padding:3px 9px;background:var(--bg2);border-radius:0 3px 3px 0">
         <div style="display:flex;gap:6px;align-items:center">
@@ -569,7 +585,9 @@ function cpTraceEvent(ev) {
       </div>`;
   }
   if (ev.type === 'observation') {
-    return `<details style="margin-left:9px">
+    const obsKey = `obs:${sid}:${ev.step}`;
+    const obsOpen = cpOpenDetails.has(obsKey) ? ' open' : '';
+    return `<details${obsOpen} ontoggle="cpToggleDetails(${jsArg(obsKey)}, this.open)" style="margin-left:9px">
         <summary style="cursor:pointer;font-size:9px;color:var(--txt2)">observation (step ${ev.step})</summary>
         <pre style="margin-top:4px;padding:7px;background:#0a0a1a;border:1px solid var(--bdr);border-radius:3px;
              font-size:10px;overflow:auto;white-space:pre-wrap;color:#7ef7a0;max-height:160px">${esc(ev.observation || '')}</pre>

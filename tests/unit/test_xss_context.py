@@ -90,6 +90,37 @@ def test_angular_parse_sink_false_for_plain_js_string():
     out = classify_context(f"<script>var x = '{MK}'; foo();</script>", MK)
     assert out["context"] == "js_string_single"
     assert out["angular_parse_sink"] is False
+    assert out["angular_parse_key_sink"] is False
+
+
+def test_angular_parse_key_sink_when_parse_arg_is_param_name():
+    # The client $parses a VARIABLE (the query-param NAME), not a string literal:
+    #   key = <paramName>; $scope.query[key] = '<marker>'; $scope.value = $parse(key)($scope.query)
+    # → the param KEY is the evaluated Angular expression, so angular_parse_key_sink is set.
+    html = (
+        '<html><head><script src="/resources/js/angular_1-4-4.js"></script></head>'
+        '<body ng-app>'
+        f"<script>$scope.query[key] = '{MK}'; $scope.value = $parse(key)($scope.query);</script>"
+        '</body></html>'
+    )
+    out = classify_context(html, MK)
+    assert out["context"] == "js_string_single"       # surface context still reported
+    assert out["angular_parse_sink"] is True
+    assert out["angular_parse_key_sink"] is True
+    assert out["framework_version"] == "1.4"
+
+
+def test_angular_parse_key_sink_false_for_string_literal_arg():
+    # $parse('search') feeds a STRING LITERAL (a fixed expression), not a param key → not a key sink
+    # even though it is still a $parse sink.
+    html = (
+        '<html><body ng-app>'
+        f"<script>$scope.query['search'] = '{MK}'; $scope.value = $parse('search')($scope.query);</script>"
+        '</body></html>'
+    )
+    out = classify_context(html, MK)
+    assert out["angular_parse_sink"] is True
+    assert out["angular_parse_key_sink"] is False
 
 
 # ── classify_context: quotes_encoded heuristic ───────────────────────────────

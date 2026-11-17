@@ -260,6 +260,103 @@ async def test_angular_parse_sink_in_js_string_confirms_via_no_strings_vector():
     assert "CSTI" in title or "template injection" in title
 
 
+class _AngularParseKeySinkBrowser:
+    """Models the AngularJS ``$parse``-of-KEY lab: the benign marker reflects into a single-quoted
+    JS string that the page feeds through ``$parse(key)`` where ``key`` is the query-param NAME. The
+    sandbox only escapes when the Angular expression is delivered AS A SECOND RAW QUERY-PARAM KEY
+    (``?search=1&...charAt%3d[].join;...=1``) — so a dialog fires ONLY when the opened URL carries
+    the expression as a raw key with a lowercase ``%3d`` and a raw ``&``, NOT for the url-encoded
+    value delivery of the same vector, and NOT for the JS-string break-outs."""
+
+    _DOM = (
+        '<html><head><script src="/resources/js/angular_1-4-4.js"></script></head>'
+        '<body ng-app>'
+        "<script>$scope.query[key] = '{MARKER}'; $scope.value = $parse(key)($scope.query);</script>"
+        '</body></html>'
+    )
+
+    def __init__(self, point: str) -> None:
+        self.point = point
+        self._page = _FakePage(self)
+        self.marker = ""
+        self.navigated: list = []
+        self.confirming_url = ""
+        self._dialog = None
+
+    async def _ensure_page(self):
+        return self._page
+
+    async def navigate(self, url: str):
+        self.navigated.append(url)
+        qs = parse_qs(urlparse(url).query, keep_blank_values=True)
+        first_val = (qs.get(self.point, [""]) or [""])[0]
+        if first_val.startswith("dastxss"):
+            self.marker = first_val  # benign-marker step
+            self._dialog = None
+            return {"ok": True, "url": url}
+        # Fire ONLY for the raw KEY-delivery URL: the expression sits as a second param KEY with its
+        # internal '=' as a lowercase %3d (value delivery would url-encode it to %3D and never add a
+        # raw '&'). This is the exact exploit structure for the $parse-of-key sandbox escape.
+        if "&" in url and "charAt%3d[].join" in url and "fromCharCode" in url:
+            self.confirming_url = url
+            self._dialog = {"type": "alert", "message": "1"}
+        else:
+            self._dialog = None
+        return {"ok": True, "url": url}
+
+    def pop_last_dialog(self):
+        dlg, self._dialog = self._dialog, None
+        return dlg
+
+    async def snapshot(self):
+        return {"forms": [], "fields": [], "buttons": [], "links": []}
+
+    async def fill(self, selector, value):
+        return {"ok": True}
+
+    async def click(self, selector, expect_nav=False):
+        return {"ok": True}
+
+    @property
+    def _dom_template(self):
+        return self._DOM
+
+
+async def test_angular_parse_key_sink_confirms_via_raw_key_delivery():
+    from dast.payloads.loader import get_value
+
+    browser = _AngularParseKeySinkBrowser("search")
+    store = _FakeStore()
+    ctx = _FakeCtx(browser, store)
+    out = await xpt._xss_probe(ctx, {"url": _URL, "injection_point": "search"})
+
+    assert out["ok"] is True
+    assert out["confirmed"] is True
+    # Surface context is a JS string, yet the confirming payload is the key-delivered no-strings vector.
+    assert out["context"] == "js_string_single"
+    assert out["framework_version"] == "1.4"
+    no_strings = (get_value("xss", "angular_no_strings", {}) or {})["1.4"][0]
+    assert out["payload"] == no_strings
+
+    # The confirming delivery was a RAW second query-param KEY: internal '=' → lowercase %3d, raw '&',
+    # and NO url-encoding of the '&' (%26) or the key '=' (uppercase %3D).
+    key_url = browser.confirming_url
+    assert key_url, "expected a key-delivery URL to have fired the dialog"
+    assert "search=1&" in key_url
+    assert "charAt%3d[].join" in key_url          # internal '=' encoded, structure kept raw
+    assert key_url.endswith("=1")                 # trailing KEY→value separator preserved
+    assert "%26" not in key_url                   # the '&' between params is RAW, not url-encoded
+    assert "charAt%3D" not in key_url             # not url-encoded (urlencode would uppercase)
+    # Raw expression chars the lab needs must survive verbatim (not percent-encoded).
+    for raw in ("[].join;", "|orderBy:", "fromCharCode(120,61"):
+        assert raw in key_url
+
+    # Reported as CSTI even though the surface context was a JS string.
+    assert len(store.recorded) == 1
+    title = store.recorded[0][0]["title"]
+    assert "CSTI" in title or "template injection" in title
+
+
 async def test_browser_unavailable_errors_cleanly():
     class _NoBrowserCtx(_FakeCtx):
         def __init__(self):

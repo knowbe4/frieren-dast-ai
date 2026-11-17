@@ -479,6 +479,68 @@ async def test_repeated_failing_tool_calls_end_turn_early():
 
 
 @pytest.mark.asyncio
+async def test_login_form_loop_hint_steers_to_browser_login():
+    # The model hand-drives a login FORM, snapshotting the login page in a loop
+    # (identical browser_snapshot calls get suppressed, 200 body — no 302/401 in
+    # play). The spin-hint that fires before the kill must steer it to the
+    # deterministic browser_login tool instead of more manual browser steps.
+    tools = [_FakeTool("browser_snapshot"), _FakeTool("browser_login"),
+             _FakeTool("send_request")]
+    session = CopilotSession("s-loginloop")
+    _, on_event = _collector()
+    # The login page snapshot body carries the login signal (email/password form).
+    run_tool = AsyncMock(return_value={
+        "ok": True, "status": 200,
+        "body": "Email Password Sign in to your account"})
+
+    def drive_login(*_a, **_k):
+        # Same browser_snapshot of the login page every step -> exact-dedup
+        # suppression accumulates toward the consecutive-failure ceiling (snapshot
+        # does not reset the anti-repeat set, unlike navigate/fill/click).
+        return {"action": "call_tool", "thought": "read the login form",
+                "tool_name": "browser_snapshot", "tool_args": {}}
+
+    with patch("dast.tools.all_tools", return_value=tools), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=drive_login)):
+        reply = await session.send("log in and solve", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "need_direction"
+    assert "browser_login" in reply.message
+    assert "{url, email, password}" in reply.message
+
+
+@pytest.mark.asyncio
+async def test_non_login_browser_loop_keeps_generic_repeat_hint():
+    # A browser_snapshot loop on a NON-login page must NOT be captured by the new
+    # login-loop branch — it falls through to the generic repeat hint, which does
+    # not mention browser_login. Guards the branch ordering against over-capture.
+    tools = [_FakeTool("browser_snapshot"), _FakeTool("browser_login"),
+             _FakeTool("send_request")]
+    session = CopilotSession("s-dashloop")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={
+        "ok": True, "status": 200, "body": "Dashboard widgets and metrics"})
+
+    def drive_dash(*_a, **_k):
+        return {"action": "call_tool", "thought": "look again",
+                "tool_name": "browser_snapshot", "tool_args": {}}
+
+    with patch("dast.tools.all_tools", return_value=tools), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=drive_dash)):
+        reply = await session.send("keep going", _FakeCtx(), on_event=on_event,
+                                   wait_for_human=_deny_human())
+
+    assert reply.blocked_reason == "need_direction"
+    assert "browser_login" not in reply.message
+    assert "repeating the same tool call" in reply.message
+
+
+@pytest.mark.asyncio
 async def test_successful_calls_reset_the_failure_guard():
     # An occasional failure interleaved with successes must not accumulate toward
     # the failure ceiling — only a *consecutive* run of failures ends the turn.

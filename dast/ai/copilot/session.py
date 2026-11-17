@@ -343,6 +343,10 @@ Operational notes:
   returns mfa_required=true, the operator must complete the MFA challenge manually
   (browser is visible on their screen). Only fall back to manual
   browser_navigate/fill/click if browser_login fails for an unusual login form.
+  This also applies when you already HAVE credentials to submit to complete a login /
+  reach an authenticated area / solve: use `browser_login {url,email,password}` in a
+  single call; do NOT hand-drive browser_navigate/fill/click/snapshot on a login form,
+  that loops.
   After browser_login succeeds, auth (CSRF token + session cookies, and a captured
   Bearer) is auto-injected on BOTH send_request and browser_fetch. Use send_request as
   the default for API/GraphQL calls; you do not need to hand-manage transport — if a
@@ -1279,6 +1283,36 @@ class CopilotSession:
                 "without making progress, so I'm stopping to avoid spinning.\n\n"
             )
 
+            # Login-loop detection: the model is hand-driving a login FORM with manual
+            # browser steps and looping (no 302/401/403 — the page just returns 200), so
+            # no real login POST is ever submitted. Detected from a browser-driving last
+            # tool plus a login indicator in the observation or a recent nav URL. Steered
+            # to the deterministic browser_login tool below. Evaluated as a branch ordered
+            # AFTER the 302/401/403 branches so it only catches the 200 login-loop case.
+            _LOGIN_DRIVE_TOOLS = ("browser_navigate", "browser_snapshot",
+                                  "browser_fill", "browser_click")
+            _LOGIN_MARKERS = ("/login", "login", "signin", "sign-in", "sign in",
+                              "log in", "logon", "password")
+
+            def _has_login_marker(text: str) -> bool:
+                low = text.lower()
+                return any(m in low for m in _LOGIN_MARKERS)
+
+            # The login signal may be in the triggering observation OR in a recent
+            # transcript entry — the login URL the model navigated to, or the login
+            # form's snapshot text ("password" / "sign in"). Scan both.
+            login_loop = False
+            if last_tool in _LOGIN_DRIVE_TOOLS:
+                if _has_login_marker(obs):
+                    login_loop = True
+                else:
+                    for item in reversed(turn_transcript[-6:]):
+                        url = str((item.get("tool_args") or {}).get("url", ""))
+                        observation = str(item.get("observation") or "")
+                        if _has_login_marker(url) or _has_login_marker(observation):
+                            login_loop = True
+                            break
+
             if ('"status": 302' in recent_observation or '"status":302' in recent_observation
                     or ("redirect" in obs and "login" in obs)):
                 detail = (
@@ -1307,6 +1341,20 @@ class CopilotSession:
                     "(e.g. 'Bearer <token>') so I can inject it.\n"
                     "  3. If this is a second-account test, give me the credentials or "
                     "session cookie for that account."
+                )
+            elif login_loop:
+                detail = (
+                    f"Root cause: I'm hand-driving a login form with manual {tool_label}"
+                    "calls (browser_navigate/snapshot/fill/click) and looping — the page "
+                    "returns 200 (no 302/401/403), so I keep navigating and snapshotting "
+                    "without ever submitting a real login.\n\n"
+                    "If I have the credentials, I should call `browser_login` with "
+                    "{url, email, password} in ONE call — it discovers the form fields, "
+                    "fills them, submits, and waits for the redirect — instead of manual "
+                    "browser_navigate/snapshot/fill/click, which loops. Only fall back to "
+                    "manual browser steps if browser_login fails for an unusual form.\n\n"
+                    "If you have not given me credentials yet, tell me the username and "
+                    "password to use."
                 )
             elif "repeat" in obs or "suppressed" in obs:
                 detail = (

@@ -570,12 +570,29 @@ class AgentBrowser:
             logger.debug("AgentBrowser reload: did not settle, continuing",
                          error=str(exc)[:160])
         await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
-        return {"ok": True, "url": page.url, "status": (resp.status if resp else None)}
+        result: Dict[str, Any] = {"ok": True, "url": page.url,
+                                  "status": (resp.status if resp else None)}
+        # Surface a JS dialog raised during the reload (e.g. a stored XSS alert() that fires on
+        # re-render) as execution evidence. Only ADDS a key when a dialog fired.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired during reload ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def fill(self, selector: str, value: str, timeout_ms: int = 10000) -> Dict[str, Any]:
         page = await self._ensure_page()
         await page.fill(selector, value, timeout=timeout_ms)
-        return {"ok": True, "selector": selector}
+        result: Dict[str, Any] = {"ok": True, "selector": selector}
+        # Surface a JS dialog raised by filling (e.g. an onfocus/oninput XSS alert()) as
+        # execution evidence. Only ADDS a key when a dialog fired — existing keys untouched.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def click(self, selector: str, timeout_ms: int = 10000,
                     expect_nav: bool = False) -> Dict[str, Any]:
@@ -588,7 +605,15 @@ class AgentBrowser:
                 logger.debug("AgentBrowser click nav wait ended", error=str(exc))
         else:
             await page.click(selector, timeout=timeout_ms)
-        return {"ok": True, "selector": selector, "url": page.url}
+        result: Dict[str, Any] = {"ok": True, "selector": selector, "url": page.url}
+        # Surface a JS dialog raised by the click (e.g. an onclick XSS alert()) as execution
+        # evidence. Only ADDS a key when a dialog fired — existing keys untouched.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def wait_for(self, selector: str, timeout_ms: int = 10000,
                        state: str = "visible") -> Dict[str, Any]:
@@ -624,7 +649,13 @@ class AgentBrowser:
         # still snapshots promptly once both attempts time out).
         await self._wait_for_hydration(page, timeout_ms=8000)
         view = await page.evaluate(_SNAPSHOT_JS)
-        return {"ok": True, "url": page.url, "title": await page.title(), **view}
+        result: Dict[str, Any] = {"ok": True, "url": page.url, "title": await page.title(), **view}
+        # Peek (do NOT pop) any JS dialog the page has raised, so a snapshot after an XSS
+        # delivery still shows the execution evidence without consuming it. Only ADDS a key.
+        dialog = self.last_dialog
+        if dialog is not None:
+            result["dialog"] = dialog
+        return result
 
     async def _find_submit(self, page: Any) -> Any:
         """Best submit control for the login form: scored to prefer the sign-in

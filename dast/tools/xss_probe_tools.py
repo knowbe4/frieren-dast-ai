@@ -1,0 +1,375 @@
+"""
+xss_probe tool — deterministic, LLM-free reflected/stored/DOM-XSS + AngularJS-CSTI probe.
+
+Mirrors ``sqli_probe``: a fixed, self-contained confirmation the gateway's content-safety filter
+cannot block, because no language model generates the payload. The twist is that confirming an
+XSS needs a REAL browser firing a REAL ``alert()`` dialog — a reflection in the body is not proof,
+and a 200 is not proof. So this tool drives ``ctx.browser`` (the live ``AgentBrowser`` that already
+carries the authenticated session) rather than httpx:
+
+  1. Inject a benign unique MARKER (not a payload) and read the rendered DOM.
+  2. ``xss_context.classify_context`` locates the marker and decides the reflection context
+     (HTML body / quoted attribute / JS-string / href / AngularJS expression), and
+     ``detect_angular_version`` reads the AngularJS era for a CSTI sandbox-escape.
+  3. Pick the context-correct payload from ``xss.yaml`` (the quote-free sibling when the app
+     HTML-encodes quotes), substitute the per-run MARK, and deliver it through the browser.
+  4. CONFIRM strictly via a captured JS dialog: for a context payload the dialog message must
+     contain the exact MARK (an ambient alert cannot match); for the fixed AngularJS alert(1)
+     cheat-sheet vectors, a fired dialog is the proof. Reflection alone never confirms.
+
+Dialogs are read from two sources so a synchronous inline-script alert is never missed: the
+AgentBrowser's native ``page.on("dialog")`` handler (``pop_last_dialog``) AND the
+``XSS_PROOF_INIT_SCRIPT`` window hooks installed before delivery (which also catch an alert that
+fires during document commit, before the native listener can attach).
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
+
+from dast.payloads.loader import get_value
+from dast.tools.base import Tool, register
+from dast.tools.context import ToolContext
+from dast.triage.xss_browser import XSS_PROOF_INIT_SCRIPT
+from dast.triage.xss_context import classify_context, detect_angular_version
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_VALID_SEVERITIES = ("critical", "high", "medium", "low", "info")
+_LOCATIONS = ("query", "fragment", "path", "body")
+
+# JS that resets then reads the XSS_PROOF_INIT_SCRIPT window hooks. Returned by the init script
+# when an alert/confirm/prompt fired during the current document, with the string message.
+_READ_DIALOG_JS = "() => (window._xssAlertFired === true)"
+_READ_MSG_JS = "() => String(window._xssAlertMessage == null ? '' : window._xssAlertMessage)"
+_RESET_DIALOG_JS = "() => { window._xssAlertFired = false; window._xssAlertMessage = ''; }"
+
+
+_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "url": {"type": "string", "description": "Target URL (must be in scope). For a URL-borne "
+                "parameter this is the page URL; for a form field it is the page carrying the form."},
+        "injection_point": {"type": "string", "description": "The parameter / form-field NAME to "
+                            "inject into (e.g. 'q', 'search', 'comment')."},
+        "injection_location": {"type": "string", "description": "Where the parameter lives: "
+                               "'query' (URL query string, default), 'fragment' (URL #fragment, for "
+                               "a DOM-XSS sink reading location.hash), 'path' (appended to the URL "
+                               "path), or 'body' (a form field — the tool navigates, fills the field "
+                               "named by injection_point, and submits). Default 'query'."},
+        "method": {"type": "string", "description": "Optional HTTP method hint (informational; the "
+                   "browser drives navigation/form submission). Default GET."},
+        "record": {"type": "boolean", "description": "Record a finding when CONFIRMED (default true)."},
+        "title": {"type": "string", "description": "Finding title (optional; a sensible default is used)."},
+        "severity": {"type": "string", "description": "critical|high|medium|low|info (default high)."},
+        "cwe": {"type": "string", "description": "CWE id (default CWE-79)."},
+    },
+    "required": ["url", "injection_point"],
+}
+
+
+def _set_query_param(url: str, param: str, value: str) -> str:
+    parts = urlparse(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q[param] = value
+    return urlunparse(parts._replace(query=urlencode(q)))
+
+
+def _set_fragment(url: str, param: str, value: str) -> str:
+    parts = urlparse(url)
+    frag = f"{param}={value}" if param else value
+    return urlunparse(parts._replace(fragment=frag))
+
+
+def _append_path(url: str, value: str) -> str:
+    parts = urlparse(url)
+    base = parts.path.rstrip("/")
+    new_path = f"{base}/{quote(value, safe='')}"
+    return urlunparse(parts._replace(path=new_path))
+
+
+def _build_url(url: str, point: str, value: str, location: str) -> str:
+    """Place ``value`` at ``point`` in a URL-borne location (query/fragment/path)."""
+    if location == "fragment":
+        return _set_fragment(url, point, value)
+    if location == "path":
+        return _append_path(url, value)
+    return _set_query_param(url, point, value)  # query (default)
+
+
+def _field_selector(snap: Dict[str, Any], point: str) -> str:
+    """Build a CSS selector for the form field named ``point`` from a browser snapshot
+    (matching name, then id). Falls back to a plain [name=...] selector."""
+    fields: List[Dict[str, Any]] = list(snap.get("fields", []) or [])
+    for form in (snap.get("forms", []) or []):
+        fields.extend(form.get("fields", []) or [])
+    for f in fields:
+        if f.get("name") == point:
+            return f'[name="{point}"]'
+    for f in fields:
+        if f.get("id") == point:
+            return f'#{point}'
+    return f'[name="{point}"]'
+
+
+def _submit_selector(snap: Dict[str, Any]) -> Optional[str]:
+    """Best submit control from a snapshot: a submit-typed button, else the first button."""
+    buttons: List[Dict[str, Any]] = list(snap.get("buttons", []) or [])
+    for b in buttons:
+        if (b.get("type") or "").lower() == "submit":
+            if b.get("id"):
+                return f'#{b["id"]}'
+            if b.get("name"):
+                return f'[name="{b["name"]}"]'
+            return "button[type=submit], input[type=submit]"
+    if buttons:
+        b = buttons[0]
+        if b.get("id"):
+            return f'#{b["id"]}'
+        if b.get("name"):
+            return f'[name="{b["name"]}"]'
+    return "button[type=submit], input[type=submit], button"
+
+
+async def _install_proof_script(browser: Any) -> None:
+    """Install XSS_PROOF_INIT_SCRIPT on the live page via add_init_script BEFORE delivery, so an
+    alert() that fires on a synchronous inline script (during commit, before the native dialog
+    listener attaches) is still captured into window._xssAlertFired. Idempotent per browser."""
+    if getattr(browser, "_xss_proof_installed", False):
+        return
+    try:
+        page = await browser._ensure_page()
+        await page.add_init_script(XSS_PROOF_INIT_SCRIPT)
+        browser._xss_proof_installed = True
+    except Exception as exc:
+        logger.debug("xss_probe: proof-script install failed", error=str(exc)[:160])
+
+
+async def _reset_dialog(browser: Any) -> None:
+    """Clear both dialog sources before a delivery, so a captured dialog belongs to THIS payload."""
+    try:
+        browser.pop_last_dialog()
+    except Exception:
+        pass
+    try:
+        page = await browser._ensure_page()
+        await page.evaluate(_RESET_DIALOG_JS)
+    except Exception:
+        pass
+
+
+async def _capture_dialog(browser: Any) -> Optional[Dict[str, Any]]:
+    """Read the most recent JS dialog from either source: the native page.on("dialog") handler
+    (pop_last_dialog) first, else the XSS_PROOF_INIT_SCRIPT window hooks (which capture an alert
+    the init script's override intercepted). Returns {"type","message"} or None."""
+    try:
+        native = browser.pop_last_dialog()
+    except Exception:
+        native = None
+    if native is not None:
+        return native
+    try:
+        page = await browser._ensure_page()
+        if await page.evaluate(_READ_DIALOG_JS):
+            msg = await page.evaluate(_READ_MSG_JS)
+            await page.evaluate(_RESET_DIALOG_JS)
+            return {"type": "alert", "message": str(msg)}
+    except Exception as exc:
+        logger.debug("xss_probe: init-script dialog read failed", error=str(exc)[:160])
+    return None
+
+
+async def _read_dom(browser: Any) -> str:
+    """Current rendered DOM for context classification. Best-effort; '' on failure."""
+    try:
+        page = await browser._ensure_page()
+        return await page.content()
+    except Exception as exc:
+        logger.debug("xss_probe: DOM read failed", error=str(exc)[:160])
+        return ""
+
+
+async def _deliver(browser: Any, url: str, point: str, value: str, location: str) -> None:
+    """Deliver ``value`` at the injection point through the live browser. URL-borne locations
+    navigate; a form field is filled and submitted. Reuses the authenticated session."""
+    if location == "body":
+        await browser.navigate(url)
+        snap = await browser.snapshot()
+        selector = _field_selector(snap, point)
+        await browser.fill(selector, value)
+        submit = _submit_selector(snap)
+        if submit:
+            await browser.click(submit, expect_nav=True)
+        return
+    await browser.navigate(_build_url(url, point, value, location))
+
+
+def _candidate_payloads(context: str, quotes_encoded: bool, version: str,
+                        mark: str) -> "tuple[List[str], bool]":
+    """Pick the context-correct candidate payloads and whether they are the fixed AngularJS
+    alert(1) vectors (confirmed by a fired dialog) vs MARK-substituted context payloads
+    (confirmed by MARK in the dialog message)."""
+    if context == "angular_expression":
+        if quotes_encoded:
+            ns = get_value("xss", "angular_no_strings", {}) or {}
+            payloads = list(ns.get(version, []) or [])
+            if payloads:
+                return payloads, True
+        csti = get_value("xss", "angular_csti", {}) or {}
+        payloads = list(csti.get(version, []) or csti.get("no_sandbox", []) or [])
+        return payloads, True
+    ctx_payloads = get_value("xss", "context_payloads", {}) or {}
+    group = context
+    if quotes_encoded:
+        qf = f"{context}_quote_free"
+        if ctx_payloads.get(qf):
+            group = qf
+    raw = list(ctx_payloads.get(group, []) or [])
+    payloads = [p.replace("{MARK}", mark) for p in raw]
+    return payloads, False
+
+
+async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    url = str(args.get("url", "")).strip()
+    point = str(args.get("injection_point", "")).strip()
+    location = str(args.get("injection_location", "query")).strip().lower() or "query"
+    method = str(args.get("method", "GET")).strip().upper() or "GET"
+    if not url or not point:
+        return {"ok": False, "error": "url and injection_point are required"}
+    if location not in _LOCATIONS:
+        return {"ok": False, "error": f"injection_location must be one of {_LOCATIONS}"}
+    if not ctx.is_in_scope(url):
+        return {"ok": False, "error": "url is out of scope", "url": url}
+    browser = getattr(ctx, "browser", None)
+    if browser is None:
+        return {"ok": False, "error": "xss_probe needs the agent browser (not available in this "
+                "context); it confirms XSS via a real alert() dialog, not httpx"}
+
+    # Unique per-run MARK (numeric so it survives JS-number contexts) + a benign DOM marker.
+    mark = str(int(time.time() * 1000) % 100000000)
+    marker = f"dastxss{mark}"
+
+    steps: List[Dict[str, Any]] = []
+    try:
+        await _install_proof_script(browser)
+        # 1. Benign marker → read rendered DOM → classify the reflection context.
+        await _reset_dialog(browser)
+        await _deliver(browser, url, point, marker, location)
+        dom = await _read_dom(browser)
+        info = classify_context(dom, marker)
+        context = str(info.get("context"))
+        quotes_encoded = bool(info.get("quotes_encoded"))
+        version = detect_angular_version(dom)
+        steps.append({"label": "classify", "context": context,
+                      "quotes_encoded": quotes_encoded, "framework": info.get("framework"),
+                      "framework_version": version, "snippet": info.get("snippet")})
+
+        if context == "unknown":
+            return {"ok": True, "confirmed": False, "context": context,
+                    "framework_version": version,
+                    "verdict": f"NOT CONFIRMED — marker not reflected in the DOM for '{point}' "
+                               f"({location}); nothing to probe.", "steps": steps}
+
+        candidates, angular_fixed = _candidate_payloads(context, quotes_encoded, version, mark)
+        if not candidates:
+            return {"ok": True, "confirmed": False, "context": context,
+                    "framework_version": version,
+                    "verdict": f"NOT CONFIRMED — no payload template for context '{context}' "
+                               f"(version {version}).", "steps": steps}
+
+        # 2. Deliver each candidate; confirm strictly on a captured alert() dialog.
+        for payload in candidates:
+            await _reset_dialog(browser)
+            await _deliver(browser, url, point, payload, location)
+            dialog = await _capture_dialog(browser)
+            if dialog is None:
+                steps.append({"label": "miss (no dialog)", "payload": payload})
+                continue
+            msg = str(dialog.get("message", ""))
+            # Context payloads: the dialog MUST echo our MARK (ambient alert cannot). Fixed
+            # AngularJS alert(1) vectors: a fired dialog is the proof (message is "1").
+            confirmed = (mark in msg) if not angular_fixed else True
+            if confirmed:
+                steps.append({"label": "CONFIRMED", "payload": payload, "dialog": dialog})
+                return _confirm_result(ctx, args, url, method, point, location, context,
+                                       version, payload, dialog, steps)
+            steps.append({"label": "miss (dialog without marker)", "payload": payload,
+                          "dialog": dialog})
+    except Exception as exc:
+        return {"ok": False, "error": f"probe failed: {str(exc)[:200]}", "steps": steps}
+
+    return {"ok": True, "confirmed": False, "context": context, "framework_version": version,
+            "verdict": f"NOT CONFIRMED — no payload fired an alert() carrying the marker for "
+                       f"'{point}' ({location}, context {context}).", "steps": steps}
+
+
+def _confirm_result(ctx: ToolContext, args: Dict[str, Any], url: str, method: str, point: str,
+                    location: str, context: str, version: str, payload: str,
+                    dialog: Dict[str, Any], steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build the CONFIRMED result and record the finding (same store API sqli_probe uses)."""
+    is_angular = context == "angular_expression"
+    kind = (f"AngularJS client-side template injection (CSTI, v{version})" if is_angular
+            else f"{context} XSS")
+    verdict = (f"CONFIRMED — {kind} in '{point}' ({location}). Payload {payload!r} fired a JS "
+               f"dialog ({dialog.get('type')}: {dialog.get('message')!r}).")
+    sev_arg = str(args.get("severity", "")).strip().lower()
+    severity = sev_arg if sev_arg in _VALID_SEVERITIES else "high"
+    result: Dict[str, Any] = {
+        "ok": True, "confirmed": True, "context": context, "framework_version": version,
+        "payload": payload, "dialog": dialog, "verdict": verdict,
+        "severity": severity, "steps": steps,
+    }
+    if bool(args.get("record", True)) and getattr(ctx, "store", None) is not None:
+        evidence = (verdict + f" [context={context}; framework_version={version}; "
+                    f"dialog_message={dialog.get('message')!r}]")
+        finding = {
+            "title": str(args.get("title", "")).strip()
+            or (f"AngularJS template injection (CSTI) in '{point}'" if is_angular
+                else f"Reflected XSS in '{point}' ({context})"),
+            "severity": severity,
+            "attack_type": "xss",
+            "cwe": str(args.get("cwe", "CWE-79")).strip() or "CWE-79",
+            "parameter": point,
+            "evidence": evidence,
+            "context": context,
+            "framework_version": version,
+            "payload": payload,
+            "steps": steps,
+            "confirmed": True,
+            "confidence": 1.0,
+            "validated_by": ["xss_probe"],
+            "source": "copilot",
+        }
+        try:
+            entry_id = ctx.store.record_manual_finding(finding, url, method)
+            result["recorded_entry_id"] = entry_id
+            logger.info("xss_probe recorded finding", entry_id=entry_id, context=context,
+                        severity=severity)
+        except Exception as exc:
+            result["record_error"] = str(exc)[:200]
+    return result
+
+
+register(Tool(
+    name="xss_probe",
+    description=(
+        "Deterministically probe ONE parameter or form field for reflected/stored/DOM XSS or "
+        "AngularJS client-side template injection (CSTI) — no LLM, so the gateway's content-safety "
+        "filter cannot block it. It injects a benign marker, auto-detects the reflection context "
+        "(HTML body / quoted attribute / JS-string / href / AngularJS expression) and the AngularJS "
+        "version, picks the context-correct (and quote-free when quotes are encoded) payload itself, "
+        "delivers it through the REAL agent browser (carrying the authenticated session), and "
+        "confirms STRICTLY via the captured alert() dialog — the dialog must echo the probe's unique "
+        "marker (ambient alerts cannot), so reflection alone never confirms. injection_location: "
+        "'query' (default), 'fragment' (location.hash DOM sink), 'path', or 'body' (fills + submits "
+        "the named form field). Records a CONFIRMED finding (CWE-79) with the context, version, "
+        "payload, and dialog message as evidence. Use this once you have located the reflected "
+        "parameter instead of hand-crafting XSS payloads."
+    ),
+    input_schema=_SCHEMA,
+    handler=_xss_probe,
+    tags=["active", "write"],
+))

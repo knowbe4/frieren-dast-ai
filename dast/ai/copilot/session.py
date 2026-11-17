@@ -66,7 +66,8 @@ _MAX_HEADER_STRIPS = 2
 # loop breaker, and the absolute _MAX_NORMALIZED_REPEATS cap still bounds them — so loop
 # protection is unchanged; only the "identical twice" suppression is lifted for these tools.
 _DETERMINISTIC_PROBE_TOOLS = frozenset({
-    "sqli_probe", "idor_probe", "authz_differential_probe", "oob_generate", "oob_poll",
+    "sqli_probe", "xss_probe", "idor_probe", "authz_differential_probe", "oob_generate",
+    "oob_poll",
 })
 
 
@@ -454,6 +455,12 @@ Operational notes:
   or 'oast' — passing injection_template (with a {cond} placeholder) and extract_sql; it runs the
   whole deterministic extraction in one call. Use injection_location 'cookie' when the injectable
   parameter is a cookie.
+- Reflected/stored/DOM XSS or AngularJS template injection: once you've located the reflected
+  parameter, STOP hand-crafting payloads — call `xss_probe` once with url + injection_point. It
+  auto-detects the reflection context (HTML / attribute / JS-string / Angular `$parse`), reads the
+  AngularJS version, picks the context-correct (and quote-free when quotes are encoded) payload
+  itself, delivers through the real browser, and confirms strictly via the captured `alert()`
+  dialog. Treat XSS as confirmed ONLY when a JS dialog fired; never from reflection alone.
 - Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
   1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
      testing, confirm the actual route, its parameters and its authz with code_lookup_path

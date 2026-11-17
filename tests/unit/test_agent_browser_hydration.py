@@ -121,3 +121,76 @@ def test_navigate_soft_result_when_goto_times_out():
     assert res["status"] is None
     assert res["url"] == "https://app.example.com/partial"
     assert "note" in res
+
+
+# ── JS dialog capture: an XSS alert() must be accepted (never block) + recorded ──
+
+class _DialogPage:
+    """Fake Playwright page that records the dialog handler AgentBrowser registers."""
+
+    def __init__(self) -> None:
+        self.handlers: dict = {}
+
+    def on(self, event, handler):
+        self.handlers[event] = handler
+
+
+class _FakeDialog:
+    def __init__(self, dtype: str, message: str) -> None:
+        self.type = dtype
+        self.message = message
+        self.accepted = False
+
+    async def accept(self):
+        self.accepted = True
+
+
+def test_dialog_handler_captures_and_accepts():
+    async def run():
+        b = object.__new__(AgentBrowser)
+        b._last_dialog = None
+        b._dialog_count = 0
+        page = _DialogPage()
+        b._register_dialog_handler(page)
+        assert "dialog" in page.handlers            # handler registered on the page
+
+        dlg = _FakeDialog("alert", "xss-pwned")
+        page.handlers["dialog"](dlg)                # Playwright calls the sync callback
+        await asyncio.sleep(0)                       # let the scheduled accept() task run
+
+        assert b.last_dialog == {"type": "alert", "message": "xss-pwned"}
+        assert b._dialog_count == 1
+        assert dlg.accepted is True                  # accepted, not left blocking
+
+        # pop clears it so the next navigation starts clean
+        assert b.pop_last_dialog() == {"type": "alert", "message": "xss-pwned"}
+        assert b.last_dialog is None
+
+    asyncio.run(run())
+
+
+def test_dialog_count_increments_across_dialogs():
+    async def run():
+        b = object.__new__(AgentBrowser)
+        b._last_dialog = None
+        b._dialog_count = 0
+        page = _DialogPage()
+        b._register_dialog_handler(page)
+        page.handlers["dialog"](_FakeDialog("alert", "1"))
+        page.handlers["dialog"](_FakeDialog("confirm", "2"))
+        await asyncio.sleep(0)
+        assert b._dialog_count == 2
+        assert b.last_dialog == {"type": "confirm", "message": "2"}
+
+    asyncio.run(run())
+
+
+def test_navigate_surfaces_fired_dialog():
+    page = _NavPage()
+    b = _browser_with_page(page)
+    b._last_dialog = {"type": "alert", "message": "1"}   # a dialog fired during the load
+    b._dialog_count = 1
+    res = asyncio.run(b.navigate("https://app.example.com/x"))
+    assert res["dialog"] == {"type": "alert", "message": "1"}
+    assert "script executed" in res["note"]
+    assert b.last_dialog is None                          # popped out of the browser state

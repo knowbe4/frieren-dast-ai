@@ -167,6 +167,25 @@ class AgentBrowser:
         self._page: Any = None
         self._lock = asyncio.Lock()
         self._last_cookie_sync: float = 0.0
+        # Most recent JS dialog (alert/confirm/prompt) the live page raised, e.g. the
+        # alert() a reflected-XSS payload fires. {"type", "message"} or None. Browser
+        # tools surface this as proof the injected script executed. See _ensure_page.
+        self._last_dialog: Optional[dict] = None
+        self._dialog_count: int = 0
+
+    @property
+    def last_dialog(self) -> Optional[dict]:
+        """The most recent JS dialog the page raised ({"type","message"}), or None.
+
+        A reflected/stored-XSS payload that fires ``alert()`` is auto-accepted (so it never
+        blocks the page) and recorded here as execution evidence for the copilot."""
+        return getattr(self, "_last_dialog", None)
+
+    def pop_last_dialog(self) -> Optional[dict]:
+        """Return the last captured dialog and clear it, so the next navigation starts clean."""
+        dlg = getattr(self, "_last_dialog", None)
+        self._last_dialog = None
+        return dlg
 
     @property
     def current_url(self) -> str:
@@ -208,8 +227,30 @@ class AgentBrowser:
                 await self._context.route("**/*", make_route_guard("agent-browser"))
             await self._seed_cookies()
             self._page = await self._context.new_page()
+            self._register_dialog_handler(self._page)
             logger.info("AgentBrowser launched", proxy_port=self._proxy_port)
             return self._page
+
+    def _register_dialog_handler(self, page: Any) -> None:
+        """Capture + auto-accept JS dialogs so an XSS alert() never blocks the page and is
+        recorded as execution evidence. Playwright delivers the event to a sync callback;
+        dialog.accept() is async, so schedule it as a task. Must never raise."""
+        def handle_dialog(dialog: Any) -> None:
+            try:
+                self._last_dialog = {"type": dialog.type, "message": dialog.message}
+                self._dialog_count += 1
+            except Exception:
+                pass
+            try:
+                # accept() behaves like clicking OK; unblocks the page either way.
+                asyncio.create_task(dialog.accept())
+            except Exception:
+                pass
+
+        try:
+            page.on("dialog", handle_dialog)
+        except Exception as exc:
+            logger.debug("AgentBrowser: dialog handler registration failed", error=str(exc)[:120])
 
     async def _seed_cookies(self) -> None:
         """Seed the context so it starts authenticated. For a session-scoped browser,
@@ -499,7 +540,15 @@ class AgentBrowser:
         result: Dict[str, Any] = {"ok": True, "url": page.url,
                                   "status": (resp.status if resp else None),
                                   "title": title, "timed_out": timed_out}
-        if timed_out:
+        # Surface a JS dialog raised during this navigation (e.g. an XSS alert()) as
+        # execution evidence so the copilot sees "alert fired" without a separate probe.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired during navigation "
+                              f"({dialog.get('type')}: {dialog.get('message')!r}) — "
+                              f"script executed")
+        if timed_out and "note" not in result:
             result["note"] = ("navigation did not fully settle; showing the current page — "
                               "check get_history for captured traffic, then snapshot/retry")
         return result

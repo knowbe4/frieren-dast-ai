@@ -178,6 +178,88 @@ async def test_marker_not_reflected_is_not_confirmed():
     assert store.recorded == []
 
 
+class _AngularParseSinkBrowser:
+    """Models the AngularJS ``$parse`` js-string lab: the benign marker reflects into a
+    single-quoted JS string that the page feeds through ``$parse`` (surface context js_string_single,
+    but an Angular-expression sink). A dialog fires ONLY for the string-free Angular escape vector
+    (its ``fromCharCode`` signature) — NOT for the JS-string break-out, and NOT for the moustache
+    CSTI vector (which does not apply to a direct ``$parse`` of a string)."""
+
+    _DOM = (
+        '<html><head><script src="/resources/js/angular_1-4-4.js"></script></head>'
+        '<body ng-app>'
+        "<script>$scope.query[key] = '{MARKER}'; $scope.value = $parse(key)($scope.query);</script>"
+        '</body></html>'
+    )
+
+    def __init__(self, point: str) -> None:
+        self.point = point
+        self._page = _FakePage(self)
+        self.marker = ""
+        self.delivered: list = []
+        self._dialog = None
+
+    async def _ensure_page(self):
+        return self._page
+
+    def _value(self, url: str) -> str:
+        qs = parse_qs(urlparse(url).query, keep_blank_values=True)
+        vals = qs.get(self.point, [])
+        return vals[0] if vals else ""
+
+    async def navigate(self, url: str):
+        val = self._value(url)
+        if val.startswith("dastxss"):
+            self.marker = val  # benign-marker step
+            self._dialog = None
+            return {"ok": True, "url": url}
+        self.delivered.append(val)
+        # Only the string-free Angular escape (fromCharCode) actually evaluates to alert(1) here.
+        self._dialog = {"type": "alert", "message": "1"} if "fromCharCode" in val else None
+        return {"ok": True, "url": url}
+
+    def pop_last_dialog(self):
+        dlg, self._dialog = self._dialog, None
+        return dlg
+
+    async def snapshot(self):
+        return {"forms": [], "fields": [], "buttons": [], "links": []}
+
+    async def fill(self, selector, value):
+        return {"ok": True}
+
+    async def click(self, selector, expect_nav=False):
+        return {"ok": True}
+
+    @property
+    def _dom_template(self):
+        return self._DOM
+
+
+async def test_angular_parse_sink_in_js_string_confirms_via_no_strings_vector():
+    from dast.payloads.loader import get_value
+
+    browser = _AngularParseSinkBrowser("key")
+    store = _FakeStore()
+    ctx = _FakeCtx(browser, store)
+    out = await xpt._xss_probe(ctx, {"url": _URL, "injection_point": "key"})
+
+    assert out["ok"] is True
+    assert out["confirmed"] is True
+    # Surface context is a JS string, yet the confirming payload is the Angular CSTI escape vector.
+    assert out["context"] == "js_string_single"
+    assert out["framework_version"] == "1.4"
+    no_strings = (get_value("xss", "angular_no_strings", {}) or {})["1.4"][0]
+    assert out["payload"] == no_strings
+    # The tool delivered an Angular vector (fromCharCode escape), not just the JS-string break-out.
+    assert any("fromCharCode" in v for v in browser.delivered)
+    assert not out["payload"].startswith("';alert(")
+    # Reported as CSTI even though the surface context was a JS string.
+    assert len(store.recorded) == 1
+    title = store.recorded[0][0]["title"]
+    assert "CSTI" in title or "template injection" in title
+
+
 async def test_browser_unavailable_errors_cleanly():
     class _NoBrowserCtx(_FakeCtx):
         def __init__(self):

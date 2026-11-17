@@ -32,6 +32,11 @@ _ANGULAR_MARKERS = re.compile(
 # ng-app / ng-controller establish an Angular scope subtree whose text nodes are interpolated.
 _NG_SUBTREE = re.compile(r"ng-app|ng-controller", re.IGNORECASE)
 
+# An Angular expression-evaluator call. When the <script> that the marker landed in feeds the
+# marker through $parse(...) / $eval(...), the value reaches the AngularJS expression evaluator —
+# an Angular-CSTI sink — even though its SURFACE context is a plain JS string literal.
+_PARSE_SINK = re.compile(r"\$parse\s*\(|\$eval\s*\(", re.IGNORECASE)
+
 # Window (chars each side of the marker) for the quote-encoding heuristic.
 _QUOTE_WINDOW = 100
 
@@ -80,16 +85,41 @@ def _quotes_encoded(text: str, marker_idx: int, marker: str) -> bool:
     return has_encoded and not has_raw
 
 
+def _angular_parse_sink(text: str, marker_idx: int) -> bool:
+    """True when the ``<script>`` block the marker sits inside evaluates the marker through
+    AngularJS's expression evaluator (``$parse(...)`` / ``$eval(...)``).
+
+    This catches the shape ``$scope.query[key] = '<marker>'; $scope.value = $parse(key)($scope.query)``
+    where the marker's SURFACE context is a single/double-quoted JS string, yet the value still
+    reaches the Angular expression evaluator — so the Angular CSTI vectors apply, not just a
+    JS-string break-out. Scoped to the enclosing script block (content before AND after the marker,
+    since the ``$parse`` call typically follows the assignment)."""
+    lower = text.lower()
+    script_open = lower.rfind("<script", 0, marker_idx)
+    if script_open == -1:
+        return False
+    script_close = lower.rfind("</script", 0, marker_idx)
+    if script_open <= script_close:  # marker is not inside an open <script> block
+        return False
+    end = lower.find("</script", marker_idx)
+    region = text[script_open:(end if end != -1 else len(text))]
+    return bool(_PARSE_SINK.search(region))
+
+
 def classify_context(response_text: str, marker: str) -> Dict[str, object]:
     """Locate ``marker`` in the rendered response and classify the reflection context.
 
-    Returns ``{context, quotes_encoded, framework, framework_version, snippet}`` where
-    ``context`` is one of: ``js_string_double`` / ``js_string_single`` (inside a <script> string
-    literal, by the enclosing quote), ``href_js`` (an href=/src= attribute value),
+    Returns ``{context, quotes_encoded, angular_parse_sink, framework, framework_version,
+    snippet}`` where ``context`` is one of: ``js_string_double`` / ``js_string_single`` (inside a
+    <script> string literal, by the enclosing quote), ``href_js`` (an href=/src= attribute value),
     ``attr_double_quote`` / ``attr_single_quote`` (any other quoted attribute value),
     ``angular_expression`` (a text node inside an Angular ng-app/ng-controller subtree or a
     ``{{ }}`` interpolation), ``html_body`` (a plain HTML text node), or ``unknown`` (marker not
-    found — the probe cannot proceed on this response)."""
+    found — the probe cannot proceed on this response).
+
+    ``angular_parse_sink`` is True when the marker's enclosing ``<script>`` feeds it through
+    ``$parse``/``$eval`` — the value reaches the Angular expression evaluator even though its
+    surface ``context`` is a JS string, so Angular CSTI vectors must still be tried."""
     text = response_text or ""
     framework_version = detect_angular_version(text)
     angular_present = bool(_ANGULAR_MARKERS.search(text))
@@ -97,11 +127,12 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
 
     idx = text.find(marker)
     if idx == -1:
-        return {"context": "unknown", "quotes_encoded": False,
+        return {"context": "unknown", "quotes_encoded": False, "angular_parse_sink": False,
                 "framework": framework, "framework_version": framework_version, "snippet": ""}
 
     snippet = text[max(0, idx - 40):idx + len(marker) + 60]
     quotes_encoded = _quotes_encoded(text, idx, marker)
+    angular_parse_sink = _angular_parse_sink(text, idx)
 
     lower = text.lower()
     # 1. Inside a <script>…</script> block → a JS string literal context.
@@ -110,7 +141,8 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
     if script_open != -1 and script_open > script_close:
         quote = _enclosing_quote(text[script_open:idx])
         context = "js_string_single" if quote == "'" else "js_string_double"
-        return {"context": context, "quotes_encoded": quotes_encoded, "framework": framework,
+        return {"context": context, "quotes_encoded": quotes_encoded,
+                "angular_parse_sink": angular_parse_sink, "framework": framework,
                 "framework_version": framework_version, "snippet": snippet}
 
     # 2. Inside an (unclosed) tag → an attribute value context.
@@ -127,7 +159,8 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
             context = "attr_single_quote"
         else:
             context = "attr_double_quote"
-        return {"context": context, "quotes_encoded": quotes_encoded, "framework": framework,
+        return {"context": context, "quotes_encoded": quotes_encoded,
+                "angular_parse_sink": angular_parse_sink, "framework": framework,
                 "framework_version": framework_version, "snippet": snippet}
 
     # 3. A text node. Inside an Angular subtree / {{ }} interpolation → CSTI; else plain HTML.
@@ -139,5 +172,6 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
         context = "angular_expression"
     else:
         context = "html_body"
-    return {"context": context, "quotes_encoded": quotes_encoded, "framework": framework,
+    return {"context": context, "quotes_encoded": quotes_encoded,
+            "angular_parse_sink": angular_parse_sink, "framework": framework,
             "framework_version": framework_version, "snippet": snippet}

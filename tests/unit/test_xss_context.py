@@ -70,6 +70,28 @@ def test_marker_not_found_is_unknown():
     assert out["context"] == "unknown"
 
 
+def test_angular_parse_sink_inside_js_string():
+    # The marker's SURFACE context is a single-quoted JS string, but the <script> feeds it through
+    # $parse(...) — the value reaches the Angular expression evaluator (a CSTI sink).
+    html = (
+        '<html><head><script src="/resources/js/angular_1-4-4.js"></script></head>'
+        '<body ng-app>'
+        f"<script>$scope.query[key] = '{MK}'; $scope.value = $parse(key)($scope.query);</script>"
+        '</body></html>'
+    )
+    out = classify_context(html, MK)
+    assert out["context"] == "js_string_single"  # surface context still reported
+    assert out["angular_parse_sink"] is True
+    assert out["framework"] == "angularjs"
+    assert out["framework_version"] == "1.4"
+
+
+def test_angular_parse_sink_false_for_plain_js_string():
+    out = classify_context(f"<script>var x = '{MK}'; foo();</script>", MK)
+    assert out["context"] == "js_string_single"
+    assert out["angular_parse_sink"] is False
+
+
 # ── classify_context: quotes_encoded heuristic ───────────────────────────────
 
 def test_quotes_encoded_true_when_entities_and_no_raw_quote():

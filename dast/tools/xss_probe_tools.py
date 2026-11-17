@@ -207,29 +207,56 @@ async def _deliver(browser: Any, url: str, point: str, value: str, location: str
     await browser.navigate(_build_url(url, point, value, location))
 
 
-def _candidate_payloads(context: str, quotes_encoded: bool, version: str,
-                        mark: str) -> "tuple[List[str], bool]":
-    """Pick the context-correct candidate payloads and whether they are the fixed AngularJS
-    alert(1) vectors (confirmed by a fired dialog) vs MARK-substituted context payloads
-    (confirmed by MARK in the dialog message)."""
-    if context == "angular_expression":
+def _angular_vectors(version: str, quotes_encoded: bool) -> List[str]:
+    """The fixed AngularJS sandbox-escape vectors for the detected era, as RAW parameter values.
+    When quotes are HTML-encoded near the reflection the string-free ``angular_no_strings`` form
+    is preferred (tried first); otherwise the era cheat-sheet ``angular_csti`` form leads. Both are
+    returned so a miss on one still tries the other."""
+    ns = list((get_value("xss", "angular_no_strings", {}) or {}).get(version, []) or [])
+    csti = get_value("xss", "angular_csti", {}) or {}
+    era = list(csti.get(version, []) or csti.get("no_sandbox", []) or [])
+    return (ns + era) if quotes_encoded else (era + ns)
+
+
+def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: str,
+                        framework: str = "", angular_parse_sink: bool = False,
+                        ) -> "List[tuple[str, bool]]":
+    """Build the ordered candidate list as ``(payload, angular_fixed)`` tuples.
+
+    ``angular_fixed`` True → a fixed AngularJS ``alert(1)`` sandbox-escape vector, delivered RAW and
+    confirmed by ANY fired dialog; False → a MARK-substituted context payload confirmed only when
+    the dialog echoes the unique MARK.
+
+    For an Angular app (``framework == "angularjs"`` OR a detected ``$parse``/``$eval`` sink) the
+    Angular vectors are ALWAYS included in addition to the normal context payloads — tried FIRST
+    when the value feeds an Angular expression (surface ``angular_expression``/``js_string_*`` or
+    ``angular_parse_sink``), and appended after the context payloads otherwise. Non-Angular targets
+    get exactly the context payloads, unchanged."""
+    def _context_list() -> "List[tuple[str, bool]]":
+        ctx_payloads = get_value("xss", "context_payloads", {}) or {}
+        group = context
         if quotes_encoded:
-            ns = get_value("xss", "angular_no_strings", {}) or {}
-            payloads = list(ns.get(version, []) or [])
-            if payloads:
-                return payloads, True
-        csti = get_value("xss", "angular_csti", {}) or {}
-        payloads = list(csti.get(version, []) or csti.get("no_sandbox", []) or [])
-        return payloads, True
-    ctx_payloads = get_value("xss", "context_payloads", {}) or {}
-    group = context
-    if quotes_encoded:
-        qf = f"{context}_quote_free"
-        if ctx_payloads.get(qf):
-            group = qf
-    raw = list(ctx_payloads.get(group, []) or [])
-    payloads = [p.replace("{MARK}", mark) for p in raw]
-    return payloads, False
+            qf = f"{context}_quote_free"
+            if ctx_payloads.get(qf):
+                group = qf
+        return [(p.replace("{MARK}", mark), False) for p in (ctx_payloads.get(group, []) or [])]
+
+    # Pure Angular interpolation context: Angular vectors only (unchanged behaviour).
+    if context == "angular_expression":
+        return [(p, True) for p in _angular_vectors(version, quotes_encoded)]
+
+    is_angular = framework == "angularjs" or angular_parse_sink
+    if not is_angular:
+        return _context_list()
+
+    angular_firsts = [(p, True) for p in _angular_vectors(version, quotes_encoded)]
+    # The value feeds an Angular expression sink (surface JS-string or an explicit $parse sink):
+    # try the Angular CSTI vectors before the (doomed) JS-string break-outs.
+    if angular_parse_sink or str(context).startswith("js_string"):
+        return angular_firsts + _context_list()
+    # Angular app, but the reflection surface is unrelated (html_body/attr/href): context payloads
+    # first, Angular vectors appended as a fallback.
+    return _context_list() + angular_firsts
 
 
 async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -262,10 +289,13 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         info = classify_context(dom, marker)
         context = str(info.get("context"))
         quotes_encoded = bool(info.get("quotes_encoded"))
+        angular_parse_sink = bool(info.get("angular_parse_sink"))
+        framework = str(info.get("framework") or "")
         version = detect_angular_version(dom)
         steps.append({"label": "classify", "context": context,
-                      "quotes_encoded": quotes_encoded, "framework": info.get("framework"),
-                      "framework_version": version, "snippet": info.get("snippet")})
+                      "quotes_encoded": quotes_encoded, "angular_parse_sink": angular_parse_sink,
+                      "framework": framework, "framework_version": version,
+                      "snippet": info.get("snippet")})
 
         if context == "unknown":
             return {"ok": True, "confirmed": False, "context": context,
@@ -273,7 +303,9 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                     "verdict": f"NOT CONFIRMED — marker not reflected in the DOM for '{point}' "
                                f"({location}); nothing to probe.", "steps": steps}
 
-        candidates, angular_fixed = _candidate_payloads(context, quotes_encoded, version, mark)
+        candidates = _candidate_payloads(context, quotes_encoded, version, mark,
+                                         framework=framework,
+                                         angular_parse_sink=angular_parse_sink)
         if not candidates:
             return {"ok": True, "confirmed": False, "context": context,
                     "framework_version": version,
@@ -281,7 +313,7 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                                f"(version {version}).", "steps": steps}
 
         # 2. Deliver each candidate; confirm strictly on a captured alert() dialog.
-        for payload in candidates:
+        for payload, angular_fixed in candidates:
             await _reset_dialog(browser)
             await _deliver(browser, url, point, payload, location)
             dialog = await _capture_dialog(browser)
@@ -291,11 +323,11 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             msg = str(dialog.get("message", ""))
             # Context payloads: the dialog MUST echo our MARK (ambient alert cannot). Fixed
             # AngularJS alert(1) vectors: a fired dialog is the proof (message is "1").
-            confirmed = (mark in msg) if not angular_fixed else True
+            confirmed = True if angular_fixed else (mark in msg)
             if confirmed:
                 steps.append({"label": "CONFIRMED", "payload": payload, "dialog": dialog})
                 return _confirm_result(ctx, args, url, method, point, location, context,
-                                       version, payload, dialog, steps)
+                                       version, payload, dialog, steps, angular_fixed=angular_fixed)
             steps.append({"label": "miss (dialog without marker)", "payload": payload,
                           "dialog": dialog})
     except Exception as exc:
@@ -308,9 +340,14 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def _confirm_result(ctx: ToolContext, args: Dict[str, Any], url: str, method: str, point: str,
                     location: str, context: str, version: str, payload: str,
-                    dialog: Dict[str, Any], steps: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Build the CONFIRMED result and record the finding (same store API sqli_probe uses)."""
-    is_angular = context == "angular_expression"
+                    dialog: Dict[str, Any], steps: List[Dict[str, Any]],
+                    angular_fixed: bool = False) -> Dict[str, Any]:
+    """Build the CONFIRMED result and record the finding (same store API sqli_probe uses).
+
+    ``angular_fixed`` marks that the confirming payload was a fixed AngularJS sandbox-escape vector
+    — so the finding is reported as CSTI even when the surface reflection context was a JS string
+    feeding ``$parse``/``$eval`` (not just the ``angular_expression`` interpolation context)."""
+    is_angular = angular_fixed or context == "angular_expression"
     kind = (f"AngularJS client-side template injection (CSTI, v{version})" if is_angular
             else f"{context} XSS")
     verdict = (f"CONFIRMED — {kind} in '{point}' ({location}). Payload {payload!r} fired a JS "

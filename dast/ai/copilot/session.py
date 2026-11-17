@@ -67,7 +67,7 @@ _MAX_HEADER_STRIPS = 2
 # protection is unchanged; only the "identical twice" suppression is lifted for these tools.
 _DETERMINISTIC_PROBE_TOOLS = frozenset({
     "sqli_probe", "xss_probe", "idor_probe", "authz_differential_probe", "oob_generate",
-    "oob_poll",
+    "oob_poll", "web_cache_deception_probe", "prototype_pollution_probe",
 })
 
 
@@ -461,6 +461,17 @@ Operational notes:
   AngularJS version, picks the context-correct (and quote-free when quotes are encoded) payload
   itself, delivers through the real browser, and confirms strictly via the captured `alert()`
   dialog. Treat XSS as confirmed ONLY when a JS dialog fired; never from reflection alone.
+- Client-side prototype pollution → DOM XSS: when a page reads `location.hash`/query into an
+  object merge (or you suspect a proto-pollution sink), call `prototype_pollution_probe` once with
+  the page `url`. It pollutes a sentinel through the source-vector library, reads Object.prototype
+  on the real browser to find the polluting source, then drives the gadget library (transport_url,
+  srcdoc, ...) and confirms STRICTLY on a captured `alert()` dialog carrying its marker.
+- Web cache deception (a sensitive authed page served through a CDN/cache): once you have an
+  authenticated page exposing private data (e.g. /my-account with an API key), call
+  `web_cache_deception_probe` once with the url. It crafts cache-key variants (static-ext append,
+  path delimiters, normalization), checks the origin path-maps them back while a cache signal is
+  present, then re-reads anonymously — confirming ONLY when the victim markers survive the unauth
+  request. Do not hand-drive this via send_request.
 - Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
   1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
      testing, confirm the actual route, its parameters and its authz with code_lookup_path

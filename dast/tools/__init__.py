@@ -45,9 +45,11 @@ from dast.tools import record_finding_tools as _record_finding_tools  # noqa: F4
 from dast.tools import scan_tools as _scan_tools  # noqa: F401
 from dast.tools import sqli_probe_tools as _sqli_probe_tools  # noqa: F401
 from dast.tools import xss_probe_tools as _xss_probe_tools  # noqa: F401
+from dast.tools import protopollute_tools as _protopollute_tools  # noqa: F401
 from dast.tools import token_inventory_tools as _token_inventory_tools  # noqa: F401
 from dast.tools import triage_tools as _triage_tools  # noqa: F401
 from dast.tools import verify_tools as _verify_tools  # noqa: F401
+from dast.tools import web_cache_deception_tools as _web_cache_deception_tools  # noqa: F401
 
 __all__ = [
     "Tool",

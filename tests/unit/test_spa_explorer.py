@@ -25,6 +25,29 @@ from dast.proxy.ui_route_graph import normalise_route_key
 
 playwright = pytest.importorskip("playwright.async_api")
 
+
+@pytest.fixture(autouse=True)
+def _fast_render_timings(monkeypatch):
+    """Shrink the explorer's per-route render/settle waits for the tests.
+
+    These knobs exist so a real, slow-painting SPA finishes rendering before we
+    enumerate it; against the instant in-process fixture server below they are
+    pure dead time. The production defaults (see dast/proxy/spa_explorer.py) are
+    generous on purpose — we only shrink them here, where the fixture renders its
+    nav synchronously in an inline <script>. The biggest win is the settle
+    deadline: on a login-bounce route the interactive-element census never
+    reaches its threshold, so each such route previously burned the full 10s.
+    """
+    monkeypatch.setattr(spa_explorer, "_RENDER_NETWORKIDLE_MS", 800)
+    monkeypatch.setattr(spa_explorer, "_RENDER_SETTLE_DEADLINE_S", 1.0)
+    monkeypatch.setattr(spa_explorer, "_RENDER_POLL_S", 0.1)
+    monkeypatch.setattr(spa_explorer, "_CLICK_SETTLE_NETWORKIDLE_MS", 500)
+    monkeypatch.setattr(spa_explorer, "_CLICK_SETTLE_PAUSE_S", 0.05)
+    monkeypatch.setattr(spa_explorer, "_CLICK_SETTLE_FALLBACK_S", 0.1)
+    monkeypatch.setattr(spa_explorer, "_SCROLL_SETTLE_S", 0.05)
+    monkeypatch.setattr(spa_explorer, "_SCROLL_RESET_S", 0.05)
+    monkeypatch.setattr(spa_explorer, "_MENU_HOVER_SETTLE_S", 0.05)
+
 # One page serves the same SPA shell for every GET path, so every discovered
 # route "exists" and returns 200. A button reveals an extra link only on hover
 # (to prove hover-reveal), and there is a form that POSTs to /submit.

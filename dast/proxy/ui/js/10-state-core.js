@@ -448,13 +448,43 @@ function dot(on) {
   document.getElementById('ws-lbl').textContent = on ? 'connected' : 'disconnected';
 }
 
+// Path shown in the history table: path + query string when one exists.
+// Prefer an explicit e.query field; otherwise parse it from e.url (substring
+// after the first '?'). Falls back to the path parsed from e.url when e.path
+// is empty. Never throws.
+function pathWithQuery(e) {
+  if (!e) return '';
+  let path = e.path || '';
+  let query = e.query || '';
+  try {
+    if (!query && e.url) {
+      const qi = e.url.indexOf('?');
+      if (qi !== -1) query = e.url.slice(qi + 1);
+    }
+    if (!path && e.url) {
+      const noFrag = e.url.split('#')[0];
+      const qi = noFrag.indexOf('?');
+      const beforeQuery = qi !== -1 ? noFrag.slice(0, qi) : noFrag;
+      const schemeEnd = beforeQuery.indexOf('://');
+      if (schemeEnd !== -1) {
+        const afterScheme = beforeQuery.slice(schemeEnd + 3);
+        const slash = afterScheme.indexOf('/');
+        path = slash !== -1 ? afterScheme.slice(slash) : '/';
+      } else {
+        path = beforeQuery;
+      }
+    }
+  } catch (_) { /* fall through to best-effort values */ }
+  return query ? path + '?' + query : path;
+}
+
 // ── column sort ────────────────────────────────────────────────────────
 const _SORT_KEY = {
   seq:    e => e._seq ?? 0,
   method: e => e.method || '',
   status: e => e.status || 0,
   host:   e => e.host || '',
-  path:   e => e.path || '',
+  path:   e => pathWithQuery(e),
   ms:     e => e.duration_ms ?? 0,
 };
 
@@ -673,7 +703,7 @@ function renderRow(entry, isNew) {
     <td class="cm ${esc(entry.method)}">${esc(entry.method)}</td>
     <td class="cs ${sc}">${entry.status || ''}</td>
     <td class="ch" title="${esc(entry.host)}">${esc(entry.host)}</td>
-    <td class="cp" title="${esc(entry.path)}">${esc(entry.path)}${scanBdg}</td>
+    <td class="cp" title="${esc(pathWithQuery(entry))}">${esc(pathWithQuery(entry))}${scanBdg}</td>
     <td class="cb">${bodyCell}</td>
     <td class="cpl">${entry.ai_queued ? '<span class="sbdg" style="background:#EF9F27;color:#0a0a1a;margin-right:4px" title="Manually queued for AI scan">AI</span>' : ''}${probeBdg}${entry.probe_payload ? `<span title="${esc(_isProbe ? _probeTip : entry.probe_payload)}">${esc(entry.probe_payload.slice(0,40))}${entry.probe_payload.length > 40 ? '…' : ''}</span>` : ''}</td>
     <td class="cz" style="${entry.duration_ms > 2000 ? 'color:var(--red)' : entry.duration_ms > 500 ? 'color:var(--yellow)' : ''}">${entry.duration_ms != null ? entry.duration_ms.toFixed(0) : ''}</td>`;

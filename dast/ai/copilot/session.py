@@ -55,6 +55,21 @@ _MAX_NORMALIZED_REPEATS = 8
 # once; after 2x, kill the turn with stuck_loop so the driver escalates.
 _MAX_HEADER_STRIPS = 2
 
+# Deterministic, idempotent probe tools do their real HTTP work INTERNALLY and return fresh
+# results on each call, so re-issuing identical args is legitimate (a blind-SQLi binary-search
+# re-run, an OAST re-poll). They are EXEMPT from the exact-identical-call suppression below:
+# that suppression would otherwise permanently block a probe whose earlier identical call was
+# registered in _seen_calls but NEVER actually executed (added pre-execution, then scope-denied
+# / watchdog-killed / errored before it ran), which pushed the model to perturb args with a
+# hand-pasted Cookie header it must never set. The no-progress watchdog still governs them —
+# a probe re-issued that returns the SAME outcome grows the no-progress streak and trips the
+# loop breaker, and the absolute _MAX_NORMALIZED_REPEATS cap still bounds them — so loop
+# protection is unchanged; only the "identical twice" suppression is lifted for these tools.
+_DETERMINISTIC_PROBE_TOOLS = frozenset({
+    "sqli_probe", "xss_probe", "idor_probe", "authz_differential_probe", "oob_generate",
+    "oob_poll", "web_cache_deception_probe", "prototype_pollution_probe",
+})
+
 
 class RefreshTier(IntEnum):
     """Bearer-refresh escalation tiers, cheapest -> most expensive. ``refresh_bearer``
@@ -329,6 +344,10 @@ Operational notes:
   returns mfa_required=true, the operator must complete the MFA challenge manually
   (browser is visible on their screen). Only fall back to manual
   browser_navigate/fill/click if browser_login fails for an unusual login form.
+  This also applies when you already HAVE credentials to submit to complete a login /
+  reach an authenticated area / solve: use `browser_login {url,email,password}` in a
+  single call; do NOT hand-drive browser_navigate/fill/click/snapshot on a login form,
+  that loops.
   After browser_login succeeds, auth (CSRF token + session cookies, and a captured
   Bearer) is auto-injected on BOTH send_request and browser_fetch. Use send_request as
   the default for API/GraphQL calls; you do not need to hand-manage transport — if a
@@ -350,6 +369,9 @@ Operational notes:
   selector like "button, input, a" for up to 15s; (3) try a different URL path from
   history. Never classify an empty snapshot as WAF_BLOCK — it is a rendering issue.
 - Do not repeat an identical tool call — a repeat is suppressed and returned as a note.
+  Exception: the deterministic probe tools (sqli_probe, idor_probe,
+  authz_differential_probe, oob_generate, oob_poll) may be re-issued with identical args;
+  they do the real work internally and return fresh results each call.
 - Prefer replying as soon as you have something worth the operator's attention; do
   not pad the turn with tool calls.
 - Named sessions and privilege levels: the project context may list named sessions
@@ -418,6 +440,42 @@ Operational notes:
 - Stored-object IDOR/BOLA: prefer the idor_probe tool over issuing the
   write/read/control/delete chain by hand — one call proves the differential and
   records the finding. Only ever target an object id you created yourself.
+- SQL injection on a parametrized endpoint: once you have located the injectable
+  parameter (via the page or get_history), STOP calling browser_snapshot — switch to
+  sqli_probe (deterministic: confirms the injection and extracts version/database/user;
+  for a GraphQL variable it also lists tables/columns/row-count via target_table/scope_where)
+  or send_request. For multi-step extraction, plan the chain and delegate the deterministic
+  part to sqli_probe rather than hand-driving many browser calls; if you must hand-drive
+  UNION/blind steps and the turn's tool-call budget runs out, say so and continue in the next
+  turn — budget exhaustion is not a dead end.
+- BLIND SQLi (no visible data — the response only differs by a true/false marker, a status code,
+  a conditional error, a time delay, or an out-of-band callback): do NOT hand-drive the binary
+  search char-by-char via send_request. Call sqli_probe ONCE with the matching mode —
+  'blind_boolean' (true_marker/false_marker/true_status/error_oracle), 'blind_time', 'error_visible',
+  or 'oast' — passing injection_template (with a {cond} placeholder) and extract_sql; it runs the
+  whole deterministic extraction in one call. Use injection_location 'cookie' when the injectable
+  parameter is a cookie.
+- Reflected/stored/DOM XSS or AngularJS template injection: once you've located the reflected
+  parameter, STOP hand-crafting payloads — call `xss_probe` once with url + injection_point. It
+  auto-detects the reflection context (HTML / attribute / JS-string / Angular `$parse`), reads the
+  AngularJS version, picks the context-correct (and quote-free when quotes are encoded) payload
+  itself, delivers through the real browser, and confirms strictly via the captured `alert()`
+  dialog. Treat XSS as confirmed ONLY when a JS dialog fired; never from reflection alone. For an
+  AngularJS-bootstrapped raw-HTML reflection under CSP (the HTML-directive-gadget class), do NOT
+  hand-craft `{{ }}` payloads — call `xss_probe`; if it returns `suspected=True` with a `poc`, that
+  class needs fragment-focus (`#x`) + victim delivery, so surface the generated PoC to the operator
+  (deliver via the exploit server) instead of spinning on it.
+- Client-side prototype pollution → DOM XSS: when a page reads `location.hash`/query into an
+  object merge (or you suspect a proto-pollution sink), call `prototype_pollution_probe` once with
+  the page `url`. It pollutes a sentinel through the source-vector library, reads Object.prototype
+  on the real browser to find the polluting source, then drives the gadget library (transport_url,
+  srcdoc, ...) and confirms STRICTLY on a captured `alert()` dialog carrying its marker.
+- Web cache deception (a sensitive authed page served through a CDN/cache): once you have an
+  authenticated page exposing private data (e.g. /my-account with an API key), call
+  `web_cache_deception_probe` once with the url. It crafts cache-key variants (static-ext append,
+  path delimiters, normalization), checks the origin path-maps them back while a cache signal is
+  present, then re-reads anonymously — confirming ONLY when the victim markers survive the unauth
+  request. Do not hand-drive this via send_request.
 - Validating a REPORTED (SAST) finding — follow this order, do not skip steps:
   1. GROUND THE REAL ROUTE. A reported endpoint path may be INFERRED and wrong. Before
      testing, confirm the actual route, its parameters and its authz with code_lookup_path
@@ -1247,6 +1305,36 @@ class CopilotSession:
                 "without making progress, so I'm stopping to avoid spinning.\n\n"
             )
 
+            # Login-loop detection: the model is hand-driving a login FORM with manual
+            # browser steps and looping (no 302/401/403 — the page just returns 200), so
+            # no real login POST is ever submitted. Detected from a browser-driving last
+            # tool plus a login indicator in the observation or a recent nav URL. Steered
+            # to the deterministic browser_login tool below. Evaluated as a branch ordered
+            # AFTER the 302/401/403 branches so it only catches the 200 login-loop case.
+            _LOGIN_DRIVE_TOOLS = ("browser_navigate", "browser_snapshot",
+                                  "browser_fill", "browser_click")
+            _LOGIN_MARKERS = ("/login", "login", "signin", "sign-in", "sign in",
+                              "log in", "logon", "password")
+
+            def _has_login_marker(text: str) -> bool:
+                low = text.lower()
+                return any(m in low for m in _LOGIN_MARKERS)
+
+            # The login signal may be in the triggering observation OR in a recent
+            # transcript entry — the login URL the model navigated to, or the login
+            # form's snapshot text ("password" / "sign in"). Scan both.
+            login_loop = False
+            if last_tool in _LOGIN_DRIVE_TOOLS:
+                if _has_login_marker(obs):
+                    login_loop = True
+                else:
+                    for item in reversed(turn_transcript[-6:]):
+                        url = str((item.get("tool_args") or {}).get("url", ""))
+                        observation = str(item.get("observation") or "")
+                        if _has_login_marker(url) or _has_login_marker(observation):
+                            login_loop = True
+                            break
+
             if ('"status": 302' in recent_observation or '"status":302' in recent_observation
                     or ("redirect" in obs and "login" in obs)):
                 detail = (
@@ -1275,6 +1363,20 @@ class CopilotSession:
                     "(e.g. 'Bearer <token>') so I can inject it.\n"
                     "  3. If this is a second-account test, give me the credentials or "
                     "session cookie for that account."
+                )
+            elif login_loop:
+                detail = (
+                    f"Root cause: I'm hand-driving a login form with manual {tool_label}"
+                    "calls (browser_navigate/snapshot/fill/click) and looping — the page "
+                    "returns 200 (no 302/401/403), so I keep navigating and snapshotting "
+                    "without ever submitting a real login.\n\n"
+                    "If I have the credentials, I should call `browser_login` with "
+                    "{url, email, password} in ONE call — it discovers the form fields, "
+                    "fills them, submits, and waits for the redirect — instead of manual "
+                    "browser_navigate/snapshot/fill/click, which loops. Only fall back to "
+                    "manual browser steps if browser_login fails for an unusual form.\n\n"
+                    "If you have not given me credentials yet, tell me the username and "
+                    "password to use."
                 )
             elif "repeat" in obs or "suppressed" in obs:
                 detail = (
@@ -1524,7 +1626,12 @@ class CopilotSession:
                             page_url = getattr(browser, "current_url", "") or ""
                             if page_url:
                                 call_key = f"{tool_name}:{page_url}:{_canonical(tool_args)}"
-                    if call_key in self._seen_calls:
+                    # Deterministic probe tools do their work internally and return fresh
+                    # results per call — never suppress a re-issue (the no-progress watchdog
+                    # below still catches a genuine same-outcome spin). All other tools keep
+                    # the exact-identical-call suppression.
+                    if (call_key in self._seen_calls
+                            and tool_name not in _DETERMINISTIC_PROBE_TOOLS):
                         reply = await _record_tool_failure(
                             entry, "Repeat of an earlier identical call — suppressed. "
                             "Try a different request or reply.")

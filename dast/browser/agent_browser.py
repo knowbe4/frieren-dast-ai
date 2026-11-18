@@ -167,6 +167,37 @@ class AgentBrowser:
         self._page: Any = None
         self._lock = asyncio.Lock()
         self._last_cookie_sync: float = 0.0
+        # Most recent JS dialog (alert/confirm/prompt) the live page raised, e.g. the
+        # alert() a reflected-XSS payload fires. {"type", "message"} or None. Browser
+        # tools surface this as proof the injected script executed. See _ensure_page.
+        self._last_dialog: Optional[dict] = None
+        self._dialog_count: int = 0
+        # Response headers of the most recent navigation (lower-cased keys), stashed best-effort so
+        # callers can read e.g. a Content-Security-Policy header without re-fetching. See navigate.
+        self._last_response_headers: Dict[str, str] = {}
+
+    @property
+    def last_response_headers(self) -> Dict[str, str]:
+        """Response headers (lower-cased keys) from the most recent ``navigate``, or ``{}``.
+
+        A read-only snapshot used by ``xss_probe`` to detect a CSP *response header* (so an
+        Angular HTML-directive gadget is tried ahead of CSP-blocked inline-handler vectors).
+        Never raises."""
+        return getattr(self, "_last_response_headers", {}) or {}
+
+    @property
+    def last_dialog(self) -> Optional[dict]:
+        """The most recent JS dialog the page raised ({"type","message"}), or None.
+
+        A reflected/stored-XSS payload that fires ``alert()`` is auto-accepted (so it never
+        blocks the page) and recorded here as execution evidence for the copilot."""
+        return getattr(self, "_last_dialog", None)
+
+    def pop_last_dialog(self) -> Optional[dict]:
+        """Return the last captured dialog and clear it, so the next navigation starts clean."""
+        dlg = getattr(self, "_last_dialog", None)
+        self._last_dialog = None
+        return dlg
 
     @property
     def current_url(self) -> str:
@@ -208,8 +239,30 @@ class AgentBrowser:
                 await self._context.route("**/*", make_route_guard("agent-browser"))
             await self._seed_cookies()
             self._page = await self._context.new_page()
+            self._register_dialog_handler(self._page)
             logger.info("AgentBrowser launched", proxy_port=self._proxy_port)
             return self._page
+
+    def _register_dialog_handler(self, page: Any) -> None:
+        """Capture + auto-accept JS dialogs so an XSS alert() never blocks the page and is
+        recorded as execution evidence. Playwright delivers the event to a sync callback;
+        dialog.accept() is async, so schedule it as a task. Must never raise."""
+        def handle_dialog(dialog: Any) -> None:
+            try:
+                self._last_dialog = {"type": dialog.type, "message": dialog.message}
+                self._dialog_count += 1
+            except Exception:
+                pass
+            try:
+                # accept() behaves like clicking OK; unblocks the page either way.
+                asyncio.create_task(dialog.accept())
+            except Exception:
+                pass
+
+        try:
+            page.on("dialog", handle_dialog)
+        except Exception as exc:
+            logger.debug("AgentBrowser: dialog handler registration failed", error=str(exc)[:120])
 
     async def _seed_cookies(self) -> None:
         """Seed the context so it starts authenticated. For a session-scoped browser,
@@ -492,6 +545,12 @@ class AgentBrowser:
                 logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
         else:
             await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
+        # Stash the final navigation response's headers (lower-cased keys) so callers can read e.g.
+        # a CSP header. Guarded + best-effort: a parse/transport hiccup must never fail navigate.
+        try:
+            self._last_response_headers = (await resp.all_headers()) if resp is not None else {}
+        except Exception:
+            self._last_response_headers = {}
         try:
             title = await page.title()
         except Exception:
@@ -499,7 +558,15 @@ class AgentBrowser:
         result: Dict[str, Any] = {"ok": True, "url": page.url,
                                   "status": (resp.status if resp else None),
                                   "title": title, "timed_out": timed_out}
-        if timed_out:
+        # Surface a JS dialog raised during this navigation (e.g. an XSS alert()) as
+        # execution evidence so the copilot sees "alert fired" without a separate probe.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired during navigation "
+                              f"({dialog.get('type')}: {dialog.get('message')!r}) — "
+                              f"script executed")
+        if timed_out and "note" not in result:
             result["note"] = ("navigation did not fully settle; showing the current page — "
                               "check get_history for captured traffic, then snapshot/retry")
         return result
@@ -521,12 +588,29 @@ class AgentBrowser:
             logger.debug("AgentBrowser reload: did not settle, continuing",
                          error=str(exc)[:160])
         await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
-        return {"ok": True, "url": page.url, "status": (resp.status if resp else None)}
+        result: Dict[str, Any] = {"ok": True, "url": page.url,
+                                  "status": (resp.status if resp else None)}
+        # Surface a JS dialog raised during the reload (e.g. a stored XSS alert() that fires on
+        # re-render) as execution evidence. Only ADDS a key when a dialog fired.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired during reload ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def fill(self, selector: str, value: str, timeout_ms: int = 10000) -> Dict[str, Any]:
         page = await self._ensure_page()
         await page.fill(selector, value, timeout=timeout_ms)
-        return {"ok": True, "selector": selector}
+        result: Dict[str, Any] = {"ok": True, "selector": selector}
+        # Surface a JS dialog raised by filling (e.g. an onfocus/oninput XSS alert()) as
+        # execution evidence. Only ADDS a key when a dialog fired — existing keys untouched.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def click(self, selector: str, timeout_ms: int = 10000,
                     expect_nav: bool = False) -> Dict[str, Any]:
@@ -539,7 +623,15 @@ class AgentBrowser:
                 logger.debug("AgentBrowser click nav wait ended", error=str(exc))
         else:
             await page.click(selector, timeout=timeout_ms)
-        return {"ok": True, "selector": selector, "url": page.url}
+        result: Dict[str, Any] = {"ok": True, "selector": selector, "url": page.url}
+        # Surface a JS dialog raised by the click (e.g. an onclick XSS alert()) as execution
+        # evidence. Only ADDS a key when a dialog fired — existing keys untouched.
+        dialog = self.pop_last_dialog()
+        if dialog is not None:
+            result["dialog"] = dialog
+            result["note"] = (f"JS dialog fired ({dialog.get('type')}: "
+                              f"{dialog.get('message')!r}) — script executed")
+        return result
 
     async def wait_for(self, selector: str, timeout_ms: int = 10000,
                        state: str = "visible") -> Dict[str, Any]:
@@ -575,7 +667,13 @@ class AgentBrowser:
         # still snapshots promptly once both attempts time out).
         await self._wait_for_hydration(page, timeout_ms=8000)
         view = await page.evaluate(_SNAPSHOT_JS)
-        return {"ok": True, "url": page.url, "title": await page.title(), **view}
+        result: Dict[str, Any] = {"ok": True, "url": page.url, "title": await page.title(), **view}
+        # Peek (do NOT pop) any JS dialog the page has raised, so a snapshot after an XSS
+        # delivery still shows the execution evidence without consuming it. Only ADDS a key.
+        dialog = self.last_dialog
+        if dialog is not None:
+            result["dialog"] = dialog
+        return result
 
     async def _find_submit(self, page: Any) -> Any:
         """Best submit control for the login form: scored to prefer the sign-in

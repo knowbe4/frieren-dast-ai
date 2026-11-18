@@ -270,6 +270,29 @@ def strip_pasted_secret_headers(headers: Dict[str, str]) -> list:
     return stripped
 
 
+_CALLER_AUTH_HEADER_NAMES = ("cookie", "authorization", "x-csrf-token", "x-xsrf-token")
+
+
+def strip_caller_auth_headers(headers: Dict[str, str]) -> list:
+    """Remove ALL caller-supplied auth headers (``Cookie``/``Authorization``/
+    ``X-CSRF-Token``/``X-XSRF-Token``), case-insensitive, mutating ``headers``; return the
+    stripped header NAMES.
+
+    For the copilot-facing tools (``browser_fetch``, ``send_request``) where the managed
+    session/browser is the sole source of truth for auth: the copilot repeatedly pastes a
+    STALE raw Cookie/Bearer/CSRF token into the headers arg, and that override breaks the
+    request (the live session would otherwise supply the right one). Unlike
+    :func:`strip_pasted_secret_headers` this drops the header regardless of whether the value
+    looks like a raw secret. Every other caller header (Origin/Referer/Content-Type/Accept/
+    X-Requested-With/...) is left untouched."""
+    stripped = []
+    for name in list(headers.keys()):
+        if name.lower() in _CALLER_AUTH_HEADER_NAMES:
+            headers.pop(name, None)
+            stripped.append(name)
+    return stripped
+
+
 def inject_csrf(headers: Dict[str, str], cookies, *, refresh: bool = False) -> Dict[str, str]:
     """Add the CSRF + XHR headers a cookie-authenticated SPA requires on a
     state-changing request, mutating and returning ``headers``.

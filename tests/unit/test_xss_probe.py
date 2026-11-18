@@ -9,8 +9,9 @@ the right context/version and records a finding on "match", and does NOT confirm
 
 from __future__ import annotations
 
+import json
 import re
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from dast.tools import xss_probe_tools as xpt
 
@@ -24,7 +25,12 @@ class _FakePage:
         self.init_scripts.append(script)
 
     async def evaluate(self, expr: str):
-        # window._xssAlertFired read (native pop path is used by the fake) → never fired here.
+        # A browser that models an Angular sandbox exposes an ``_oracle``; the tool's _angular_eval
+        # JS routes through here, so page.evaluate becomes the live CSTI synthesis oracle. Other
+        # fakes have no oracle, so the dialog-read / reset JS just reports "nothing fired" (False).
+        oracle = getattr(self._browser, "_oracle", None)
+        if oracle is not None:
+            return oracle(expr)
         return False
 
     async def content(self) -> str:
@@ -352,6 +358,158 @@ async def test_angular_parse_key_sink_confirms_via_raw_key_delivery():
         assert raw in key_url
 
     # Reported as CSTI even though the surface context was a JS string.
+    assert len(store.recorded) == 1
+    title = store.recorded[0][0]["title"]
+    assert "CSTI" in title or "template injection" in title
+
+
+class _AngularSynthBrowser:
+    """Models a SANDBOXED AngularJS 1.4 ``$parse``-of-KEY app as a REAL synthesis oracle.
+
+    ``page.evaluate`` (routed through ``_oracle``) evaluates the tool's Angular-expression probes the
+    way the live sandbox would: ``7*7``→``49``; ``constructor.constructor`` is BLOCKED (a sandbox
+    error, forcing the charAt-override path); ``fromCharCode(<codes>)`` round-trips to its decoded
+    string (so the string builder and the charAt-override probe both verify). A real alert() dialog
+    fires ONLY when the SYNTHESIZED no-strings escape — whose ``fromCharCode`` codes decode to
+    ``x=alert(<MARK>)`` — is delivered as a raw query-param KEY. A curated JS-string break-out never
+    fires here (it carries no fromCharCode), so a confirm PROVES synthesis, not a lookup."""
+
+    _DOM = (
+        '<html><head><script src="/resources/js/angular_1-4-4.js"></script></head>'
+        '<body ng-app>'
+        "<script>$scope.query[key] = '{MARKER}'; $scope.value = $parse(key)($scope.query);</script>"
+        '</body></html>'
+    )
+
+    def __init__(self, point: str) -> None:
+        self.point = point
+        self._page = _FakePage(self)
+        self.marker = ""
+        self.navigated: list = []
+        self.confirming_url = ""
+        self._dialog = None
+
+    async def _ensure_page(self):
+        return self._page
+
+    # ── the live-sandbox oracle (pure, deterministic) ──
+    def _oracle(self, js: str):
+        m = re.search(r'const EXPR = ("(?:[^"\\]|\\.)*");', js)
+        if not m:  # a dialog-read / reset JS, not an Angular-expression probe
+            return False
+        expr = json.loads(m.group(1))
+        if "constructor.constructor" in expr:
+            return {"ok": False, "err": "Referencing Function in Angular expressions is disallowed! "
+                    "($parse:isecfn)"}
+        if expr == "7*7":
+            return {"ok": True, "val": "49"}
+        codes = re.findall(r"fromCharCode\(([^)]*)\)", expr)
+        if codes:
+            try:
+                return {"ok": True, "val": "".join(chr(int(c)) for c in codes[-1].split(","))}
+            except Exception:
+                return {"ok": False, "err": "bad codes"}
+        return {"ok": False, "err": "$parse:isecfld"}
+
+    async def navigate(self, url: str):
+        self.navigated.append(url)
+        qs = parse_qs(urlparse(url).query, keep_blank_values=True)
+        first_val = (qs.get(self.point, [""]) or [""])[0]
+        if first_val.startswith("dastxss"):
+            self.marker = first_val  # benign-marker step
+            self._dialog = None
+            return {"ok": True, "url": url}
+        # Fire ONLY for the synthesized escape delivered as a raw key: decode its fromCharCode and
+        # require it to be exactly x=alert(<the probe's MARK>).
+        fired = None
+        codes = re.findall(r"fromCharCode\(([^)]*)\)", unquote(url))
+        if codes:
+            try:
+                built = "".join(chr(int(c)) for c in codes[-1].split(","))
+            except Exception:
+                built = ""
+            mm = re.match(r"x=alert\((\d+)\)$", built)
+            if mm:
+                self.confirming_url = url
+                fired = {"type": "alert", "message": mm.group(1)}
+        self._dialog = fired
+        return {"ok": True, "url": url}
+
+    def pop_last_dialog(self):
+        dlg, self._dialog = self._dialog, None
+        return dlg
+
+    async def snapshot(self):
+        return {"forms": [], "fields": [], "buttons": [], "links": []}
+
+    async def fill(self, selector, value):
+        return {"ok": True}
+
+    async def click(self, selector, expect_nav=False):
+        return {"ok": True}
+
+    @property
+    def _dom_template(self):
+        return self._DOM
+
+
+async def test_synthesize_angular_builds_escape(monkeypatch):
+    """With the curated AngularJS vectors ABSENT, xss_probe still CONFIRMS by SYNTHESIZING the
+    sandbox escape from primitives against the live oracle (not by looking one up)."""
+    real_get_value = xpt.get_value
+
+    def blanked(category, key, default=None):
+        # Remove ONLY the curated full-payload vectors; the primitive library stays available.
+        if (category, key) in (("xss", "angular_csti"), ("xss", "angular_no_strings")):
+            return {}
+        return real_get_value(category, key, default)
+
+    monkeypatch.setattr(xpt, "get_value", blanked)
+    monkeypatch.setattr("dast.triage.xss_synthesis.get_value", blanked)
+
+    browser = _AngularSynthBrowser("search")
+    store = _FakeStore()
+    ctx = _FakeCtx(browser, store)
+    out = await xpt._xss_probe(ctx, {"url": _URL, "injection_point": "search"})
+
+    assert out["ok"] is True
+    assert out["confirmed"] is True, out
+    payload = out["payload"]
+    # The confirming dialog echoed the unique per-run MARK (alert(MARK) ran), not a canned alert(1):
+    # the dialog message is the MARK, and the synthesized escape's fromCharCode encodes x=alert(MARK).
+    mark = out["dialog"]["message"]
+    assert mark.isdigit()
+    codes = [str(ord(c)) for c in f"x=alert({mark})"]
+    assert "fromCharCode(" + ",".join(codes) + ")" in payload
+
+    # The payload was BUILT (fromCharCode no-strings escape), and it was NOT read from the curated
+    # vectors (those are blanked) — it is the synthesizer's own composition.
+    assert "toString().constructor.prototype.charAt=[].join" in payload
+    assert "fromCharCode(" in payload
+    assert "'" not in payload and '"' not in payload
+
+    # The step chain shows the oracle-verified primitives, in order.
+    labels = [s.get("label", "") for s in out["steps"]]
+    assert "synth: oracle" in labels
+    assert "synth: probe fromCharCode" in labels
+    assert "synth: probe charAt override" in labels
+    assert "synth: composed" in labels
+    assert "synth: CONFIRMED" in labels
+    # The oracle established evaluation and verified the escape primitives.
+    by_label = {s["label"]: s for s in out["steps"] if "label" in s}
+    assert str(by_label["synth: oracle"]["result"]["val"]) == "49"
+    assert by_label["synth: probe fromCharCode"]["verified"] is True
+    assert by_label["synth: probe charAt override"]["verified"] is True
+    # The constructor.constructor path was tried and REJECTED by the sandbox (forcing the charAt path).
+    assert by_label["synth: probe constructor.constructor"]["verified"] is False
+    assert by_label["synth: composed"]["strategy"] == "charat"
+
+    # Delivery was a RAW key: the escape sat as a second param key with its internal '=' as %3d.
+    assert browser.confirming_url
+    assert "charAt%3d[].join" in browser.confirming_url
+    assert browser.confirming_url.endswith("=1")
+
+    # Recorded as CSTI.
     assert len(store.recorded) == 1
     title = store.recorded[0][0]["title"]
     assert "CSTI" in title or "template injection" in title

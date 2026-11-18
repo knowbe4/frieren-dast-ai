@@ -32,6 +32,16 @@ _ANGULAR_MARKERS = re.compile(
 # ng-app / ng-controller establish an Angular scope subtree whose text nodes are interpolated.
 _NG_SUBTREE = re.compile(r"ng-app|ng-controller", re.IGNORECASE)
 
+# A Content-Security-Policy constraint on the page. ``ng-csp`` tells AngularJS to run in its
+# CSP-compatible mode (no unsafe-eval), and a ``<meta http-equiv="Content-Security-Policy">`` sets a
+# policy from markup. Either (or a CSP *response header*, OR'd in by the tool layer) means an
+# inline-handler / Function-constructor vector is blocked — but an Angular HTML-element DIRECTIVE
+# gadget runs an Angular EXPRESSION (not inline JS), so it still fires. ``csp_present`` is used only
+# to REORDER candidates (gadgets first under CSP); it never gates the context, so no-CSP labs are
+# unaffected.
+_NG_CSP = re.compile(r"ng-csp", re.IGNORECASE)
+_META_CSP = re.compile(r"<meta[^>]+http-equiv=['\"]?content-security-policy", re.IGNORECASE)
+
 # An Angular expression-evaluator call. When the <script> that the marker landed in feeds the
 # marker through $parse(...) / $eval(...), the value reaches the AngularJS expression evaluator —
 # an Angular-CSTI sink — even though its SURFACE context is a plain JS string literal.
@@ -139,13 +149,15 @@ def _angular_parse_key_sink(text: str, marker_idx: int) -> bool:
 def classify_context(response_text: str, marker: str) -> Dict[str, object]:
     """Locate ``marker`` in the rendered response and classify the reflection context.
 
-    Returns ``{context, quotes_encoded, angular_parse_sink, angular_parse_key_sink, framework,
-    framework_version, snippet}`` where ``context`` is one of: ``js_string_double`` /
-    ``js_string_single`` (inside a
+    Returns ``{context, quotes_encoded, angular_parse_sink, angular_parse_key_sink, ng_csp,
+    csp_present, framework, framework_version, snippet}`` where ``context`` is one of:
+    ``js_string_double`` / ``js_string_single`` (inside a
     <script> string literal, by the enclosing quote), ``href_js`` (an href=/src= attribute value),
     ``attr_double_quote`` / ``attr_single_quote`` (any other quoted attribute value),
-    ``angular_expression`` (a text node inside an Angular ng-app/ng-controller subtree or a
-    ``{{ }}`` interpolation), ``html_body`` (a plain HTML text node), or ``unknown`` (marker not
+    ``angular_expression`` (a marker inside a ``{{ }}`` interpolation), ``angular_html_injection``
+    (a marker reflected RAW as an HTML text node inside an Angular ng-app/ng-controller subtree —
+    the server markup is ``$compile``'d on the next digest, so an injected element carrying an
+    Angular directive runs), ``html_body`` (a plain HTML text node), or ``unknown`` (marker not
     found — the probe cannot proceed on this response).
 
     ``angular_parse_sink`` is True when the marker's enclosing ``<script>`` feeds it through
@@ -153,17 +165,22 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
     surface ``context`` is a JS string, so Angular CSTI vectors must still be tried.
     ``angular_parse_key_sink`` is True (a stricter subset) when that ``$parse``/``$eval`` argument
     is a bare identifier (``$parse(key)``) rather than a string literal — the param NAME is the
-    evaluated expression, so the sandbox escape must be delivered AS a query-param KEY."""
+    evaluated expression, so the sandbox escape must be delivered AS a query-param KEY.
+    ``ng_csp``/``csp_present`` flag an AngularJS CSP constraint (``ng-csp`` attr or a meta-CSP);
+    the tool layer ORs in a CSP *response header* and uses it only to reorder candidates (Angular
+    directive/expression gadgets ahead of CSP-blocked inline-handler vectors)."""
     text = response_text or ""
     framework_version = detect_angular_version(text)
     angular_present = bool(_ANGULAR_MARKERS.search(text))
     framework = "angularjs" if angular_present else ""
+    ng_csp = bool(_NG_CSP.search(text))
+    csp_present = ng_csp or bool(_META_CSP.search(text))
 
     idx = text.find(marker)
     if idx == -1:
         return {"context": "unknown", "quotes_encoded": False, "angular_parse_sink": False,
-                "angular_parse_key_sink": False, "framework": framework,
-                "framework_version": framework_version, "snippet": ""}
+                "angular_parse_key_sink": False, "ng_csp": ng_csp, "csp_present": csp_present,
+                "framework": framework, "framework_version": framework_version, "snippet": ""}
 
     snippet = text[max(0, idx - 40):idx + len(marker) + 60]
     quotes_encoded = _quotes_encoded(text, idx, marker)
@@ -179,7 +196,8 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
         context = "js_string_single" if quote == "'" else "js_string_double"
         return {"context": context, "quotes_encoded": quotes_encoded,
                 "angular_parse_sink": angular_parse_sink,
-                "angular_parse_key_sink": angular_parse_key_sink, "framework": framework,
+                "angular_parse_key_sink": angular_parse_key_sink, "ng_csp": ng_csp,
+                "csp_present": csp_present, "framework": framework,
                 "framework_version": framework_version, "snippet": snippet}
 
     # 2. Inside an (unclosed) tag → an attribute value context.
@@ -198,19 +216,33 @@ def classify_context(response_text: str, marker: str) -> Dict[str, object]:
             context = "attr_double_quote"
         return {"context": context, "quotes_encoded": quotes_encoded,
                 "angular_parse_sink": angular_parse_sink,
-                "angular_parse_key_sink": angular_parse_key_sink, "framework": framework,
+                "angular_parse_key_sink": angular_parse_key_sink, "ng_csp": ng_csp,
+                "csp_present": csp_present, "framework": framework,
                 "framework_version": framework_version, "snippet": snippet}
 
-    # 3. A text node. Inside an Angular subtree / {{ }} interpolation → CSTI; else plain HTML.
+    # 3. A text node. Decide between an AngularJS ``{{ }}`` interpolation (CSTI), a RAW-HTML Angular
+    #    injection (an element-directive gadget), or a plain HTML body reflection.
+    #      - marker INSIDE actual ``{{ }}`` → ``angular_expression`` (the interpolation target itself)
+    #      - else Angular present + inside an ng-app/ng-controller subtree + marker reflected RAW as
+    #        an HTML text node → ``angular_html_injection``: the server markup is $compile'd on the
+    #        next digest, so an injected element carrying an Angular directive (e.g.
+    #        ``<input autofocus ng-focus=...>``) runs an Angular expression — not blocked by a CSP
+    #        that stops inline JS. (Previously an ``ng-app``/``ng-controller`` ANYWHERE on the page
+    #        mislabelled this raw reflection as ``angular_expression``, offering only ``{{ }}``
+    #        value-vectors that ng-csp+CSP defeat.)
+    #      - else → ``html_body``.
     moustache_open = text.rfind("{{", 0, idx)
     moustache_close = text.rfind("}}", 0, idx)
     inside_moustache = (moustache_open != -1 and moustache_open > moustache_close
                         and "}}" in text[idx:])
-    if angular_present and (inside_moustache or _NG_SUBTREE.search(text)):
+    if inside_moustache:
         context = "angular_expression"
+    elif angular_present and _NG_SUBTREE.search(text):
+        context = "angular_html_injection"
     else:
         context = "html_body"
     return {"context": context, "quotes_encoded": quotes_encoded,
             "angular_parse_sink": angular_parse_sink,
-            "angular_parse_key_sink": angular_parse_key_sink, "framework": framework,
+            "angular_parse_key_sink": angular_parse_key_sink, "ng_csp": ng_csp,
+            "csp_present": csp_present, "framework": framework,
             "framework_version": framework_version, "snippet": snippet}

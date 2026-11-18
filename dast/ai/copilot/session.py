@@ -460,7 +460,11 @@ Operational notes:
   auto-detects the reflection context (HTML / attribute / JS-string / Angular `$parse`), reads the
   AngularJS version, picks the context-correct (and quote-free when quotes are encoded) payload
   itself, delivers through the real browser, and confirms strictly via the captured `alert()`
-  dialog. Treat XSS as confirmed ONLY when a JS dialog fired; never from reflection alone.
+  dialog. Treat XSS as confirmed ONLY when a JS dialog fired; never from reflection alone. For an
+  AngularJS-bootstrapped raw-HTML reflection under CSP (the HTML-directive-gadget class), do NOT
+  hand-craft `{{ }}` payloads — call `xss_probe`; if it returns `suspected=True` with a `poc`, that
+  class needs fragment-focus (`#x`) + victim delivery, so surface the generated PoC to the operator
+  (deliver via the exploit server) instead of spinning on it.
 - Client-side prototype pollution → DOM XSS: when a page reads `location.hash`/query into an
   object merge (or you suspect a proto-pollution sink), call `prototype_pollution_probe` once with
   the page `url`. It pollutes a sentinel through the source-vector library, reads Object.prototype

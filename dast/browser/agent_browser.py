@@ -172,6 +172,18 @@ class AgentBrowser:
         # tools surface this as proof the injected script executed. See _ensure_page.
         self._last_dialog: Optional[dict] = None
         self._dialog_count: int = 0
+        # Response headers of the most recent navigation (lower-cased keys), stashed best-effort so
+        # callers can read e.g. a Content-Security-Policy header without re-fetching. See navigate.
+        self._last_response_headers: Dict[str, str] = {}
+
+    @property
+    def last_response_headers(self) -> Dict[str, str]:
+        """Response headers (lower-cased keys) from the most recent ``navigate``, or ``{}``.
+
+        A read-only snapshot used by ``xss_probe`` to detect a CSP *response header* (so an
+        Angular HTML-directive gadget is tried ahead of CSP-blocked inline-handler vectors).
+        Never raises."""
+        return getattr(self, "_last_response_headers", {}) or {}
 
     @property
     def last_dialog(self) -> Optional[dict]:
@@ -533,6 +545,12 @@ class AgentBrowser:
                 logger.debug("AgentBrowser navigate: wait_selector ended", error=str(exc)[:120])
         else:
             await self._wait_for_hydration(page, timeout_ms=min(timeout_ms, 10000))
+        # Stash the final navigation response's headers (lower-cased keys) so callers can read e.g.
+        # a CSP header. Guarded + best-effort: a parse/transport hiccup must never fail navigate.
+        try:
+            self._last_response_headers = (await resp.all_headers()) if resp is not None else {}
+        except Exception:
+            self._last_response_headers = {}
         try:
             title = await page.title()
         except Exception:

@@ -52,6 +52,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
     "pytest-mock>=3.14.0",
+    "pytest-xdist>=3.6.0",
     "respx>=0.21.0",
     # Secret-scanning / internal-data guardrails (see .pre-commit-config.yaml)
     "pre-commit>=4.0.0",
@@ -62,6 +63,12 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Run across all CPU cores by default (pytest-xdist). The suite is isolated for
+# parallel execution: servers bind port 0, per-test state goes to tmp_path (see
+# tests/unit/conftest.py), and no test writes a shared fixed path. Override with
+# `-n0` (or `-p no:xdist`) for a single-process run / easier debugging / a
+# resource-constrained CI runner.
+addopts = "-n auto"
 
 [tool.ruff]
 # Lenient line length: this pass targets dead code / unused imports, not reformatting.

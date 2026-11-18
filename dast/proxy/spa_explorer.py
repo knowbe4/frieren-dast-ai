@@ -72,6 +72,21 @@ _MAX_WIZARD_STEPS = 6
 _MAX_VISION_CALLS = 25
 _VIEWPORT = {"width": 1280, "height": 900}
 
+# Render/settle timing knobs. Module-level (like the caps above) purely so tests
+# driving a local, instant fixture server can shrink them — the production
+# defaults here are unchanged, so real-target behaviour is identical. These are
+# the per-route waits that let a client-rendered SPA finish painting before we
+# enumerate it; against a real app they must stay generous.
+_RENDER_NETWORKIDLE_MS = 8000   # networkidle wait before the interactive-element census
+_RENDER_SETTLE_DEADLINE_S = 10.0  # poll-until-interactive-elements-exist budget
+_RENDER_POLL_S = 0.5            # census poll interval
+_CLICK_SETTLE_NETWORKIDLE_MS = 3000  # networkidle wait after a possibly-navigating click
+_CLICK_SETTLE_PAUSE_S = 0.15    # brief pause so a navigating click gets in-flight
+_CLICK_SETTLE_FALLBACK_S = 0.3  # fallback settle when networkidle times out
+_SCROLL_SETTLE_S = 0.6          # pause after scrolling to the bottom (lazy-load trigger)
+_SCROLL_RESET_S = 0.3           # pause after scrolling back to the top
+_MENU_HOVER_SETTLE_S = 0.15     # pause after hovering a menu trigger so the flyout renders
+
 
 class SpaExplorer:
     def __init__(
@@ -331,7 +346,7 @@ class SpaExplorer:
         enumerate: network-idle, then poll until interactive elements exist (links,
         buttons, role=button/menuitem/tab, routerLink), piercing open shadow DOM."""
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=_RENDER_NETWORKIDLE_MS)
         except Exception:
             pass
         census_js = """() => {
@@ -345,7 +360,7 @@ class SpaExplorer:
           scan(document);
           return n;
         }"""
-        deadline = asyncio.get_event_loop().time() + 10
+        deadline = asyncio.get_event_loop().time() + _RENDER_SETTLE_DEADLINE_S
         count = 0
         while asyncio.get_event_loop().time() < deadline:
             try:
@@ -354,7 +369,7 @@ class SpaExplorer:
                 count = 0
             if count >= 5:
                 break
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(_RENDER_POLL_S)
         # Per-frame census: a micro-frontend SPA renders nav/content inside iframes
         # that top-document queries never see. Log counts per frame at info so we
         # can tell "empty shell" from "content is in a frame we're not crawling".
@@ -406,18 +421,18 @@ class SpaExplorer:
         and the new route would be missed on a fast server. A brief pause lets the
         navigation get in-flight; networkidle then waits for it to finish. A no-op
         click just settles quickly."""
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(_CLICK_SETTLE_PAUSE_S)
         try:
-            await page.wait_for_load_state("networkidle", timeout=3000)
+            await page.wait_for_load_state("networkidle", timeout=_CLICK_SETTLE_NETWORKIDLE_MS)
         except Exception:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(_CLICK_SETTLE_FALLBACK_S)
 
     async def _scroll(self, page) -> None:
         try:
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(_SCROLL_SETTLE_S)
             await page.evaluate("window.scrollTo(0, 0)")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(_SCROLL_RESET_S)
         except Exception as exc:
             logger.debug("explorer: scroll failed", error=str(exc))
 
@@ -435,7 +450,7 @@ class SpaExplorer:
                 try:
                     if await trigger.is_visible():
                         await trigger.hover(timeout=1000)
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(_MENU_HOVER_SETTLE_S)
                 except Exception:
                     continue
 

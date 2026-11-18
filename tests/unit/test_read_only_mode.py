@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
+import respx
 
 from dast.tools.base import run_tool, Tool
 from dast.tools.context import ToolContext
@@ -143,8 +145,18 @@ def test_is_read_only_graphql_blocks_mutations_and_non_graphql():
     assert not read_only.is_read_only_graphql(url, "")  # empty body
 
 
+@respx.mock
 def test_send_request_allows_read_only_graphql_introspection():
     from dast.tools import http_tools
+
+    # Mock the upstream so the allowed send returns instantly instead of going out
+    # through the proxy and timing out (ctx.proxy_url points at a proxy port with
+    # nothing to forward to in a unit test). respx intercepts httpx below the
+    # transport, so no socket/proxy connection is attempted; the point of the test
+    # — that the read-only gate ALLOWS introspection — is unchanged.
+    respx.route(method="POST", host="api.example.com", path="/graphql").mock(
+        return_value=httpx.Response(200, json={"data": {"__schema": {"types": []}}})
+    )
 
     ctx = ToolContext(read_only=True)
     ctx.is_in_scope = lambda url: True  # type: ignore[method-assign]

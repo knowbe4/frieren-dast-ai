@@ -303,6 +303,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                 "hint": "Re-send with the safe_variant substituted; detection-only policy.",
             }
 
+    # Snapshot known history ids BEFORE sending so we can resolve the real
+    # proxy-history entry_id of the request we are about to issue (see below). This
+    # is what lets the caller cite evidence_entry_ids in record_finding instead of
+    # narrating an ungrounded chain. In-process store only (MCP has no store).
+    known_entry_ids: Optional[set] = None
+    if getattr(ctx, "store", None) is not None:
+        try:
+            known_entry_ids = {e.id for e in ctx.store.entries_newest_first()}
+        except Exception:
+            known_entry_ids = None
+
     try:
         import httpx
 
@@ -332,6 +343,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
+        # Resolve the REAL proxy-history entry_id of the request just issued (like
+        # browser_fetch), so the caller can pass it to record_finding as grounded
+        # evidence. The proxy records the entry (request+response) before our httpx
+        # client sees the response, so it exists by now.
+        if known_entry_ids is not None:
+            try:
+                eid = ctx.store.resolve_sent_entry_id(url, method, known_entry_ids)
+                if eid:
+                    result["entry_id"] = eid
+            except Exception as exc:
+                logger.debug("send_request: entry_id resolution failed", error=str(exc)[:120])
         _flagged = list(dict.fromkeys(_res.stripped))
         if _flagged:
             result["note"] = (
@@ -482,6 +504,10 @@ register(Tool(
         "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
+        "The result includes 'entry_id' — the real proxy-history id of the request you just "
+        "sent. Keep it: pass these ids as record_finding's evidence_entry_ids so the finding "
+        "is grounded in the exact captured request/response that proves it (especially for a "
+        "multi-request proof), instead of only narrating a chain.\n"
         "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
         "headers from the jar, and a cached sub-app Bearer selected by request "
         "path when one is known. If a request still 401/403s after that (e.g. an SPA whose token "

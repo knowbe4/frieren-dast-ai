@@ -663,7 +663,15 @@ function renderRow(entry, isNew) {
             : entry.queued_for_scan              ? 'r-q'
             : entry.source === 'crawler'         ? 'r-c'
             : entry.source === 'out-of-scope'    ? 'r-oos' : '';
-  const srcTag = _SRC_TAG[entry.source] || _SRC_TAG.proxy;
+  // Dual-label an out-of-scope entry with the tool that originated it (origin), so a
+  // copilot/agent request to an out-of-scope host reads as "oos · copilot" instead of
+  // looking like stray proxy traffic. Scope tag (source) is unchanged.
+  let srcTag = _SRC_TAG[entry.source] || _SRC_TAG.proxy;
+  if (entry.source === 'out-of-scope' && entry.origin && entry.origin !== 'out-of-scope') {
+    const originTag = _SRC_TAG[entry.origin]
+      || `<span class="src-tag" title="Originating tool">${esc(entry.origin)}</span>`;
+    srcTag = srcTag + ' ' + originTag;
+  }
   const scanBdg = entry.queued_for_scan && !entry.scan_result ? '<span class="sbdg q">queued</span>' : '';
   // Probe legend: a scanner request injects a test value to observe how the
   // endpoint reacts. Detection is based on the RESPONSE (reflected value,

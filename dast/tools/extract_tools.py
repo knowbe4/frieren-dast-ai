@@ -27,6 +27,12 @@ logger = get_logger(__name__)
 # Caps so the result always survives the turn-transcript observation trim.
 _MAX_VALUES = 200
 _MAX_VALUE_CHARS = 200
+# A single-field extract (exactly one matched value) returns the value in FULL rather than
+# the 200-char per-value preview: reading one field/token (a full JWT, a nested id) is the
+# whole point, and the copilot's observation cap is lifted for a result flagged full_value
+# (see dast/ai/copilot/session.py _summarize_result / the full_value exemption). Still bounded
+# so a single giant object can't blow the context.
+_MAX_SINGLE_VALUE_CHARS = 8000
 
 # Path tokens: a bare key, ``[]`` (map over an array), or ``[n]`` (index into an array).
 _TOKEN_RE = re.compile(r"([^.\[\]]+)|\[(\d*)\]")
@@ -92,15 +98,19 @@ def _select(root: Any, path: str) -> List[Any]:
     return frontier
 
 
-def _stringify(value: Any) -> str:
+def _stringify(value: Any, max_chars: int = _MAX_VALUE_CHARS) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
-    return text[:_MAX_VALUE_CHARS]
+    return text[:max_chars]
 
 
 def _slice_result(matches: List[Any], offset: int, limit: int, url: str, selector: str) -> Dict[str, Any]:
     total = len(matches)
     window = matches[offset:offset + limit]
-    return {
+    # Exactly one matched value (from offset 0): a single-field extract. Return it in full
+    # and flag it so the observation cap is lifted for this one result.
+    single = total == 1 and offset == 0 and len(window) == 1
+    per_value_cap = _MAX_SINGLE_VALUE_CHARS if single else _MAX_VALUE_CHARS
+    result: Dict[str, Any] = {
         "ok": True,
         "url": url,
         "selector": selector,
@@ -108,8 +118,11 @@ def _slice_result(matches: List[Any], offset: int, limit: int, url: str, selecto
         "count": len(window),
         "offset": offset,
         "truncated": offset + len(window) < total,
-        "values": [_stringify(v) for v in window],
+        "values": [_stringify(v, per_value_cap) for v in window],
     }
+    if single:
+        result["full_value"] = True
+    return result
 
 
 def _summary(body: str, url: str) -> Dict[str, Any]:
@@ -127,7 +140,8 @@ def _summary(body: str, url: str) -> Dict[str, Any]:
         return {"ok": True, "url": url, "kind": "array", "length": len(data),
                 "element_keys": sorted(first.keys())[:50] if isinstance(first, dict) else None,
                 "note": "pass path=[].<key> to map a field over every element."}
-    return {"ok": True, "url": url, "kind": type(data).__name__, "value": _stringify(data)}
+    return {"ok": True, "url": url, "kind": type(data).__name__,
+            "value": _stringify(data, _MAX_SINGLE_VALUE_CHARS), "full_value": True}
 
 
 def _entry_body(entry: Any) -> str:

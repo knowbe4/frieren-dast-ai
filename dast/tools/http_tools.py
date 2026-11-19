@@ -11,6 +11,7 @@ This is the repeater primitive exposed to agents and MCP clients.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
@@ -21,6 +22,16 @@ from dast.utils.logger import get_logger
 from dast.utils.placeholders import looks_like_placeholder
 
 logger = get_logger(__name__)
+
+# A cookie whose name looks like a session/auth cookie — used only for observability
+# logging, to flag a likely-guest (no-session) request to an auth-gated endpoint.
+_SESSION_COOKIE_RE = re.compile(r"session|_session|sid", re.IGNORECASE)
+
+
+def _session_cookie_present(names: "List[str]") -> bool:
+    """True if any cookie name looks like a session/auth cookie."""
+    return any(_SESSION_COOKIE_RE.search(n or "") for n in names)
+
 
 # Reflection detection: an injected value shorter than this is too noisy to be a
 # reliable reflection signal (e.g. "1", "ok"), so it is skipped.
@@ -221,6 +232,18 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
+
+            # Observability: surface whether a session cookie was actually pulled, so a
+            # guest (no-session) request to an auth-gated endpoint is visible in the logs.
+            _names = list(jar_cookie_map.keys())
+            _has_session = _session_cookie_present(_names)
+            logger.info("send_request cookie jar", host=_host,
+                        cookies=len(_names), session_cookie=_has_session)
+            if not _has_session:
+                logger.warning(
+                    "send_request: no session cookie in jar for %s — if the app "
+                    "authenticated in the browser, use browser_fetch" % _host,
+                    host=_host, method=method, cookies=len(_names))
 
     # Resolve a sub-app Bearer when one is known for this (host, path), so a direct / MCP
     # caller can reach a Bearer-authed sub-app instead of a 403. Prefer the

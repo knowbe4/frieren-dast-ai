@@ -94,6 +94,11 @@ class ProxyEntry:
     duration_ms: float = 0.0
     ts: float = field(default_factory=time.time)
     source: str = "proxy"   # "proxy" | "crawler" | "browse" | "scanner"
+    # Originating tool/component (from the internal x-dast-source header) recorded ALONGSIDE
+    # source. For an out-of-scope request the authoritative scope tag stays source="out-of-scope"
+    # (every scope/deny consumer keys on that), while origin preserves who made it — e.g. a
+    # copilot tool PUT to an out-of-scope S3 host reads as source="out-of-scope", origin="copilot".
+    origin: Optional[str] = None
     browse_session_id: Optional[str] = None
     crawler_session_id: Optional[str] = None
     # scan state
@@ -129,6 +134,7 @@ class ProxyEntry:
             "duration_ms": round(self.duration_ms, 1),
             "ts": self.ts,
             "source": self.source,
+            "origin": self.origin,
             "browse_session_id": self.browse_session_id,
             "crawler_session_id": self.crawler_session_id,
             "queued_for_scan": self.queued_for_scan,
@@ -421,9 +427,14 @@ class SessionStore:
         request_headers: Dict[str, str],
         request_body: Optional[bytes],
         source: str = "proxy",
+        origin: Optional[str] = None,
     ) -> Optional[str]:
         """
         Register a new request. Returns the entry ID, or None if filtered out.
+
+        ``origin`` records the originating tool/component (e.g. "copilot") ALONGSIDE the
+        resolved source, without overwriting it — so an out-of-scope tool request keeps its
+        authoritative source="out-of-scope" scope tag while still being attributable.
         """
         parsed = urlparse(url)
         host = parsed.netloc
@@ -458,6 +469,7 @@ class SessionStore:
                 request_headers=request_headers,
                 request_body=request_body,
                 source=resolved_source,
+                origin=origin,
                 browse_session_id=browse_sid,
                 crawler_session_id=crawler_sid,
                 probe_payload=probe_payload,

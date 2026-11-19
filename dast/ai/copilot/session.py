@@ -152,6 +152,11 @@ _MAX_CONSECUTIVE_TOOL_FAILURES = 4
 # chars so a large response body cannot blow the context.
 _OBSERVATION_MAX_CHARS = 2000
 
+# A single-field extract_response result (flagged ``full_value``) is exempt from the generic
+# observation cap: the one field it pulled (e.g. a full JWT or a nested id) must reach the model
+# intact. The tool already bounds the value, so this stays finite.
+_EXTRACT_FULL_OBSERVATION_CHARS = 12000
+
 # Within a single observation, the response body is trimmed to this much so the
 # decisive compact signals (status, length, reflections) that follow it always
 # survive the _OBSERVATION_MAX_CHARS cut instead of being pushed out by the body.
@@ -695,8 +700,9 @@ def _render_turn_transcript(transcript: List[Dict[str, Any]]) -> str:
         head += f"\n  -> called {item.get('tool_name', '?')}({_canonical(item.get('tool_args', {}))})"
         observation = item.get("observation")
         if observation:
+            cap = item.get("observation_cap") or _OBSERVATION_MAX_CHARS
             head += "\n  observation:\n" + wrap_untrusted(
-                str(observation), "tool_observation", _OBSERVATION_MAX_CHARS
+                str(observation), "tool_observation", cap
             )
         blocks.append(head)
     return "\n".join(blocks)
@@ -1233,10 +1239,11 @@ class CopilotSession:
 
         async def _observe(entry: Dict[str, Any], observation: str) -> None:
             entry["observation"] = observation
+            cap = entry.get("observation_cap") or _OBSERVATION_MAX_CHARS
             await on_event({
                 "type": "observation",
                 "step": entry["step"],
-                "observation": observation[:_OBSERVATION_MAX_CHARS],
+                "observation": observation[:cap],
             })
 
         def _finalize(message: str, blocked_reason: str = "") -> CopilotReply:
@@ -1843,6 +1850,10 @@ class CopilotSession:
                     if tool_name in ("send_request", "browser_fetch",
                                      "browser_navigate"):
                         _auth_note = _auth_error_hint(result, tool_args)
+                    # A single-field extract returns its value in full — exempt this one
+                    # observation from the generic cap so the field reaches the model intact.
+                    if isinstance(result, dict) and result.get("full_value"):
+                        entry["observation_cap"] = _EXTRACT_FULL_OBSERVATION_CHARS
                     await _observe(entry, _auth_note + _strip_guidance
                                    + _summarize_result(result))
                     # A successful state-changing request invalidates earlier read

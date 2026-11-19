@@ -51,6 +51,39 @@ class TestNewEntry:
         assert entry.source == "browse"
         assert entry.browse_session_id == "sess-1"
 
+    # ── P4: dual-label — origin recorded ALONGSIDE source, scope tag unchanged ──
+    def test_origin_defaults_to_none(self):
+        store = _make_store()
+        eid = store.new_entry("GET", "https://example.com/page", {}, None)
+        assert store.get_entry(eid).origin is None
+
+    def test_out_of_scope_entry_records_origin_without_changing_source(self):
+        """An out-of-scope tool request (x-dast-source present) keeps the authoritative
+        source='out-of-scope' scope tag while attributing the request via origin."""
+        store = _make_store()
+        eid = store.new_entry(
+            "PUT", "https://bucket.s3.amazonaws.com/obj", {}, b"data",
+            source="out-of-scope", origin="copilot",
+        )
+        entry = store.get_entry(eid)
+        assert entry.source == "out-of-scope"   # scope signal unchanged
+        assert entry.origin == "copilot"        # attribution preserved
+        d = entry.to_dict()
+        assert d["source"] == "out-of-scope" and d["origin"] == "copilot"
+
+    def test_out_of_scope_with_origin_still_excluded_from_in_scope(self):
+        """Recording origin must NOT regress the out-of-scope deny: an out-of-scope
+        entry (even one attributed to a tool) stays out of in_scope_entries()."""
+        store = _make_store()
+        store.new_entry("GET", "https://example.com/in", {}, None)
+        store.new_entry(
+            "PUT", "https://bucket.s3.amazonaws.com/obj", {}, b"data",
+            source="out-of-scope", origin="copilot",
+        )
+        urls = [e.url for e in store.in_scope_entries()]
+        assert "https://example.com/in" in urls
+        assert all("s3.amazonaws.com" not in u for u in urls)
+
 
 # ── complete_entry ─────────────────────────────────────────────────────────
 

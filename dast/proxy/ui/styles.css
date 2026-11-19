@@ -154,6 +154,9 @@ th input[type=checkbox] { accent-color: var(--acc); cursor: pointer; }
 .col-resizer { position: absolute; right: 0; top: 0; bottom: 0; width: 5px;
                cursor: col-resize; z-index: 3; }
 .col-resizer:hover, .col-resizer.dragging { background: var(--acc2); opacity: .6; }
+/* header reorder-drag: the grabbed column dims, the drop target gets a seam */
+th.col-dragging { opacity: .5; }
+th.col-drop-target { box-shadow: inset 2px 0 0 var(--acc2); }
 tbody tr { cursor: pointer; border-bottom: 1px solid #252525; }
 tbody tr:hover { background: var(--hov); }
 tbody tr.on { background: var(--sel) !important; }
@@ -215,6 +218,11 @@ tbody tr.r-oos td { opacity: .55; }
   width: 8px; height: 8px; border-radius: 50%; background: #ffd666; flex-shrink: 0;
 }
 #cp-pause-banner .cp-banner-hint { margin-left: auto; font-weight: 400; opacity: .8; font-size: 11px; }
+#cp-pause-banner .cp-banner-x {
+  font-size: 15px; line-height: 1; font-weight: 700; opacity: .7;
+  padding: 0 2px; cursor: pointer; flex-shrink: 0;
+}
+#cp-pause-banner .cp-banner-x:hover { opacity: 1; }
 @keyframes cp-banner-pulse { 0%,100% { opacity: 1; } 50% { opacity: .82; } }
 .src-imported { background: #1a0d30; color: #ce93d8; }
 /* Repeater drag handles */

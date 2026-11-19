@@ -13,6 +13,10 @@ let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (se
 // session_id -> { kind, payload } for every copilot run currently waiting on the
 // operator. Drives the persistent top-level pause banner (visible on every tab).
 const _cpPaused = {};
+// session_ids whose pause banner the operator has dismissed. A dismissal lasts
+// only for THIS pause: the id is cleared the moment the run resumes (see the WS
+// 'resumed' handler + cpReconcilePausedBanner), so a fresh pause shows again.
+const _cpBannerDismissed = new Set();
 
 // Stable keys of the <details> the operator has expanded in the session panel
 // (Tool activity, per-observation). The panel rebuilds its innerHTML on every
@@ -268,6 +272,7 @@ function cpConnectWs() {
       } else if (m.type === 'resumed'
                  || (m.type === 'autonomous' && (m.event === 'stopped' || m.event === 'complete'))) {
         delete _cpPaused[m.session_id];
+        _cpBannerDismissed.delete(m.session_id); // a fresh pause should show again
         cpRenderPauseBanner();
       }
       if (m.session_id === _cpActive) cpRefresh(m.session_id);
@@ -282,7 +287,8 @@ function cpConnectWs() {
 function cpRenderPauseBanner() {
   const el = document.getElementById('cp-pause-banner');
   if (!el) return;
-  const ids = Object.keys(_cpPaused);
+  // Only runs the operator has NOT dismissed drive the banner.
+  const ids = Object.keys(_cpPaused).filter(id => !_cpBannerDismissed.has(id));
   if (!ids.length) { el.style.display = 'none'; return; }
   let text;
   if (ids.length === 1) {
@@ -292,13 +298,22 @@ function cpRenderPauseBanner() {
     text = `${ids.length} copilot runs paused — need you`;
   }
   el.innerHTML = `<span class="cp-banner-dot"></span><span>${esc(text)}</span>`
-    + `<span class="cp-banner-hint">click to open Copilot</span>`;
+    + `<span class="cp-banner-hint">click to open Copilot</span>`
+    + `<span class="cp-banner-x" role="button" tabindex="0" title="dismiss"`
+    + ` onclick="event.stopPropagation();cpDismissBanner()">×</span>`;
   el.style.display = 'flex';
 }
 
-// Jump to the Copilot tab and focus the first paused run.
+// Dismiss the banner for every run currently paused. Stays hidden until one of
+// them resumes and pauses afresh (the dismissed id is cleared on resume).
+function cpDismissBanner() {
+  Object.keys(_cpPaused).forEach(id => _cpBannerDismissed.add(id));
+  cpRenderPauseBanner();
+}
+
+// Jump to the Copilot tab and focus the first paused (not-dismissed) run.
 function cpBannerGoto() {
-  const ids = Object.keys(_cpPaused);
+  const ids = Object.keys(_cpPaused).filter(id => !_cpBannerDismissed.has(id));
   switchMain('copilot');
   if (ids.length) cpSelectSession(ids[0]);
 }
@@ -327,7 +342,10 @@ async function cpReconcilePausedBanner() {
       if (st.indexOf('paused_') === 0) serverPaused[s.session_id] = st.slice('paused_'.length);
     });
     Object.keys(_cpPaused).forEach(id => {
-      if (!(id in serverPaused)) delete _cpPaused[id];
+      if (!(id in serverPaused)) {
+        delete _cpPaused[id];
+        _cpBannerDismissed.delete(id); // run resumed → allow a future pause to show
+      }
     });
     Object.keys(serverPaused).forEach(id => {
       if (!_cpPaused[id]) _cpPaused[id] = { kind: serverPaused[id], payload: {} };

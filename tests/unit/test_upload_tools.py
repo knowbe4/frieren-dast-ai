@@ -29,9 +29,11 @@ from dast.tools import upload_tools as ut
 # ── Fakes ──────────────────────────────────────────────────────────────────────
 
 class _FakeEntry:
-    """Minimal ProxyEntry stand-in — only response_body + source are read."""
+    """Minimal ProxyEntry stand-in — only id + response_body + source are read."""
 
-    def __init__(self, response_body: Optional[bytes], source: str = "proxy") -> None:
+    def __init__(self, response_body: Optional[bytes], source: str = "proxy",
+                 id: str = "e1") -> None:
+        self.id = id
         self.response_body = response_body
         self.source = source
 
@@ -43,6 +45,14 @@ class _FakeStore:
     def in_scope_entries(self) -> List[_FakeEntry]:
         # Mirror the real store: out-of-scope entries are excluded.
         return [e for e in self._entries if e.source != "out-of-scope"]
+
+    def get_entry(self, entry_id: str) -> Optional[_FakeEntry]:
+        # Mirror the real store: get_entry returns the entry regardless of scope
+        # (scope is enforced separately by the tool).
+        for e in self._entries:
+            if e.id == entry_id:
+                return e
+        return None
 
 
 class _FakeCtx:
@@ -294,6 +304,148 @@ async def test_read_only_blocks_put(monkeypatch):
     assert result["ok"] is False
     assert result.get("read_only") is True
     assert holder == {}
+
+
+# ── (d) by-reference resolution (source_entry_id) ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_by_reference_happy_path(monkeypatch):
+    # The model passes the entry id of the in-scope createPersonaAsset response; the
+    # tool reads that stored body, extracts uploadUrl at the default json_path, and PUTs.
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    store = _FakeStore([_FakeEntry(_BODY_WITH_URL.encode("utf-8"), id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E42", "body_base64": _b64(b"hello")})
+
+    assert result["ok"] is True
+    assert result["status"] == 200
+    assert holder["method"] == "PUT"
+    # The tool resolved the FULL url from the stored response — the model never passed it.
+    assert holder["url"] == _UPLOAD_URL
+
+
+@pytest.mark.asyncio
+async def test_by_reference_entry_not_found(monkeypatch):
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    store = _FakeStore([_FakeEntry(_BODY_WITH_URL.encode("utf-8"), id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "does-not-exist", "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is False
+    assert "not found" in result["error"]
+    assert holder == {}  # nothing was sent
+
+
+@pytest.mark.asyncio
+async def test_by_reference_entry_out_of_scope(monkeypatch):
+    # The source entry itself must be in scope — an out-of-scope entry is refused.
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    store = _FakeStore([_FakeEntry(_BODY_WITH_URL.encode("utf-8"),
+                                   source="out-of-scope", id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E42", "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is False
+    assert "out of scope" in result["error"]
+    assert holder == {}
+
+
+@pytest.mark.asyncio
+async def test_by_reference_json_path_missing(monkeypatch):
+    # A json_path that points at nothing in the stored body gives a clear error.
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    store = _FakeStore([_FakeEntry(_BODY_WITH_URL.encode("utf-8"), id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E42",
+                          "url_json_path": "data.nope.missing",
+                          "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is False
+    assert "data.nope.missing" in result["error"]
+    assert holder == {}
+
+
+@pytest.mark.asyncio
+async def test_by_reference_value_not_a_url(monkeypatch):
+    # The value at the json_path exists but is not an absolute http(s) URL.
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    body = '{"data":{"createPersonaAsset":{"uploadUrl":"/relative/not/absolute"}}}'
+    store = _FakeStore([_FakeEntry(body.encode("utf-8"), id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E42", "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is False
+    assert "absolute http(s) URL" in result["error"]
+    assert holder == {}
+
+
+@pytest.mark.asyncio
+async def test_by_reference_value_not_a_string(monkeypatch):
+    # The value at the json_path is present but not a string (e.g. a dict).
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    body = '{"data":{"createPersonaAsset":{"uploadUrl":{"nested":"x"}}}}'
+    store = _FakeStore([_FakeEntry(body.encode("utf-8"), id="E42")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E42", "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is False
+    assert "not a string URL" in result["error"]
+    assert holder == {}
+
+
+@pytest.mark.asyncio
+async def test_by_reference_custom_json_path(monkeypatch):
+    # A caller-supplied url_json_path is honored.
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    body = ('{"data":{"makeUpload":{"put":'
+            '"https://persona-assets-xyz.s3.amazonaws.com/uploads/abc123?X-Amz-Signature=sig"}}}')
+    store = _FakeStore([_FakeEntry(body.encode("utf-8"), id="E7")])
+    result = await ut._upload_to_presigned_url(
+        _FakeCtx(store), {"source_entry_id": "E7",
+                          "url_json_path": "data.makeUpload.put",
+                          "body_base64": _b64(b"hi")})
+
+    assert result["ok"] is True
+    assert holder["method"] == "PUT"
+
+
+@pytest.mark.asyncio
+async def test_requires_exactly_one_of_url_or_source_entry_id(monkeypatch):
+    import httpx
+    holder: Dict[str, Any] = {}
+    monkeypatch.setattr(httpx, "AsyncClient", _capture_client(holder))
+
+    store = _FakeStore([_FakeEntry(_BODY_WITH_URL.encode("utf-8"), id="E42")])
+    # Neither supplied.
+    r1 = await ut._upload_to_presigned_url(_FakeCtx(store), {"body_base64": _b64(b"hi")})
+    assert r1["ok"] is False and "required" in r1["error"]
+    # Both supplied.
+    r2 = await ut._upload_to_presigned_url(
+        _FakeCtx(store),
+        {"url": _UPLOAD_URL, "source_entry_id": "E42", "body_base64": _b64(b"hi")})
+    assert r2["ok"] is False and "not both" in r2["error"]
+    assert holder == {}  # nothing was sent in either case
 
 
 # ── scope-gate exemption (and non-regression of the generic deny) ─────────────────

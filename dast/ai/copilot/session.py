@@ -415,15 +415,24 @@ Operational notes:
 - Presigned-upload / asset chains: some APIs mint an asset in three steps — a mutation
   returns a presigned upload URL (e.g. createPersonaAsset returns uploadUrl pointing at a
   storage host like *.s3.amazonaws.com), you PUT the bytes to that URL, then a second
-  mutation finalizes it (e.g. completePersonaAssetUpload). Do the PUT with
-  upload_to_presigned_url — NOT send_request/browser_fetch, which force-attach session auth
-  that breaks the SigV4 signature (SignatureDoesNotMatch) and leaks app auth to the storage
-  host. Pass body_base64 (base64 of the bytes to upload) and, only if the mutation signed a
-  Content-Type, pass that same content_type. Use the upload URL EXACTLY as the mutation
-  returned it — the tool refuses a host+path it did not see in an in-scope response (SSRF
-  guard), and the presigned URL expires, so run create -> PUT -> complete promptly in one
-  go. This chain is also how you test asset size/type limits and byte-level tampering
-  (upload a crafted/oversized/mismatched blob).
+  mutation finalizes it (e.g. completePersonaAssetUpload). Run it BY REFERENCE — do NOT try
+  to read or copy the upload URL yourself (it is ~1500 chars with a long security token; the
+  observation display truncates it and you will mangle it as a tool arg):
+  (1) run createPersonaAsset with browser_fetch;
+  (2) call get_history to find that POST's response entry id;
+  (3) call upload_to_presigned_url with source_entry_id=<that id> (optionally
+      url_json_path, default 'data.createPersonaAsset.uploadUrl'), body_base64=<base64 of the
+      bytes to upload>, and — only if the mutation signed a Content-Type — content_type set to
+      that same value. The tool reads the full upload URL from that stored in-scope response
+      itself, so you never relay it;
+  (4) run completePersonaAssetUpload.
+  Use upload_to_presigned_url for the PUT — NOT send_request/browser_fetch, which force-attach
+  session auth that breaks the SigV4 signature (SignatureDoesNotMatch) and leaks app auth to
+  the storage host. The source entry must be in scope, and presigned URLs expire (~1h), so run
+  create -> PUT -> complete promptly in one go. Passing a raw url= verbatim still works for
+  non-persona cases but is discouraged — prefer source_entry_id. This chain is also how you
+  test asset size/type limits and byte-level tampering (upload a crafted/oversized/mismatched
+  blob).
 - CSRF-protected / token-bearing forms: when a form carries a single-use token
   (ComposeToken, __VIEWSTATE, draftId), raw send_request replay fails. Drive the real
   browser instead: browser_navigate to the page, browser_snapshot to see the form

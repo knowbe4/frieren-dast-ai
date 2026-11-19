@@ -121,6 +121,18 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                            "multi-request proof keep this a SHORT mechanism summary and put "
                            "the per-request detail in 'steps'.",
         },
+        "evidence_entry_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The REAL proxy-history entry ids of the exact requests that "
+                           "prove this finding, in order — take them from the 'entry_id' "
+                           "returned by send_request / browser_fetch (or get_history). The "
+                           "first is the primary request the verdict rests on. ALWAYS pass "
+                           "these, especially for a multi-request proof (e.g. create, "
+                           "upload, before/after read): it links the finding to the real "
+                           "captured request+response so 'Go to request' opens real traffic, "
+                           "not an empty stub. Do not invent ids.",
+        },
         "steps": {
             "type": "array",
             "description": "The ordered request chain that proves the finding, when it "
@@ -136,6 +148,10 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                     "url": {"type": "string", "description": "Full request URL."},
                     "status": {"type": "integer", "description": "Observed response status code."},
                     "note": {"type": "string", "description": "Short observed result, e.g. 'returned the value written in step 1'."},
+                    "entry_id": {"type": "string", "description": "The real proxy-history entry id for "
+                                 "this step's request (from send_request/browser_fetch/get_history), so "
+                                 "the row opens the real request+response. If omitted, the backend "
+                                 "resolves it from this step's url+method."},
                 },
                 "required": ["method", "url"],
             },
@@ -173,14 +189,25 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
         for step in steps_raw:
             if not isinstance(step, dict) or not str(step.get("url", "")).strip():
                 continue
-            steps.append({
+            built_step = {
                 "label": str(step.get("label", "")).strip(),
                 "method": str(step.get("method", "GET")).strip().upper() or "GET",
                 "url": str(step.get("url", "")).strip(),
                 "status": step.get("status"),
                 "note": str(step.get("note", "")).strip(),
-            })
-    return {
+            }
+            step_entry_id = str(step.get("entry_id", "") or "").strip()
+            if step_entry_id:
+                built_step["entry_id"] = step_entry_id
+            steps.append(built_step)
+    evidence_entry_ids = []
+    raw_evidence_ids = args.get("evidence_entry_ids")
+    if isinstance(raw_evidence_ids, list):
+        for raw in raw_evidence_ids:
+            eid = str(raw or "").strip()
+            if eid and eid not in evidence_entry_ids:
+                evidence_entry_ids.append(eid)
+    finding = {
         "title": str(args.get("title", "")).strip(),
         "severity": severity,
         "evidence": str(args.get("evidence", "")).strip(),
@@ -194,6 +221,9 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
         "validated_by": ["copilot"],
         "source": "copilot",
     }
+    if evidence_entry_ids:
+        finding["evidence_entry_ids"] = evidence_entry_ids
+    return finding
 
 
 async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -234,10 +264,25 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
             entry_id = ctx.store.record_manual_finding(finding, url, method)
             if not entry_id:
                 return {"ok": False, "error": "could not record finding (missing url)"}
+            linked_ids = finding.get("evidence_entry_ids") or [entry_id]
+            synthetic = bool(finding.get("evidence_synthetic"))
             logger.info("record_finding: recorded", entry_id=entry_id,
-                        title=title, severity=finding["severity"])
-            return {"ok": True, "entry_id": entry_id, "title": title,
-                    "severity": finding["severity"]}
+                        title=title, severity=finding["severity"],
+                        evidence_entry_ids=linked_ids, grounded=not synthetic)
+            result: Dict[str, Any] = {"ok": True, "entry_id": entry_id, "title": title,
+                                      "severity": finding["severity"],
+                                      "evidence_entry_ids": linked_ids}
+            # C2 guard: surface (non-fatal) when the finding could not be grounded to a
+            # real captured request, so an empty-stub evidence is visible, not silent.
+            if synthetic:
+                result["warning"] = (
+                    "this finding is NOT grounded in a real captured request — a placeholder "
+                    "entry was created, so 'Go to request' would open an empty stub. Re-run the "
+                    "proof through send_request/browser_fetch and pass their 'entry_id' values as "
+                    "evidence_entry_ids so the finding cites the real request/response.")
+                logger.warning("record_finding: ungrounded finding (synthetic evidence)",
+                               title=title, url=url)
+            return result
         except Exception as exc:
             return {"ok": False, "error": f"record failed: {str(exc)[:200]}"}
 
@@ -267,6 +312,13 @@ register(Tool(
         "linked to the request it was found on, not just a chat message. Provide a clear "
         "title, severity (critical/high/medium/low/info), the url it was confirmed on, and "
         "concrete evidence; redact any raw secret/token values.\n"
+        "GROUND THE FINDING IN REAL TRAFFIC: pass evidence_entry_ids = the real 'entry_id' "
+        "values returned by send_request / browser_fetch (or get_history) for the exact "
+        "requests that prove it, in order (the first is the primary). For a multi-request "
+        "proof (e.g. create, upload, before/after read) list every request's entry_id, and/or "
+        "give each steps[] entry its own entry_id — do NOT just narrate the chain. Grounding "
+        "makes 'Go to request' open the real request+response instead of an empty stub; "
+        "recording without it warns and may link to a placeholder.\n"
         "Only record CONFIRMED issues — a false positive that wastes the operator's time is "
         "a failure. Use get_findings first to avoid recording a duplicate.\n"
         "Do NOT use this to: send or re-test a request (use send_request) or read existing "

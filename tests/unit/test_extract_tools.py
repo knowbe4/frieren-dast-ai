@@ -131,3 +131,55 @@ async def test_requires_url_or_entry_id():
     ctx = _ctx(_Store([_entry("e1", _URL, "{}")]))
     r = await _extract_response(ctx, {"path": "a"})
     assert r["ok"] is False and "url or entry_id" in r["error"]
+
+
+# ── P2: a single-field extract returns the value in FULL (not the 200-char preview) ──
+from dast.tools.extract_tools import _MAX_VALUE_CHARS, _MAX_SINGLE_VALUE_CHARS  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_single_field_returns_full_value():
+    """One matched value (e.g. a long JWT) is returned in full and flagged full_value,
+    so the copilot's observation cap can be lifted for just that result."""
+    long_token = "T" * 1500  # well over the 200-char per-value preview cap
+    body = json.dumps({"user": {"attributes": {"appJwt": long_token}}})
+    ctx = _ctx(_Store([_entry("e1", _URL, body)]))
+    r = await _extract_response(ctx, {"url": _URL, "path": "user.attributes.appJwt"})
+    assert r["ok"] and r["total"] == 1 and r["count"] == 1
+    assert r["values"] == [long_token]           # NOT clipped to 200
+    assert len(r["values"][0]) == 1500
+    assert r.get("full_value") is True
+
+
+@pytest.mark.asyncio
+async def test_single_field_bounded_by_single_cap():
+    """A single value is still finite — bounded by _MAX_SINGLE_VALUE_CHARS, not unbounded."""
+    huge = "T" * (_MAX_SINGLE_VALUE_CHARS + 500)
+    body = json.dumps({"k": huge})
+    ctx = _ctx(_Store([_entry("e1", _URL, body)]))
+    r = await _extract_response(ctx, {"url": _URL, "path": "k"})
+    assert r.get("full_value") is True
+    assert len(r["values"][0]) == _MAX_SINGLE_VALUE_CHARS
+
+
+@pytest.mark.asyncio
+async def test_multiple_values_still_clipped_and_not_full():
+    """Multi-value results keep the generic 200-char per-value preview and no full_value flag."""
+    long_a = "A" * 1500
+    long_b = "B" * 1500
+    body = json.dumps({"items": [long_a, long_b]})
+    ctx = _ctx(_Store([_entry("e1", _URL, body)]))
+    r = await _extract_response(ctx, {"url": _URL, "path": "items[]"})
+    assert r["total"] == 2
+    assert all(len(v) == _MAX_VALUE_CHARS for v in r["values"])
+    assert "full_value" not in r
+
+
+@pytest.mark.asyncio
+async def test_scalar_summary_is_full_value():
+    """A scalar body (no path/regex) returns its value in full and flagged full_value."""
+    long_val = "Z" * 1200
+    ctx = _ctx(_Store([_entry("e1", _URL, json.dumps(long_val))]))
+    r = await _extract_response(ctx, {"url": _URL})
+    assert r["ok"] and r["kind"] == "str"
+    assert r["value"] == long_val and r.get("full_value") is True

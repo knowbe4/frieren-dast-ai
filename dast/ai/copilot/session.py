@@ -152,6 +152,11 @@ _MAX_CONSECUTIVE_TOOL_FAILURES = 4
 # chars so a large response body cannot blow the context.
 _OBSERVATION_MAX_CHARS = 2000
 
+# A single-field extract_response result (flagged ``full_value``) is exempt from the generic
+# observation cap: the one field it pulled (e.g. a full JWT or a nested id) must reach the model
+# intact. The tool already bounds the value, so this stays finite.
+_EXTRACT_FULL_OBSERVATION_CHARS = 12000
+
 # Within a single observation, the response body is trimmed to this much so the
 # decisive compact signals (status, length, reflections) that follow it always
 # survive the _OBSERVATION_MAX_CHARS cut instead of being pushed out by the body.
@@ -302,7 +307,11 @@ Each turn, respond with a single step object:
       When you CONFIRM a real, exploitable issue, call record_finding to persist it
       to the Findings tab BEFORE you reply — a finding that only lives in your reply
       text is not tracked, reported, or exported. Redact secrets/token values in the
-      evidence.
+      evidence. GROUND IT IN REAL TRAFFIC: pass evidence_entry_ids = the real entry_id
+      values returned by send_request / browser_fetch (or get_history) for the exact
+      requests that prove it, in order; for a multi-request proof list every request's
+      entry_id. Do not rely on narrating a chain — an ungrounded finding links to an
+      empty stub and "Go to request" opens nothing real.
   action="reply" — send the operator a message and hand the turn back. Use this to
       report a confirmed finding with its evidence, to ask a question, or — this is
       important — to say honestly when you are BLOCKED and need the human: a WAF is
@@ -404,7 +413,11 @@ Operational notes:
   pair in Authorization header" = SigV4), and a 404 with an app body (e.g. `{}` /
   "not found") means your request REACHED the handler and found nothing — neither proves
   a control works; both are commonly misread. Call record_finding with title, severity
-  (critical/high/medium/low), description, and steps (evidence request/response pairs).
+  (critical/high/medium/low), description, steps (evidence request/response pairs), and
+  evidence_entry_ids — the real entry_id values from send_request/browser_fetch for the
+  exact requests that prove it (give each step its own entry_id too for a multi-request
+  proof). Grounding the finding in real captured traffic is required: without it the
+  finding links to an empty stub and the tool warns.
 - Cleanup after write tests: track every object you CREATE (rule IDs, token IDs, etc).
   After confirming a vuln, DELETE or revert test data immediately. For PATCH tests:
   GET the original state BEFORE the test, run the exploit, record the finding, then
@@ -708,8 +721,9 @@ def _render_turn_transcript(transcript: List[Dict[str, Any]]) -> str:
         head += f"\n  -> called {item.get('tool_name', '?')}({_canonical(item.get('tool_args', {}))})"
         observation = item.get("observation")
         if observation:
+            cap = item.get("observation_cap") or _OBSERVATION_MAX_CHARS
             head += "\n  observation:\n" + wrap_untrusted(
-                str(observation), "tool_observation", _OBSERVATION_MAX_CHARS
+                str(observation), "tool_observation", cap
             )
         blocks.append(head)
     return "\n".join(blocks)
@@ -1246,10 +1260,11 @@ class CopilotSession:
 
         async def _observe(entry: Dict[str, Any], observation: str) -> None:
             entry["observation"] = observation
+            cap = entry.get("observation_cap") or _OBSERVATION_MAX_CHARS
             await on_event({
                 "type": "observation",
                 "step": entry["step"],
-                "observation": observation[:_OBSERVATION_MAX_CHARS],
+                "observation": observation[:cap],
             })
 
         def _finalize(message: str, blocked_reason: str = "") -> CopilotReply:
@@ -1856,6 +1871,10 @@ class CopilotSession:
                     if tool_name in ("send_request", "browser_fetch",
                                      "browser_navigate"):
                         _auth_note = _auth_error_hint(result, tool_args)
+                    # A single-field extract returns its value in full — exempt this one
+                    # observation from the generic cap so the field reaches the model intact.
+                    if isinstance(result, dict) and result.get("full_value"):
+                        entry["observation_cap"] = _EXTRACT_FULL_OBSERVATION_CHARS
                     await _observe(entry, _auth_note + _strip_guidance
                                    + _summarize_result(result))
                     # A successful state-changing request invalidates earlier read

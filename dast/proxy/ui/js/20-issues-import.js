@@ -313,8 +313,13 @@ function _buildIssueCard(host, f, globalIdx) {
         Exploit Proof — probe with payload injected; confirms the vulnerability is exploitable
       </div>
       ${_httpPair(f.probe_request, f.probe_response, 'Probe Request', 'Probe Response', [f.evidence, f.payload])}` : '';
+  // Use the real-entry viewer for findings grounded in explicit evidence ids, or for
+  // findings with a real linked entry but no legacy raw_request to show (copilot findings).
+  // Scanner/import findings that already carry raw_request keep their existing rendering.
+  const _hasLegacyRaw = !!(f.raw_request || f.raw_response);
+  const useEntryViewer = hasRealEntry && (_hasRealEvidence || !_hasLegacyRaw);
   let httpDetails;
-  if (hasRealEntry) {
+  if (useEntryViewer) {
     httpDetails = `
     <details id="${rrvDetailsId}" style="margin-top:8px" ontoggle="if(this.open&&!_rrvState[${jsArg(rrvId)}])_rrvLoadEntry(${jsArg(rrvId)},${jsArg(primaryEntryId)})">
       <summary style="cursor:pointer;font-size:10px;color:var(--txt2);user-select:none">HTTP Request / Response${hasProbe ? ' · <span style="color:#4caf50">+ Exploit Proof</span>' : ''}</summary>
@@ -367,7 +372,7 @@ function _buildIssueCard(host, f, globalIdx) {
       <span class="iissue-arrow" style="margin-left:6px">▶</span>
     </div>
     <div class="iissue-detail" onclick="event.stopPropagation()">
-      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f, rrvId, rrvDetailsId) : ''}
+      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f, useEntryViewer ? rrvId : '', useEntryViewer ? rrvDetailsId : '') : ''}
       <div class="iissue-evidence">${evidence}</div>
       ${paramHtml}${snippetHtml}${reasoningHtml}${cwe}${payload}${httpDetails}
       ${hasRealEntry

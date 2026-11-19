@@ -412,6 +412,18 @@ Operational notes:
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.
+- Presigned-upload / asset chains: some APIs mint an asset in three steps — a mutation
+  returns a presigned upload URL (e.g. createPersonaAsset returns uploadUrl pointing at a
+  storage host like *.s3.amazonaws.com), you PUT the bytes to that URL, then a second
+  mutation finalizes it (e.g. completePersonaAssetUpload). Do the PUT with
+  upload_to_presigned_url — NOT send_request/browser_fetch, which force-attach session auth
+  that breaks the SigV4 signature (SignatureDoesNotMatch) and leaks app auth to the storage
+  host. Pass body_base64 (base64 of the bytes to upload) and, only if the mutation signed a
+  Content-Type, pass that same content_type. Use the upload URL EXACTLY as the mutation
+  returned it — the tool refuses a host+path it did not see in an in-scope response (SSRF
+  guard), and the presigned URL expires, so run create -> PUT -> complete promptly in one
+  go. This chain is also how you test asset size/type limits and byte-level tampering
+  (upload a crafted/oversized/mismatched blob).
 - CSRF-protected / token-bearing forms: when a form carries a single-use token
   (ComposeToken, __VIEWSTATE, draftId), raw send_request replay fails. Drive the real
   browser instead: browser_navigate to the page, browser_snapshot to see the form
@@ -2060,6 +2072,14 @@ class CopilotSession:
         once is remembered: a repeat is denied immediately (no second operator pause)
         with an escalating message, and every denial is counted by the caller so a
         model that keeps inventing hosts trips the failure breaker instead of looping."""
+        # upload_to_presigned_url is the ONE exemption from the session-level hard-deny:
+        # its target is a storage host (e.g. *.s3.amazonaws.com) that is intentionally out
+        # of scope, reached only because an IN-SCOPE response handed us the presigned URL.
+        # The tool enforces its own observed-URL (SSRF) check in the handler, which is the
+        # real authority here, so pausing/denying it at the scope level would just block a
+        # legitimate upload. This is NARROW — every other tool stays fully scope-gated.
+        if tool_name == "upload_to_presigned_url":
+            return None
         temp_allowed: List[str] = []
         for candidate in _candidate_urls(tool_args):
             host = (urlparse(candidate).hostname or "").lower()

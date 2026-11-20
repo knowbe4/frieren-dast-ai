@@ -72,6 +72,57 @@ def test_record_finding_fallback_prefers_real_post_over_empty_get():
     assert "warning" not in result
 
 
+# ── classification: same-tenant integrity flaw is NOT forced to idor ─────────
+
+def test_same_tenant_integrity_finding_accepted_and_hinted():
+    """A business-logic / consent / data-integrity finding on the OWN tenant's object is
+    recorded as submitted (never refused, values unchanged) and, when mislabeled idor/BOLA,
+    gets a non-fatal reclassification hint."""
+    store = SessionStore()
+    e1 = store.new_entry("PATCH", "https://example.com/g", {}, b'{"query":"mutation"}')
+    result = asyncio.run(record_finding_tools._record_finding(_ctx(store), {
+        "title": "IDOR: linked-field lock bypass",
+        "severity": "medium",
+        "url": "https://example.com/g",
+        "evidence": "same-tenant object: the consent-locked field updated anyway after swap",
+        "reasoning": "business-logic / data-integrity failure on my own account's object",
+        "attack_type": "idor",
+        "cwe": "CWE-639",
+        "evidence_entry_ids": [e1],
+    }))
+    # Accepted, not refused, and stored exactly as submitted (hint never mutates values).
+    assert result["ok"] is True
+    finding = store.get_entry(e1).findings[0]
+    assert finding["attack_type"] == "idor"
+    assert finding["cwe"] == "CWE-639"
+    assert finding["title"] == "IDOR: linked-field lock bypass"
+    # Soft guard: nudge toward an honest reclassification (business-logic, not idor/BOLA).
+    assert "warning" in result
+    assert "business-logic" in result["warning"].lower()
+    assert "cross-tenant object access" in result["warning"].lower()
+
+
+def test_genuine_cross_tenant_idor_classifies_without_hint():
+    """A real cross-tenant IDOR still classifies as idor with no spurious reclassification hint."""
+    store = SessionStore()
+    e1 = store.new_entry("GET", "https://example.com/api/orders/42", {}, b"{}")
+    result = asyncio.run(record_finding_tools._record_finding(_ctx(store), {
+        "title": "IDOR: cross-tenant order disclosure",
+        "severity": "high",
+        "url": "https://example.com/api/orders/42",
+        "evidence": "200 reading ANOTHER tenant's order 42 — foreign object returned in full",
+        "reasoning": "object-level access to a different account's resource",
+        "attack_type": "idor",
+        "cwe": "CWE-639",
+        "evidence_entry_ids": [e1],
+    }))
+    assert result["ok"] is True
+    finding = store.get_entry(e1).findings[0]
+    assert finding["attack_type"] == "idor"
+    assert finding["cwe"] == "CWE-639"
+    assert "warning" not in result
+
+
 # ── send_request returns the real history entry_id ───────────────────────────
 
 @respx.mock

@@ -405,6 +405,15 @@ Operational notes:
     (SAME tenant, wrong role) = BFLA / function-level (attack_type bfla, CWE-862): e.g. a
     low-privilege session creating/editing/archiving an admin-only or system/global resource
     in its OWN account. Classify as bfla, NOT idor — a role bypass is not an IDOR.
+  * A flaw that is NEITHER cross-tenant object access NOR a role/privilege bypass — a
+    business-logic / data-integrity / consent / server-side-validation failure on your OWN
+    tenant's own object (e.g. a locked/linked field you may edit anyway, asset bytes
+    swappable after consent, a server-side check the client can skip) = do NOT force it into
+    idor/BOLA. Use an honest attack_type (e.g. "business-logic") and the real CWE (e.g.
+    CWE-345 insufficient data authenticity, CWE-284 improper access control, CWE-602
+    server-side validation), and a title stating the ACTUAL weakness — not "IDOR/BOLA".
+    idor is for reaching ANOTHER tenant's/user's object; if no foreign object was reached,
+    it is not idor.
   * 200/204 from an endpoint with NO auth headers (missing authentication)
   * Response contains data with a different account_id than yours (cross-tenant disclosure)
   What is NOT a finding: 200 on your own data (normal), 401/403 (control works),

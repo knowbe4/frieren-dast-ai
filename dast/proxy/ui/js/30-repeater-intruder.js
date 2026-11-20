@@ -1,6 +1,6 @@
 // ── tab switching ──────────────────────────────────────────────────────
 function switchMain(tab) {
-  ['overview', 'findings', 'proxy', 'browse', 'ai', 'scan', 'plugins', 'graphql', 'repeater', 'intruder', 'logs', 'extras', 'copilot'].forEach(t => {
+  ['overview', 'findings', 'proxy', 'browse', 'settings', 'scan', 'plugins', 'graphql', 'repeater', 'intruder', 'logs', 'extras', 'copilot'].forEach(t => {
     document.getElementById('panel-' + t).classList.toggle('on', t === tab);
     document.getElementById('mt-' + t).classList.toggle('on', t === tab);
   });
@@ -16,7 +16,14 @@ function switchMain(tab) {
   if (tab === 'logs')     loadLogs();
   if (tab === 'plugins')  loadPlugins();
   if (tab === 'scan')     loadScanQueue();
-  if (tab === 'ai')       { loadAiPanel(); loadScanConfig(); }
+  if (tab === 'settings') {
+    // Re-fire the active Settings sub-tab's load call (mirrors the old per-tab
+    // dispatch that ran when the AI tab / Proxy▸Settings sub-tab opened).
+    const activeSub = ['ai', 'proxy'].find(
+      s => document.getElementById('st-set-' + s)?.classList.contains('on')
+    );
+    switchSettingsSub(activeSub || 'ai');
+  }
   if (tab === 'copilot')  cpOnOpen();
   if (tab === 'findings') renderAllIssues();
   if (tab === 'overview') loadOverview();
@@ -31,7 +38,7 @@ function switchMain(tab) {
     // Re-fire the currently active Proxy sub-tab's load call (mirrors the old
     // per-top-level-tab dispatch for the folded-in Target tab, plus the
     // existing Settings-on-first-open behavior).
-    const activeSub = ['history', 'intercept', 'sitemap', 'issues', 'psettings'].find(
+    const activeSub = ['history', 'intercept', 'sitemap', 'issues'].find(
       s => document.getElementById('st-' + s).classList.contains('on')
     );
     if (activeSub) switchProxySub(activeSub);

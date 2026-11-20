@@ -675,3 +675,29 @@ pre { white-space: pre-wrap; word-break: break-all; font-size: 11.5px; line-heig
   .detail-col { width: 52%; min-width: 220px; }
   #session-name { width: 92px; }
 }
+
+/* ── Copilot starter prompts (new-conversation examples) ────────────────────
+   Clickable example cards shown on the empty copilot thread; clicking one
+   prefills the composer. Reuses the dark-theme tokens so they read as native. */
+.cp-starters { margin: auto 0; max-width: 760px; width: 100%; align-self: center;
+  display: flex; flex-direction: column; gap: 14px; }
+.cp-starters-intro { color: var(--txt2); font-size: 12px; line-height: 1.6;
+  text-align: center; max-width: 520px; margin: 0 auto 2px; }
+.cp-starters-intro code { background: var(--bg2); border: 1px solid var(--bdr);
+  border-radius: 3px; padding: 0 4px; color: var(--orange); font-family: inherit; }
+.cp-starter-group-hdr { display: flex; align-items: center; gap: 6px;
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px;
+  color: var(--txt3); margin: 6px 0 2px; }
+.cp-starter-group-icon { display: inline-flex; color: var(--txt3); }
+.cp-starter-grid { display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.cp-starter-card { background: var(--bg2); border: 1px solid var(--bdr);
+  border-radius: 6px; padding: 10px 12px; cursor: pointer;
+  transition: border-color .12s, background .12s; text-align: left; }
+.cp-starter-card:hover, .cp-starter-card:focus-visible {
+  border-color: var(--acc); background: var(--hov); outline: none; }
+.cp-starter-card-title { font-size: 11px; font-weight: 600; color: var(--acc2);
+  margin-bottom: 4px; }
+.cp-starter-card-body { font-size: 10px; color: var(--txt2); line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }

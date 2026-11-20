@@ -1354,3 +1354,40 @@ def test_agent_browser_current_url_contract_drives_on_host_check():
     assert CopilotSession._browser_on_host(ab, "api.svc.example") is True
     ab._page = SimpleNamespace(url="https://unrelated.example/")
     assert CopilotSession._browser_on_host(ab, "api.svc.example") is False
+
+
+# ── P2: single-field extract_response observation is exempt from the generic cap ──
+from dast.ai.copilot.session import (  # noqa: E402
+    _render_turn_transcript,
+    _summarize_result,
+    _OBSERVATION_MAX_CHARS,
+    _EXTRACT_FULL_OBSERVATION_CHARS,
+)
+
+
+def test_turn_transcript_respects_per_step_observation_cap():
+    """A large observation is truncated under the default cap, but a per-step
+    observation_cap (set for a full_value extract) lets the full value through."""
+    big = "V" * (_OBSERVATION_MAX_CHARS + 3000)
+    assert len(big) < _EXTRACT_FULL_OBSERVATION_CHARS
+
+    capped = _render_turn_transcript([
+        {"step": 1, "thought": "t", "tool_name": "send_request",
+         "tool_args": {}, "observation": big},
+    ])
+    assert big not in capped  # generic cap still trims an uncapped observation
+
+    lifted = _render_turn_transcript([
+        {"step": 1, "thought": "t", "tool_name": "extract_response",
+         "tool_args": {}, "observation": big,
+         "observation_cap": _EXTRACT_FULL_OBSERVATION_CHARS},
+    ])
+    assert big in lifted  # the exempt result reaches the model intact
+
+
+def test_summarize_result_passes_full_value_result_through():
+    """extract_response results carry no 'body' key, so _summarize_result serializes
+    them verbatim (no internal body trim) — the full value survives."""
+    token = "J" * 1500
+    out = _summarize_result({"ok": True, "values": [token], "full_value": True})
+    assert token in out

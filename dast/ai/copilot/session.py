@@ -152,6 +152,11 @@ _MAX_CONSECUTIVE_TOOL_FAILURES = 4
 # chars so a large response body cannot blow the context.
 _OBSERVATION_MAX_CHARS = 2000
 
+# A single-field extract_response result (flagged ``full_value``) is exempt from the generic
+# observation cap: the one field it pulled (e.g. a full JWT or a nested id) must reach the model
+# intact. The tool already bounds the value, so this stays finite.
+_EXTRACT_FULL_OBSERVATION_CHARS = 12000
+
 # Within a single observation, the response body is trimmed to this much so the
 # decisive compact signals (status, length, reflections) that follow it always
 # survive the _OBSERVATION_MAX_CHARS cut instead of being pushed out by the body.
@@ -302,7 +307,11 @@ Each turn, respond with a single step object:
       When you CONFIRM a real, exploitable issue, call record_finding to persist it
       to the Findings tab BEFORE you reply — a finding that only lives in your reply
       text is not tracked, reported, or exported. Redact secrets/token values in the
-      evidence.
+      evidence. GROUND IT IN REAL TRAFFIC: pass evidence_entry_ids = the real entry_id
+      values returned by send_request / browser_fetch (or get_history) for the exact
+      requests that prove it, in order; for a multi-request proof list every request's
+      entry_id. Do not rely on narrating a chain — an ungrounded finding links to an
+      empty stub and "Go to request" opens nothing real.
   action="reply" — send the operator a message and hand the turn back. Use this to
       report a confirmed finding with its evidence, to ask a question, or — this is
       important — to say honestly when you are BLOCKED and need the human: a WAF is
@@ -396,6 +405,15 @@ Operational notes:
     (SAME tenant, wrong role) = BFLA / function-level (attack_type bfla, CWE-862): e.g. a
     low-privilege session creating/editing/archiving an admin-only or system/global resource
     in its OWN account. Classify as bfla, NOT idor — a role bypass is not an IDOR.
+  * A flaw that is NEITHER cross-tenant object access NOR a role/privilege bypass — a
+    business-logic / data-integrity / consent / server-side-validation failure on your OWN
+    tenant's own object (e.g. a locked/linked field you may edit anyway, asset bytes
+    swappable after consent, a server-side check the client can skip) = do NOT force it into
+    idor/BOLA. Use an honest attack_type (e.g. "business-logic") and the real CWE (e.g.
+    CWE-345 insufficient data authenticity, CWE-284 improper access control, CWE-602
+    server-side validation), and a title stating the ACTUAL weakness — not "IDOR/BOLA".
+    idor is for reaching ANOTHER tenant's/user's object; if no foreign object was reached,
+    it is not idor.
   * 200/204 from an endpoint with NO auth headers (missing authentication)
   * Response contains data with a different account_id than yours (cross-tenant disclosure)
   What is NOT a finding: 200 on your own data (normal), 401/403 (control works),
@@ -404,7 +422,11 @@ Operational notes:
   pair in Authorization header" = SigV4), and a 404 with an app body (e.g. `{}` /
   "not found") means your request REACHED the handler and found nothing — neither proves
   a control works; both are commonly misread. Call record_finding with title, severity
-  (critical/high/medium/low), description, and steps (evidence request/response pairs).
+  (critical/high/medium/low), description, steps (evidence request/response pairs), and
+  evidence_entry_ids — the real entry_id values from send_request/browser_fetch for the
+  exact requests that prove it (give each step its own entry_id too for a multi-request
+  proof). Grounding the finding in real captured traffic is required: without it the
+  finding links to an empty stub and the tool warns.
 - Cleanup after write tests: track every object you CREATE (rule IDs, token IDs, etc).
   After confirming a vuln, DELETE or revert test data immediately. For PATCH tests:
   GET the original state BEFORE the test, run the exploit, record the finding, then
@@ -412,6 +434,27 @@ Operational notes:
 - Confirming a state change: after a mutating request (POST/PUT/PATCH/DELETE),
   always issue a FRESH send_request to observe the new state. Do NOT infer the
   result from get_history — its entries predate your mutation and will mislead you.
+- Presigned-upload / asset chains: some APIs mint an asset in three steps — a mutation
+  returns a presigned upload URL (e.g. createPersonaAsset returns uploadUrl pointing at a
+  storage host like *.s3.amazonaws.com), you PUT the bytes to that URL, then a second
+  mutation finalizes it (e.g. completePersonaAssetUpload). Run it BY REFERENCE — do NOT try
+  to read or copy the upload URL yourself (it is ~1500 chars with a long security token; the
+  observation display truncates it and you will mangle it as a tool arg):
+  (1) run createPersonaAsset with browser_fetch;
+  (2) call get_history to find that POST's response entry id;
+  (3) call upload_to_presigned_url with source_entry_id=<that id> (optionally
+      url_json_path, default 'data.createPersonaAsset.uploadUrl'), body_base64=<base64 of the
+      bytes to upload>, and — only if the mutation signed a Content-Type — content_type set to
+      that same value. The tool reads the full upload URL from that stored in-scope response
+      itself, so you never relay it;
+  (4) run completePersonaAssetUpload.
+  Use upload_to_presigned_url for the PUT — NOT send_request/browser_fetch, which force-attach
+  session auth that breaks the SigV4 signature (SignatureDoesNotMatch) and leaks app auth to
+  the storage host. The source entry must be in scope, and presigned URLs expire (~1h), so run
+  create -> PUT -> complete promptly in one go. Passing a raw url= verbatim still works for
+  non-persona cases but is discouraged — prefer source_entry_id. This chain is also how you
+  test asset size/type limits and byte-level tampering (upload a crafted/oversized/mismatched
+  blob).
 - CSRF-protected / token-bearing forms: when a form carries a single-use token
   (ComposeToken, __VIEWSTATE, draftId), raw send_request replay fails. Drive the real
   browser instead: browser_navigate to the page, browser_snapshot to see the form
@@ -687,8 +730,9 @@ def _render_turn_transcript(transcript: List[Dict[str, Any]]) -> str:
         head += f"\n  -> called {item.get('tool_name', '?')}({_canonical(item.get('tool_args', {}))})"
         observation = item.get("observation")
         if observation:
+            cap = item.get("observation_cap") or _OBSERVATION_MAX_CHARS
             head += "\n  observation:\n" + wrap_untrusted(
-                str(observation), "tool_observation", _OBSERVATION_MAX_CHARS
+                str(observation), "tool_observation", cap
             )
         blocks.append(head)
     return "\n".join(blocks)
@@ -1225,10 +1269,11 @@ class CopilotSession:
 
         async def _observe(entry: Dict[str, Any], observation: str) -> None:
             entry["observation"] = observation
+            cap = entry.get("observation_cap") or _OBSERVATION_MAX_CHARS
             await on_event({
                 "type": "observation",
                 "step": entry["step"],
-                "observation": observation[:_OBSERVATION_MAX_CHARS],
+                "observation": observation[:cap],
             })
 
         def _finalize(message: str, blocked_reason: str = "") -> CopilotReply:
@@ -1835,6 +1880,10 @@ class CopilotSession:
                     if tool_name in ("send_request", "browser_fetch",
                                      "browser_navigate"):
                         _auth_note = _auth_error_hint(result, tool_args)
+                    # A single-field extract returns its value in full — exempt this one
+                    # observation from the generic cap so the field reaches the model intact.
+                    if isinstance(result, dict) and result.get("full_value"):
+                        entry["observation_cap"] = _EXTRACT_FULL_OBSERVATION_CHARS
                     await _observe(entry, _auth_note + _strip_guidance
                                    + _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
@@ -2060,6 +2109,14 @@ class CopilotSession:
         once is remembered: a repeat is denied immediately (no second operator pause)
         with an escalating message, and every denial is counted by the caller so a
         model that keeps inventing hosts trips the failure breaker instead of looping."""
+        # upload_to_presigned_url is the ONE exemption from the session-level hard-deny:
+        # its target is a storage host (e.g. *.s3.amazonaws.com) that is intentionally out
+        # of scope, reached only because an IN-SCOPE response handed us the presigned URL.
+        # The tool enforces its own observed-URL (SSRF) check in the handler, which is the
+        # real authority here, so pausing/denying it at the scope level would just block a
+        # legitimate upload. This is NARROW — every other tool stays fully scope-gated.
+        if tool_name == "upload_to_presigned_url":
+            return None
         temp_allowed: List[str] = []
         for candidate in _candidate_urls(tool_args):
             host = (urlparse(candidate).hostname or "").lower()

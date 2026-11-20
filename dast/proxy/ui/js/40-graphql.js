@@ -459,19 +459,32 @@ function switchProxySub(sub) {
   const isHistory   = sub === 'history';
   const isIntercept = sub === 'intercept';
   const isSitemap   = sub === 'sitemap';
-  const isSettings  = sub === 'psettings';
   const setDisp = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? 'flex' : 'none'; };
   const setOn   = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', on); };
   setDisp('proxy-history', isHistory);
   setDisp('proxy-intercept', isIntercept);
   setDisp('proxy-sitemap', isSitemap);
-  setDisp('proxy-settings', isSettings);
   setOn('st-history', isHistory);
   setOn('st-intercept', isIntercept);
   setOn('st-sitemap', isSitemap);
-  setOn('st-psettings', isSettings);
-  if (isSettings) { loadSettings(); loadScanConfig(); loadMatchReplace(); updateSetupPort(); updateSetupAiStatus(); }
   if (isIntercept) { interceptLoadStatus(); }
   if (isSitemap) renderSmHostList();
+}
+
+// Settings tab sub-navigation: "AI & Models" (the relocated #ai-sub-settings) and
+// "Scope & Rules" (the relocated #proxy-settings). Both blocks keep their original
+// ids and handlers; this only toggles which one is visible and re-fires the same
+// load* dispatch the AI tab and the Proxy▸Settings sub-tab ran before the move.
+function switchSettingsSub(sub) {
+  const isAi = sub !== 'proxy';
+  const ai = document.getElementById('ai-sub-settings');
+  const px = document.getElementById('proxy-settings');
+  if (ai) ai.style.display = isAi ? '' : 'none';
+  if (px) px.style.display = isAi ? 'none' : 'flex';
+  const setOn = (id, on) => { const el = document.getElementById(id); if (el) el.classList.toggle('on', on); };
+  setOn('st-set-ai', isAi);
+  setOn('st-set-proxy', !isAi);
+  if (isAi) { loadAiPanel(); loadScanConfig(); }
+  else { loadSettings(); loadScanConfig(); loadMatchReplace(); updateSetupPort(); updateSetupAiStatus(); }
 }
 

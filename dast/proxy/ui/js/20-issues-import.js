@@ -196,6 +196,16 @@ function _buildIssueCard(host, f, globalIdx) {
   const sc = _SEV_CLASS[sev] || 'I';
   const uid = esc(f._entryId) + '-' + globalIdx;
   const entryId = esc(f._entryId);
+  // Ground the finding in a REAL captured request+response. Prefer the backend-provided
+  // proof ids (evidence_entry_ids[0]); fall back to the finding's own linked entry. When the
+  // finding is synthetic (no real capture matched), there is nothing real to open.
+  const _evIds = Array.isArray(f.evidence_entry_ids) ? f.evidence_entry_ids : [];
+  const _hasRealEvidence = _evIds.length > 0;
+  const isSynthetic = !!f.evidence_synthetic && !_hasRealEvidence;
+  const primaryEntryId = (_evIds[0] || f._entryId || '') + '';
+  const hasRealEntry = !!primaryEntryId && !isSynthetic;
+  const rrvId = 'rrv-' + uid;
+  const rrvDetailsId = 'rrvdet-' + uid;
   const evidence = esc(f.evidence || '');
   const cwe = f.cwe ? `<div class="iissue-cwe">${esc(f.cwe)}</div>` : '';
   const payload = f.payload ? `<div class="iissue-cwe">Payload: <code>${esc(f.payload)}</code></div>` : '';
@@ -294,18 +304,43 @@ function _buildIssueCard(host, f, globalIdx) {
       <pre style="margin:0;padding:8px;background:#0a1a0a;border:1px solid var(--bdr);border-radius:3px;font-size:10px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:#7ef7a0;max-height:260px">${_hlHttp(respText, hlTerms, '#ffe066', '#2a2000')}</pre>
     </div>` : ''}`;
   const hasProbe = f.probe_request || f.probe_response;
-  const httpDetails = (f.raw_request || f.raw_response) ? `
+  // HTTP Request / Response section. When the finding is grounded in a REAL captured entry
+  // (hasRealEntry), lazy-load request AND response from /api/entry/{id} into the shared
+  // viewer on first open. Otherwise fall back to the legacy raw_request/raw_response pair
+  // (scanner/imported findings), or a note when the capture is synthetic.
+  const _probeBlock = hasProbe ? `
+      <div style="margin-top:12px;padding:6px 8px;background:#0a200a;border-left:2px solid #4caf50;border-radius:2px;font-size:9px;color:#4caf50;margin-bottom:4px">
+        Exploit Proof — probe with payload injected; confirms the vulnerability is exploitable
+      </div>
+      ${_httpPair(f.probe_request, f.probe_response, 'Probe Request', 'Probe Response', [f.evidence, f.payload])}` : '';
+  // Use the real-entry viewer for findings grounded in explicit evidence ids, or for
+  // findings with a real linked entry but no legacy raw_request to show (copilot findings).
+  // Scanner/import findings that already carry raw_request keep their existing rendering.
+  const _hasLegacyRaw = !!(f.raw_request || f.raw_response);
+  const useEntryViewer = hasRealEntry && (_hasRealEvidence || !_hasLegacyRaw);
+  let httpDetails;
+  if (useEntryViewer) {
+    httpDetails = `
+    <details id="${rrvDetailsId}" style="margin-top:8px" ontoggle="if(this.open&&!_rrvState[${jsArg(rrvId)}])_rrvLoadEntry(${jsArg(rrvId)},${jsArg(primaryEntryId)})">
+      <summary style="cursor:pointer;font-size:10px;color:var(--txt2);user-select:none">HTTP Request / Response${hasProbe ? ' · <span style="color:#4caf50">+ Exploit Proof</span>' : ''}</summary>
+      <div id="${rrvId}" style="margin-top:8px"><div class="dp-none" style="padding:10px;font-size:10px;color:var(--txt2)">Open to load the captured request and response.</div></div>
+      ${_probeBlock}
+    </details>`;
+  } else if (f.raw_request || f.raw_response) {
+    httpDetails = `
     <details style="margin-top:8px">
       <summary style="cursor:pointer;font-size:10px;color:var(--txt2);user-select:none">HTTP Request / Response${hasProbe ? ' · <span style="color:#4caf50">+ Exploit Proof</span>' : ''}</summary>
       ${hasProbe ? `<div style="margin-top:8px;padding:6px 8px;background:#0a1a0a;border-left:2px solid var(--txt3);border-radius:2px;font-size:9px;color:var(--txt3);margin-bottom:4px">
         Baseline — clean request with original parameter value (no payload)
       </div>` : ''}
       ${_httpPair(f.raw_request, f.raw_response, 'Request', 'Response', [f.evidence, f.payload])}
-      ${hasProbe ? `<div style="margin-top:12px;padding:6px 8px;background:#0a200a;border-left:2px solid #4caf50;border-radius:2px;font-size:9px;color:#4caf50;margin-bottom:4px">
-        Exploit Proof — probe with payload injected; confirms the vulnerability is exploitable
-      </div>
-      ${_httpPair(f.probe_request, f.probe_response, 'Probe Request', 'Probe Response', [f.evidence, f.payload])}` : ''}
-    </details>` : '';
+      ${_probeBlock}
+    </details>`;
+  } else if (isSynthetic) {
+    httpDetails = `<div style="margin-top:8px;font-size:10px;color:var(--txt2);font-style:italic">${esc(f.evidence_note || 'No captured request for this finding — re-run the proof through send_request/browser_fetch so it is grounded in real traffic.')}</div>`;
+  } else {
+    httpDetails = '';
+  }
   const hostBadge = `<span style="font-size:9px;color:var(--txt2);margin-left:6px">${esc(host)}</span>`;
   const hasAiValidation = _vbyList.includes('ai');
   const fidx = f._fidx ?? globalIdx;
@@ -337,11 +372,15 @@ function _buildIssueCard(host, f, globalIdx) {
       <span class="iissue-arrow" style="margin-left:6px">▶</span>
     </div>
     <div class="iissue-detail" onclick="event.stopPropagation()">
-      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f) : ''}
+      ${(typeof _buildFindingSteps === 'function') ? _buildFindingSteps(f, useEntryViewer ? rrvId : '', useEntryViewer ? rrvDetailsId : '') : ''}
       <div class="iissue-evidence">${evidence}</div>
       ${paramHtml}${snippetHtml}${reasoningHtml}${cwe}${payload}${httpDetails}
-      <span class="iissue-goto" onclick="goToEntry(${jsArg(entryId)})">Go to request →</span>
-      <span class="iissue-goto" style="margin-left:12px" onclick="repLoadEntry(${jsArg(entryId)})">Send to Repeater →</span>
+      ${hasRealEntry
+        ? `<span class="iissue-goto" onclick="goToEntry(${jsArg(primaryEntryId)})">Go to request →</span>`
+        : `<span class="iissue-goto" style="opacity:.45;cursor:not-allowed;text-decoration:none" title="no captured request for this finding">Go to request →</span>`}
+      ${hasRealEntry
+        ? `<span class="iissue-goto" style="margin-left:12px" onclick="repLoadEntry(${jsArg(primaryEntryId)})">Send to Repeater →</span>`
+        : ''}
     </div>
   </div>`;
 }

@@ -82,30 +82,203 @@ document.addEventListener('click', e => {
   _applyColVisToDOM(vis);
 })();
 
-// ── column resize ─────────────────────────────────────────────────────
-(function initColResize() {
-  let dragging = null; // { th, startX, startW }
+// ── HTTP-history column layout: resize + reorder + persist ──────────────
+// Three persisted facets of the history table, all keyed by the stable column
+// CSS class (c1, csrc, cm, …): visibility (above), WIDTH (drag a .col-resizer),
+// and ORDER (drag a header). c0 (the row checkbox) is fixed and never moves.
+const _COL_WIDTH_KEY = 'dast-col-width';
+const _COL_ORDER_KEY = 'dast-col-order';
+// Canonical left-to-right order, matching the <th>s in index.html. Also the
+// whitelist of known column classes (c0 excluded — it is pinned first).
+const _COL_ORDER_DEFAULT = ['c1', 'csrc', 'cm', 'cs', 'ch', 'cp', 'cb', 'cpl', 'cz'];
+let _colOrder = _loadColOrder();
+
+function _colClassOf(el) {
+  // The known column class carried by a <th> or <td> (ignores sortable/status
+  // helper classes like "sortable" or the status "s2" tint).
+  if (!el || !el.classList) return null;
+  for (const c of el.classList) {
+    if (_COL_ORDER_DEFAULT.includes(c) || c === 'c0') return c;
+  }
+  return null;
+}
+
+function _loadColOrder() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(_COL_ORDER_KEY) || 'null');
+    if (!Array.isArray(saved)) return [..._COL_ORDER_DEFAULT];
+    // Keep only known columns, then append any default column the saved list is
+    // missing (e.g. a column added in a newer build) so none silently vanish.
+    const known = saved.filter(c => _COL_ORDER_DEFAULT.includes(c));
+    for (const c of _COL_ORDER_DEFAULT) if (!known.includes(c)) known.push(c);
+    return known;
+  } catch { return [..._COL_ORDER_DEFAULT]; }
+}
+
+function _saveColOrder() {
+  try { localStorage.setItem(_COL_ORDER_KEY, JSON.stringify(_colOrder)); } catch {}
+}
+
+function _loadColWidths() {
+  try { return JSON.parse(localStorage.getItem(_COL_WIDTH_KEY) || '{}') || {}; }
+  catch { return {}; }
+}
+
+function _saveColWidth(cls, w) {
+  const widths = _loadColWidths();
+  widths[cls] = w;
+  try { localStorage.setItem(_COL_WIDTH_KEY, JSON.stringify(widths)); } catch {}
+}
+
+// Reorder the <th>s in the history header to match _colOrder (c0 stays first).
+function applyColOrderToHeader() {
+  const tr = document.querySelector('.tbl-wrap thead tr');
+  if (!tr) return;
+  const byCls = {};
+  tr.querySelectorAll('th').forEach(th => {
+    const c = _colClassOf(th);
+    if (c) byCls[c] = th;
+  });
+  for (const cls of _colOrder) {
+    if (byCls[cls]) tr.appendChild(byCls[cls]); // appendChild moves the node
+  }
+}
+
+// Reorder one body row's <td>s to match _colOrder. Called after each renderRow
+// (which rewrites innerHTML in the source order) so rows track the header.
+function applyColOrderToRow(tr) {
+  if (!tr) return;
+  const byCls = {};
+  tr.querySelectorAll('td').forEach(td => {
+    const c = _colClassOf(td);
+    if (c) byCls[c] = td;
+  });
+  for (const cls of _colOrder) {
+    if (byCls[cls]) tr.appendChild(byCls[cls]);
+  }
+}
+
+function applyColOrder() {
+  applyColOrderToHeader();
+  document.querySelectorAll('#tbody tr').forEach(applyColOrderToRow);
+}
+
+// Restore persisted widths onto the header <th>s (td widths follow via
+// table-layout:fixed). Safe to call repeatedly.
+function applyColWidths() {
+  const widths = _loadColWidths();
+  document.querySelectorAll('.tbl-wrap thead th').forEach(th => {
+    const c = _colClassOf(th);
+    if (c && widths[c] != null) th.style.width = widths[c] + 'px';
+  });
+}
+
+(function initColLayout() {
+  // ── resize: drag a .col-resizer handle, persist the resulting width ──
+  let rz = null; // { th, cls, startX, startW, handle }
   document.addEventListener('mousedown', e => {
     if (!e.target.classList.contains('col-resizer')) return;
     const th = e.target.closest('th');
-    dragging = { th, startX: e.clientX, startW: th.offsetWidth, handle: e.target };
+    if (!th || !th.closest('.tbl-wrap')) return; // history table only
+    rz = { th, cls: _colClassOf(th), startX: e.clientX, startW: th.offsetWidth, handle: e.target };
     e.target.classList.add('dragging');
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
     e.preventDefault();
+    e.stopPropagation(); // never let a resize start a header reorder-drag
   });
   document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    const w = Math.max(40, dragging.startW + e.clientX - dragging.startX);
-    dragging.th.style.width = w + 'px';
+    if (!rz) return;
+    const w = Math.max(40, rz.startW + e.clientX - rz.startX);
+    rz.th.style.width = w + 'px';
   });
   document.addEventListener('mouseup', () => {
-    if (!dragging) return;
-    dragging.handle.classList.remove('dragging');
+    if (!rz) return;
+    rz.handle.classList.remove('dragging');
     document.body.style.cursor = '';
     document.body.style.userSelect = '';
-    dragging = null;
+    if (rz.cls) _saveColWidth(rz.cls, rz.th.offsetWidth);
+    rz = null;
   });
+
+  // ── reorder: drag a header onto another to move the column ──
+  // A small pixel threshold separates a reorder-drag from a sort-click; a plain
+  // click never crosses it, so setSort still fires normally. When a drag DID
+  // happen we swallow the trailing click (capture phase) so it does not sort.
+  const DRAG_THRESHOLD = 5;
+  let drag = null; // { th, cls, startX, moved }
+  let _suppressNextHeaderClick = false;
+
+  document.addEventListener('mousedown', e => {
+    if (e.target.classList.contains('col-resizer')) return; // resize owns this
+    const th = e.target.closest('th');
+    if (!th || !th.closest('.tbl-wrap')) return;
+    const cls = _colClassOf(th);
+    if (!cls || cls === 'c0') return; // the checkbox column is pinned
+    drag = { th, cls, startX: e.clientX, moved: false };
+  });
+  document.addEventListener('mousemove', e => {
+    if (!drag) return;
+    if (!drag.moved) {
+      if (Math.abs(e.clientX - drag.startX) < DRAG_THRESHOLD) return;
+      drag.moved = true;
+      drag.th.classList.add('col-dragging');
+      document.body.style.cursor = 'grabbing';
+      document.body.style.userSelect = 'none';
+    }
+    // Highlight the header currently under the cursor as the drop target.
+    const over = document.elementFromPoint(e.clientX, e.clientY);
+    const overTh = over && over.closest ? over.closest('.tbl-wrap thead th') : null;
+    document.querySelectorAll('.tbl-wrap thead th.col-drop-target')
+      .forEach(t => t.classList.remove('col-drop-target'));
+    if (overTh && overTh !== drag.th) {
+      const oc = _colClassOf(overTh);
+      if (oc && oc !== 'c0') overTh.classList.add('col-drop-target');
+    }
+  });
+  document.addEventListener('mouseup', e => {
+    if (!drag) return;
+    const d = drag;
+    drag = null;
+    d.th.classList.remove('col-dragging');
+    document.querySelectorAll('.tbl-wrap thead th.col-drop-target')
+      .forEach(t => t.classList.remove('col-drop-target'));
+    if (!d.moved) return; // was a click → leave it for setSort
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+    const over = document.elementFromPoint(e.clientX, e.clientY);
+    const overTh = over && over.closest ? over.closest('.tbl-wrap thead th') : null;
+    const targetCls = overTh ? _colClassOf(overTh) : null;
+    if (targetCls && targetCls !== 'c0' && targetCls !== d.cls) {
+      const from = _colOrder.indexOf(d.cls);
+      let to = _colOrder.indexOf(targetCls);
+      if (from !== -1 && to !== -1) {
+        _colOrder.splice(from, 1);
+        to = _colOrder.indexOf(targetCls);
+        // Dropping onto a column to the right lands AFTER it, else before.
+        _colOrder.splice(e.clientX > overTh.getBoundingClientRect().left
+          + overTh.offsetWidth / 2 ? to + 1 : to, 0, d.cls);
+        _saveColOrder();
+        applyColOrder();
+      }
+    }
+    // Swallow the click this drag produced so it does not trigger setSort.
+    _suppressNextHeaderClick = true;
+  }, true);
+
+  // Capture-phase click guard: cancels the sort-click that follows a reorder.
+  document.addEventListener('click', e => {
+    if (!_suppressNextHeaderClick) return;
+    _suppressNextHeaderClick = false;
+    if (e.target.closest && e.target.closest('.tbl-wrap thead th')) {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }, true);
+
+  // Restore persisted order + widths once the header exists.
+  applyColOrder();
+  applyColWidths();
 })();
 
 // ── panel resize (hosts | list | detail columns) ──────────────────────
@@ -663,7 +836,15 @@ function renderRow(entry, isNew) {
             : entry.queued_for_scan              ? 'r-q'
             : entry.source === 'crawler'         ? 'r-c'
             : entry.source === 'out-of-scope'    ? 'r-oos' : '';
-  const srcTag = _SRC_TAG[entry.source] || _SRC_TAG.proxy;
+  // Dual-label an out-of-scope entry with the tool that originated it (origin), so a
+  // copilot/agent request to an out-of-scope host reads as "oos · copilot" instead of
+  // looking like stray proxy traffic. Scope tag (source) is unchanged.
+  let srcTag = _SRC_TAG[entry.source] || _SRC_TAG.proxy;
+  if (entry.source === 'out-of-scope' && entry.origin && entry.origin !== 'out-of-scope') {
+    const originTag = _SRC_TAG[entry.origin]
+      || `<span class="src-tag" title="Originating tool">${esc(entry.origin)}</span>`;
+    srcTag = srcTag + ' ' + originTag;
+  }
   const scanBdg = entry.queued_for_scan && !entry.scan_result ? '<span class="sbdg q">queued</span>' : '';
   // Probe legend: a scanner request injects a test value to observe how the
   // endpoint reacts. Detection is based on the RESPONSE (reflected value,
@@ -707,6 +888,7 @@ function renderRow(entry, isNew) {
     <td class="cb">${bodyCell}</td>
     <td class="cpl">${entry.ai_queued ? '<span class="sbdg" style="background:#EF9F27;color:#0a0a1a;margin-right:4px" title="Manually queued for AI scan">AI</span>' : ''}${probeBdg}${entry.probe_payload ? `<span title="${esc(_isProbe ? _probeTip : entry.probe_payload)}">${esc(entry.probe_payload.slice(0,40))}${entry.probe_payload.length > 40 ? '…' : ''}</span>` : ''}</td>
     <td class="cz" style="${entry.duration_ms > 2000 ? 'color:var(--red)' : entry.duration_ms > 500 ? 'color:var(--yellow)' : ''}">${entry.duration_ms != null ? entry.duration_ms.toFixed(0) : ''}</td>`;
+  applyColOrderToRow(tr);  // keep cell order in sync with the (persisted) header order
   applyFilterRow(tr, entry);
   if (selId === entry.id) tr.classList.add('on');
 }

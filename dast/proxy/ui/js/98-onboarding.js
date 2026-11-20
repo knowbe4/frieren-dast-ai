@@ -19,8 +19,8 @@
 
   function openProxySetup() {
     dismiss();
-    if (typeof switchMain === 'function') switchMain('proxy');
-    if (typeof switchProxySub === 'function') switchProxySub('psettings');
+    if (typeof switchMain === 'function') switchMain('settings');
+    if (typeof switchSettingsSub === 'function') switchSettingsSub('proxy');
   }
 
   let _overlay = null;

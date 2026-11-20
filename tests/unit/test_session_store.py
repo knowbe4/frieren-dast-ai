@@ -51,6 +51,39 @@ class TestNewEntry:
         assert entry.source == "browse"
         assert entry.browse_session_id == "sess-1"
 
+    # ── P4: dual-label — origin recorded ALONGSIDE source, scope tag unchanged ──
+    def test_origin_defaults_to_none(self):
+        store = _make_store()
+        eid = store.new_entry("GET", "https://example.com/page", {}, None)
+        assert store.get_entry(eid).origin is None
+
+    def test_out_of_scope_entry_records_origin_without_changing_source(self):
+        """An out-of-scope tool request (x-dast-source present) keeps the authoritative
+        source='out-of-scope' scope tag while attributing the request via origin."""
+        store = _make_store()
+        eid = store.new_entry(
+            "PUT", "https://bucket.s3.amazonaws.com/obj", {}, b"data",
+            source="out-of-scope", origin="copilot",
+        )
+        entry = store.get_entry(eid)
+        assert entry.source == "out-of-scope"   # scope signal unchanged
+        assert entry.origin == "copilot"        # attribution preserved
+        d = entry.to_dict()
+        assert d["source"] == "out-of-scope" and d["origin"] == "copilot"
+
+    def test_out_of_scope_with_origin_still_excluded_from_in_scope(self):
+        """Recording origin must NOT regress the out-of-scope deny: an out-of-scope
+        entry (even one attributed to a tool) stays out of in_scope_entries()."""
+        store = _make_store()
+        store.new_entry("GET", "https://example.com/in", {}, None)
+        store.new_entry(
+            "PUT", "https://bucket.s3.amazonaws.com/obj", {}, b"data",
+            source="out-of-scope", origin="copilot",
+        )
+        urls = [e.url for e in store.in_scope_entries()]
+        assert "https://example.com/in" in urls
+        assert all("s3.amazonaws.com" not in u for u in urls)
+
 
 # ── complete_entry ─────────────────────────────────────────────────────────
 
@@ -154,6 +187,109 @@ class TestRecordManualFinding:
     def test_missing_url_returns_none(self):
         store = _make_store()
         assert store.record_manual_finding({"title": "x"}, "", "GET") is None
+
+    def test_links_to_explicit_evidence_entry_ids(self):
+        store = _make_store()
+        e1 = store.new_entry("POST", "https://example.com/persona/graphql", {},
+                             b'{"query":"mutation{createPersonaAsset}"}')
+        e2 = store.new_entry("PUT", "https://example.com/upload/1", {}, b"bytes")
+        returned = store.record_manual_finding(
+            {"title": "Consent not revalidated", "confirmed": True,
+             "evidence_entry_ids": [e1, e2]},
+            "https://example.com/persona/graphql", "GET",
+        )
+        # Primary = first evidence id, NOT a fabricated synthetic entry.
+        assert returned == e1
+        assert not returned.startswith("copilot-")
+        entry = store.get_entry(e1)
+        assert entry.findings[0]["evidence_entry_ids"] == [e1, e2]
+        assert not entry.findings[0].get("evidence_synthetic")
+
+    def test_fallback_prefers_real_post_over_empty_get(self):
+        store = _make_store()
+        # An empty GET stub recorded first, then a REAL POST with a body for the same url.
+        empty = store.new_entry("GET", "https://example.com/persona/graphql", {}, None)
+        real = store.new_entry("POST", "https://example.com/persona/graphql", {},
+                               b'{"query":"mutation{createPersonaAsset}"}')
+        # Caller records with the default GET method and NO evidence ids.
+        returned = store.record_manual_finding(
+            {"title": "GraphQL BOLA", "confirmed": True},
+            "https://example.com/persona/graphql", "GET",
+        )
+        assert returned == real
+        assert returned != empty
+
+    def test_fallback_does_not_fabricate_when_real_match_exists(self):
+        store = _make_store()
+        # Only an empty GET (no body/response) exists for the url — still a REAL history row.
+        existing = store.new_entry("GET", "https://example.com/api/thing", {}, None)
+        returned = store.record_manual_finding(
+            {"title": "Issue", "confirmed": True},
+            "https://example.com/api/thing?x=1", "GET",  # same host+path, different query
+        )
+        # Reuses the real matching entry rather than fabricating a synthetic one.
+        assert returned == existing
+        assert not returned.startswith("copilot-")
+        assert not store.get_entry(returned).findings[0].get("evidence_synthetic")
+
+    def test_synthetic_last_resort_is_flagged(self):
+        store = _make_store()
+        returned = store.record_manual_finding(
+            {"title": "SSRF", "confirmed": True},
+            "https://never-proxied.example.com/api", "GET",
+        )
+        entry = store.get_entry(returned)
+        assert entry.source == "copilot"
+        assert entry.findings[0].get("evidence_synthetic") is True
+        assert entry.findings[0].get("evidence_note")
+
+    def test_steps_resolve_to_real_entry_ids(self):
+        store = _make_store()
+        write = store.new_entry("POST", "https://example.com/persona/graphql", {},
+                                b'{"query":"mutation"}')
+        read = store.new_entry("POST", "https://example.com/consent/graphql", {},
+                               b'{"query":"query consent"}')
+        finding = {
+            "title": "Consent chain", "confirmed": True,
+            "evidence_entry_ids": [write],
+            "steps": [
+                {"label": "write", "method": "POST",
+                 "url": "https://example.com/persona/graphql"},
+                {"label": "read", "method": "POST",
+                 "url": "https://example.com/consent/graphql"},
+            ],
+        }
+        store.record_manual_finding(finding, "https://example.com/persona/graphql", "POST")
+        assert finding["steps"][0]["entry_id"] == write
+        assert finding["steps"][1]["entry_id"] == read
+
+    def test_step_supplied_entry_id_is_kept(self):
+        store = _make_store()
+        real = store.new_entry("POST", "https://example.com/g", {}, b"{}")
+        finding = {
+            "title": "x", "confirmed": True,
+            "steps": [{"label": "s", "method": "POST",
+                       "url": "https://example.com/g", "entry_id": real}],
+        }
+        store.record_manual_finding(finding, "https://example.com/g", "POST")
+        assert finding["steps"][0]["entry_id"] == real
+
+
+class TestResolveSentEntryId:
+    def test_returns_new_matching_entry(self):
+        store = _make_store()
+        old = store.new_entry("POST", "https://example.com/g", {}, b"a")
+        known = {old}
+        new = store.new_entry("POST", "https://example.com/g", {}, b"b")
+        resolved = store.resolve_sent_entry_id("https://example.com/g", "POST", known)
+        assert resolved == new
+
+    def test_returns_none_when_no_new_entry(self):
+        store = _make_store()
+        store.new_entry("GET", "https://example.com/g", {}, None)
+        known = {e.id for e in store.entries_newest_first()}
+        resolved = store.resolve_sent_entry_id("https://example.com/g", "GET", known)
+        assert resolved is None
 
 
 # ── cookie jar ────────────────────────────────────────────────────────────

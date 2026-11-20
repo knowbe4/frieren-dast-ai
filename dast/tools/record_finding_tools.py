@@ -95,6 +95,46 @@ def _reject_reason(title: str, evidence: str, reasoning: str) -> Optional[str]:
                 "re-verify before recording.")
     return None
 
+# Soft reclassification hint (HINT ONLY — never blocks, never refuses, never mutates the stored
+# finding). idor (CWE-639) is cross-tenant OBJECT access; bfla (CWE-862) is a same-tenant role
+# bypass. A business-logic / data-integrity / consent / server-side-validation flaw on your OWN
+# tenant's own object is NEITHER — if the title/attack_type says idor/BOLA but the evidence reads
+# same-tenant/same-object with no cross-tenant access, nudge an honest reclassification.
+_IDOR_CLAIM_MARKERS = ("idor", "bola", "object-level", "object level")
+_SAME_TENANT_MARKERS = (
+    "same tenant", "same-tenant", "own tenant", "own account", "same account",
+    "same object", "same user", "consent", "business logic", "business-logic",
+    "data integrity", "data-integrity", "integrity", "locked field", "locked-field",
+    "linked field", "linked-field", "server-side validation", "server side validation",
+)
+_CROSS_TENANT_MARKERS = (
+    "cross-tenant", "cross tenant", "foreign", "another tenant", "other tenant",
+    "another user", "other user", "another account", "other account",
+    "different account", "different tenant", "different user",
+)
+
+
+def _reclassification_hint(title: str, attack_type: str, evidence: str,
+                           reasoning: str) -> Optional[str]:
+    """Return a non-fatal nudge when a finding is labeled idor/BOLA but its own evidence reads
+    same-tenant / same-object with no cross-tenant access. A HINT only — the caller records the
+    finding exactly as submitted; this never blocks or edits it."""
+    claim = f"{title} {attack_type}".lower()
+    if not any(m in claim for m in _IDOR_CLAIM_MARKERS):
+        return None
+    body = f"{title}\n{evidence}\n{reasoning}".lower()
+    if any(m in body for m in _CROSS_TENANT_MARKERS):
+        return None  # a genuine cross-tenant object access is claimed — leave idor/BOLA as-is
+    if not any(m in body for m in _SAME_TENANT_MARKERS):
+        return None
+    return ("this reads as a business-logic / data-integrity / consent / server-side-validation "
+            "flaw on your OWN tenant's own object, not cross-tenant object access — idor/BOLA "
+            "(CWE-639) may be the wrong label. If no OTHER tenant's/user's object was reached, "
+            "consider an honest attack_type (e.g. 'business-logic') with the real CWE (e.g. "
+            "CWE-345 insufficient data authenticity, CWE-284 improper access control, CWE-602 "
+            "server-side validation) and a title stating the actual weakness. (Hint only — the "
+            "finding was recorded as submitted.)")
+
 _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -162,7 +202,15 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                            "sensitive-param. For access control, pick precisely: 'idor' "
                            "(object-level/BOLA — reaching ANOTHER tenant's/user's object, "
                            "CWE-639) vs 'bfla' (function-level — a SAME-tenant action your "
-                           "role should not allow / vertical privilege escalation, CWE-862).",
+                           "role should not allow / vertical privilege escalation, CWE-862). "
+                           "But a flaw that is NEITHER cross-tenant object access NOR a "
+                           "role/privilege bypass — a business-logic / data-integrity / "
+                           "consent / server-side-validation failure on your OWN tenant's "
+                           "own object (e.g. a locked/linked field editable anyway, asset "
+                           "bytes swappable after consent) — is NOT idor/BOLA: use an honest "
+                           "type such as 'business-logic' and the real CWE (e.g. CWE-345 "
+                           "insufficient data authenticity, CWE-284 improper access control, "
+                           "CWE-602 server-side validation).",
         },
         "cwe": {"type": "string", "description": "Optional CWE id, e.g. CWE-284."},
         "method": {"type": "string", "description": "HTTP method of the request (default GET)."},
@@ -282,6 +330,13 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
                     "evidence_entry_ids so the finding cites the real request/response.")
                 logger.warning("record_finding: ungrounded finding (synthetic evidence)",
                                title=title, url=url)
+            reclass = _reclassification_hint(title, finding.get("attack_type", ""), evidence,
+                                             str(args.get("reasoning", "")))
+            if reclass:
+                result["warning"] = (
+                    f"{result['warning']}\n{reclass}" if result.get("warning") else reclass)
+                logger.info("record_finding: reclassification hint (same-tenant labeled idor)",
+                            title=title, attack_type=finding.get("attack_type", ""))
             return result
         except Exception as exc:
             return {"ok": False, "error": f"record failed: {str(exc)[:200]}"}

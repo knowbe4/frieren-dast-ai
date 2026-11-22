@@ -144,3 +144,18 @@ def _isolate_provider_health():
     provider_health.reset()
     yield
     provider_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_recorder(tmp_path, monkeypatch):
+    """Redirect the LLM-call recorder's JSONL sink to a per-test tmp dir and
+    reset the in-memory ring/counters around every test. Tests that exercise
+    the real ``_invoke_raw`` walk (failover, model fallback — and the recorder
+    suite itself) now record one entry per attempt; without the redirect each
+    of those would append to the developer's real ~/.dast-ai/llm_calls file
+    and leak counters across tests."""
+    from dast.ai import llm_recorder  # noqa: PLC0415
+    monkeypatch.setattr(llm_recorder, "_CALLS_DIR", tmp_path / "llm_calls")
+    llm_recorder.clear()
+    yield
+    llm_recorder.clear()

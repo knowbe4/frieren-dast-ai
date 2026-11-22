@@ -353,6 +353,7 @@ async def _llm_validate_finding(
                 model_id=get_fast_model(),
                 temperature=0,
                 schema=GQL_VALIDATE_SCHEMA,
+                purpose="graphql_validate",
             ),
         )
         updated = dict(finding)

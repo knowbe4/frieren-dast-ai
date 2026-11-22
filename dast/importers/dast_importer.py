@@ -153,6 +153,7 @@ def parse_findings(
             model_id=bedrock_client.get_active_model(),
             max_tokens=8192,
             schema=DAST_IMPORT_SCHEMA,
+            purpose="import_parse",
         )
     except Exception as exc:
         logger.error("Findings import parse failed", error=str(exc))

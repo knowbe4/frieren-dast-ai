@@ -66,6 +66,7 @@ def plan_chain(report_text: str, model_id: Optional[str] = None) -> Optional[Cha
             temperature=0,
             cache_system=True,
             schema=ATTACK_CHAIN_SCHEMA,
+            purpose="chain_planner",
         )
     except Exception as exc:
         logger.warning("chain planning failed", error=str(exc))

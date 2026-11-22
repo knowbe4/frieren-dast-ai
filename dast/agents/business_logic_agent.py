@@ -721,6 +721,7 @@ async def _llm_hint_probes(
                 model_id=bedrock_client.get_fast_model(),
                 max_tokens=512,
                 schema=BL_HINT_PROBES_SCHEMA,
+                purpose="bola_hint_probes",
             ),
         )
         probes = result.get("probes") or []
@@ -767,6 +768,7 @@ async def _llm_evaluate(
                 model_id=bedrock_client.get_validation_model(),
                 max_tokens=512,
                 schema=BL_EVAL_SCHEMA,
+                purpose="bola_verdict",
             ),
         )
         confirmed = bool(result.get("confirmed", False))

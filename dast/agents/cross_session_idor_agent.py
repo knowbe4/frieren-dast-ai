@@ -86,6 +86,7 @@ async def _llm_evaluate(
                 model_id=bedrock_client.get_validation_model(),
                 max_tokens=512,
                 schema=CROSS_SESSION_IDOR_SCHEMA,
+                purpose="idor_cross_session",
             ),
         )
         return bool(result.get("confirmed", False)), str(result.get("reasoning", ""))

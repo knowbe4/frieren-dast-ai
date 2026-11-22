@@ -100,7 +100,8 @@ async def _llm_gate(target: "CheckTarget", baseline_text: str) -> Optional[dict]
         return await loop.run_in_executor(
             None,
             lambda: bedrock_client.invoke_json(
-                system=_SYSTEM_GATE, user=user, schema=RACE_CANDIDATE_SCHEMA, temperature=0
+                system=_SYSTEM_GATE, user=user, schema=RACE_CANDIDATE_SCHEMA, temperature=0,
+                purpose="race_gate",
             ),
         )
     except Exception as exc:
@@ -130,6 +131,7 @@ async def _llm_verdict(
                 user=user,
                 schema=RACE_VERDICT_SCHEMA,
                 temperature=0,
+                purpose="race_verdict",
             ),
         )
     except Exception as exc:

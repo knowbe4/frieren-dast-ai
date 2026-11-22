@@ -88,7 +88,8 @@ async def _llm_evaluate(
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None,
-            lambda: bedrock_client.invoke_json(system=_SYSTEM_IDOR, user=user, schema=IDOR_SCHEMA),
+            lambda: bedrock_client.invoke_json(system=_SYSTEM_IDOR, user=user,
+                                               schema=IDOR_SCHEMA, purpose="idor"),
         )
         confirmed = bool(result.get("confirmed", False))
         reasoning = str(result.get("reasoning", ""))

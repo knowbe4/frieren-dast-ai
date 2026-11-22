@@ -139,6 +139,7 @@ def classify_discovery_hit_with_llm(hit: dict) -> Optional[str]:
             },
             model_id=bedrock_client.get_fast_model(),
             temperature=0,
+            purpose="suggestions",
         )
         candidate = str(result.get("attack_type", "")).strip().lower()
         _allowed = {

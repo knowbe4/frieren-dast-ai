@@ -340,7 +340,8 @@ class AppContextWorker:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
-                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=3000, schema=APP_CONTEXT_SCHEMA),
+                lambda: bedrock_client.invoke_json(system=_SYSTEM, user=user, max_tokens=3000,
+                                                   schema=APP_CONTEXT_SCHEMA, purpose="app_context"),
             )
             self._apply_result(host, result, len(entries))
             logger.info(

@@ -196,6 +196,7 @@ async def _llm_step(system: str, user: str) -> Optional[Dict[str, Any]]:
                 temperature=0,
                 schema=TRIAGE_AGENT_STEP_SCHEMA,
                 cache_system=True,
+                purpose="triage_agent",
             ),
         )
     except Exception as exc:
@@ -247,6 +248,7 @@ async def _second_pass_agrees(
                 max_tokens=512,
                 temperature=0,
                 schema=H1_VERDICT_SCHEMA,
+                purpose="triage_second_pass",
             ),
         )
         reproduced = bool(result.get("reproduced"))

@@ -5,6 +5,42 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (LLM recorder round 3-F)
+- **LLM-call recorder** (`dast/ai/llm_recorder.py`) — every LLM attempt (failover
+  candidates, repair retries, cache hits, model-resolution failures) is persisted
+  as one JSONL record under `~/.dast-ai/llm_calls/llm_calls.jsonl` (0700 dir,
+  login_journal pattern) with an outcome taxonomy (`ok`/`cache_hit`/
+  `safety_block`/`throttled`/`provider_error`/`unavailable`/`caller_error`),
+  usage normalised across Anthropic/OpenAI shapes, latency (sanitised against
+  NaN/negative), and ≤500-char request/response excerpts + ≤200-char error
+  excerpts — prompts carry untrusted target content, so bodies are never stored
+  in full. The safety-classifier refusal excerpt is captured at the raise site,
+  before the generic `AiContentBlockedError` replaces it.
+- **`purpose` labels on every LLM call site** (~30 across `dast/`) — planner,
+  copilot_step/copilot_repair, triage_* (verdict/analyse/repair/dns/ssrf/enrich),
+  probe_classifier, mutator, payload_gen/mutation, response_analyzer, the agents
+  (idor/race/bola), login_llm, explore, suggestions, importers, passive/graphql
+  validators, code analysis and chain planner — so the recorder and the panel
+  show WHAT a refused or failing call was for instead of a generic "other".
+- **Usage panel** — `GET /api/ai/usage` + `POST /api/ai/usage/clear` (status
+  routes) and an "LLM Usage" section in the dashboard AI tab: stat cards
+  (calls/ok/cache hits/safety blocks/errors/tokens/avg latency), by-purpose and
+  by-model tables, the 20 most recent attempts with outcome coloring and error
+  excerpts, plus the response-cache stats. Unit suite: recorder core, the real
+  `_invoke_raw` wiring (failover/repair/cache paths) and the route round-trip.
+
+### Changed (roadmap re-baseline vs ARTEX 0.7.0)
+- `docs/ROADMAP.md` §4 re-baselined against upstream `BaaRai/ARTEX` 0.7.0
+  (2026-11-21; the old local `/opt/tools/artex-global` copy no longer exists on
+  this machine — GitHub is the source now): the "no rate limit" weakness is
+  fixed upstream (noise governor), guardrails are far harder (closed-question
+  judge, untrusted boundary), and the updated borrow-list feeds new rounds
+  **3-G** (noise governor), **3-H** (coverage ledger) and **3-I** (match&replace
+  + traffic replay + HAR export). ARTEX still has NO target-login mechanism —
+  its api-recon skill forbids real credentials — so frieren's login stack
+  (vault, verify_authenticated, recoverable breaker, agentless three-gates)
+  remains far ahead; nothing to copy there.
+
 ### Added (new agents round 3-E)
 - **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
   framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours

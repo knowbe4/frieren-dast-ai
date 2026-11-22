@@ -162,6 +162,33 @@ def test_clear_resets_memory_but_keeps_jsonl():
     assert len(_jsonl_lines()) == 1  # the durable record is kept
 
 
+# ── dashboard routes (GET /api/ai/usage + POST /api/ai/usage/clear) ──────────
+
+def test_usage_routes_round_trip(monkeypatch):
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from dast.proxy.api.status_routes import make_router
+
+    ctx = SimpleNamespace(scan_queue_state=None, mcp_last_heartbeat=[0.0])
+    app = FastAPI()
+    app.include_router(make_router(ctx))
+    client = TestClient(app)
+
+    llm_recorder.record_call(purpose="planner", outcome="ok",
+                             usage={"input_tokens": 3, "output_tokens": 1})
+
+    body = client.get("/api/ai/usage").json()
+    assert body["totals"]["calls"] == 1
+    assert body["totals"]["input_tokens"] == 3
+    assert body["by_purpose"]["planner"] == 1
+
+    assert client.post("/api/ai/usage/clear").json() == {"ok": True}
+    assert client.get("/api/ai/usage").json()["totals"]["calls"] == 0
+
+
 # ── wiring: the real _invoke_raw walk records every attempt ──────────────────
 
 def _invoke_raw(purpose: str = ""):

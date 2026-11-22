@@ -222,6 +222,20 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import bedrock_client as _bc
         return await asyncio.get_running_loop().run_in_executor(None, _bc.list_models)
 
+    @router.get("/api/ai/usage")
+    async def ai_usage():
+        """LLM-call usage snapshot (round 3-F recorder): totals by outcome,
+        per-purpose/per-model counts, recent attempts and response-cache stats."""
+        from dast.ai import llm_recorder
+        return llm_recorder.usage_snapshot()
+
+    @router.post("/api/ai/usage/clear")
+    async def ai_usage_clear():
+        """Reset the in-memory usage counters/ring (the JSONL record is kept)."""
+        from dast.ai import llm_recorder
+        llm_recorder.clear()
+        return {"ok": True}
+
     # MCP server liveness. The MCP process (`dast-ai mcp`) is separate from the
     # dashboard and drives it over HTTP, so the dashboard only knows the MCP
     # server is up if it posts a heartbeat. `_MCP_STALE_SECONDS` must exceed the

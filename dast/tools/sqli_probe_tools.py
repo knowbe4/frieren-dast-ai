@@ -459,7 +459,18 @@ async def _sqli_probe(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     time_threshold_ms = float(get_value("sqli", "time_threshold_ms", 4500) or 4500)
 
     async def _send_value(client: "httpx.AsyncClient", value: str) -> Optional["httpx.Response"]:
-        """Inject ``value`` at the chosen point and send through the proxy. Returns the response."""
+        """Inject ``value`` at the chosen point and send through the proxy, paced
+        by the noise governor (3-G) when a profile is active. Returns the response."""
+        from dast.scanners import noise_governor  # noqa: PLC0415 — local to avoid import cost
+        pace_token = await noise_governor.acquire(urlparse(url).hostname or url)
+        try:
+            return await _send_value_raw(client, value)
+        finally:
+            if pace_token is not None:
+                pace_token.release()
+
+    async def _send_value_raw(client: "httpx.AsyncClient", value: str) -> Optional["httpx.Response"]:
+        """The un-paced injection send (the wrapper above owns pacing)."""
         try:
             # Optional payload encoding (WAF/input-filter bypass) — applied to the injected value
             # for ANY location; default encode="" is a no-op, so existing behavior is unchanged.

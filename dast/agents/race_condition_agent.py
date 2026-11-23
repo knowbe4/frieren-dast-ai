@@ -184,9 +184,12 @@ class RaceConditionAgent(VulnAgent):
         if target.method not in ("POST", "PUT", "PATCH", "DELETE"):
             return []
 
-        # Baseline: one replay of the exact original request.
+        # Baseline: one replay of the exact original request. pace=False: the
+        # noise governor's per-host slots (quiet = 1) would serialize the burst,
+        # which IS the experiment (see the gather below).
         try:
-            baseline = await _send(client, target.method, target.url, target.headers, target.body)
+            baseline = await _send(client, target.method, target.url, target.headers,
+                                   target.body, pace=False)
         except Exception as exc:
             logger.debug("Race agent baseline failed", url=target.url, error=str(exc))
             return []
@@ -212,10 +215,11 @@ class RaceConditionAgent(VulnAgent):
                 return []
             single_use = True  # keyword filter only fires on single-use-shaped params
 
-        # Burst: identical concurrent replays.
+        # Burst: identical concurrent replays — un-paced (see the baseline note).
         try:
             responses = list(await asyncio.gather(*[
-                _send(client, target.method, target.url, target.headers, target.body)
+                _send(client, target.method, target.url, target.headers, target.body,
+                      pace=False)
                 for _ in range(_BURST_SIZE)
             ]))
         except Exception as exc:

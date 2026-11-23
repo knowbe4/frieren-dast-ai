@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
+import respx
 
+from dast.scanners import active_checks as ac
 from dast.scanners import noise_governor as gov
 
 
@@ -244,3 +247,81 @@ def test_user_agent_persists_across_profile_switch_but_not_reset():
     gov.reset()
     gov.set_profile("quiet")
     assert gov.user_agent() == ""  # reset() clears it (test isolation)
+
+
+# ── wiring: the real _send walk under an active profile ──────────────────────
+
+@pytest.fixture(autouse=True)
+def _clean_breaker():
+    ac.reset_host_reachability()
+    yield
+    ac.reset_host_reachability()
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+
+
+@respx.mock
+async def test_send_paces_and_injects_ua(monkeypatch):
+    _install_clock(monkeypatch)  # no real sleeps while paced
+    gov.set_profile("quiet")
+    gov.set_user_agent("DAST-AI/1.0 (+noise)")
+    route = respx.get("https://paced.example.com/a").mock(return_value=httpx.Response(200))
+
+    async with _client() as client:
+        resp = await ac._send(client, "GET", "https://paced.example.com/a", {}, None,
+                              source="agent")
+
+    assert resp is not None and resp.status_code == 200
+    sent = route.calls.last.request
+    assert sent.headers["user-agent"] == "DAST-AI/1.0 (+noise)"
+    assert sent.headers["x-dast-source"] == "agent"
+    snap = gov.snapshot()
+    assert snap["hosts"][0]["host"] == "paced.example.com"
+    assert snap["hosts"][0]["sent"] == 1
+
+
+@respx.mock
+async def test_send_respects_a_captured_ua(monkeypatch):
+    _install_clock(monkeypatch)
+    gov.set_profile("quiet")
+    gov.set_user_agent("DAST-AI/1.0")
+    route = respx.get("https://paced.example.com/b").mock(return_value=httpx.Response(200))
+
+    async with _client() as client:
+        await ac._send(client, "GET", "https://paced.example.com/b",
+                       {"User-Agent": "captured/9"}, None)
+
+    assert route.calls.last.request.headers["user-agent"] == "captured/9"
+
+
+@respx.mock
+async def test_429_pauses_host_for_subsequent_probes(monkeypatch):
+    clock = _install_clock(monkeypatch)
+    gov.set_profile("quiet")  # base host pause 2s
+    respx.get("https://paced.example.com/c").mock(return_value=httpx.Response(429))
+    async with _client() as client:
+        resp = await ac._send(client, "GET", "https://paced.example.com/c", {}, None)
+        assert resp.status_code == 429
+        st = gov._current._hosts["paced.example.com"]
+        assert st.not_before > clock.t  # the whole host is paused, not just this probe
+
+        respx.get("https://paced.example.com/d").mock(return_value=httpx.Response(200))
+        resp2 = await ac._send(client, "GET", "https://paced.example.com/d", {}, None)
+        assert resp2.status_code == 200  # still sent — pacing, not blocking
+    assert any(abs(s - 2.0) < 0.1 for s in clock.sleeps)  # pause waited out first
+
+
+@respx.mock
+async def test_pace_false_skips_the_governor_entirely(monkeypatch):
+    _install_clock(monkeypatch)
+    gov.set_profile("quiet")
+    respx.get("https://paced.example.com/e").mock(return_value=httpx.Response(200))
+
+    async with _client() as client:
+        resp = await ac._send(client, "GET", "https://paced.example.com/e", {}, None,
+                              pace=False)
+
+    assert resp.status_code == 200  # the race-agent path: un-paced, un-counted
+    assert gov.snapshot()["hosts"] == []

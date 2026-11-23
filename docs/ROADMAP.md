@@ -251,7 +251,18 @@ daqui.
 
 **Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → ~~2-C~~ ✅ →
 ~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → ~~3-F~~ ✅ → ~~3-G~~ ✅ → ~~3-H~~ ✅ →
-~~3-I~~ ✅ — **fase 3 completa**.
+~~3-I~~ ✅ — **fase 3 completa** → ~~4-A~~ ✅ (expansão de agentes) → 4-B
+(follow-ups de agentes).
+
+| **4-A Expansão de agentes (ARTEX api-security)** — ✅ FEITA (2026-11-23, branch `feat/agents-expansion`): `5f392f1` (quick wins: nosql usava grupo yaml **inexistente** `where_injection` → `mongodb_js_injection`; prototype_pollution adota o próprio yaml — 5 hardcoded vs 40+ — + NOVO vetor header; **xxe-ssrf wired** — o grupo `ssrf_internal` pronto desde sempre finalmente carrega, deteção por assinaturas de metadata cloud (CWE-918); discovery_agent de-duplicado — sub-sweeps SSTI/open-redirect removidos (duplicavam os especialistas com payloads piores), mantém CRLF+TRACE; `llm_injection` era o único agente sem regra de dispatch — regra contextual por marcadores), `03aada7` (**cors_agent** — probe de origin arbitrário promovido do passive scanner: ACAO refletido + credentials = critical CWE-942; same-site nunca é finding; 1 probe/endpoint), `377cc56` (**hpp_agent** — duplicação de param com canary escalado, confirmado só por reflexão (CWE-436); **rate_limit_trust_agent** — XFF/X-Real-IP refletido = trust-boundary CWE-345 + variantes de path com diferencial de status CWE-436 — o mecanismo, nunca bypass demonstrado sob carga), `b8f3060` (**graphql_abuse_agent** — escada de introspection full→reduced→minimal, field-suggestion leak, alias overload 60×, batching aceito, GraphQL-via-GET (CSRF surface), depth probing limitado — metade que o graphql_agent exclui explicitamente; payloads em `graphql_abuse.yaml`), `f550e4d` (**cache_deception_agent** — port do probe de 3 passos da tool de copilot (CWE-525): path-mapping autenticado → sinal cacheável → re-leitura anônima com markers sobrevivendo; redaction de secrets; caps de variantes). Registry: 26 → **31 agentes** | planner testa como pentester: classes novas cobertas + bugs de cobertura silenciosos eliminados | novos `dast/agents/{cors,hpp,rate_limit_trust,graphql_abuse,cache_deception}_agent.py`, `dast/payloads/graphql_abuse.yaml`, fixes em `nosql/prototype_pollution/xxe/discovery_agent.py`, `dast/ai/coordinator.py` |
+
+**Follow-ups de agentes (4-B candidatas, técnicas do ARTEX já mapeadas):**
+cswsh_agent (handshake WS raw estilo smuggling), deserialization_agent
+(URLDNS OOB seguro via Collaborator), bfla_agent (admin endpoints com sessão
+de usuário baixa + downgrade de versão /v2→/v1 — métodos seguros apenas),
+jwt RS256→HS256 key-confusion via jwks, mfa OTP reuse (prometido no docstring,
+não implementado), xss fragment location (a tool do copilot já faz),
+ssrf sink-hints (params webhook/import/avatar), HTTP/2.
 
 **Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
 (`copilot_service._gate_check_account_state`) agora delega para

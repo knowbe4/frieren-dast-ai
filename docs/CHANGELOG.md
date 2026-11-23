@@ -5,6 +5,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (agents expansion round 4-A)
+- **Five new agents** (registry 26 → 31), techniques from ARTEX api-security:
+  **cors_agent** (one crafted-Origin probe: reflected attacker origin with
+  `Access-Control-Allow-Credentials: true` = critical CWE-942; same-site
+  origins never count), **hpp_agent** (duplicated security-relevant parameters
+  with an escalated CANARY value — confirmed only by reflection, CWE-436),
+  **rate_limit_trust_agent** (XFF/X-Real-IP reflection = trust-boundary
+  CWE-345; path-normalization variants answering differently = CWE-436 — the
+  mechanism, never a bypass demonstrated under load), **graphql_abuse_agent**
+  (introspection escalation full→reduced→minimal, field-suggestion schema
+  disclosure, 60-alias overload, batch acceptance, GraphQL-over-GET, bounded
+  depth probing — the half the IDOR agent explicitly excludes), and
+  **cache_deception_agent** (the copilot WCD three-step probe promoted:
+  authenticated path-mapping → cacheable signal → anonymous re-read, confirmed
+  iff victim markers survive, CWE-525, secrets redacted).
+- **Silent coverage bugs fixed**: nosql_agent requested the NONEXISTENT yaml
+  group `where_injection` and degraded to 3 hardcoded strings (now the real
+  `mongodb_js_injection` group); prototype_pollution_agent ignored its own
+  40+-payload yaml (5 hardcoded — now adopted, plus a NEW header vector);
+  xxe_agent refused to load the ready-made `ssrf_internal` group (now wired —
+  cloud-metadata signatures → XXE-driven SSRF, CWE-918, critical);
+  llm_injection was the only registered agent with no dispatch rule (now
+  marker-gated); discovery_agent's SSTI/open-redirect sub-sweeps duplicated
+  the specialist agents with weaker payloads (removed — it keeps CRLF +
+  TRACE/TRACK; 298 → 138 lines).
+
 ### Added (LLM recorder round 3-F)
 - **LLM-call recorder** (`dast/ai/llm_recorder.py`) — every LLM attempt (failover
   candidates, repair retries, cache hits, model-resolution failures) is persisted

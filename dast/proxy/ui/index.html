@@ -1382,6 +1382,24 @@
           </div>
         </div>
         <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Target Noise (egress pacing)</p>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Proactively pace scanner probes against fragile targets (per-host token bucket, in-flight caps, whole-host pause on 429/503). Applies to agent probes, SQLi tools and copilot requests — never to your own browsing. Takes effect on the next request.</p>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <select id="sc-noise-profile"
+                    style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+              <option value="off">off — full speed (default)</option>
+              <option value="quiet">quiet — 2 req/s/host · 1 in flight · 60s pause cap</option>
+              <option value="balanced">balanced — 5 req/s/host · 2 in flight · 30s pause cap</option>
+              <option value="aggressive">aggressive — 20 req/s/host · 4 in flight · 10s pause cap</option>
+            </select>
+            <input id="sc-noise-ua" type="text" placeholder="Probe User-Agent override (optional)"
+                   style="flex:1;min-width:220px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+          <div id="noise-status" style="margin-top:8px">
+            <span style="color:var(--txt3);font-size:10px">Governor off — probes run at full speed.</span>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
           <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Validation Confidence Threshold</p>
           <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Minimum confidence (0.0–1.0) required for the LLM validator to confirm a finding. Higher values reduce false positives.</p>
           <div style="display:flex;align-items:center;gap:10px">

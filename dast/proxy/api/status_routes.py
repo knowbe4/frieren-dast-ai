@@ -222,6 +222,22 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import bedrock_client as _bc
         return await asyncio.get_running_loop().run_in_executor(None, _bc.list_models)
 
+    @router.get("/api/noise-status")
+    async def noise_status():
+        """Noise-governor state (3-G): active profile + per-host pacing counters,
+        merged with the legacy adaptive rate-limit multipliers (which were
+        tracked since before but never surfaced anywhere)."""
+        from dast.scanners import active_checks as _ac
+        from dast.scanners import noise_governor as _ng
+        snap = _ng.snapshot()
+        return {
+            "profile": _ng.profile_name(),
+            "user_agent_set": bool(_ng.user_agent()),
+            "hosts": snap["hosts"],
+            "total_sent": snap["total_sent"],
+            "rate_limit_multipliers": _ac.get_rate_limit_state(),
+        }
+
     # MCP server liveness. The MCP process (`dast-ai mcp`) is separate from the
     # dashboard and drives it over HTTP, so the dashboard only knows the MCP
     # server is up if it posts a heartbeat. `_MCP_STALE_SECONDS` must exceed the

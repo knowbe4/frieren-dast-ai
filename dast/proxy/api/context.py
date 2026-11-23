@@ -141,6 +141,8 @@ class DashboardContext:
                 "scan_budget_seconds": 300,
                 "passive_aggressive_rules": False,
                 "ai_response_cache": False,
+                "noise_profile": _settings.noise_profile,
+                "noise_user_agent": _settings.noise_user_agent,
             }
 
         # Apply tiered model defaults to bedrock_client immediately
@@ -153,6 +155,12 @@ class DashboardContext:
         # Apply the opt-in deterministic-response cache setting (default off).
         from dast.ai import response_cache as _rc
         _rc.set_enabled(bool(self._scan_cfg.get("ai_response_cache", False)))
+
+        # Noise governor (3-G): start from the env/config default profile (off
+        # unless the operator set one); runtime switches go through scan-config.
+        from dast.scanners import noise_governor as _ng
+        _ng.set_profile(str(self._scan_cfg.get("noise_profile", "off")))
+        _ng.set_user_agent(str(self._scan_cfg.get("noise_user_agent", "")))
 
     async def broadcast(self, entry) -> None:
         import json

@@ -325,3 +325,30 @@ async def test_pace_false_skips_the_governor_entirely(monkeypatch):
 
     assert resp.status_code == 200  # the race-agent path: un-paced, un-counted
     assert gov.snapshot()["hosts"] == []
+
+
+# ── dashboard route (GET /api/noise-status) ──────────────────────────────────
+
+def test_noise_status_route():
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from dast.proxy.api.status_routes import make_router
+
+    ctx = SimpleNamespace(scan_queue_state=None, mcp_last_heartbeat=[0.0])
+    app = FastAPI()
+    app.include_router(make_router(ctx))
+    client = TestClient(app)
+
+    body = client.get("/api/noise-status").json()
+    assert body["profile"] == "off"
+    assert body["hosts"] == []
+    assert "rate_limit_multipliers" in body
+
+    gov.set_profile("quiet")
+    gov.set_user_agent("DAST-AI/1.0")
+    body = client.get("/api/noise-status").json()
+    assert body["profile"] == "quiet"
+    assert body["user_agent_set"] is True

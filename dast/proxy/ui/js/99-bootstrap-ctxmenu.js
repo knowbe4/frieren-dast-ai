@@ -160,6 +160,33 @@
       showToast('Failed to copy reproduce link', true);
     }
   };
+
+  // Replay (3-I mini-Repeater): re-send the captured request THROUGH the MITM
+  // proxy so it is recorded in history (source 'replay') and match&replace
+  // applies, then jump to the fresh entry in the history list.
+  window._replayEntry = async function(id) {
+    if (!id) return;
+    showToast('Replaying through proxy…');
+    try {
+      const r = await fetch('/api/replay/' + id, {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: '{}',
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.ok) {
+        showToast(`Replay failed: ${d.error || r.status}`, true);
+        return;
+      }
+      showToast(`Replayed → ${d.status} (${Math.round(d.duration_ms)} ms)`);
+      if (typeof loadAllEntries === 'function') await loadAllEntries();
+      if (d.entry_id && typeof selectRow === 'function') selectRow(d.entry_id);
+    } catch(_) {
+      showToast('Replay failed', true);
+    }
+  };
+  window._ctxReplay = function() {
+    if (_ctxId) _replayEntry(_ctxId);
+    hideMenu();
+  };
 })();
 
 // Open the WebSocket only after every script above has loaded: ws.onopen calls

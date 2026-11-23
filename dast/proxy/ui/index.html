@@ -205,6 +205,8 @@
           <label title="Autonomous copilot requests"><input type="checkbox" id="chk-src-copilot" checked onchange="applyFilter()"> <span class="src-tag src-copilot">copilot</span></label>
           <input type="checkbox" id="chk-src-oos" style="display:none" onchange="applyFilter()">
           <div class="sep" style="margin:0 2px"></div>
+          <button class="tbtn" title="Download the in-scope history as a HAR 1.2 file"
+                  onclick="exportHistoryHar()">⇩ HAR</button>
           <label><input type="checkbox" id="chk-conn" checked onchange="applyFilter()"> Hide CONNECT</label>
           <label><input type="checkbox" id="chk-vuln" onchange="applyFilter()"> Vuln only</label>
           <label title="Show requests outside configured scope" style="color:var(--txt2)">
@@ -1109,6 +1111,24 @@
           </div>
         </div>
         <div style="margin-bottom:14px">
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Target Noise (egress pacing)</p>
+          <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Proactively pace scanner probes against fragile targets (per-host token bucket, in-flight caps, whole-host pause on 429/503). Applies to agent probes, SQLi tools and copilot requests — never to your own browsing. Takes effect on the next request.</p>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <select id="sc-noise-profile"
+                    style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 10px;border-radius:3px;font-family:inherit;font-size:12px;width:340px">
+              <option value="off">off — full speed (default)</option>
+              <option value="quiet">quiet — 2 req/s/host · 1 in flight · 60s pause cap</option>
+              <option value="balanced">balanced — 5 req/s/host · 2 in flight · 30s pause cap</option>
+              <option value="aggressive">aggressive — 20 req/s/host · 4 in flight · 10s pause cap</option>
+            </select>
+            <input id="sc-noise-ua" type="text" placeholder="Probe User-Agent override (optional)"
+                   style="flex:1;min-width:220px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:5px 8px;border-radius:3px;font-family:inherit;font-size:12px">
+          </div>
+          <div id="noise-status" style="margin-top:8px">
+            <span style="color:var(--txt3);font-size:10px">Governor off — probes run at full speed.</span>
+          </div>
+        </div>
+        <div style="margin-bottom:14px">
           <p style="color:var(--txt2);font-size:10px;margin-bottom:6px;font-weight:600;text-transform:uppercase;letter-spacing:.4px">Validation Confidence Threshold</p>
           <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Minimum confidence (0.0–1.0) required for the LLM validator to confirm a finding. Higher values reduce false positives.</p>
           <div style="display:flex;align-items:center;gap:10px">
@@ -1160,6 +1180,27 @@
       <!-- Payload sources -->
       <h3>Payload Sources</h3>
       <div id="ai-payload-sources" style="margin-bottom:20px"></div>
+
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- LLM usage (round 3-F recorder) -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <h3 style="margin:0">LLM Usage</h3>
+        <span style="font-size:10px;color:var(--txt2)">every LLM call since dashboard start — totals, purposes, recent attempts</span>
+        <button class="tbtn" onclick="clearAiUsage()" style="margin-left:auto">Clear counters</button>
+      </div>
+      <div id="ai-usage" style="margin-bottom:20px">
+        <div style="color:var(--txt2);font-size:11px">No LLM calls recorded yet.</div>
+      </div>
+
+      <!-- Coverage ledger (3-H) -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <h3 style="margin:0">Coverage</h3>
+        <span style="font-size:10px;color:var(--txt2)">what scans examined / ruled out / left open — a class with no entry is untested, never clean</span>
+      </div>
+      <div id="ai-coverage" style="margin-bottom:20px">
+        <div style="color:var(--txt2);font-size:11px">No coverage recorded yet — run a scan.</div>
+      </div>
 
     </div>
     </div><!-- end ai-sub-settings -->
@@ -1311,6 +1352,16 @@
               <input id="mr-replace" placeholder="e.g. Authorization: Bearer token123" spellcheck="false"
                      style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
             </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Host matcher (optional)</label>
+              <input id="mr-host" placeholder="api.example.com or *.example.com" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">URL matcher (optional regex over path+query)</label>
+              <input id="mr-url-regex" placeholder="e.g. ^/api/v2/" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
           </div>
           <div style="margin-bottom:8px">
             <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Comment (optional)</label>
@@ -1331,6 +1382,8 @@
                 <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Type</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Match</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Replace</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Scope matchers</th>
+                <th style="padding:3px 8px;text-align:right;font-weight:500" title="times this rule changed a request/response">Hits</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Comment</th>
                 <th style="width:26px;padding:3px 4px"></th>
               </tr>
@@ -2249,7 +2302,10 @@
   <div class="ctx-item ctx-sep" onclick="_ctxSendAI()">
     <span class="ctx-icon">▶</span> Scan with AI
   </div>
-  <div class="ctx-item ctx-sep" onclick="_ctxCopyUrl()">
+  <div class="ctx-item ctx-sep" onclick="_ctxReplay()">
+    <span class="ctx-icon">↻</span> Replay through proxy
+  </div>
+  <div class="ctx-item" onclick="_ctxCopyUrl()">
     <span class="ctx-icon">⎘</span> Copy URL
   </div>
   <div class="ctx-item" onclick="_ctxCopyCurl()">

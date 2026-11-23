@@ -18,6 +18,7 @@ delete, …) are never clicked or submitted.
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import uuid
 from typing import Callable, List, Optional
@@ -622,7 +623,9 @@ class SpaExplorer:
 
         self._vision_calls += 1
         try:
-            targets = await vision_clickables(page, bedrock_client.invoke_json, _VIEWPORT)
+            targets = await vision_clickables(
+                page, functools.partial(bedrock_client.invoke_json, purpose="explore"),
+                _VIEWPORT)
         except Exception as exc:  # noqa: BLE001 — vision is best-effort
             logger.warning("explorer: vision nav failed", error=str(exc))
             return 0

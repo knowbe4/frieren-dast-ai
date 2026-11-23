@@ -144,3 +144,40 @@ def _isolate_provider_health():
     provider_health.reset()
     yield
     provider_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_recorder(tmp_path, monkeypatch):
+    """Redirect the LLM-call recorder's JSONL sink to a per-test tmp dir and
+    reset the in-memory ring/counters around every test. Tests that exercise
+    the real ``_invoke_raw`` walk (failover, model fallback — and the recorder
+    suite itself) now record one entry per attempt; without the redirect each
+    of those would append to the developer's real ~/.dast-ai/llm_calls file
+    and leak counters across tests."""
+    from dast.ai import llm_recorder  # noqa: PLC0415
+    monkeypatch.setattr(llm_recorder, "_CALLS_DIR", tmp_path / "llm_calls")
+    llm_recorder.clear()
+    yield
+    llm_recorder.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_noise_governor():
+    """Back to the off profile around every test. Tests that pace probes set
+    a real noise profile; without the reset one of those profiles leaked into
+    later tests and silently changed their pacing/timing."""
+    from dast.scanners import noise_governor  # noqa: PLC0415
+    noise_governor.reset()
+    yield
+    noise_governor.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_coverage_ledger():
+    """Empty the coverage ledger around every test — the store is process-wide
+    and the coordinator writes into it during scans; without the reset one
+    test's entries leaked into another test's planner prompts and snapshots."""
+    from dast.coverage import ledger  # noqa: PLC0415
+    ledger.reset()
+    yield
+    ledger.reset()

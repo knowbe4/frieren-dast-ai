@@ -29,16 +29,20 @@ function switchBrowseSub(sub) {
 // ── AI panel (settings) ────────────────────────────────────────────────
 async function loadAiPanel() {
   try {
-    const [agentsR, graphR, ctxR, tmR] = await Promise.all([
+    const [agentsR, graphR, ctxR, tmR, usageR, covR] = await Promise.all([
       fetch('/api/ai/agents'),
       fetch('/api/service-graph'),
       fetch('/api/ai/app-context'),
       fetch('/api/ai/threat-models'),
+      fetch('/api/ai/usage'),
+      fetch('/api/coverage'),
     ]);
     const agentsData = await agentsR.json();
     const graphData = await graphR.json();
     const ctxData   = ctxR.ok ? await ctxR.json() : {};
     const tmData    = tmR.ok  ? await tmR.json()  : {};
+    const usageData = usageR.ok ? await usageR.json() : {};
+    const covData   = covR.ok ? await covR.json() : {};
 
     // App context
     const ctxEl = document.getElementById('ai-app-context');
@@ -180,9 +184,114 @@ async function loadAiPanel() {
         </table>`;
     }
 
+    // LLM usage (round 3-F recorder)
+    const usageEl = document.getElementById('ai-usage');
+    if (usageEl && usageData && usageData.totals) {
+      const t = usageData.totals;
+      if (!t.calls) {
+        usageEl.innerHTML = '<div style="color:var(--txt2);font-size:11px">No LLM calls recorded yet.</div>';
+      } else {
+        const _card = (label, value, color) => `
+          <div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;padding:8px 12px;min-width:96px">
+            <div style="font-size:9px;text-transform:uppercase;letter-spacing:.4px;color:var(--txt2)">${label}</div>
+            <div style="font-size:15px;font-weight:700;color:${color}">${value}</div>
+          </div>`;
+        const errors = (t.throttled||0)+(t.provider_error||0)+(t.unavailable||0)+(t.caller_error||0);
+        const _oc = {ok:'var(--green)', cache_hit:'var(--blue)', safety_block:'var(--orange)',
+                     throttled:'var(--orange)', provider_error:'var(--red)',
+                     unavailable:'var(--red)', caller_error:'var(--red)'};
+        const _miniTable = (title, obj) => Object.keys(obj||{}).length ? `
+          <div style="flex:1;min-width:220px">
+            <div style="font-weight:600;color:var(--txt2);margin-bottom:4px">${title}</div>
+            ${Object.entries(obj).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`
+              <div style="display:flex;justify-content:space-between;padding:1px 0;font-size:10px">
+                <span style="color:var(--txt);font-family:monospace">${esc(k)}</span>
+                <span style="color:var(--txt2)">${v}</span>
+              </div>`).join('')}
+          </div>` : '';
+        const recent = (usageData.recent||[]).slice(-20).reverse();
+        usageEl.innerHTML = `
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+            ${_card('Calls', t.calls, 'var(--txt)')}
+            ${_card('OK', t.ok||0, 'var(--green)')}
+            ${_card('Cache hits', t.cache_hit||0, 'var(--blue)')}
+            ${_card('Safety blocks', t.safety_block||0, 'var(--orange)')}
+            ${_card('Errors', errors, 'var(--red)')}
+            ${_card('Tokens in/out', `${t.input_tokens||0} / ${t.output_tokens||0}`, 'var(--txt)')}
+            ${_card('Avg latency', `${t.latency_ms_avg||0} ms`, 'var(--txt)')}
+          </div>
+          <div style="display:flex;gap:24px;flex-wrap:wrap;margin-bottom:10px">
+            ${_miniTable('By purpose', usageData.by_purpose)}
+            ${_miniTable('By model', usageData.by_model)}
+          </div>
+          ${recent.length ? `
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead><tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Time</th>
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Purpose</th>
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Model</th>
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Outcome</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">Tokens</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">ms</th>
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Error</th>
+            </tr></thead>
+            <tbody>${recent.map(e=>`
+              <tr style="border-bottom:1px solid var(--bdr3,#252525)">
+                <td style="padding:3px 6px;color:var(--txt3)">${esc(e.ts||'')}</td>
+                <td style="padding:3px 6px;color:var(--txt);font-family:monospace">${esc(e.purpose||'')}</td>
+                <td style="padding:3px 6px;color:var(--txt2);font-family:monospace">${esc(e.model||'')}</td>
+                <td style="padding:3px 6px;color:${_oc[e.outcome]||'var(--txt2)'}">${esc(e.outcome||'')}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${(e.input_tokens||0)+(e.output_tokens||0)}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${Math.round(e.latency_ms||0)}</td>
+                <td style="padding:3px 6px;color:var(--txt3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px" title="${esc(e.error_excerpt||'')}">${esc(e.error_excerpt||'')}</td>
+              </tr>`).join('')}</tbody>
+          </table>` : ''}
+          ${usageData.response_cache ? `<div style="margin-top:8px;color:var(--txt3);font-size:10px">Response cache: ${usageData.response_cache.enabled?'on':'off'} · ${usageData.response_cache.entries} entries · ${usageData.response_cache.hits} hits / ${usageData.response_cache.misses} misses</div>` : ''}
+        `;
+      }
+    }
+    renderCoverage(covData);
+
   } catch(e) {
     console.error('loadAiPanel:', e);
   }
+}
+
+async function clearAiUsage() {
+  const r = await fetch('/api/ai/usage/clear', {method: 'POST'});
+  if (r.ok) { showToast('LLM usage counters cleared'); loadAiPanel(); }
+  else showToast('Clear failed');
+}
+
+// ── Coverage ledger (3-H) ─────────────────────────────────────────────────────
+async function renderCoverage(covData) {
+  const covEl = document.getElementById('ai-coverage');
+  if (!covEl || !covData || !covData.hosts) return;
+  const hosts = Object.keys(covData.hosts);
+  if (!hosts.length) {
+    covEl.innerHTML = '<div style="color:var(--txt2);font-size:11px">No coverage recorded yet — run a scan.</div>';
+    return;
+  }
+  const _oc = {reported:'var(--green)', no_issue_found:'var(--blue)', ruled_out:'var(--txt)',
+               not_applicable:'var(--txt3)', needs_follow_up:'var(--orange)'};
+  covEl.innerHTML = hosts.map(h => {
+    const d = covData.hosts[h];
+    const chips = Object.entries(d.outcomes).map(([k, v]) =>
+      `<span style="background:var(--bg3);border:1px solid var(--bdr);border-radius:3px;padding:1px 6px;margin-right:4px;color:${_oc[k]||'var(--txt)'}">${esc(k)}: ${v}</span>`).join('');
+    const gaps = (d.needs_follow_up || []).map(g =>
+      `<div style="color:var(--orange);font-size:10px;padding:1px 0;font-family:monospace">${esc(g)}</div>`).join('');
+    return `<div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                        padding:12px 14px;margin-bottom:12px;font-size:11px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+        <span style="font-weight:700;color:var(--blue)">${esc(h)}</span>
+        <span style="color:var(--txt2)">${d.entries} covered class${d.entries === 1 ? '' : 'es'}</span>
+        <span style="color:var(--green)">${d.findings} finding${d.findings === 1 ? '' : 's'}</span>
+        <span style="color:var(--txt3);font-size:10px;margin-left:auto">updated ${esc(d.last_updated_at)}</span>
+      </div>
+      <div style="margin-bottom:6px">${chips}</div>
+      ${gaps ? `<div style="font-weight:600;color:var(--txt2);margin-bottom:2px">Open follow-ups (covered, but not settled)</div>${gaps}` : ''}
+    </div>`;
+  }).join('');
 }
 
 async function mergeHosts() {

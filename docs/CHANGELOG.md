@@ -5,6 +5,130 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (LLM recorder round 3-F)
+- **LLM-call recorder** (`dast/ai/llm_recorder.py`) — every LLM attempt (failover
+  candidates, repair retries, cache hits, model-resolution failures) is persisted
+  as one JSONL record under `~/.dast-ai/llm_calls/llm_calls.jsonl` (0700 dir,
+  login_journal pattern) with an outcome taxonomy (`ok`/`cache_hit`/
+  `safety_block`/`throttled`/`provider_error`/`unavailable`/`caller_error`),
+  usage normalised across Anthropic/OpenAI shapes, latency (sanitised against
+  NaN/negative), and ≤500-char request/response excerpts + ≤200-char error
+  excerpts — prompts carry untrusted target content, so bodies are never stored
+  in full. The safety-classifier refusal excerpt is captured at the raise site,
+  before the generic `AiContentBlockedError` replaces it.
+- **`purpose` labels on every LLM call site** (~30 across `dast/`) — planner,
+  copilot_step/copilot_repair, triage_* (verdict/analyse/repair/dns/ssrf/enrich),
+  probe_classifier, mutator, payload_gen/mutation, response_analyzer, the agents
+  (idor/race/bola), login_llm, explore, suggestions, importers, passive/graphql
+  validators, code analysis and chain planner — so the recorder and the panel
+  show WHAT a refused or failing call was for instead of a generic "other".
+- **Usage panel** — `GET /api/ai/usage` + `POST /api/ai/usage/clear` (status
+  routes) and an "LLM Usage" section in the dashboard AI tab: stat cards
+  (calls/ok/cache hits/safety blocks/errors/tokens/avg latency), by-purpose and
+  by-model tables, the 20 most recent attempts with outcome coloring and error
+  excerpts, plus the response-cache stats. Unit suite: recorder core, the real
+  `_invoke_raw` wiring (failover/repair/cache paths) and the route round-trip.
+
+### Changed (roadmap re-baseline vs ARTEX 0.7.0)
+- `docs/ROADMAP.md` §4 re-baselined against upstream `BaaRai/ARTEX` 0.7.0
+  (2026-11-21; the old local `/opt/tools/artex-global` copy no longer exists on
+  this machine — GitHub is the source now): the "no rate limit" weakness is
+  fixed upstream (noise governor), guardrails are far harder (closed-question
+  judge, untrusted boundary), and the updated borrow-list feeds new rounds
+  **3-G** (noise governor), **3-H** (coverage ledger) and **3-I** (match&replace
+  + traffic replay + HAR export). ARTEX still has NO target-login mechanism —
+  its api-recon skill forbids real credentials — so frieren's login stack
+  (vault, verify_authenticated, recoverable breaker, agentless three-gates)
+  remains far ahead; nothing to copy there.
+
+### Added (noise governor round 3-G)
+- **Noise governor** (`dast/scanners/noise_governor.py`) — proactive per-host
+  pacing for scanner-originated egress, borrowed from ARTEX 0.7.0's egress
+  governor. Operator-chosen profiles (`off` default / `quiet` / `balanced` /
+  `aggressive`, with ARTEX's concrete numbers) bound every probe through a
+  per-host token bucket with jitter, per-host and global in-flight slots, a
+  whole-host pause after a 429/503 (Retry-After honoured up to the profile
+  cap) and an optional probe User-Agent override. Acquisition order follows
+  ARTEX (host slot → bucket wait → global slot last) and waits fail open at
+  60s — pacing can stall a probe but never deadlock a scan. `off` is a strict
+  passthrough: one cheap `active()` check, zero behavior change.
+- **Scanner egress wired** — `active_checks._send` (the chokepoint every agent
+  probe flows through) takes the paced slot BEFORE the scan concurrency
+  controls and subsumes the flat probe delay while pacing; a 429/503 now also
+  pauses the whole host so concurrent probes queue instead of each re-paying
+  the rejection. The race-condition agent opts out (`pace=False` — the burst
+  IS the experiment), as do raw-socket smuggling probes naturally. The
+  `sqli_probe_tools` send path and both `http_tools` request sites (copilot
+  `send_request` + the unauth-access check) are paced too. Operator browsing,
+  login flows and the SPA crawler are untouched in v1.
+- **Target Noise dashboard control** — `noise_profile` + `noise_user_agent`
+  in scan config (runtime switch, unknown profiles fall back to `off`),
+  `GET /api/noise-status` with per-host sent/in-flight/peak/backoff counters
+  plus the legacy adaptive rate-limit multipliers (tracked but never surfaced
+  until now), and a Target Noise card in the scan-config panel polling every
+  10s. When a profile is active the planner prompt gains a code-owned
+  low-noise note (precision over volume, no parallel bursts); with `off` the
+  prompt is byte-for-byte identical to before.
+
+### Added (coverage ledger round 3-H)
+- **Coverage ledger** (`dast/coverage/ledger.py`) — a durable record of what
+  scans EXAMINED / RULED OUT / LEFT OPEN per (endpoint, attack class),
+  distilled from ARTEX's coverage ledger (#207). Closed outcome vocabulary
+  (`reported` / `no_issue_found` / `ruled_out` / `not_applicable` /
+  `needs_follow_up`), upsert last-write-wins with bounded history, ARTEX caps
+  enforced as errors (never silent truncation), and every stored field
+  normalised to one line (entries reach the planner prompt — anti-injection).
+  Two central invariants: **a class with no entry is UNEXAMINED, never
+  clean**, and an incomplete run always carries a caveat — the absence of a
+  finding is never a clean bill.
+- **Machine-observed recording** — the Coordinator writes one entry per
+  dispatched attack_type (findings → reported with titles as evidence; the
+  agent's own waf/rate-limit/structural observations → needs_follow_up; a
+  clean run → no_issue_found with probe-count evidence). Until now "ran and
+  found nothing" only lived in a rotating 200-line activity log.
+- **Planner coverage feed** — a gated `[Coverage ledger]` section in the
+  planner prompt (top gaps, unrecorded classes first, lines fenced untrusted)
+  so a replan or rescan tests like a human: covered classes are labelled
+  EXAMINED — not skipped — and the untested ones lead. With an empty ledger
+  the prompt is byte-for-byte identical to before.
+- **Persistence + dashboard** — the scan worker copies the endpoint's rows
+  onto the history entry (survives session save/restore), `GET /api/coverage`
+  serves the per-host aggregation, and the AI panel gains a Coverage card
+  (outcome chips, open follow-ups in orange).
+
+### Added (rewrite rules + replay + HAR round 3-I)
+- **Rewrite rules** — the proxy match&replace evolved toward ARTEX-style
+  rewrite rules: every rule gains a stable id (no more index-based toggle that
+  broke on removal), optional matchers (methods list, host exact or
+  `*.suffix`-excluding-apex, url regex over path+query, response-only status
+  `404`/`4xx` — AND semantics), persisted hit counters, and validation as
+  ERRORS (invalid regex/enum/status and the ARTEX caps of 100 rules / 50
+  enabled return 400 instead of the old silent regex fallback). Body rules
+  skip whole on oversized (>1 MiB) or encoded bodies and no-body responses
+  (HEAD/1xx/204/304). `apply_to_response` finally receives a real URL (url
+  rules in response scope never worked) and the response gate now excludes
+  crawler traffic like the request gate. Every exchange records WHICH rules
+  fired: `ProxyEntry.rewritten_by` (persisted) replaces the fragile
+  header-diff heuristic; the settings UI gains matcher inputs, a matchers
+  column and a Hits column. Legacy rules without ids are migrated on load.
+- **Entry replay (mini-Repeater)** — `POST /api/replay/{entry_id}` re-sends a
+  captured request THROUGH the MITM proxy, so it is RECORDED in history with
+  source `replay` and the operator's rewrite rules apply (attributed via
+  `rewritten_by`) — unlike `/api/repeater/send`, which bypasses the proxy.
+  Rebuilt from the raw stored fields, hop-by-hop/internal headers stripped,
+  fresh-cookie opt-in, 8 MiB body cap / 60 s timeout / 2 MiB response cap /
+  502 on upstream error, and the response carries the fresh entry id to jump
+  to. Excluded from pending-import matching and session intelligence
+  (operator verification, not discovery). UI: context-menu item, ↻ Replay
+  button in the detail-pane summary, `replay` source tag.
+- **HAR 1.2 export** — `dast/proxy/har_export.py` (pure generator) +
+  `GET /api/history/export/har`: in-scope history as a spec-compliant HAR
+  file with stable (ts, id) ordering, explicit placeholders for unrecorded
+  timings, multi-Set-Cookie pairs, text-vs-base64 body encoding, userinfo
+  redaction, and never-silent truncation (1000 entries / 20 MiB raw / 31 MiB
+  marshalled caps reported via `X-DAST-HAR-*` headers and log fields). A ⇩ HAR
+  button sits in the history filter bar.
+
 ### Added (new agents round 3-E)
 - **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
   framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours

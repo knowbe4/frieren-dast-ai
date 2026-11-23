@@ -152,6 +152,8 @@ function _dpSummary(d) {
       <span class="dp-meta">${meta}</span>
       <span class="dp-fill"></span>
       ${_dpFindingsBadge(d)}
+      ${d.id && d.status ? `<button class="tbtn" style="font-size:9px;padding:1px 6px" title="Re-send this request through the MITM proxy (recorded in history)"
+                              onclick="_replayEntry('${esc(String(d.id))}')">↻ Replay</button>` : ''}
     </div>
     <div class="dp-url" title="${esc(d.url || '')}"><span class="dp-host">${esc(host)}</span><span class="dp-path">${esc(pathAndQuery)}</span></div>
   </div>`;

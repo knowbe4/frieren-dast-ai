@@ -173,6 +173,11 @@ class Settings(BaseSettings):
     parallel_workers: int = 4
     request_delay_ms: int = 100
     browser_headless: bool = True
+    # Noise governor (3-G): proactive per-host egress pacing for scanner traffic
+    # (borrowed from ARTEX 0.7.0). Startup defaults — switchable at runtime via
+    # POST /api/scan-config (the dashboard "Target Noise" card).
+    noise_profile: str = "off"          # off | quiet | balanced | aggressive
+    noise_user_agent: str = ""          # probe UA override (empty = keep as-is)
 
     # Attack engine
     max_attack_iterations: int = 3

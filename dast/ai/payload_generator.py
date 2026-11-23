@@ -100,7 +100,9 @@ Respond with JSON array. Each item must have:
 Generate up to 10 payloads, prioritized by likelihood of success."""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user, schema=PAYLOAD_GEN_SCHEMA)
+        result = bedrock_client.invoke_json(system=_SYSTEM_PAYLOAD_GEN, user=user,
+                                            schema=PAYLOAD_GEN_SCHEMA,
+                                            purpose="payload_gen")
         payloads = []
         items = result if isinstance(result, list) else result.get("payloads", [])
         if not isinstance(items, list):
@@ -168,7 +170,9 @@ Respond with JSON:
 (new_payload is required only when action is mutate or different_param)"""
 
     try:
-        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user, schema=PAYLOAD_MUTATION_SCHEMA)
+        result = bedrock_client.invoke_json(system=_SYSTEM_MUTATION, user=user,
+                                            schema=PAYLOAD_MUTATION_SCHEMA,
+                                            purpose="payload_mutation")
         if result.get("action") == "stop":
             return None
 

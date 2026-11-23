@@ -1,4 +1,4 @@
-# Frieren DAST-AI — Roadmap e Auditorias (2026-11-15)
+# Frieren DAST-AI — Roadmap e Auditorias (2026-11-22)
 
 > Documento de estado e plano. Gerado a partir da comparação com o ARTEX
 > (`/opt/tools/artex-global`, pentest autônomo multi-agente em Go) e de duas
@@ -179,20 +179,59 @@ gargalo — dispatch e evidência contextual são.
    análise estática dos bundles JS (isLogin/getToken/localStorage, interceptors
    axios, código de permissão/menu) + hook/stub runtime das APIs de
    auth/permission com respostas fake → SPA renderiza o shell pós-login SEM
-   backend session → gravar o tráfego outbound de API. Base da rodada 2-D
+   backend session → gravar o tráfego outbound de API. ✅ Base da rodada 2-D
 2. **proxyEnv + CA trust por ecossistema** (`agent/worker.go:194-224`):
    SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, GIT_SSL_CAINFO,
    NODE_EXTRA_CA_CERTS, NODE_USE_ENV_PROXY injetados em todo subprocess
 3. **Tráfego como banco pesquisável** (SQLite+FTS, `body_contains`) —
    "arqueologia de sessão" entre workers
-4. **Headless browser como tool de primeira classe auto-ligada ao MITM**
+4. **Headless browser como tool de primeira classe auto-ligado ao MITM**
    (`server/manager.go:syncBrowserMCPProxy`)
 5. **Transcript durável por intent** (WorkerSessionID + Resume) — login pela
    metade é retomável
-6. Já roubado na rodada 1: wrap-up (`agent/wrapup.go`) e llmpool (health)
+6. Já roubado: wrap-up e llmpool/health (rodada 1); **gravador de LLM**
+   (`llmrec/` upstream) → ✅ rodada 3-F frieren (JSONL por tentativa + painel de
+   uso); telemetria de contexto do `llmrec` segue como follow-up (item 11)
 
-Fraco no ARTEX (não imitar): guardrails prompt-first desativáveis, sem rate
-limit, plaintext creds no Postgres, sem multi-user.
+**Re-baseline vs upstream `BaaRai/ARTEX` 0.7.0 (2026-11-21):** a cópia local
+`/opt/tools/artex-global` não existe nesta máquina — a fonte agora é o GitHub
+(cópia de referência: `~/Downloads/ARTEX-main`). Novidade relevante no upstream:
+
+7. **Noise governor / target noise profile** (#205/#212/#233): token bucket por
+   host com jitter, caps de in-flight, backoff 429/503, dedup GET com cache
+   curto, UA configurável, chaveável em runtime — e os limites são injetados nos
+   prompts dos agentes (nmap/nuclei/ffuf/sqlmap paced, inclusive via proxy do
+   Bash). O antigo "sem rate limit" **não é mais verdade**; rate limit de
+   egress é o que falta ao frieren para escanear targets frágeis com segurança
+   — ✅ roubado na rodada 3-G frieren (ver linha 3-G do §5)
+8. **Coverage ledger** (#207): o worker registra o que examinou / descartou /
+   deixou aberto por superfície e classe de risco; gaps alimentam o planner e o
+   relatório — ataca direto o buraco de descoberta de cobertura do §3.3
+   — ✅ roubado na rodada 3-H frieren (v1 machine-observed; ver linha 3-H do §5)
+9. **Rewrite rules + tamper hooks** (`traffic/rewrite`, `traffic/hookvm`):
+   match&replace estilo Burp com dry-run, versionamento/rollback e limites duros
+   (hooks operator-only, Go-subset sandboxed, off por default)
+   — rewrite rules ✅ roubado na rodada 3-I frieren (hooks/VM seguem fora de escopo)
+10. **HAR 1.2 import/export + traffic replay** (#266): replay de request
+    gravada do tráfego = mini-Repeater; export HAR para entrega de report
+    — ✅ replay + export HAR roubados na rodada 3-I frieren (import HAR segue aberto)
+11. **Context telemetry** (`llm_context` + `/api/llm/context/summary`): bytes
+    por seção do prompt, ratios cache_read/input, p50/p90/p99 por (worker,
+    model) — follow-up natural da 3-F
+12. **Budgets hierárquicos** (#206): budget por task e por intent (mín. com o
+    do pai), reserva força wrap-up — versão sistemática do watchdog do copilot
+13. **Closed-question judge** (#208): juiz LLM responde 8 perguntas fixas e o
+    CÓDIGO decide (falha → ask, nunca allow) — padrão para validação honesta
+
+Fraco no ARTEX (não imitar) — atualizado em 2026-11-22 vs 0.7.0: ~~sem rate
+limit~~ (corrigido pelo noise governor) e ~~guardrails prompt-first
+desativáveis~~ (muito mais fortes: untrusted boundary, adversarial gates,
+closed-question judge com o código dono da decisão). Seguem fracos: plaintext
+creds no Postgres, sem multi-user. **Login de target continua AUSENTE** — o
+skill `api-recon` proíbe login real/credenciais (confirmado no SKILL.md da
+cópia 2026-11): o sistema de login do frieren (vault, verify_authenticated,
+breaker recuperável, three-gates agentless) segue muito à frente; nada a copiar
+daqui.
 
 ---
 
@@ -205,10 +244,14 @@ limit, plaintext creds no Postgres, sem multi-user.
 | **2-C Agents quick wins** — ✅ FEITA (2026-11-16): `3a35f6f` (XXE OOB: 3 falhas empilhadas + prefixo no `was_hit` para sub-paths), `d2f2808` (dispatch dos 8 órfãos + nota do planner), `e8269da` (canaries blind time/OOB), `fac289d` (`probe_common.py`: injector + time-oracle + OOB confirm; SSTI body/multipart), `b886dc8` (oracle booleano SQLi com âncora + reprodução). Adiado: unificação das 4 similaridades divergentes (bandas intencionais) e dedup JWT (vai com o agente JWT da 3-E) | bug XXE; regras determinísticas para os 8 órfãos; canaries blind (time SLEEP vs zero-control + OOB); SSTI body/multipart via injector compartilhado; oracle booleano SQLi | `dast/agents/xxe_agent.py`, `dast/ai/coordinator.py`, `dast/agents/ssti_agent.py`, `dast/agents/sqli_agent.py`, novo `dast/agents/probe_common.py` |
 | **2-D Agentless auth-bypass (ARTEX)** — ✅ FEITA (2026-11-16): `a32cf0d` (`dast/browser/auth_gates.py`: detecção estática + storage hook + route stub; wiring em `proxied_browser_context`), `f04468a` (modo `bypass_auth` no SpaExplorer em 2 rodadas + tool `explore` + worker; teste de integração com SPA guardada client-side). Browse (agent_browser) documentado como follow-up | three auth gates no JS + hook/stub das APIs de auth no browser → pós-login sem credenciais, gravando o tráfego de API — novo modo do browse/spa_explorer | `dast/proxy/spa_explorer.py`, `dast/browser/*`, novo módulo de auth-gates |
 | **3-E Novos agents** — ✅ FEITA (2026-11-16): `571e11b` (`smuggling_agent`: raw-socket CL.TE/TE.CL por diferencial de resposta + hints → `focus_attack_types` + regra CL+TE + coverage), `6a52276` (`jwt_agent`: alg:none/weak-secret/escalation/kid via probe_common proxy-routed + `_PARAM_ATTACK_MAP["token"]: ["jwt"]` + regra JWT-bearing). Detalhe de design: smuggling exige cliente raw direto (proxy/_send re-enquadram CL/TE); detecção por contagem de respostas vs controle (não timing) | request smuggling ativo (CL.TE/TE.CL com o time-oracle existente, disparado pelos hints de `dast/plugins/request_smuggling_hints.py`) + JWT como VulnAgent registrado | novo `dast/agents/smuggling_agent.py`, `dast/agents/jwt_agent.py`, `dast/agents/__init__.py`, `dast/ai/coordinator.py` |
-| **3-F Gravador de LLM** | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
+| **3-F Gravador de LLM** — ✅ FEITA (2026-11-22, branch `feat/llm-recorder`): `839a512` (`dast/ai/llm_recorder.py`: JSONL por tentativa no chokepoint `_invoke_raw`, ring + counters; outcomes ok/cache_hit/safety_block/throttled/provider_error/unavailable/caller_error; excerpts request/response ≤500 e erro ≤200; refusal capturado no raise site; latency sanitizada), `ac1b192` (`purpose=` em todos os ~30 call sites — planner, copilot, triage, agents, login, explore…), `a541e64` (GET `/api/ai/usage` + POST `/api/ai/usage/clear` + painel LLM Usage). Follow-up: telemetria de contexto (4.11) | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
+| **3-G Noise governor (ARTEX 4.7)** — ✅ FEITA (2026-11-23, branch `feat/noise-governor`): `6d0c77a` (`dast/scanners/noise_governor.py`: perfis quiet/balanced/aggressive com os números do ARTEX, token bucket lazy por host, slots in-flight host+global — ordem host→bucket→global, pausa `notBefore` do host inteiro em 429/503 com Retry-After capado, UA configurável, wait fail-open 60s; off = passthrough; clock injetável p/ testes), `5521605` (wiring no chokepoint `_send` com kwarg `pace` — slot paced ANTES da concorrência de scan, delay fixo subsumido, UA no `forward_headers`, race agent com `pace=False` pois o burst É o experimento; `_send_value` do sqli_probe_tools + 2 sites do http_tools paced), `bfecdd4` (chaves `noise_profile`/`noise_user_agent` no scan-config + `GET /api/noise-status` com contadores por host + card Target Noise no dashboard com poll 10s), `2b8107f` (nota low-noise no prompt do planner, code-owned; off = prompt byte-a-byte igual). v1 mínimo: sem GET-dedup e sem retry (seguem os oráculos de tempo); crawler e browsing do operador fora do pacing | rate limit pró-ativo de egress por perfil de operador para targets frágeis (o ARTEX 0.7.0 corrigiu o próprio "sem rate limit") | novo `dast/scanners/noise_governor.py`, `dast/scanners/active_checks.py`, `dast/tools/sqli_probe_tools.py`, `dast/tools/http_tools.py`, `dast/agents/race_condition_agent.py`, `dast/proxy/api/{context,settings_routes,status_routes}.py`, `dast/ai/coordinator.py`, UI scan-config |
+| **3-H Coverage ledger (ARTEX 4.8)** — ✅ FEITA (2026-11-23, branch `feat/coverage-ledger`): `70bc647` (`dast/coverage/ledger.py`: entradas por (superfície=chave de scan, risk_area=attack_type) com outcome fechado reported/no_issue_found/ruled_out/not_applicable/needs_follow_up; upsert última-vence + histórico limitado; caps do ARTEX como ERRO nunca truncamento; campos normalizados a uma linha — anti-injection, vão para o prompt; gaps derivados com o invariante central primeiro: **classe sem entrada = unexamined, nunca clean**; completude com caveat nunca vazio — ausência de finding ≠ alvo limpo), `8947cbf` (`Coordinator._record_coverage` machine-observed por attack_type despachado + seção `[Coverage ledger]` gated no `_plan` com top-3 gaps fenced untrusted — prompt byte-a-byte igual sem entradas), `fbfc5d7` (`ProxyEntry.coverage_ledger` persistido pelo scan_worker no finally + `GET /api/coverage` + card Coverage no AI panel). v1 machine-observed: a tool `record_coverage` de LLM para o copilot fica de follow-up | registro durável de EXAMINADO/DESCARTADO/ABERTO por endpoint×classe (hoje "rodou e não achou" é efêmero no log rotativo) → planner testa como humano (não repete classe limpa, segue o gap aberto) e dashboard mostra o que falta testar | novo `dast/coverage/ledger.py`, `dast/ai/coordinator.py`, `dast/proxy/session_store.py`, `dast/proxy/workers/scan_worker.py`, `dast/proxy/api/status_routes.py`, UI AI panel |
+| **3-I Rewrite rules + replay + HAR (Burp/ARTEX 4.9-4.10)** — ✅ FEITA (2026-11-23, branch `feat/rewrite-replay-har`): rewrite rules (evolução do match&replace de `proxy_settings.py`: matchers methods/host exato-ou-`*.sufixo`/url_regex path+query/status response-only com AND, ids estáveis uuid — fim dos toggles por índice, contadores hits/last_applied_at persistidos, validação como ERRO (regex/enum/caps 100/50 → 400) em vez do fallback silencioso, skips de integridade p/ body (1 MiB/encoded/HEAD-1xx-204-304), migration de rules legadas; `apply_to_response` agora recebe url real e o gate response exclui crawler; trace na entry: `ProxyEntry.rewritten_by` substitui o diff frágil de headers), replay (`POST /api/replay/{id}`: re-envia a request CRUA da entry VIA O PROXY → gravada no history com source `replay`, match&replace aplicado e atribuído; strip de hop-by-hop/x-dast-*; fresh_cookie opcional; caps 8 MiB/60s/resposta 2 MiB; exclusão de pending-import e session-intelligence; UI: item de context menu + botão ↻ Replay no detail pane + `_SRC_TAG['replay']`), HAR 1.2 export (`dast/proxy/har_export.py` puro + `GET /api/history/export/har` sobre in-scope entries: ordem estável (ts,id), placeholders explícitos (timings -1/time 0/cookies[]), pares de headers com multi-Set-Cookie, texto vs base64, redaction de userinfo, caps 1000/20 MiB/31 MiB com truncamento nunca-silencioso `X-DAST-HAR-*`; botão ⇩ HAR na filter bar) | Burp-core: match&replace com escopo por matcher + mini-Repeater gravado + entrega HAR | `dast/proxy/proxy_settings.py`, `dast/proxy/proxy_server.py`, `dast/proxy/session_store.py`, `dast/proxy/api/{settings_routes,proxy_routes}.py`, novo `dast/proxy/har_export.py`, UI `96-mode-intercept-mr.js`/`61-detail-pane.js`/`99-bootstrap-ctxmenu.js`/`10-state-core.js` |
 
 **Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → ~~2-C~~ ✅ →
-~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F (última).
+~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → ~~3-F~~ ✅ → ~~3-G~~ ✅ → ~~3-H~~ ✅ →
+~~3-I~~ ✅ — **fase 3 completa**.
 
 **Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
 (`copilot_service._gate_check_account_state`) agora delega para
@@ -219,5 +262,6 @@ integração natural).
 
 ---
 
-*Última atualização: 2026-11-15 (rodada 2-A entregue). Manter este documento
-vivo: marcar itens como feitos com referência ao commit.*
+*Última atualização: 2026-11-22 (rodada 3-F entregue; re-baseline vs ARTEX
+0.7.0 upstream). Manter este documento vivo: marcar itens como feitos com
+referência ao commit.*

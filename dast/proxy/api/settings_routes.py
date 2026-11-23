@@ -173,27 +173,39 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     async def add_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        settings.add_match_replace(body)
-        return {"ok": True}
+        try:
+            rule = settings.add_match_replace(body)
+        except ValueError as exc:
+            # invalid enum/regex/cap (3-I) — a 400 instead of the old silent fallback
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"ok": True, "rule": rule}
 
     @router.delete("/api/settings/match-replace")
     async def remove_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        idx = body.get("index")
-        if idx is None:
-            return JSONResponse({"error": "index required"}, status_code=400)
-        settings.remove_match_replace(int(idx))
+        identifier = body.get("id", body.get("index"))
+        if identifier is None:
+            return JSONResponse({"error": "id (or legacy index) required"}, status_code=400)
+        try:
+            settings._find_mr_index(identifier)
+        except KeyError:
+            return JSONResponse({"error": "rule not found"}, status_code=404)
+        settings.remove_match_replace(identifier)
         return {"ok": True}
 
     @router.post("/api/settings/match-replace/toggle")
     async def toggle_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        idx = body.get("index")
-        if idx is None:
-            return JSONResponse({"error": "index required"}, status_code=400)
-        settings.toggle_match_replace(int(idx), bool(body.get("enabled", True)))
+        identifier = body.get("id", body.get("index"))
+        if identifier is None:
+            return JSONResponse({"error": "id (or legacy index) required"}, status_code=400)
+        try:
+            settings._find_mr_index(identifier)
+        except KeyError:
+            return JSONResponse({"error": "rule not found"}, status_code=404)
+        settings.toggle_match_replace(identifier, bool(body.get("enabled", True)))
         return {"ok": True}
 
     @router.post("/api/settings/import")
@@ -286,6 +298,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             enabled = bool(body["ai_response_cache"])
             _scan_config["ai_response_cache"] = enabled
             _rc.set_enabled(enabled)  # toggling clears any stored decisions
+        if "noise_profile" in body:
+            # Noise governor (3-G): unknown names fall back to off (set_profile
+            # returns False) so the echoed config always reflects reality.
+            from dast.scanners import noise_governor as _ng
+            name = str(body["noise_profile"]).strip().lower()
+            _scan_config["noise_profile"] = name if _ng.set_profile(name) else "off"
+        if "noise_user_agent" in body:
+            from dast.scanners import noise_governor as _ng
+            ua = str(body["noise_user_agent"]).strip()
+            _scan_config["noise_user_agent"] = ua
+            _ng.set_user_agent(ua)  # applies only while a profile is active
         if "model_id" in body:
             new_model = str(body["model_id"]).strip()
             _scan_config["model_id"] = new_model

@@ -232,7 +232,7 @@ class ThreatModelWorker:
                 None,
                 lambda: bedrock_client.invoke_json(
                     system=_SYSTEM + UNTRUSTED_CONTENT_DIRECTIVE, user=user, max_tokens=1500,
-                    schema=THREAT_MODEL_SCHEMA, temperature=0,
+                    schema=THREAT_MODEL_SCHEMA, temperature=0, purpose="threat_model",
                 ),
             )
             self._apply_result(host, result)

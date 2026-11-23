@@ -222,6 +222,44 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import bedrock_client as _bc
         return await asyncio.get_running_loop().run_in_executor(None, _bc.list_models)
 
+    @router.get("/api/ai/usage")
+    async def ai_usage():
+        """LLM-call usage snapshot (round 3-F recorder): totals by outcome,
+        per-purpose/per-model counts, recent attempts and response-cache stats."""
+        from dast.ai import llm_recorder
+        return llm_recorder.usage_snapshot()
+
+    @router.post("/api/ai/usage/clear")
+    async def ai_usage_clear():
+        """Reset the in-memory usage counters/ring (the JSONL record is kept)."""
+        from dast.ai import llm_recorder
+        llm_recorder.clear()
+        return {"ok": True}
+
+    @router.get("/api/noise-status")
+    async def noise_status():
+        """Noise-governor state (3-G): active profile + per-host pacing counters,
+        merged with the legacy adaptive rate-limit multipliers (which were
+        tracked since before but never surfaced anywhere)."""
+        from dast.scanners import active_checks as _ac
+        from dast.scanners import noise_governor as _ng
+        snap = _ng.snapshot()
+        return {
+            "profile": _ng.profile_name(),
+            "user_agent_set": bool(_ng.user_agent()),
+            "hosts": snap["hosts"],
+            "total_sent": snap["total_sent"],
+            "rate_limit_multipliers": _ac.get_rate_limit_state(),
+        }
+
+    @router.get("/api/coverage")
+    async def coverage_status():
+        """Coverage ledger (3-H): per-host outcome histogram, open follow-ups and
+        reported findings — what was examined / ruled out / left open, so an
+        absent finding is never read as a clean target."""
+        from dast.coverage import ledger as _cov
+        return _cov.snapshot()
+
     # MCP server liveness. The MCP process (`dast-ai mcp`) is separate from the
     # dashboard and drives it over HTTP, so the dashboard only knows the MCP
     # server is up if it posts a heartbeat. `_MCP_STALE_SECONDS` must exceed the

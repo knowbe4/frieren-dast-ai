@@ -369,6 +369,20 @@ async def run_scan_worker(runner: "ProxyRunner", config: "ScanConfig", session_m
                     except Exception as _out_exc:
                         logger.debug("recording scan_outcome failed",
                                      url=entry.url, error=str(_out_exc))
+                # Copy the coverage ledger rows the coordinator wrote for THIS
+                # endpoint (3-H) onto the entry, so the per-endpoint record
+                # survives session save/restore and drives the dashboard card.
+                try:
+                    from urllib.parse import urlparse as _cov_up
+                    from dast.coverage import ledger as _cov_ledger
+                    _cov_rows = _cov_ledger.entries_for(
+                        target.method, _cov_up(target.url).path or "/",
+                        _extract_operation(target))
+                    if _cov_rows:
+                        entry.coverage_ledger = [e.as_dict() for e in _cov_rows]
+                except Exception as _led_exc:
+                    logger.debug("recording coverage ledger failed",
+                                 url=entry.url, error=str(_led_exc))
 
             # Update any stub imported findings on this entry to reflect scan outcome
             update_import_stubs(entry, bool(findings))

@@ -201,6 +201,7 @@ def make_llm_decider(model_id: Optional[str] = None) -> AuthDecider:
                 model_id=model_id,
                 temperature=0,
                 schema=LOGIN_ACTION_SCHEMA,
+                purpose="login_llm",
             )
         except Exception as exc:
             logger.warning("llm login: LLM decider call failed", error=str(exc)[:200])

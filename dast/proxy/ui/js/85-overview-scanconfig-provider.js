@@ -264,6 +264,8 @@ async function loadScanConfig() {
     if (s('sc-discovery-llm-classify')) s('sc-discovery-llm-classify').checked = c.discovery_llm_classify ?? false;
     if (s('sc-probe-diff'))        s('sc-probe-diff').checked      = c.probe_diff          ?? false;
     if (s('sc-ai-response-cache')) s('sc-ai-response-cache').checked = c.ai_response_cache ?? false;
+    if (s('sc-noise-profile'))     s('sc-noise-profile').value     = c.noise_profile      ?? 'off';
+    if (s('sc-noise-ua'))          s('sc-noise-ua').value          = c.noise_user_agent   ?? '';
     // Populate the model presets from the backend (dast.config.settings) —
     // the UI never hardcodes a model ARN/name.
     populateModelPresets(c.model_presets ?? []);
@@ -323,6 +325,8 @@ async function saveScanConfig() {
     discovery_llm_classify: chk('sc-discovery-llm-classify', false),
     probe_diff:            chk('sc-probe-diff', false),
     ai_response_cache:     chk('sc-ai-response-cache', false),
+    noise_profile:         v('sc-noise-profile', 'off'),
+    noise_user_agent:      v('sc-noise-ua', '').trim(),
     confidence_threshold:  parseFloat(v('sc-confidence', 0.5)),
     fast_model_id:         v('sc-fast-model-id', ''),
     validation_model_id:   v('sc-validation-model-id', ''),
@@ -578,4 +582,41 @@ window.addEventListener('unhandledrejection', function(ev) {
 
 loadOverview();
 setInterval(loadOverview, 10000);
+
+// ── Noise governor status (3-G) ───────────────────────────────────────────────
+// Per-host pacing counters next to the profile selector; poll only refreshes
+// when the governor is on (the off state is rendered once and stays cheap).
+async function loadNoiseStatus() {
+  const el = document.getElementById('noise-status');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/noise-status');
+    if (!r.ok) return;
+    const n = await r.json();
+    if (n.profile === 'off') {
+      el.innerHTML = '<span style="color:var(--txt3);font-size:10px">Governor off — probes run at full speed.</span>';
+      return;
+    }
+    const rows = (n.hosts || []).map(h => `
+      <tr style="border-bottom:1px solid var(--bdr3,#252525)">
+        <td style="padding:3px 6px;font-family:monospace;color:var(--txt)">${esc(h.host)}</td>
+        <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${h.sent}</td>
+        <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${h.inflight}${h.peak_inflight > h.inflight ? ` (peak ${h.peak_inflight})` : ''}</td>
+        <td style="padding:3px 6px;text-align:right;color:${h.backoff_remaining_s > 0 ? 'var(--orange)' : 'var(--txt3)'}">${h.backoff_remaining_s > 0 ? h.backoff_remaining_s + 's' : '—'}</td>
+      </tr>`).join('');
+    el.innerHTML = `
+      <div style="font-size:10px;color:var(--txt2);margin-bottom:4px">Profile <b style="color:var(--orange)">${esc(n.profile)}</b>
+        · ${n.total_sent} paced request${n.total_sent === 1 ? '' : 's'}${n.user_agent_set ? ' · UA override set' : ''}</div>
+      ${rows ? `<table style="width:100%;border-collapse:collapse;font-size:10px">
+        <thead><tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+          <th style="text-align:left;padding:3px 6px;font-weight:500">Host</th>
+          <th style="text-align:right;padding:3px 6px;font-weight:500">Sent</th>
+          <th style="text-align:right;padding:3px 6px;font-weight:500">In flight</th>
+          <th style="text-align:right;padding:3px 6px;font-weight:500">Backoff</th>
+        </tr></thead><tbody>${rows}</tbody></table>`
+      : '<div style="color:var(--txt3);font-size:10px">No paced requests yet.</div>'}`;
+  } catch (e) {}
+}
+loadNoiseStatus();
+setInterval(loadNoiseStatus, 10000);
 

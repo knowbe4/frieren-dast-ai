@@ -755,6 +755,7 @@ async def _ai_validate_finding(title: str, snippet: str, raw_response_body: str 
                 system=system_prompt + UNTRUSTED_CONTENT_DIRECTIVE, user=user,
                 model_id=bedrock_client.get_fast_model(),
                 schema=PASSIVE_VALIDATE_SCHEMA, temperature=0,
+                purpose="passive_validate",
             ),
         )
         # Only claim AI validation when the model EXPLICITLY confirmed. A response

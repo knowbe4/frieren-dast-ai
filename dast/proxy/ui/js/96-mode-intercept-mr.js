@@ -358,6 +358,8 @@ function showAddMrForm() {
     document.getElementById('mr-match').value   = '';
     document.getElementById('mr-replace').value = '';
     document.getElementById('mr-comment').value = '';
+    const h = document.getElementById('mr-host');   if (h) h.value = '';
+    const u = document.getElementById('mr-url-regex'); if (u) u.value = '';
   }
 }
 
@@ -370,29 +372,38 @@ async function saveMrRule() {
     replace: document.getElementById('mr-replace').value,
     comment: document.getElementById('mr-comment').value.trim(),
   };
+  const h = document.getElementById('mr-host');
+  const u = document.getElementById('mr-url-regex');
+  if (h && h.value.trim()) rule.host = h.value.trim();
+  if (u && u.value.trim()) rule.url_regex = u.value.trim();
   if (!rule.match && rule.type !== 'header') {
     showToast('Match regex is required for body/url rules'); return;
   }
-  await fetch('/api/settings/match-replace', {
+  const r = await fetch('/api/settings/match-replace', {
     method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(rule)
   });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    showToast(`Rule rejected: ${err.error || r.status}`);
+    return;
+  }
   document.getElementById('add-mr-form').style.display = 'none';
   await loadMatchReplace();
   showToast('Match & Replace rule added');
 }
 
-async function deleteMrRule(idx) {
+async function deleteMrRule(id) {
   await fetch('/api/settings/match-replace', {
     method: 'DELETE', headers: {'content-type':'application/json'},
-    body: JSON.stringify({index: idx})
+    body: JSON.stringify({id})
   });
   await loadMatchReplace();
 }
 
-async function toggleMrRule(idx, enabled) {
+async function toggleMrRule(id, enabled) {
   await fetch('/api/settings/match-replace/toggle', {
     method: 'POST', headers: {'content-type':'application/json'},
-    body: JSON.stringify({index: idx, enabled})
+    body: JSON.stringify({id, enabled})
   });
   await loadMatchReplace();
 }
@@ -401,6 +412,15 @@ async function toggleMrRule(idx, enabled) {
 function settingsJump(id) {
   const el = document.getElementById(id);
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function _mrMatchers(r) {
+  const parts = [];
+  if (r.host) parts.push(esc(r.host));
+  if (r.methods && r.methods.length) parts.push(esc(r.methods.join(',')));
+  if (r.url_regex) parts.push('~' + esc(r.url_regex));
+  if (r.status) parts.push(esc(r.status));
+  return parts.length ? parts.join(' · ') : '<em style="color:var(--txt3)">all traffic</em>';
 }
 
 function _renderMrTable() {
@@ -421,19 +441,21 @@ function _renderMrTable() {
     return;
   }
   if (empty) empty.style.display = 'none';
-  tbody.innerHTML = _mrRules.map((r, i) => `
+  tbody.innerHTML = _mrRules.map((r) => `
     <tr style="border-bottom:1px solid var(--bdr);opacity:${r.enabled ? 1 : 0.45}">
       <td style="padding:3px 6px;text-align:center">
         <input type="checkbox" ${r.enabled ? 'checked' : ''} style="accent-color:var(--acc)"
-               onchange="toggleMrRule(${i}, this.checked)">
+               onchange="toggleMrRule('${esc(r.id)}', this.checked)">
       </td>
       <td style="padding:3px 8px;white-space:nowrap;font-size:11px">${esc(r.scope)}</td>
       <td style="padding:3px 8px;white-space:nowrap;font-size:11px">${esc(r.type)}</td>
       <td style="padding:3px 8px;font-size:11px;font-family:monospace;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.match)}">${esc(r.match) || '<em style="color:var(--txt2)">any</em>'}</td>
       <td style="padding:3px 8px;font-size:11px;font-family:monospace;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.replace)}">${esc(r.replace)}</td>
+      <td style="padding:3px 8px;font-size:10px;color:var(--txt2);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${_mrMatchers(r)}</td>
+      <td style="padding:3px 8px;text-align:right;font-size:10px;color:var(--txt2)" title="${esc(r.last_applied_at || 'never fired')}">${r.hits || 0}</td>
       <td style="padding:3px 8px;font-size:11px;color:var(--txt2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.comment)}</td>
       <td style="padding:3px 4px;text-align:center">
-        <button class="tbtn" style="font-size:9px;padding:1px 5px;color:#ff6b6b;border-color:#7a2020" onclick="deleteMrRule(${i})">x</button>
+        <button class="tbtn" style="font-size:9px;padding:1px 5px;color:#ff6b6b;border-color:#7a2020" onclick="deleteMrRule('${esc(r.id)}')">x</button>
       </td>
     </tr>`).join('');
 }

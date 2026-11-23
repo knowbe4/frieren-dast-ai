@@ -793,6 +793,8 @@ def _invoke_external(
             if _is_safety_classifier_block(status, str(exc)):
                 logger.warning("AI request blocked by upstream safety classifier",
                                provider=provider, status=status)
+                from dast.ai import llm_recorder
+                llm_recorder.note_safety_block(str(exc))
                 raise AiContentBlockedError(
                     "the upstream safety classifier blocked this request") from exc
             transient = status == 429 or (status is not None and 500 <= status < 600)
@@ -1000,6 +1002,7 @@ def _invoke_raw(
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
     image_b64: Optional[str] = None,
+    purpose: str = "",
 ) -> Dict[str, Any]:
     """
     Send one request and return the parsed response envelope (always
@@ -1016,7 +1019,32 @@ def _invoke_raw(
     Never fails over on a content-policy block (AiContentBlockedError —
     content-based, not provider-based) or on a caller/config ValueError.
     """
-    model = _resolve_model(model_id)
+    # ── LLM-call recorder (round 3-F): one record per attempt ──
+    from dast.ai import llm_recorder
+    _started_ms = time.monotonic()
+    _req_excerpt = f"{system}\n·\n{user}"
+
+    def _record(provider_name: str, result: Optional[Dict[str, Any]],
+                outcome: str, error_excerpt: str = "") -> None:
+        llm_recorder.record_call(
+            purpose=purpose, provider=provider_name, model=model,
+            usage=(result or {}).get("usage"),
+            latency_ms=(time.monotonic() - _started_ms) * 1000.0,
+            outcome=outcome, error_excerpt=error_excerpt,
+            req_excerpt=_req_excerpt,
+            resp_excerpt=_extract_text_safe(result) if result else "")
+
+    try:
+        model = _resolve_model(model_id)
+    except Exception:
+        llm_recorder.record_call(
+            purpose=purpose, provider=get_active_provider(),
+            model=str(model_id or ""),
+            latency_ms=(time.monotonic() - _started_ms) * 1000.0,
+            outcome="unavailable",
+            error_excerpt="model resolution failed (AI unavailable)",
+            req_excerpt=_req_excerpt)
+        raise
     provider = get_active_provider()
     if image_b64 and provider in ("openai", "glm"):
         raise ValueError(f"image input is not supported for provider '{provider}' "
@@ -1032,13 +1060,20 @@ def _invoke_raw(
             # Content policy refusal — content-based, not provider-based: another
             # provider's verdict on identical content proves nothing about health,
             # and failing over would only dodge safety classifiers. Surface it.
+            _record(candidate_provider, None, "safety_block",
+                    error_excerpt=llm_recorder._take_safety_block())
             raise
-        except ValueError:
+        except ValueError as exc:
             # Caller/config misuse (e.g. an unsupported input shape) — failing
             # over would mask the bug instead of surfacing it.
+            _record(candidate_provider, None, "caller_error", error_excerpt=str(exc))
             raise
         except Exception as exc:
             provider_health.record_failure(candidate_provider, str(exc))
+            _status = getattr(exc, "status_code", None)
+            _record(candidate_provider, None,
+                    "throttled" if _status == 429 else "provider_error",
+                    error_excerpt=str(exc))
             last_exc = exc
             if index < len(chain) - 1:
                 logger.warning(
@@ -1051,6 +1086,7 @@ def _invoke_raw(
         provider_health.record_success(candidate_provider)
         if candidate_provider != provider:
             _promote_active_provider(candidate_provider)
+        _record(candidate_provider, result, "ok")
         return result
     # Unreachable (loop either returns or raises), but keeps type-checkers happy.
     if last_exc:
@@ -1098,6 +1134,7 @@ def _invoke_json_as_text(
     temperature: Optional[float],
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
+    purpose: str = "",
 ) -> Dict[str, Any]:
     """Structured output for models that can't do forced tool-use: describe the
     schema in the prompt, ask for raw JSON, then parse with the repair-retry.
@@ -1110,11 +1147,12 @@ def _invoke_json_as_text(
         text_user = f"{user}\n\nReturn a JSON object matching this schema:\n{json.dumps(schema)}"
     raw = invoke(
         system=text_system, user=text_user, model_id=model_id, max_tokens=max_tokens,
-        temperature=temperature, cache_system=cache_system,
+        temperature=temperature, cache_system=cache_system, purpose=purpose,
     )
     parsed = _parse_json_or_repair(
         raw=raw, system=text_system, user=text_user, model_id=model_id,
         max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        purpose=purpose,
     )
     return _coerce_structured(parsed, schema) if schema else parsed
 
@@ -1127,6 +1165,7 @@ def _parse_json_or_repair(
     max_tokens: int,
     temperature: Optional[float],
     cache_system: bool,
+    purpose: str = "",
 ) -> Dict[str, Any]:
     """Parse ``raw`` as JSON, repairing once via a free-text re-invocation.
 
@@ -1149,6 +1188,7 @@ def _parse_json_or_repair(
         raw2 = invoke(
             system=repair_system, user=repair_user, model_id=model_id,
             max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+            purpose=purpose,
         )
         return json.loads(_strip_json_fence(raw2))
 
@@ -1283,6 +1323,7 @@ def invoke(
     temperature: Optional[float] = None,
     cache_system: bool = False,
     image_b64: Optional[str] = None,
+    purpose: str = "",
 ) -> str:
     """
     Send a system+user message to Claude and return the text response.
@@ -1298,7 +1339,7 @@ def invoke(
     result = _invoke_raw(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=None,
-        image_b64=image_b64,
+        image_b64=image_b64, purpose=purpose,
     )
     return _extract_text(result)
 
@@ -1325,6 +1366,7 @@ def invoke_json(
     cache_system: bool = False,
     schema: Optional[Dict[str, Any]] = None,
     image_b64: Optional[str] = None,
+    purpose: str = "",
 ) -> Dict[str, Any]:
     """
     Like invoke() but returns parsed JSON.
@@ -1358,12 +1400,18 @@ def invoke_json(
         )
         cached = response_cache.get(cache_key)
         if cached is not None:
+            # Cache hits never reach _invoke_raw — record them so the usage panel
+            # reflects the logical call volume (zero tokens; no provider contact).
+            from dast.ai import llm_recorder
+            llm_recorder.record_call(purpose=purpose, provider=get_active_provider(),
+                                     model=_resolve_model(model_id), outcome="cache_hit",
+                                     cache_hit=True, req_excerpt=f"{system}\n·\n{user}")
             return cached
 
     result = _invoke_json_uncached(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
         temperature=temperature, cache_system=cache_system, schema=schema,
-        image_b64=image_b64,
+        image_b64=image_b64, purpose=purpose,
     )
 
     if cache_key is not None and isinstance(result, dict):
@@ -1380,6 +1428,7 @@ def _invoke_json_uncached(
     cache_system: bool,
     schema: Optional[Dict[str, Any]],
     image_b64: Optional[str] = None,
+    purpose: str = "",
 ) -> Dict[str, Any]:
     """The uncached invoke_json body — one LLM round-trip (plus repair retry on
     the legacy text path). Wrapped by invoke_json, which layers optional
@@ -1392,7 +1441,7 @@ def _invoke_json_uncached(
             result = _invoke_raw(
                 system=system, user=user, model_id=model_id, max_tokens=max_tokens,
                 temperature=temperature, cache_system=cache_system, schema=schema,
-                image_b64=image_b64,
+                image_b64=image_b64, purpose=purpose,
             )
         except providers.ProviderError as exc:
             # The server refused forced tool-use outright (e.g. a tool-less local
@@ -1407,6 +1456,7 @@ def _invoke_json_uncached(
                 return _invoke_json_as_text(
                     system=system, user=user, model_id=model_id, max_tokens=max_tokens,
                     temperature=temperature, cache_system=cache_system, schema=schema,
+                    purpose=purpose,
                 )
             raise
         tool_input = _extract_tool_input(result)
@@ -1422,6 +1472,7 @@ def _invoke_json_uncached(
         parsed = _parse_json_or_repair(
             raw=_extract_text_safe(result), system=system, user=user, model_id=model_id,
             max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+            purpose=purpose,
         )
         return _coerce_structured(parsed, schema)
 
@@ -1431,9 +1482,10 @@ def _invoke_json_uncached(
 
     raw = invoke(
         system=system, user=user, model_id=model_id, max_tokens=max_tokens,
-        temperature=temperature, cache_system=cache_system,
+        temperature=temperature, cache_system=cache_system, purpose=purpose,
     )
     return _parse_json_or_repair(
         raw=raw, system=system, user=user, model_id=model_id,
         max_tokens=max_tokens, temperature=temperature, cache_system=cache_system,
+        purpose=purpose,
     )

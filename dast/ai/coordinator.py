@@ -24,6 +24,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, AgentObservation, VulnAgent
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import BASELINE_SCHEMA, PLANNER_SCHEMA
+from dast.scanners import noise_governor
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -2099,6 +2100,22 @@ class Coordinator:
         if baseline_response:
             baseline_section = f"\n{baseline_response}\n"
 
+        # Noise governor (3-G): when the operator paced egress, tell the planner —
+        # code-owned text only (profile name/limits, no target content), and with
+        # the profile off the prompt is byte-for-byte identical to before.
+        noise_section = ""
+        if noise_governor.active():
+            _prof = noise_governor.PROFILES[noise_governor.profile_name()]
+            noise_section = (
+                f"\n[Noise profile: {_prof.name}. Operator setting, not a target fact.]\n"
+                f"Egress is paced to {_prof.rps:g} requests/second per host with at most"
+                f" {_prof.per_host} request(s) in flight per host; after a 429/503 the whole"
+                f" host pauses up to {_prof.max_delay_s:g}s. Favour precision over volume:"
+                f" fewer, well-chosen payloads beat repeated spraying. Do not run parallel"
+                f" bursts against the same host; if probes come back rate-limited, do not"
+                f" request more agents to compensate — the governor is the operator's brake.\n"
+            )
+
         # Sanitize body before embedding — MongoDB/NoSQL operators trigger Bedrock content filter
         _body_snippet = (target.body or "")[:600]
         _body_snippet = _re.sub(r'\$(?:where|ne|eq|gt|lt|gte|lte|in|nin|regex|exists|or|and|not|nor|all|elemMatch)\b', r'[op]', _body_snippet)
@@ -2118,6 +2135,7 @@ class Coordinator:
             f"{code_section}"
             f"{canary_section}"
             f"{restrict_note}"
+            f"{noise_section}"
             f"\nSelect only the agents worth running for this endpoint."
             f" Use the baseline response above to understand what this endpoint does before deciding."
             f" Prioritise attack types that showed canary signal or have worked on this host before."

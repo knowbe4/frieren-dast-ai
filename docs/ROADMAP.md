@@ -191,8 +191,10 @@ gargalo — dispatch e evidência contextual são.
    metade é retomável
 6. Já roubado na rodada 1: wrap-up (`agent/wrapup.go`) e llmpool (health)
 
-Fraco no ARTEX (não imitar): guardrails prompt-first desativáveis, sem rate
-limit, plaintext creds no Postgres, sem multi-user.
+Fraco no ARTEX (não imitar): guardrails prompt-first desativáveis (⚠ bem mais
+fortes no upstream 0.7.0: closed-question judge, untrusted boundary), sem rate
+limit (⚠ corrigido no upstream 0.7.0 pelo noise governor — roubado na 3-G),
+plaintext creds no Postgres, sem multi-user.
 
 ---
 
@@ -206,9 +208,11 @@ limit, plaintext creds no Postgres, sem multi-user.
 | **2-D Agentless auth-bypass (ARTEX)** — ✅ FEITA (2026-11-16): `a32cf0d` (`dast/browser/auth_gates.py`: detecção estática + storage hook + route stub; wiring em `proxied_browser_context`), `f04468a` (modo `bypass_auth` no SpaExplorer em 2 rodadas + tool `explore` + worker; teste de integração com SPA guardada client-side). Browse (agent_browser) documentado como follow-up | three auth gates no JS + hook/stub das APIs de auth no browser → pós-login sem credenciais, gravando o tráfego de API — novo modo do browse/spa_explorer | `dast/proxy/spa_explorer.py`, `dast/browser/*`, novo módulo de auth-gates |
 | **3-E Novos agents** — ✅ FEITA (2026-11-16): `571e11b` (`smuggling_agent`: raw-socket CL.TE/TE.CL por diferencial de resposta + hints → `focus_attack_types` + regra CL+TE + coverage), `6a52276` (`jwt_agent`: alg:none/weak-secret/escalation/kid via probe_common proxy-routed + `_PARAM_ATTACK_MAP["token"]: ["jwt"]` + regra JWT-bearing). Detalhe de design: smuggling exige cliente raw direto (proxy/_send re-enquadram CL/TE); detecção por contagem de respostas vs controle (não timing) | request smuggling ativo (CL.TE/TE.CL com o time-oracle existente, disparado pelos hints de `dast/plugins/request_smuggling_hints.py`) + JWT como VulnAgent registrado | novo `dast/agents/smuggling_agent.py`, `dast/agents/jwt_agent.py`, `dast/agents/__init__.py`, `dast/ai/coordinator.py` |
 | **3-F Gravador de LLM** | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
+| **3-I Rewrite rules + replay + HAR (Burp/ARTEX 4.9-4.10)** — ✅ FEITA (2026-11-23, branch `feat/rewrite-replay-har`): rewrite rules (evolução do match&replace de `proxy_settings.py`: matchers methods/host exato-ou-`*.sufixo`/url_regex path+query/status response-only com AND, ids estáveis uuid — fim dos toggles por índice, contadores hits/last_applied_at persistidos, validação como ERRO (regex/enum/caps 100/50 → 400) em vez do fallback silencioso, skips de integridade p/ body (1 MiB/encoded/HEAD-1xx-204-304), migration de rules legadas; `apply_to_response` agora recebe url real e o gate response exclui crawler; trace na entry: `ProxyEntry.rewritten_by` substitui o diff frágil de headers), replay (`POST /api/replay/{id}`: re-envia a request CRUA da entry VIA O PROXY → gravada no history com source `replay`, match&replace aplicado e atribuído; strip de hop-by-hop/x-dast-*; fresh_cookie opcional; caps 8 MiB/60s/resposta 2 MiB; exclusão de pending-import e session-intelligence; UI: item de context menu + botão ↻ Replay no detail pane + `_SRC_TAG['replay']`), HAR 1.2 export (`dast/proxy/har_export.py` puro + `GET /api/history/export/har` sobre in-scope entries: ordem estável (ts,id), placeholders explícitos (timings -1/time 0/cookies[]), pares de headers com multi-Set-Cookie, texto vs base64, redaction de userinfo, caps 1000/20 MiB/31 MiB com truncamento nunca-silencioso `X-DAST-HAR-*`; botão ⇩ HAR na filter bar) | Burp-core: match&replace com escopo por matcher + mini-Repeater gravado + entrega HAR | `dast/proxy/proxy_settings.py`, `dast/proxy/proxy_server.py`, `dast/proxy/session_store.py`, `dast/proxy/api/{settings_routes,proxy_routes}.py`, novo `dast/proxy/har_export.py`, UI `96-mode-intercept-mr.js`/`61-detail-pane.js`/`99-bootstrap-ctxmenu.js`/`10-state-core.js` |
 
 **Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → ~~2-C~~ ✅ →
-~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F (última).
+~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F → 3-G (noise governor) → 3-H
+(coverage ledger) → ~~3-I~~ ✅ — **fase 3 completa**.
 
 **Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
 (`copilot_service._gate_check_account_state`) agora delega para

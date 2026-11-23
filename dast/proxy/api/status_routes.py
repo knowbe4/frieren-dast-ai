@@ -222,6 +222,14 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import bedrock_client as _bc
         return await asyncio.get_running_loop().run_in_executor(None, _bc.list_models)
 
+    @router.get("/api/coverage")
+    async def coverage_status():
+        """Coverage ledger (3-H): per-host outcome histogram, open follow-ups and
+        reported findings — what was examined / ruled out / left open, so an
+        absent finding is never read as a clean target."""
+        from dast.coverage import ledger as _cov
+        return _cov.snapshot()
+
     # MCP server liveness. The MCP process (`dast-ai mcp`) is separate from the
     # dashboard and drives it over HTTP, so the dashboard only knows the MCP
     # server is up if it posts a heartbeat. `_MCP_STALE_SECONDS` must exceed the

@@ -195,3 +195,39 @@ def test_snapshot_aggregates_per_host():
     assert snap["hosts"]["b.example.com"]["needs_follow_up"] == ["GET /z sqli"]
     only_a = cov.snapshot(host="a.example.com")
     assert list(only_a["hosts"].keys()) == ["a.example.com"]
+
+
+# ── dashboard route + per-entry persistence ──────────────────────────────────
+
+def test_coverage_route_snapshot():
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from dast.proxy.api.status_routes import make_router
+
+    ctx = SimpleNamespace(scan_queue_state=None, mcp_last_heartbeat=[0.0])
+    app = FastAPI()
+    app.include_router(make_router(ctx))
+    client = TestClient(app)
+
+    assert client.get("/api/coverage").json()["hosts"] == {}
+    cov.record_scan_outcome("GET", "app.example.com", "/x", "", "sqli", findings=["hit"])
+    body = client.get("/api/coverage").json()
+    assert body["total_entries"] == 1
+    assert body["hosts"]["app.example.com"]["findings"] == 1
+
+
+def test_entry_persists_coverage_rows_across_save_restore():
+    from dast.proxy.session_store import ProxyEntry
+
+    cov.record_scan_outcome("GET", "app.example.com", "/x", "", "sqli", findings=["hit"])
+    rows = [e.as_dict() for e in cov.entries_for("GET", "/x", "")]
+
+    entry = ProxyEntry.from_dict({"id": "1", "method": "GET", "url": "https://app.example.com/x",
+                                  "host": "app.example.com", "path": "/x"})
+    entry.coverage_ledger = rows
+    restored = ProxyEntry.from_dict(entry.to_dict())
+    assert restored.coverage_ledger == rows
+    assert restored.coverage_ledger[0]["outcome"] == "reported"

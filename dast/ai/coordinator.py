@@ -821,6 +821,11 @@ def _select_attack_types_for_params(
 
     # Auth bypass for any authenticated endpoint
     auth_headers = {k.lower() for k in (target.headers or {})}
+
+    # Cache deception (4-A): GET + authenticated — the agent self-gates on the
+    # authed-vs-anonymous marker diff, so a coarse rule is safe.
+    if auth_headers & {"cookie", "authorization"}:
+        candidate_types.add("cache_deception")
     if "authorization" in auth_headers or "cookie" in auth_headers:
         candidate_types.add("auth_bypass")
 

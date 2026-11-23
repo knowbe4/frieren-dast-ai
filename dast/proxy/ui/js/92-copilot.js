@@ -6,6 +6,7 @@
 // login), plus a "blocked" badge when it hands the turn back needing help.
 
 let _cpActive = null;      // active session_id
+let _cpProfiles = [];      // cached login profiles (for starter-prompt slug substitution)
 let _cpPollTimer = null;
 let _cpBannerTimer = null;  // periodic reconcile of the pause banner vs server state
 let _cpWs = null;
@@ -13,6 +14,10 @@ let _cpPauseSig = null;     // last-rendered pause identity; guards live DOM (se
 // session_id -> { kind, payload } for every copilot run currently waiting on the
 // operator. Drives the persistent top-level pause banner (visible on every tab).
 const _cpPaused = {};
+// session_ids whose pause banner the operator has dismissed. A dismissal lasts
+// only for THIS pause: the id is cleared the moment the run resumes (see the WS
+// 'resumed' handler + cpReconcilePausedBanner), so a fresh pause shows again.
+const _cpBannerDismissed = new Set();
 
 // Stable keys of the <details> the operator has expanded in the session panel
 // (Tool activity, per-observation). The panel rebuilds its innerHTML on every
@@ -55,12 +60,16 @@ async function cpLoadProfiles() {
   try {
     const data = await (await fetch('/api/profiles')).json();
     const profiles = (data && data.profiles) || [];
+    _cpProfiles = profiles;
     const current = sel.value;
     sel.innerHTML = '<option value="">none</option>' +
       profiles.map(p =>
         `<option value="${esc(p.slug)}">${esc(p.name || p.slug)}${p.session_set ? '' : ' (no session)'}</option>`
       ).join('');
     if (current) sel.value = current;
+    // If the starter cards are currently showing (empty/new conversation),
+    // re-render so a real slug can replace the <profile-slug> placeholder.
+    if (!_cpActive && document.getElementById('cp-starters')) cpRender(null);
   } catch (e) { /* profiles are best-effort */ }
 }
 
@@ -268,6 +277,7 @@ function cpConnectWs() {
       } else if (m.type === 'resumed'
                  || (m.type === 'autonomous' && (m.event === 'stopped' || m.event === 'complete'))) {
         delete _cpPaused[m.session_id];
+        _cpBannerDismissed.delete(m.session_id); // a fresh pause should show again
         cpRenderPauseBanner();
       }
       if (m.session_id === _cpActive) cpRefresh(m.session_id);
@@ -282,7 +292,8 @@ function cpConnectWs() {
 function cpRenderPauseBanner() {
   const el = document.getElementById('cp-pause-banner');
   if (!el) return;
-  const ids = Object.keys(_cpPaused);
+  // Only runs the operator has NOT dismissed drive the banner.
+  const ids = Object.keys(_cpPaused).filter(id => !_cpBannerDismissed.has(id));
   if (!ids.length) { el.style.display = 'none'; return; }
   let text;
   if (ids.length === 1) {
@@ -292,13 +303,22 @@ function cpRenderPauseBanner() {
     text = `${ids.length} copilot runs paused — need you`;
   }
   el.innerHTML = `<span class="cp-banner-dot"></span><span>${esc(text)}</span>`
-    + `<span class="cp-banner-hint">click to open Copilot</span>`;
+    + `<span class="cp-banner-hint">click to open Copilot</span>`
+    + `<span class="cp-banner-x" role="button" tabindex="0" title="dismiss"`
+    + ` onclick="event.stopPropagation();cpDismissBanner()">×</span>`;
   el.style.display = 'flex';
 }
 
-// Jump to the Copilot tab and focus the first paused run.
+// Dismiss the banner for every run currently paused. Stays hidden until one of
+// them resumes and pauses afresh (the dismissed id is cleared on resume).
+function cpDismissBanner() {
+  Object.keys(_cpPaused).forEach(id => _cpBannerDismissed.add(id));
+  cpRenderPauseBanner();
+}
+
+// Jump to the Copilot tab and focus the first paused (not-dismissed) run.
 function cpBannerGoto() {
-  const ids = Object.keys(_cpPaused);
+  const ids = Object.keys(_cpPaused).filter(id => !_cpBannerDismissed.has(id));
   switchMain('copilot');
   if (ids.length) cpSelectSession(ids[0]);
 }
@@ -327,7 +347,10 @@ async function cpReconcilePausedBanner() {
       if (st.indexOf('paused_') === 0) serverPaused[s.session_id] = st.slice('paused_'.length);
     });
     Object.keys(_cpPaused).forEach(id => {
-      if (!(id in serverPaused)) delete _cpPaused[id];
+      if (!(id in serverPaused)) {
+        delete _cpPaused[id];
+        _cpBannerDismissed.delete(id); // run resumed → allow a future pause to show
+      }
     });
     Object.keys(serverPaused).forEach(id => {
       if (!_cpPaused[id]) _cpPaused[id] = { kind: serverPaused[id], payload: {} };
@@ -380,6 +403,97 @@ function cpStatusColor(st) {
          st === 'running' ? 'var(--acc2)' : 'var(--green)';
 }
 
+// ── Starter prompts (new-conversation examples) ──────────────────────────────
+// Shown only on the empty/new-conversation state. Clicking a card PREFILLS the
+// composer (#cp-input) — it never auto-sends — so the operator fills in the
+// <profile-slug>/<target-url>/<scope> placeholders before sending. Copy reflects
+// the house rules: log in only via activate_login_profile (never paste
+// Cookie/Authorization/X-CSRF-Token), work in scope through the proxy, and
+// confirm with the deterministic probes.
+const CP_STARTER_PROMPTS = [
+  {
+    group: 'Login / authenticate',
+    icon: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="3" y="7" width="10" height="7" rx="1"/><path d="M5 7V5a3 3 0 016 0v2"/></svg>',
+    cards: [
+      { title: 'Activate a saved login profile',
+        body: 'Authenticate using the saved login profile "<profile-slug>" via activate_login_profile. Do not ask me for credentials and do not paste any Cookie, Authorization or X-CSRF-Token header — the profile holds the encrypted creds and auth is injected automatically. Confirm you are logged in by fetching an authenticated page through the proxy and telling me which identity you are acting as.' },
+      { title: 'Log in, then confirm session is live',
+        body: 'Activate login profile "<profile-slug>", then verify the session is valid by requesting <target-url> through the proxy. If you get a 401/403 or a login redirect, re-prime the session and try once more before telling me what is blocking you.' },
+      { title: 'List what I can log in as',
+        body: 'List the saved login profiles available and tell me which ones have a live session. Do not activate anything yet — just show me the slugs so I can pick one.' },
+    ],
+  },
+  {
+    group: 'Run a pentest',
+    icon: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5"/><path d="M8 1v3M8 12v3M1 8h3M12 8h3"/></svg>',
+    cards: [
+      { title: 'Probe a target for SQL injection',
+        body: 'Log in with profile "<profile-slug>", then test <target-url> for SQL injection within scope <scope>. Find the injectable parameter yourself, then confirm it deterministically with sqli_probe (extract the DB version/user as proof). Stay in scope, work through the proxy, and report each finding with its evidence. Pause and ask me if you hit a WAF or a value only I have.' },
+      { title: 'Hunt broken access control / IDOR',
+        body: 'Authenticate as "<profile-slug>" and look for broken access control on <target-url> within scope <scope>. Establish an authorized baseline first, then use idor_probe / authz_differential_probe to prove any object or function a user of my role should not reach. Confirm every hit through the proxy and report it with the request/response evidence.' },
+      { title: 'Reflected/stored XSS sweep on a feature',
+        body: 'Log in with profile "<profile-slug>" and test <target-url> for XSS in scope <scope>. Identify reflected or stored sinks, confirm with xss_probe, and only report what actually executes. Do not change anything destructive — pause and check with me before any write that is not needed to prove the bug.' },
+    ],
+  },
+  {
+    group: 'Test a specific feature',
+    icon: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 1h4M6.5 1v4.5L3 12a1.5 1.5 0 001.3 2.3h7.4A1.5 1.5 0 0013 12L9.5 5.5V1"/></svg>',
+    cards: [
+      { title: 'Exercise one GraphQL operation end to end',
+        body: 'Authenticate as "<profile-slug>", then exercise the GraphQL operation <operation-name> at <target-url> end to end. Introspect the schema if the op is not already visible, build the query/mutation yourself, send it through the proxy, and check it for injection and authorization flaws. Report what you confirm with evidence.' },
+      { title: 'Walk one endpoint through the proxy',
+        body: 'Log in with profile "<profile-slug>" and drive the "<feature-name>" feature at <target-url> end to end in the browser. Capture the key requests through the proxy, then probe the parameters that feed the backend. Tell me which requests carry state I should care about.' },
+      { title: 'Confirm a specific suspected finding',
+        body: 'Authenticate as "<profile-slug>" and confirm whether <target-url> parameter "<param>" is vulnerable to <vuln-class>. Reproduce it through the proxy with the matching deterministic probe, and if it holds, record the finding with evidence. If it does not reproduce, tell me why.' },
+    ],
+  },
+];
+
+// Substitute a real slug for the <profile-slug> placeholder only when exactly
+// one profile has a live session — otherwise keep the placeholder so the
+// operator chooses the identity (never guess the wrong one).
+function cpStarterSlug() {
+  const live = (_cpProfiles || []).filter(p => p && p.session_set);
+  return live.length === 1 ? live[0].slug : null;
+}
+
+function cpStarterPromptsHtml() {
+  const slug = cpStarterSlug();
+  const groups = CP_STARTER_PROMPTS.map((g, gi) => {
+    const cards = g.cards.map((c, ci) =>
+      `<div class="cp-starter-card" onclick="cpUsePrompt(${gi},${ci})" role="button" tabindex="0"
+            onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();cpUsePrompt(${gi},${ci});}">
+         <div class="cp-starter-card-title">${esc(c.title)}</div>
+         <div class="cp-starter-card-body">${esc(c.body)}</div>
+       </div>`).join('');
+    return `<div class="cp-starter-group-hdr"><span class="cp-starter-group-icon">${g.icon}</span>${esc(g.group)}</div>
+            <div class="cp-starter-grid">${cards}</div>`;
+  }).join('');
+  const slugNote = slug
+    ? `Using your live profile <code>${esc(slug)}</code>. Fill in <code>&lt;target-url&gt;</code> and <code>&lt;scope&gt;</code>, then Send.`
+    : `Fill in <code>&lt;profile-slug&gt;</code>, <code>&lt;target-url&gt;</code> and <code>&lt;scope&gt;</code>, then Send.`;
+  return `<div id="cp-starters" class="cp-starters">
+      <div class="cp-starters-intro">Start a new exploration, or pick an example to prefill the box below. ${slugNote}</div>
+      ${groups}
+    </div>`;
+}
+
+// Prefill the composer with the chosen starter (edited, never auto-sent). Reads
+// from the constant (not the DOM) so a mid-edit re-render never clobbers typed
+// text, and substitutes a live slug when there is exactly one.
+function cpUsePrompt(groupIdx, cardIdx) {
+  const card = (CP_STARTER_PROMPTS[groupIdx] || {}).cards?.[cardIdx];
+  if (!card) return;
+  const slug = cpStarterSlug();
+  const body = slug ? card.body.replaceAll('<profile-slug>', slug) : card.body;
+  const input = document.getElementById('cp-input');
+  if (!input) return;
+  input.value = body;
+  input.focus();
+  try { input.setSelectionRange(input.value.length, input.value.length); } catch (_) {}
+  input.scrollIntoView({ block: 'nearest' });
+}
+
 // ── Conversation rendering ───────────────────────────────────────────────────
 function cpRender(session) {
   const el = document.getElementById('cp-messages');
@@ -388,11 +502,7 @@ function cpRender(session) {
   if (!el) return;
 
   if (!session || !session.session_id) {
-    el.innerHTML = `<div class="empty" style="margin:auto;text-align:center;color:var(--txt2);max-width:440px;line-height:1.6">
-        Ask the copilot to explore or exploit something in scope.<br>
-        It drives the same tools the scanner uses, reports findings with evidence,
-        and tells you when it is blocked so you can unblock it and it continues.
-      </div>`;
+    el.innerHTML = cpStarterPromptsHtml();
     if (statusEl) statusEl.textContent = '';
     if (pauseEl) pauseEl.innerHTML = '';
     return;

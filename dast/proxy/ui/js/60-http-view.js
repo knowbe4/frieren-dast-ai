@@ -6,7 +6,10 @@
 // (e.g. a BOLA differential: foreign-write, foreign-read, control, delete). This
 // is what makes a multi-request finding legible — the evidence is no longer
 // pinned to a single request. Used by the Findings view.
-function _buildFindingSteps(f) {
+// rrvId/detailsId (optional): when given, a step that resolved to a REAL captured entry
+// (step.entry_id, set by the backend record_manual_finding grounding) is rendered as a
+// CLICKABLE row that loads that request+response into the shared viewer (see _rrvChainClick).
+function _buildFindingSteps(f, rrvId, detailsId) {
   const steps = Array.isArray(f.steps) ? f.steps : null;
   if (!steps || !steps.length) return '';
   const mColor = m => ({ GET: '#4ec9b0', POST: '#569cd6', PUT: '#d7ba7d',
@@ -16,18 +19,33 @@ function _buildFindingSteps(f) {
     return n >= 500 ? '#ff6b6b' : n >= 400 ? '#e5a23b'
       : (n >= 200 && n < 300) ? '#7ec87e' : 'var(--txt2)';
   };
+  const canLink = !!rrvId;
+  let anyLinked = false;
   const rows = steps.map((s, i) => {
     const note = s.note ? `<div style="color:var(--txt2);font-size:9px;margin-top:1px">${esc(s.note)}</div>` : '';
-    return `<tr style="border-bottom:1px solid var(--bdr)">
+    const eid = s.entry_id ? String(s.entry_id) : '';
+    const clickable = canLink && eid;
+    if (clickable) anyLinked = true;
+    const rowAttrs = clickable
+      ? ` style="border-bottom:1px solid var(--bdr);cursor:pointer" title="Load this request + response below"`
+        + ` onclick="_rrvChainClick(${jsArg(rrvId)},${jsArg(detailsId)},${jsArg(eid)})"`
+      : ` style="border-bottom:1px solid var(--bdr)"`;
+    const openCell = clickable
+      ? `<td style="padding:3px 6px;color:var(--acc);vertical-align:top">${esc(s.label || '')} <span style="font-size:9px">▸</span></td>`
+      : `<td style="padding:3px 6px;color:var(--txt2);vertical-align:top">${esc(s.label || '')}</td>`;
+    return `<tr${rowAttrs}>
       <td style="padding:3px 6px;color:var(--txt2);text-align:right;vertical-align:top">${i + 1}</td>
       <td style="padding:3px 6px;font-weight:600;color:${mColor(s.method)};vertical-align:top">${esc((s.method || '').toUpperCase())}</td>
       <td style="padding:3px 6px;font-family:monospace;word-break:break-all;vertical-align:top">${esc(s.url || '')}${note}</td>
       <td style="padding:3px 6px;color:${sColor(s.status)};font-weight:600;text-align:right;vertical-align:top">${esc(String(s.status ?? ''))}</td>
-      <td style="padding:3px 6px;color:var(--txt2);vertical-align:top">${esc(s.label || '')}</td>
+      ${openCell}
     </tr>`;
   }).join('');
+  const hint = anyLinked
+    ? '<span style="font-size:9px;color:var(--acc);text-transform:none;letter-spacing:0;margin-left:6px">click a row to open its request/response</span>'
+    : '';
   return `<div style="margin-top:8px">
-    <div style="font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px">Evidence — ${steps.length}-request chain</div>
+    <div style="font-size:9px;color:var(--txt2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px">Evidence — ${steps.length}-request chain${hint}</div>
     <table style="width:100%;border-collapse:collapse;font-size:10px;background:#111;border:1px solid var(--bdr);border-radius:3px">
       <tbody>${rows}</tbody>
     </table>
@@ -295,27 +313,34 @@ function _setPaneView(pane, mode) {
   renderSmDetail();
 }
 
-// _setRepView — same toggle for Repeater response panel
-function _setRepView(tabId, mode) {
-  const respEl = document.getElementById(`rep-response-${tabId}`);
-  const tab = _repTabs.find(t => t.id === tabId);
-  if (!respEl || !tab) return;
-  tab._viewMode = mode;
-  // raw text is stored in tab._rawText, set when response arrives
-  const rawText = tab._rawText || '';
+// Shared raw-HTTP response renderer: Pretty collapses a JSON body into a tree (headers kept
+// above the blank line), Raw shows the original message text. Extracted from the Repeater so
+// its Pretty/Raw response rendering lives in ONE place rather than being duplicated.
+function _renderRawHttpResp(el, rawText, mode) {
+  if (!el) return;
+  rawText = rawText || '';
   if (mode === 'pretty') {
     // extract body after the blank line
     const sep = rawText.indexOf('\n\n');
     const bodyStr = sep >= 0 ? rawText.slice(sep + 2) : rawText;
     if (_isJsonBody(bodyStr)) {
       const headers = sep >= 0 ? esc(rawText.slice(0, sep)) : '';
-      respEl.innerHTML = `${headers}\n\n${_fmtJsonTree(bodyStr)}`;
-    } else {
-      respEl.textContent = rawText;
+      el.innerHTML = `${headers}\n\n${_fmtJsonTree(bodyStr)}`;
+      return;
     }
-  } else {
-    respEl.textContent = rawText;
   }
+  el.textContent = rawText;
+}
+
+// _setRepView — Pretty/Raw toggle for the Repeater response panel. Delegates the actual
+// rendering to the shared _renderRawHttpResp so the Repeater is a caller, not a fork.
+function _setRepView(tabId, mode) {
+  const respEl = document.getElementById(`rep-response-${tabId}`);
+  const tab = _repTabs.find(t => t.id === tabId);
+  if (!respEl || !tab) return;
+  tab._viewMode = mode;
+  // raw text is stored in tab._rawText, set when response arrives
+  _renderRawHttpResp(respEl, tab._rawText || '', mode);
   ['raw','pretty'].forEach(m => {
     const btn = document.getElementById(`rep-resp-btn-${m}-${tabId}`);
     if (btn) btn.classList.toggle('on', m === mode);
@@ -343,7 +368,12 @@ function fmtReq(d, mode) {
   return `<span class="hm">${esc(d.method)}</span> ${esc(d.url)}\n${h}${body}`;
 }
 function fmtResp(d, mode) {
-  if (!d.status) return '<span style="color:var(--txt2)">No response</span>';
+  // Render when there is any response data, not only a numeric status, so a captured
+  // response without a status line still shows (see _dpHasResponse in 61-detail-pane.js).
+  const hasResp = typeof _dpHasResponse === 'function'
+    ? _dpHasResponse(d)
+    : !!(d.status || d.response_body);
+  if (!hasResp) return '<span style="color:var(--txt2)">No response</span>';
   const h = _rawHeaderLines(d.response_headers);
   const body = d.response_body
     ? '\n\n' + (mode === 'pretty' && _isJsonBody(d.response_body)

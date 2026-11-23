@@ -5,6 +5,29 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (flows & HAR import round 4-C)
+- **mfa_agent TOTP plumbing** — the OTP reuse check now resolves the target
+  host's login profile at agent-run time (`profiles.store.resolve_for_host`):
+  when the profile is a flagged TEST account with a TOTP seed, a FRESH code is
+  submitted, accepted, and submitted AGAIN unchanged — both succeeding proves
+  the code is not invalidated after first use (CWE-294, confirmed against a
+  provably-valid code rather than the stale captured-value fallback, which
+  stays for unseeded profiles).
+- **oauth_agent** (`oauth`) — authorize-flow checks from ARTEX api-security
+  P2, GET-only, nothing redeemed: **redirect_uri takeover CONFIRMED** (swap to
+  an attacker origin; 3xx with the attacker Location = CWE-601 high; rejected
+  swap = no finding), plus mechanism findings for missing `state`
+  (authorization CSRF), missing PKCE on code flows, and implicit token flow.
+  Dispatch: contextual on authorize-shaped requests.
+- **HAR 1.2 import** — `dast/proxy/har_import.py` + `POST
+  /api/history/import/har` + ⇧ HAR button: 1.2-only (400), ≤2000 entries /
+  ≤32 MiB body (400/413), per-entry problems counted and never fatal (≤50
+  details), cookies arrays synthesize Cookie/Set-Cookie wire headers,
+  postData.params rebuilds urlencoded bodies, base64 content decoded, URL
+  userinfo redacted, deterministic `har-<sha256>` de-dup keys; imported rows
+  are plain history entries (source `imported`) — match&replace never applies
+  to them (ARTEX invariant). Round-trips with the 3-I exporter.
+
 ### Added (agents heavy round 4-B)
 - **cswsh_agent** (`cswsh`, CWE-346) — the generic Cross-Site WebSocket
   Hijacking check nobody performed: a RAW `Upgrade: websocket` handshake with

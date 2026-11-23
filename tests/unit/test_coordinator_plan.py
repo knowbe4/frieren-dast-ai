@@ -205,3 +205,81 @@ async def test_canary_summary_omitted_when_empty(install_fake_client):
 
     user_message = _last_user_message(fake)
     assert "Canary probe results" not in user_message
+
+
+# ── coverage-ledger feed (3-H) ───────────────────────────────────────────────
+
+def test_record_coverage_writes_machine_observed_entries():
+    from types import SimpleNamespace as _ns
+
+    from dast.coverage import ledger as cov
+
+    target = _target()
+    agents = [
+        _ns(attack_type="sqli", observations=[_ns(kind="no_signal", signal="")]),
+        _ns(attack_type="ssrf", observations=[
+            _ns(kind="waf_block", signal="blocked by cloudflare")]),
+    ]
+    agent_raw = {"sqli": [_ns(title="SQLi in id (confirmed)")], "ssrf": []}
+
+    Coordinator._record_coverage(target, agents, agent_raw)
+
+    sqli = cov.entries_for("GET", "/api", "api")
+    outcomes = {e.risk_area: e.outcome for e in sqli}
+    assert outcomes["sqli"] == "reported"
+    assert outcomes["ssrf"] == "needs_follow_up"
+    assert "waf_block" in next(e for e in sqli if e.risk_area == "ssrf").reason
+
+
+def test_record_coverage_never_raises_and_never_blocks(monkeypatch):
+    from types import SimpleNamespace as _ns
+
+    from dast.coverage import ledger as cov
+
+    def _boom(*a, **k):
+        raise RuntimeError("ledger disk full")
+
+    monkeypatch.setattr(cov, "record_scan_outcome", _boom)
+    # _run_inner wraps the call; the classmethod itself must not raise either
+    Coordinator._record_coverage(_target(), [_ns(attack_type="sqli", observations=[])], {})
+
+
+@pytest.mark.asyncio
+async def test_coverage_section_absent_when_no_entries(install_fake_client):
+    fake = install_fake_client([_tool_response({"agents": ["secrets"], "reason": "r"})])
+
+    await Coordinator._plan(_target(), signal_attack_types=[], candidate_types=["secrets"])
+
+    # empty ledger → prompt byte-for-byte identical to the pre-3-H shape
+    assert "[Coverage ledger" not in _last_user_message(fake)
+
+
+@pytest.mark.asyncio
+async def test_coverage_section_present_with_gaps_and_prefers_unrecorded(install_fake_client):
+    from types import SimpleNamespace as _ns
+
+    from dast.coverage import ledger as cov
+
+    target = _target()
+    # prior scan covered sqli (clean) and left ssrf open — seeded through the
+    # SAME surface derivation _plan queries (extract_operation = path tail)
+    Coordinator._record_coverage(target, [
+        _ns(attack_type="sqli", observations=[_ns(kind="no_signal", signal="")]),
+        _ns(attack_type="ssrf", observations=[
+            _ns(kind="structural_error", signal="budget exhausted")]),
+    ], {})
+
+    fake = install_fake_client([_tool_response({"agents": ["xss"], "reason": "r"})])
+    # the caller (_run_inner) builds the summary the same way — replicate it here
+    gap_lines = cov.planner_gap_lines("GET", "/api", "api",
+                                      candidate_classes=["sqli", "ssrf", "xss"])
+    assert gap_lines  # seeded entries must yield gaps
+    await Coordinator._plan(
+        target, signal_attack_types=[], candidate_types=["sqli", "ssrf", "xss"],
+        coverage_summary="\n".join("- " + line for line in gap_lines))
+
+    msg = _last_user_message(fake)
+    assert "[Coverage ledger" in msg
+    assert "unrecorded_risk_class xss" in msg          # the un-tested class leads
+    assert "needs_follow_up GET /api (api) ssrf" in msg  # the open gap is visible
+    assert "EXAMINED — not skipped" in msg             # clean ≠ skipped guidance

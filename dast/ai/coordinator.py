@@ -24,6 +24,7 @@ from dast.ai import bedrock_client
 from dast.ai.agent_base import AgentFinding, AgentObservation, VulnAgent
 from dast.ai.prompt_safety import UNTRUSTED_CONTENT_DIRECTIVE, wrap_untrusted
 from dast.ai.schemas import BASELINE_SCHEMA, PLANNER_SCHEMA
+from dast.coverage import ledger as coverage_ledger
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -998,6 +999,37 @@ class Coordinator:
         )
 
     @classmethod
+    def _record_coverage(cls, target: "CheckTarget", agents: List["VulnAgent"],
+                         agent_raw: Dict[str, List[AgentFinding]]) -> None:
+        """Write one coverage-ledger entry per dispatched attack_type (3-H).
+
+        Machine-observed mapping (see dast/coverage/ledger.py): raw findings →
+        ``reported`` with the titles as evidence; an agent's own waf/rate-limit/
+        structural observations → ``needs_follow_up`` with the blocker as the
+        reason; a clean run → ``no_issue_found`` with probe-count evidence. The
+        ledger is what later makes "ran and found nothing" readable as EXAMINED
+        instead of silently implying clean."""
+        from urllib.parse import urlparse as _up
+        _host = _up(target.url).hostname or ""
+        _path = _up(target.url).path or "/"
+        _operation = _extract_operation(target)
+        for agent in agents:
+            titles = [f.title for f in (agent_raw.get(agent.attack_type) or [])
+                      if getattr(f, "title", "")]
+            obs = list(getattr(agent, "observations", []) or [])
+            blockers = [f"{o.kind}: {str(getattr(o, 'signal', '') or '')[:80]}"
+                        for o in obs
+                        if getattr(o, "kind", "") in ("waf_block", "rate_limit",
+                                                      "structural_error")]
+            try:
+                coverage_ledger.record_scan_outcome(
+                    target.method, _host, _path, _operation, agent.attack_type,
+                    findings=titles, probe_count=len(obs), blockers=blockers)
+            except Exception as exc:  # one bad entry never skips the others
+                logger.warning("Coverage entry skipped", url=target.url,
+                               attack_type=agent.attack_type, error=str(exc))
+
+    @classmethod
     async def _run_inner(
         cls,
         target: "CheckTarget",
@@ -1282,6 +1314,24 @@ class Coordinator:
         # The planner now receives the baseline response so it can reason about
         # what the endpoint actually does, not just its URL structure.
         mine_params = False
+        # Coverage feed (3-H): what prior scans of THIS endpoint examined /
+        # left open, so a replan or rescan doesn't repeat covered classes and
+        # prefers the unrecorded ones (a human tester doesn't re-run sqli on an
+        # endpoint they just cleared). Empty ledger → empty summary → the
+        # prompt section is absent entirely.
+        coverage_summary = ""
+        try:
+            from urllib.parse import urlparse as _cov_up
+            _cov_gap_lines = coverage_ledger.planner_gap_lines(
+                target.method, _cov_up(target.url).path or "/",
+                _extract_operation(target), candidate_classes=candidate_types)
+            if _cov_gap_lines:
+                coverage_summary = "\n".join(
+                    "- " + (wrap_untrusted(line, "coverage_gap", 200) or line)
+                    for line in _cov_gap_lines)
+        except Exception as exc:  # pragma: no cover - bookkeeping must not gate planning
+            logger.warning("Coverage summary build failed", url=target.url, error=str(exc))
+            coverage_summary = ""
         # Targeted dispatch: a caller (the copilot acting as coordinator) may RESTRICT the scan
         # to an exact agent set, bypassing the LLM planner. Unknown/unregistered types are
         # filtered out here; if the caller passed types but NONE are registered, `restrict` is
@@ -1305,6 +1355,7 @@ class Coordinator:
                 canary_summary=canary_summary, signal_attack_types=list(signal_map.keys()),
                 candidate_types=candidate_types,
                 baseline_response=baseline_response_summary,
+                coverage_summary=coverage_summary,
             )
         else:
             selected_types = list({*signal_map.keys(), *no_canary_types})
@@ -1552,6 +1603,16 @@ class Coordinator:
             outcome_sink.agents_ran = [a.attack_type for a in agents]
             for _a in agents:
                 outcome_sink.observations.extend(getattr(_a, "observations", []))
+
+        # Coverage ledger (3-H): one machine-observed entry per dispatched
+        # attack_type — findings → reported; waf/rate-limit/structural →
+        # needs_follow_up; ran clean → no_issue_found with probe-count evidence.
+        # A later planner/rescan reads coverage facts instead of inferring
+        # "clean" from an absent finding. Bookkeeping never breaks a scan.
+        try:
+            cls._record_coverage(target, agents, agent_raw)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Coverage ledger update failed", url=target.url, error=str(exc))
 
         # Build per-agent outcome log entries
         confirmed_titles = {f.title for f in confirmed}
@@ -2035,6 +2096,7 @@ class Coordinator:
         signal_attack_types: Optional[List[str]] = None,
         candidate_types: Optional[List[str]] = None,
         baseline_response: str = "",
+        coverage_summary: str = "",
     ) -> tuple[List[str], str, bool]:
         available = ", ".join(cls._registry.keys())
 
@@ -2099,6 +2161,22 @@ class Coordinator:
         if baseline_response:
             baseline_section = f"\n{baseline_response}\n"
 
+        # Coverage ledger (3-H): what prior scans of THIS endpoint examined /
+        # ruled out / left open. Header is code-owned; the gap lines carry
+        # agent-derived text (finding titles, blocker reasons), so each line is
+        # fenced as untrusted. Empty ledger → absent section → the prompt is
+        # byte-for-byte identical to the pre-3-H shape.
+        coverage_section = ""
+        if coverage_summary:
+            coverage_section = (
+                "\n[Coverage ledger — prior scans of this endpoint; the gap lines below"
+                " are agent-reported data]\n"
+                f"{coverage_summary}\n"
+                "Classes covered with a clean outcome were EXAMINED — not skipped. Prefer"
+                " the unrecorded classes when selecting what to run; re-run a covered class"
+                " only if you can test something materially deeper.\n"
+            )
+
         # Sanitize body before embedding — MongoDB/NoSQL operators trigger Bedrock content filter
         _body_snippet = (target.body or "")[:600]
         _body_snippet = _re.sub(r'\$(?:where|ne|eq|gt|lt|gte|lte|in|nin|regex|exists|or|and|not|nor|all|elemMatch)\b', r'[op]', _body_snippet)
@@ -2118,6 +2196,7 @@ class Coordinator:
             f"{code_section}"
             f"{canary_section}"
             f"{restrict_note}"
+            f"{coverage_section}"
             f"\nSelect only the agents worth running for this endpoint."
             f" Use the baseline response above to understand what this endpoint does before deciding."
             f" Prioritise attack types that showed canary signal or have worked on this host before."

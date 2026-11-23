@@ -8,6 +8,8 @@ dependencies = [
     "playwright>=1.44.0",
     # HTTP
     "httpx>=0.27.0",
+    # HTTP/2 framing (http2_agent probes — 4-D)
+    "h2>=4.1.0",
     # AI (AWS Bedrock)
     "boto3>=1.34.0",
     "botocore>=1.34.0",

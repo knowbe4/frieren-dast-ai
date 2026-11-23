@@ -355,6 +355,7 @@ async def _extract_endpoints_for_chunk(
                 model_id=bedrock_client.get_fast_model(),
                 max_tokens=2000,
                 schema=ENDPOINT_EXTRACTION_SCHEMA,
+                purpose="code_endpoints",
             ),
         )
         return _parse_endpoint_response(raw)
@@ -437,7 +438,7 @@ async def _generate_hypotheses(
                 system=_HYPOTHESIS_SYSTEM,
                 user=user_prompt,
                 model_id=bedrock_client.get_validation_model(),
-                max_tokens=2000,
+                max_tokens=2000, purpose="code_hypotheses",
             ),
         )
         hypotheses = _parse_hypothesis_response(raw_text)

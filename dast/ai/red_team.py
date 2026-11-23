@@ -303,6 +303,7 @@ async def validate(
             lambda: bedrock_client.invoke_json(
                 system=_SYSTEM, user=user, model_id=validation_model,
                 schema=RED_TEAM_SCHEMA, temperature=0, cache_system=True,
+                purpose="validator",
             ),
         )
 

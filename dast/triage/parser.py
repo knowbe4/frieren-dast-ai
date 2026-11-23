@@ -319,6 +319,7 @@ def _llm_enrich(report: H1Report, text: str) -> None:
         max_tokens=768,
         temperature=0,
         schema=H1_PARSE_SCHEMA,
+        purpose="triage_enrich",
     )
 
     # LLM output always wins — it has full context

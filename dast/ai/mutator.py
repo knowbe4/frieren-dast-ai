@@ -182,6 +182,7 @@ Decide the next action and respond with JSON:
             lambda: bedrock_client.invoke_json(
                 system=_SYSTEM_MUTATOR, user=user,
                 schema=MUTATOR_SCHEMA, cache_system=True,
+                purpose="mutator",
             ),
         )
         action = result.get("action", "stop")

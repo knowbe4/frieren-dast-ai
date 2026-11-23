@@ -1434,6 +1434,18 @@
       <h3>Payload Sources</h3>
       <div id="ai-payload-sources" style="margin-bottom:20px"></div>
 
+      <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:20px">
+
+      <!-- LLM usage (round 3-F recorder) -->
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+        <h3 style="margin:0">LLM Usage</h3>
+        <span style="font-size:10px;color:var(--txt2)">every LLM call since dashboard start — totals, purposes, recent attempts</span>
+        <button class="tbtn" onclick="clearAiUsage()" style="margin-left:auto">Clear counters</button>
+      </div>
+      <div id="ai-usage" style="margin-bottom:20px">
+        <div style="color:var(--txt2);font-size:11px">No LLM calls recorded yet.</div>
+      </div>
+
     </div>
     </div><!-- end ai-sub-settings -->
   </div><!-- end panel-ai -->

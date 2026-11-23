@@ -140,6 +140,7 @@ async def llm_verdict_http(
                 model_id=bedrock_client.get_fast_model(),
                 max_tokens=384, temperature=0,
                 schema=H1_VERDICT_SCHEMA,
+                purpose="triage_verdict_http",
             ),
         )
         reproduced = bool(result.get("reproduced"))
@@ -174,7 +175,7 @@ async def llm_analyse_response(report: H1Report, body: str, status_code: int) ->
             lambda: bedrock_client.invoke(
                 system=SYSTEM_ANALYSE, user=user,
                 model_id=bedrock_client.get_fast_model(),
-                max_tokens=256,
+                max_tokens=256, purpose="triage_analyse",
             ),
         )
     except Exception as exc:
@@ -208,7 +209,7 @@ async def llm_repair_proof_url(report: H1Report, proof_url: str, page_content: s
             lambda: bedrock_client.invoke(
                 system=SYSTEM_URL_REPAIR, user=user,
                 model_id=bedrock_client.get_fast_model(),
-                max_tokens=400, temperature=0,
+                max_tokens=400, temperature=0, purpose="triage_repair_url",
             ),
         )
         candidate = (raw or "").strip().splitlines()[0].strip() if raw else ""
@@ -242,7 +243,7 @@ async def llm_dns_verdict(report: H1Report, domain: str, dns_evidence: str) -> s
             lambda: bedrock_client.invoke(
                 system=SYSTEM_DNS, user=user,
                 model_id=bedrock_client.get_fast_model(),
-                max_tokens=256,
+                max_tokens=256, purpose="triage_dns",
             ),
         )
     except Exception as exc:
@@ -266,7 +267,7 @@ async def llm_ssrf_assessment(report: H1Report) -> str:
             lambda: bedrock_client.invoke(
                 system=SYSTEM_SSRF_ASSESS, user=user,
                 model_id=bedrock_client.get_validation_model(),
-                max_tokens=400,
+                max_tokens=400, purpose="triage_ssrf",
             ),
         )
     except Exception as exc:

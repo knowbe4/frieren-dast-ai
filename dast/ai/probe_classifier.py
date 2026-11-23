@@ -114,6 +114,7 @@ def classify(signature, model_id: Optional[str] = None) -> ProbeVerdict:
             model_id=model_id or get_fast_model(),
             temperature=0,
             schema=PROBE_CLASSIFIER_SCHEMA,
+            purpose="probe_classifier",
         )
     except Exception as exc:
         logger.warning("Probe-diff classification failed", error=str(exc))

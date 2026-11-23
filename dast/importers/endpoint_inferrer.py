@@ -121,6 +121,7 @@ def infer_endpoint(
             user=prompt,
             max_tokens=1024,
             schema=ENDPOINT_INFER_SCHEMA,
+            purpose="endpoint_infer",
         )
     except Exception as e:
         logger.error(

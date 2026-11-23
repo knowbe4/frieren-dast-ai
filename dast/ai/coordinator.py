@@ -1853,6 +1853,7 @@ class Coordinator:
                     schema=BASELINE_SCHEMA,
                     temperature=0,
                     cache_system=True,
+                    purpose="baseline_classifier",
                 ),
             )
             status = result.get("status", "ok")
@@ -2133,6 +2134,7 @@ class Coordinator:
                 lambda: bedrock_client.invoke_json(
                     system=_SYSTEM_PLAN, user=user, model_id=model_id or None,
                     schema=PLANNER_SCHEMA, temperature=0, cache_system=True,
+                    purpose="planner",
                 ),
             )
             selected = result.get("agents", [])

@@ -41,6 +41,35 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (vault, verify_authenticated, recoverable breaker, agentless three-gates)
   remains far ahead; nothing to copy there.
 
+### Added (noise governor round 3-G)
+- **Noise governor** (`dast/scanners/noise_governor.py`) — proactive per-host
+  pacing for scanner-originated egress, borrowed from ARTEX 0.7.0's egress
+  governor. Operator-chosen profiles (`off` default / `quiet` / `balanced` /
+  `aggressive`, with ARTEX's concrete numbers) bound every probe through a
+  per-host token bucket with jitter, per-host and global in-flight slots, a
+  whole-host pause after a 429/503 (Retry-After honoured up to the profile
+  cap) and an optional probe User-Agent override. Acquisition order follows
+  ARTEX (host slot → bucket wait → global slot last) and waits fail open at
+  60s — pacing can stall a probe but never deadlock a scan. `off` is a strict
+  passthrough: one cheap `active()` check, zero behavior change.
+- **Scanner egress wired** — `active_checks._send` (the chokepoint every agent
+  probe flows through) takes the paced slot BEFORE the scan concurrency
+  controls and subsumes the flat probe delay while pacing; a 429/503 now also
+  pauses the whole host so concurrent probes queue instead of each re-paying
+  the rejection. The race-condition agent opts out (`pace=False` — the burst
+  IS the experiment), as do raw-socket smuggling probes naturally. The
+  `sqli_probe_tools` send path and both `http_tools` request sites (copilot
+  `send_request` + the unauth-access check) are paced too. Operator browsing,
+  login flows and the SPA crawler are untouched in v1.
+- **Target Noise dashboard control** — `noise_profile` + `noise_user_agent`
+  in scan config (runtime switch, unknown profiles fall back to `off`),
+  `GET /api/noise-status` with per-host sent/in-flight/peak/backoff counters
+  plus the legacy adaptive rate-limit multipliers (tracked but never surfaced
+  until now), and a Target Noise card in the scan-config panel polling every
+  10s. When a profile is active the planner prompt gains a code-owned
+  low-noise note (precision over volume, no parallel bursts); with `off` the
+  prompt is byte-for-byte identical to before.
+
 ### Added (new agents round 3-E)
 - **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
   framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours

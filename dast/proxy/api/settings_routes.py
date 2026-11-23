@@ -286,6 +286,17 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             enabled = bool(body["ai_response_cache"])
             _scan_config["ai_response_cache"] = enabled
             _rc.set_enabled(enabled)  # toggling clears any stored decisions
+        if "noise_profile" in body:
+            # Noise governor (3-G): unknown names fall back to off (set_profile
+            # returns False) so the echoed config always reflects reality.
+            from dast.scanners import noise_governor as _ng
+            name = str(body["noise_profile"]).strip().lower()
+            _scan_config["noise_profile"] = name if _ng.set_profile(name) else "off"
+        if "noise_user_agent" in body:
+            from dast.scanners import noise_governor as _ng
+            ua = str(body["noise_user_agent"]).strip()
+            _scan_config["noise_user_agent"] = ua
+            _ng.set_user_agent(ua)  # applies only while a profile is active
         if "model_id" in body:
             new_model = str(body["model_id"]).strip()
             _scan_config["model_id"] = new_model

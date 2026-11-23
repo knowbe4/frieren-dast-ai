@@ -308,13 +308,21 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
 
         follow = bool(args.get("follow_redirects", True))
         request_body = body if method in ("POST", "PUT", "PATCH", "DELETE") else ""
-        async with httpx.AsyncClient(
-            proxy=ctx.proxy_url, verify=False, follow_redirects=follow, timeout=15,
-        ) as client:
-            resp = await client.request(
-                method, url, headers=headers or None,
-                content=request_body.encode("utf-8") if request_body else None,
-            )
+        # Noise governor (3-G): copilot send_request is scanner-side traffic —
+        # paced when a profile is active, free (None) when off.
+        from dast.scanners import noise_governor  # noqa: PLC0415 — local import
+        pace_token = await noise_governor.acquire(urlparse(url).hostname or url)
+        try:
+            async with httpx.AsyncClient(
+                proxy=ctx.proxy_url, verify=False, follow_redirects=follow, timeout=15,
+            ) as client:
+                resp = await client.request(
+                    method, url, headers=headers or None,
+                    content=request_body.encode("utf-8") if request_body else None,
+                )
+        finally:
+            if pace_token is not None:
+                pace_token.release()
         full_text = resp.text
         # dict(resp.headers) collapses repeated headers to a single value, which
         # hides multi-cookie issuance (e.g. CloudFront signed cookies set as three
@@ -399,12 +407,19 @@ async def _test_unauth(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]
         # Route through the MITM proxy (like send_request / get_app_token) so the
         # unauthenticated test is RECORDED in history and inspectable — never out-of-band.
         # proxy=None (MCP/no-proxy context) degrades to a direct send, as before.
-        async with httpx.AsyncClient(proxy=getattr(ctx, "proxy_url", None),
-                                     verify=False, follow_redirects=False, timeout=15) as client:
-            resp = await client.request(
-                method, url, headers=headers or None,
-                content=request_body.encode("utf-8") if request_body else None,
-            )
+        # Noise governor (3-G) paces this like the rest of the scanner egress.
+        from dast.scanners import noise_governor  # noqa: PLC0415 — local import
+        pace_token = await noise_governor.acquire(urlparse(url).hostname or url)
+        try:
+            async with httpx.AsyncClient(proxy=getattr(ctx, "proxy_url", None),
+                                         verify=False, follow_redirects=False, timeout=15) as client:
+                resp = await client.request(
+                    method, url, headers=headers or None,
+                    content=request_body.encode("utf-8") if request_body else None,
+                )
+        finally:
+            if pace_token is not None:
+                pace_token.release()
         full_text = resp.text
         content_type = resp.headers.get("content-type", "")
         is_accessible = resp.status_code not in (301, 302, 401, 403)

@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import httpx
 
+from dast.scanners import noise_governor
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -747,6 +748,7 @@ async def _send(
     payload: Optional[str] = None,
     source: str = "agent",
     timeout: "Optional[float]" = None,
+    pace: bool = True,
 ) -> "Optional[httpx.Response]":
     from urllib.parse import urlparse as _up
     hostname = _up(url).hostname or url
@@ -756,104 +758,120 @@ async def _send(
     if is_host_dead(hostname):
         return None
 
-    limiter = await _get_host_limiter(hostname)
-    async with _PROBE_SEM:
-        await limiter.acquire()
-        rtt_s: "Optional[float]" = None
-        congested = False
-        try:
-            delay = await _get_probe_delay(hostname)
-            await asyncio.sleep(delay)
-            forward_headers = {
-                k: v for k, v in headers.items()
-                if k.lower() not in (
-                    "host", "content-length", "transfer-encoding",
-                    "connection", "accept-encoding", "x-dast-crawler",
+    # Noise governor (3-G): when a profile is active, take the paced slot BEFORE
+    # the scan concurrency controls so a probe parked by pacing (bucket deficit,
+    # host-wide 429/503 pause) does not occupy a _PROBE_SEM/limiter slot. The
+    # governor subsumes the flat probe delay below. Off (default) → None, free.
+    pace_token = (await noise_governor.acquire(hostname)) if pace else None
+    try:
+        limiter = await _get_host_limiter(hostname)
+        async with _PROBE_SEM:
+            await limiter.acquire()
+            rtt_s: "Optional[float]" = None
+            congested = False
+            try:
+                if pace_token is None:
+                    delay = await _get_probe_delay(hostname)
+                    await asyncio.sleep(delay)
+                forward_headers = {
+                    k: v for k, v in headers.items()
+                    if k.lower() not in (
+                        "host", "content-length", "transfer-encoding",
+                        "connection", "accept-encoding", "x-dast-crawler",
+                    )
+                }
+                forward_headers["x-dast-source"] = source
+                noise_governor.apply_user_agent(forward_headers)
+                if payload is not None:
+                    # Truncate to keep headers small; proxy strips this before forwarding
+                    forward_headers["x-dast-payload"] = payload[:200]
+                if isinstance(body, bytes):
+                    content = body
+                elif body:
+                    content = body.encode()
+                else:
+                    content = None
+                # A time-based blind probe (SLEEP/WAITFOR) needs a read timeout longer
+                # than the injected delay PLUS whatever ambient latency the target is
+                # under from concurrent probing. Without it the SLEEP response exceeds
+                # the default client timeout, the request is discarded (resp=None), and
+                # the delay we were trying to measure is never observed. Callers pass an
+                # explicit per-probe timeout for these; everything else uses the client
+                # default.
+                request_timeout = (
+                    httpx.Timeout(timeout) if timeout is not None else httpx.USE_CLIENT_DEFAULT
                 )
-            }
-            forward_headers["x-dast-source"] = source
-            if payload is not None:
-                # Truncate to keep headers small; proxy strips this before forwarding
-                forward_headers["x-dast-payload"] = payload[:200]
-            if isinstance(body, bytes):
-                content = body
-            elif body:
-                content = body.encode()
-            else:
-                content = None
-            # A time-based blind probe (SLEEP/WAITFOR) needs a read timeout longer
-            # than the injected delay PLUS whatever ambient latency the target is
-            # under from concurrent probing. Without it the SLEEP response exceeds
-            # the default client timeout, the request is discarded (resp=None), and
-            # the delay we were trying to measure is never observed. Callers pass an
-            # explicit per-probe timeout for these; everything else uses the client
-            # default.
-            request_timeout = (
-                httpx.Timeout(timeout) if timeout is not None else httpx.USE_CLIENT_DEFAULT
-            )
-            resp = await client.request(
-                method=method,
-                url=url,
-                headers=forward_headers,
-                content=content,
-                timeout=request_timeout,
-            )
-            # Feed the server round-trip to the adaptive limiter. A time-based
-            # SLEEP probe legitimately runs long, so it is not a congestion signal;
-            # exclude it (the caller passes an explicit timeout for those).
-            if timeout is None:
-                rtt_s = response_elapsed_ms(resp) / 1000.0
+                resp = await client.request(
+                    method=method,
+                    url=url,
+                    headers=forward_headers,
+                    content=content,
+                    timeout=request_timeout,
+                )
+                # Feed the server round-trip to the adaptive limiter. A time-based
+                # SLEEP probe legitimately runs long, so it is not a congestion signal;
+                # exclude it (the caller passes an explicit timeout for those).
+                if timeout is None:
+                    rtt_s = response_elapsed_ms(resp) / 1000.0
 
-            # A 502/504 from the MITM proxy means it could not reach the upstream
-            # host (DNS failure, connection refused) — treat it as a connection
-            # failure for the breaker, not a real application response.
-            if resp.status_code in _PROXY_UNREACHABLE_STATUSES:
-                await _record_connection_failure(hostname)
+                # A 502/504 from the MITM proxy means it could not reach the upstream
+                # host (DNS failure, connection refused) — treat it as a connection
+                # failure for the breaker, not a real application response.
+                if resp.status_code in _PROXY_UNREACHABLE_STATUSES:
+                    await _record_connection_failure(hostname)
+                    return resp
+
+                # Adaptive rate limiting: back off on 429/503, recover on success.
+                # The governor additionally pauses the WHOLE host so concurrent
+                # probes queue instead of each re-paying the rejection.
+                if resp.status_code in (429, 503):
+                    await _record_rate_limit(hostname)
+                    retry_after = resp.headers.get("retry-after", "")
+                    if retry_after.isdigit():
+                        wait = min(int(retry_after), 30)
+                        logger.info("Rate limited — honouring Retry-After", host=hostname, wait_s=wait)
+                        await asyncio.sleep(wait)
+                        noise_governor.note_rate_limited(hostname, float(wait))
+                    else:
+                        noise_governor.note_rate_limited(hostname)
+                elif resp.status_code < 500:
+                    await _record_success(hostname)
+
+                # Any real response (even a 4xx/5xx app error) proves the host is
+                # reachable — reset the connection-failure counter.
+                await _record_host_reachable(hostname)
                 return resp
-
-            # Adaptive rate limiting: back off on 429/503, recover on success
-            if resp.status_code in (429, 503):
-                await _record_rate_limit(hostname)
-                retry_after = resp.headers.get("retry-after", "")
-                if retry_after.isdigit():
-                    wait = min(int(retry_after), 30)
-                    logger.info("Rate limited — honouring Retry-After", host=hostname, wait_s=wait)
-                    await asyncio.sleep(wait)
-            elif resp.status_code < 500:
-                await _record_success(hostname)
-
-            # Any real response (even a 4xx/5xx app error) proves the host is
-            # reachable — reset the connection-failure counter.
-            await _record_host_reachable(hostname)
-            return resp
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as e:
-            # True connection-level failure: DNS failure, connection refused,
-            # connect timeout, or the MITM proxy could not reach upstream. The
-            # host is unreachable — count it toward the breaker so a dead host
-            # stops the scan instead of spinning.
-            logger.debug("Active check connection failed", url=url, error=str(e))
-            await _record_connection_failure(hostname)
-            return None
-        except Exception as e:
-            # The connection was established but the exchange did not complete
-            # (read/pool/write timeout, protocol error, socket read error). A
-            # read timeout in particular is EXPECTED for time-based blind probes
-            # (SLEEP/WAITFOR payloads) and proves the host is reachable — it must
-            # NOT trip the breaker, or a slow endpoint would silently disable all
-            # further active scanning of a perfectly live host. Treat it as a
-            # reachable-but-slow response: reset the failure counter, drop this
-            # probe's result.
-            logger.debug("Active check request failed (host still reachable)", url=url, error=str(e))
-            await _record_host_reachable(hostname)
-            # A default-timeout request that did not complete is the strongest
-            # congestion signal there is: the target could not answer in time under
-            # the current load. Time-based probes (explicit timeout) time out for
-            # benign reasons, so they do not count against concurrency.
-            if timeout is None:
-                congested = True
-            return None
-        finally:
-            await limiter.release(rtt_s, congested)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as e:
+                # True connection-level failure: DNS failure, connection refused,
+                # connect timeout, or the MITM proxy could not reach upstream. The
+                # host is unreachable — count it toward the breaker so a dead host
+                # stops the scan instead of spinning.
+                logger.debug("Active check connection failed", url=url, error=str(e))
+                await _record_connection_failure(hostname)
+                return None
+            except Exception as e:
+                # The connection was established but the exchange did not complete
+                # (read/pool/write timeout, protocol error, socket read error). A
+                # read timeout in particular is EXPECTED for time-based blind probes
+                # (SLEEP/WAITFOR payloads) and proves the host is reachable — it must
+                # NOT trip the breaker, or a slow endpoint would silently disable all
+                # further active scanning of a perfectly live host. Treat it as a
+                # reachable-but-slow response: reset the failure counter, drop this
+                # probe's result.
+                logger.debug("Active check request failed (host still reachable)", url=url, error=str(e))
+                await _record_host_reachable(hostname)
+                # A default-timeout request that did not complete is the strongest
+                # congestion signal there is: the target could not answer in time under
+                # the current load. Time-based probes (explicit timeout) time out for
+                # benign reasons, so they do not count against concurrency.
+                if timeout is None:
+                    congested = True
+                return None
+            finally:
+                await limiter.release(rtt_s, congested)
+    finally:
+        if pace_token is not None:
+            pace_token.release()
 
 
 def response_elapsed_ms(resp: "Optional[httpx.Response]") -> float:

@@ -205,3 +205,30 @@ async def test_canary_summary_omitted_when_empty(install_fake_client):
 
     user_message = _last_user_message(fake)
     assert "Canary probe results" not in user_message
+
+
+# ── noise-governor note (3-G) ───────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_noise_section_absent_when_profile_off(install_fake_client):
+    fake = install_fake_client([_tool_response({"agents": ["secrets"], "reason": "r"})])
+
+    await Coordinator._plan(_target(), signal_attack_types=[], candidate_types=["secrets"])
+
+    # off must keep the prompt byte-for-byte identical to the pre-3-G shape.
+    assert "Noise profile" not in _last_user_message(fake)
+
+
+@pytest.mark.asyncio
+async def test_noise_section_present_when_profile_active(install_fake_client):
+    from dast.scanners import noise_governor
+
+    noise_governor.set_profile("quiet")
+    fake = install_fake_client([_tool_response({"agents": ["secrets"], "reason": "r"})])
+
+    await Coordinator._plan(_target(), signal_attack_types=[], candidate_types=["secrets"])
+
+    msg = _last_user_message(fake)
+    assert "[Noise profile: quiet. Operator setting, not a target fact.]" in msg
+    assert "2 requests/second" in msg
+    assert "pacing, not a target fact" not in msg  # exact header only, no drift

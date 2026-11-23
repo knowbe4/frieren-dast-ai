@@ -173,27 +173,39 @@ def make_router(ctx: DashboardContext) -> APIRouter:
     async def add_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        settings.add_match_replace(body)
-        return {"ok": True}
+        try:
+            rule = settings.add_match_replace(body)
+        except ValueError as exc:
+            # invalid enum/regex/cap (3-I) — a 400 instead of the old silent fallback
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"ok": True, "rule": rule}
 
     @router.delete("/api/settings/match-replace")
     async def remove_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        idx = body.get("index")
-        if idx is None:
-            return JSONResponse({"error": "index required"}, status_code=400)
-        settings.remove_match_replace(int(idx))
+        identifier = body.get("id", body.get("index"))
+        if identifier is None:
+            return JSONResponse({"error": "id (or legacy index) required"}, status_code=400)
+        try:
+            settings._find_mr_index(identifier)
+        except KeyError:
+            return JSONResponse({"error": "rule not found"}, status_code=404)
+        settings.remove_match_replace(identifier)
         return {"ok": True}
 
     @router.post("/api/settings/match-replace/toggle")
     async def toggle_match_replace(body: dict):
         if settings is None:
             return JSONResponse({"error": "settings not available"}, status_code=503)
-        idx = body.get("index")
-        if idx is None:
-            return JSONResponse({"error": "index required"}, status_code=400)
-        settings.toggle_match_replace(int(idx), bool(body.get("enabled", True)))
+        identifier = body.get("id", body.get("index"))
+        if identifier is None:
+            return JSONResponse({"error": "id (or legacy index) required"}, status_code=400)
+        try:
+            settings._find_mr_index(identifier)
+        except KeyError:
+            return JSONResponse({"error": "rule not found"}, status_code=404)
+        settings.toggle_match_replace(identifier, bool(body.get("enabled", True)))
         return {"ok": True}
 
     @router.post("/api/settings/import")

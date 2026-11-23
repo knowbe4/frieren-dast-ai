@@ -267,8 +267,11 @@ class ProxyServer:
         # ── End request intercept ──────────────────────────────────────────
 
         # ── Match & Replace (request phase) ───────────────────────────────────
+        _mr_fired = []
         if self._settings and headers.get(_SOURCE_HEADER) is None and headers.get(_CRAWLER_HEADER) is None:
-            url, headers, body = self._settings.apply_to_request(url, headers, body)
+            _req_enc = headers.get("content-encoding", "identity")
+            url, headers, body, _mr_fired = self._settings.apply_to_request(
+                url, headers, body, method=method, content_encoding=_req_enc)
             _path = _urlparse(url).path
             # Body may have changed size — keep content-length in sync so the
             # upstream server doesn't hang waiting for bytes that will never arrive.
@@ -339,17 +342,24 @@ class ProxyServer:
             resp_reason = resp.reason_phrase
 
             # ── Match & Replace (response phase) ──────────────────────────────
-            # Track whether any response rule fired so we use the modified
-            # headers when writing back to the client (below).
+            # Track which response rules FIRED (3-I trace) so we use the modified
+            # headers when writing back to the client (below) and can attribute
+            # the rewrite on the history entry. Crawler traffic is now excluded
+            # too — aligned with the request-phase gate above.
             _resp_mr_applied = False
-            if self._settings and headers.get(_SOURCE_HEADER) is None:
+            if self._settings and headers.get(_SOURCE_HEADER) is None and headers.get(_CRAWLER_HEADER) is None:
                 resp_headers_dict = dict(resp.headers.multi_items())
-                modified_headers, body_bytes = self._settings.apply_to_response(
-                    dict(resp_headers_dict), body_bytes
+                modified_headers, body_bytes, _resp_fired = self._settings.apply_to_response(
+                    url, dict(resp_headers_dict), body_bytes,
+                    method=method, status=resp_status,
+                    content_encoding=resp.headers.get("content-encoding", "identity"),
                 )
                 if modified_headers != resp_headers_dict:
                     _resp_mr_applied = True
                     resp_headers_dict = modified_headers
+                if _resp_fired:
+                    _mr_fired = list(dict.fromkeys(list(_mr_fired) + list(_resp_fired)))
+                    _resp_mr_applied = True
             # ── End Match & Replace ────────────────────────────────────────────
 
             # ── Response intercept phase ───────────────────────────────────────
@@ -406,6 +416,17 @@ class ProxyServer:
                     response_body=body_bytes,
                     duration_ms=duration_ms,
                 )
+                # Rewrite trace (3-I): which match&replace rules fired on this
+                # exchange — replaces the old header-diff heuristic entirely.
+                if _mr_fired:
+                    try:
+                        entry = self._store.get_entry(entry_id)
+                        if entry is not None:
+                            entry.rewritten_by = list(dict.fromkeys(
+                                list(entry.rewritten_by or []) + list(_mr_fired)))
+                    except Exception as _rw_exc:
+                        logger.debug("recording rewritten_by failed",
+                                     url=url, error=str(_rw_exc))
 
             # Use multi_items() to preserve duplicate headers (e.g. Set-Cookie).
             # A plain dict comprehension would collapse them, dropping all but

@@ -466,6 +466,16 @@
               <input id="mr-replace" placeholder="e.g. Authorization: Bearer token123" spellcheck="false"
                      style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
             </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Host matcher (optional)</label>
+              <input id="mr-host" placeholder="api.example.com or *.example.com" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">URL matcher (optional regex over path+query)</label>
+              <input id="mr-url-regex" placeholder="e.g. ^/api/v2/" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
           </div>
           <div style="margin-bottom:8px">
             <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Comment (optional)</label>
@@ -486,6 +496,8 @@
                 <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Type</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Match</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Replace</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Scope matchers</th>
+                <th style="padding:3px 8px;text-align:right;font-weight:500" title="times this rule changed a request/response">Hits</th>
                 <th style="padding:3px 8px;text-align:left;font-weight:500">Comment</th>
                 <th style="width:26px;padding:3px 4px"></th>
               </tr>

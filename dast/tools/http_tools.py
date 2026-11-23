@@ -11,6 +11,7 @@ This is the repeater primitive exposed to agents and MCP clients.
 from __future__ import annotations
 
 import html
+import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlparse
 
@@ -21,6 +22,16 @@ from dast.utils.logger import get_logger
 from dast.utils.placeholders import looks_like_placeholder
 
 logger = get_logger(__name__)
+
+# A cookie whose name looks like a session/auth cookie — used only for observability
+# logging, to flag a likely-guest (no-session) request to an auth-gated endpoint.
+_SESSION_COOKIE_RE = re.compile(r"session|_session|sid", re.IGNORECASE)
+
+
+def _session_cookie_present(names: "List[str]") -> bool:
+    """True if any cookie name looks like a session/auth cookie."""
+    return any(_SESSION_COOKIE_RE.search(n or "") for n in names)
+
 
 # Reflection detection: an injected value shorter than this is too noisy to be a
 # reliable reflection signal (e.g. "1", "ok"), so it is skipped.
@@ -210,8 +221,15 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     # process ctx.store is None -> no cookie/Bearer source; use browser_fetch there.)
     trusted_cookies = headers.pop("x-dast-cookies-injected", None)
     jar_cookie_map: Dict[str, str] = {}
+    caller_stripped: List[str] = []
     if not trusted_cookies:
-        headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+        # Drop ALL caller-pasted auth (Cookie/Authorization/X-CSRF-Token/X-XSRF-Token): the
+        # managed session is the source of truth, and a hand-pasted (usually stale) value
+        # overrides it and breaks the request. attach() below re-seeds the live session's
+        # Cookie/CSRF and a cached Bearer. (A copilot-engine inject carrying the trusted marker
+        # is OURS — skipped here and kept.)
+        from dast.proxy.auth_headers import strip_caller_auth_headers
+        caller_stripped = strip_caller_auth_headers(headers)
         if ctx.store is not None:
             _host = urlparse(url).hostname or ""
             try:
@@ -221,6 +239,18 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             except Exception as exc:
                 logger.debug("send_request: cookie jar lookup failed",
                              host=_host, error=str(exc))
+
+            # Observability: surface whether a session cookie was actually pulled, so a
+            # guest (no-session) request to an auth-gated endpoint is visible in the logs.
+            _names = list(jar_cookie_map.keys())
+            _has_session = _session_cookie_present(_names)
+            logger.info("send_request cookie jar", host=_host,
+                        cookies=len(_names), session_cookie=_has_session)
+            if not _has_session:
+                logger.warning(
+                    "send_request: no session cookie in jar for %s — if the app "
+                    "authenticated in the browser, use browser_fetch" % _host,
+                    host=_host, method=method, cookies=len(_names))
 
     # Resolve a sub-app Bearer when one is known for this (host, path), so a direct / MCP
     # caller can reach a Bearer-authed sub-app instead of a 403. Prefer the
@@ -267,9 +297,10 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     _res = _attach(headers, transport="api", cookies=(jar_cookie_map or None),
                    bearer_rec=rec, trusted_marker=bool(trusted_cookies),
                    drop_all_authorization=True, csrf_token=csrf_token)
-    if _res.stripped:
+    all_stripped = list(dict.fromkeys(caller_stripped + _res.stripped))
+    if all_stripped:
         logger.warning("send_request stripped hand-pasted/caller auth header(s)",
-                       headers=",".join(_res.stripped))
+                       headers=",".join(all_stripped))
     headers.pop("x-dast-cookies-injected", None)
 
     body = args.get("body") or ""
@@ -302,6 +333,17 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                 "safe_variant": destructive["safe_variant"],
                 "hint": "Re-send with the safe_variant substituted; detection-only policy.",
             }
+
+    # Snapshot known history ids BEFORE sending so we can resolve the real
+    # proxy-history entry_id of the request we are about to issue (see below). This
+    # is what lets the caller cite evidence_entry_ids in record_finding instead of
+    # narrating an ungrounded chain. In-process store only (MCP has no store).
+    known_entry_ids: Optional[set] = None
+    if getattr(ctx, "store", None) is not None:
+        try:
+            known_entry_ids = {e.id for e in ctx.store.entries_newest_first()}
+        except Exception:
+            known_entry_ids = None
 
     try:
         import httpx
@@ -340,7 +382,14 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
-        _flagged = list(dict.fromkeys(_res.stripped))
+        if known_entry_ids is not None:
+            try:
+                eid = ctx.store.resolve_sent_entry_id(url, method, known_entry_ids)
+                if eid:
+                    result["entry_id"] = eid
+            except Exception as exc:
+                logger.debug("send_request: entry_id resolution failed", error=str(exc)[:120])
+        _flagged = all_stripped
         if _flagged:
             result["note"] = (
                 f"stripped caller-supplied auth header(s) ({', '.join(_flagged)}) — do not set "
@@ -497,6 +546,10 @@ register(Tool(
         "Set follow_redirects=false to capture a raw 302/301 response and its Location header "
         "without following the redirect chain. This is useful when you need to inspect redirect "
         "targets (e.g. OAuth /authorize URLs with acr_values or prompt parameters).\n"
+        "The result includes 'entry_id' — the real proxy-history id of the request you just "
+        "sent. Keep it: pass these ids as record_finding's evidence_entry_ids so the finding "
+        "is grounded in the exact captured request/response that proves it (especially for a "
+        "multi-request proof), instead of only narrating a chain.\n"
         "Auth is injected automatically when you do not supply it: session cookies + CSRF/XHR "
         "headers from the jar, and a cached sub-app Bearer selected by request "
         "path when one is known. If a request still 401/403s after that (e.g. an SPA whose token "

@@ -94,6 +94,11 @@ class ProxyEntry:
     duration_ms: float = 0.0
     ts: float = field(default_factory=time.time)
     source: str = "proxy"   # "proxy" | "crawler" | "browse" | "scanner"
+    # Originating tool/component (from the internal x-dast-source header) recorded ALONGSIDE
+    # source. For an out-of-scope request the authoritative scope tag stays source="out-of-scope"
+    # (every scope/deny consumer keys on that), while origin preserves who made it — e.g. a
+    # copilot tool PUT to an out-of-scope S3 host reads as source="out-of-scope", origin="copilot".
+    origin: Optional[str] = None
     browse_session_id: Optional[str] = None
     crawler_session_id: Optional[str] = None
     # scan state
@@ -137,6 +142,7 @@ class ProxyEntry:
             "duration_ms": round(self.duration_ms, 1),
             "ts": self.ts,
             "source": self.source,
+            "origin": self.origin,
             "browse_session_id": self.browse_session_id,
             "crawler_session_id": self.crawler_session_id,
             "queued_for_scan": self.queued_for_scan,
@@ -433,9 +439,14 @@ class SessionStore:
         request_headers: Dict[str, str],
         request_body: Optional[bytes],
         source: str = "proxy",
+        origin: Optional[str] = None,
     ) -> Optional[str]:
         """
         Register a new request. Returns the entry ID, or None if filtered out.
+
+        ``origin`` records the originating tool/component (e.g. "copilot") ALONGSIDE the
+        resolved source, without overwriting it — so an out-of-scope tool request keeps its
+        authoritative source="out-of-scope" scope tag while still being attributable.
         """
         parsed = urlparse(url)
         host = parsed.netloc
@@ -470,6 +481,7 @@ class SessionStore:
                 request_headers=request_headers,
                 request_body=request_body,
                 source=resolved_source,
+                origin=origin,
                 browse_session_id=browse_sid,
                 crawler_session_id=crawler_sid,
                 probe_payload=probe_payload,
@@ -835,18 +847,107 @@ class SessionStore:
         if e:
             self._notify(e)
 
+    def resolve_sent_entry_id(
+        self, url: str, method: str, known_ids: "set[str] | list[str] | None"
+    ) -> Optional[str]:
+        """Id of the newest history entry NOT already in ``known_ids`` that matches a
+        just-issued request (exact url+method first, then same host+path+method for a
+        match&replace / trailing difference). ``send_request`` snapshots the ids before
+        sending and calls this after, so a finding can later cite the REAL history id of
+        the request that proves it. Returns the id, or None when no new matching entry
+        landed (e.g. the request was filtered as noise, or there is no in-process store)."""
+        url = (url or "").strip()
+        if not url:
+            return None
+        method = (method or "GET").strip().upper() or "GET"
+        parsed = urlparse(url)
+        host = parsed.netloc
+        path = parsed.path or "/"
+        known = set(known_ids or ())
+        exact = loose = None
+        with self._lock:
+            for eid in reversed(self._order):
+                if eid in known:
+                    continue
+                e = self._entries.get(eid)
+                if e is None or e.method != method:
+                    continue
+                if exact is None and e.url == url:
+                    exact = eid
+                if loose is None and e.host == host and e.path == path:
+                    loose = eid
+                if exact is not None:
+                    break
+        return exact or loose
+
+    def _best_entry_for_url(self, url: str, method: Optional[str] = None) -> Optional[str]:
+        """Id of the newest REAL history entry for ``url`` that can serve as a finding's
+        grounded evidence. Matches exact url first, then same host+path (ignoring query);
+        when ``method`` is None any method matches (match-by-url-ignoring-method). Prefers
+        an entry carrying a non-empty request body or a response over an empty stub — so a
+        real POST is never passed over for an empty synthetic GET. Returns None when no
+        entry matches at all (caller may then create a last-resort synthetic entry); never
+        fabricates one itself. Caller must NOT hold ``self._lock``."""
+        url = (url or "").strip()
+        if not url:
+            return None
+        parsed = urlparse(url)
+        host = parsed.netloc
+        path = parsed.path or "/"
+        want_method = (method or "").strip().upper() or None
+
+        def _has_payload(e: ProxyEntry) -> bool:
+            return bool(e.request_body) or e.response_status is not None or bool(e.response_body)
+
+        exact_real = exact_any = loose_real = loose_any = None
+        with self._lock:
+            for eid in reversed(self._order):
+                e = self._entries.get(eid)
+                if e is None:
+                    continue
+                if want_method and e.method != want_method:
+                    continue
+                is_exact = e.url == url
+                is_loose = e.host == host and e.path == path
+                if not is_exact and not is_loose:
+                    continue
+                real = _has_payload(e)
+                if is_exact:
+                    if real and exact_real is None:
+                        exact_real = eid
+                    if exact_any is None:
+                        exact_any = eid
+                if is_loose:
+                    if real and loose_real is None:
+                        loose_real = eid
+                    if loose_any is None:
+                        loose_any = eid
+        # Prefer a real exact match, then a real host+path match, only then an empty one.
+        return exact_real or loose_real or exact_any or loose_any
+
     def record_manual_finding(
         self, finding: dict, url: str, method: str = "GET"
     ) -> Optional[str]:
         """Attach a finding produced outside the scan pipeline (Exploration Copilot
-        or an MCP client) to the proxy history so it shows in the Findings tab.
+        or an MCP client) to the proxy history so it shows in the Findings tab,
+        grounded in REAL captured traffic.
 
-        Links the finding to the most recent in-store entry for the same url+method
-        so it carries the real request/response it was confirmed on. When no such
-        entry exists (the caller never proxied that url through Frieren) a
-        lightweight synthetic entry is created so the finding still lands with its
-        request context. Returns the entry id it was attached to, or None if url is
-        missing.
+        Grounding order:
+        1. ``finding['evidence_entry_ids']`` — ordered real history ids the caller
+           (browser_fetch/send_request results) says prove the finding. The primary
+           link is the first that exists in the store; the cleaned list is kept on the
+           finding so the UI/report can render the whole proof chain.
+        2. Each ``finding['steps'][*]`` is resolved to a real entry: a model-supplied
+           ``step['entry_id']`` if it exists, else the newest real entry for the
+           step's url (+method) — so every chain row can open a real request/response.
+        3. Fallback primary (no usable evidence ids): the newest REAL entry for ``url``
+           IGNORING method, preferring one that carries a body/response. An empty stub
+           is never chosen over a real request, and no synthetic entry is fabricated
+           while any real matching request (same host+path) exists.
+        4. Last resort only (nothing in history matches): a lightweight synthetic entry,
+           flagged ``evidence_synthetic`` + ``evidence_note`` so the UI/operator can tell.
+
+        Returns the entry id it was attached to, or None if url is missing.
         """
         url = (url or "").strip()
         if not url:
@@ -855,25 +956,79 @@ class SessionStore:
         parsed = urlparse(url)
         host = parsed.netloc
         path = parsed.path or "/"
-        entry_id: Optional[str] = None
-        with self._lock:
-            # Newest matching entry first (the request the caller just probed).
-            for eid in reversed(self._order):
-                e = self._entries.get(eid)
-                if e and e.url == url and e.method == method:
-                    entry_id = eid
+
+        # 1) Explicit evidence entry ids — keep only those that are real history ids.
+        linked_ids: List[str] = []
+        raw_evidence = finding.get("evidence_entry_ids")
+        if isinstance(raw_evidence, list):
+            with self._lock:
+                for raw in raw_evidence:
+                    eid = str(raw).strip()
+                    if eid and eid in self._entries and eid not in linked_ids:
+                        linked_ids.append(eid)
+        if linked_ids:
+            finding["evidence_entry_ids"] = linked_ids
+        else:
+            # Drop an empty/all-unknown list so the UI does not dead-link to it.
+            finding.pop("evidence_entry_ids", None)
+        primary_id: Optional[str] = linked_ids[0] if linked_ids else None
+
+        # 2) Resolve each narrative step to a real entry so every chain row is clickable.
+        steps = finding.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                supplied = str(step.get("entry_id", "") or "").strip()
+                if supplied and self.get_entry(supplied) is not None:
+                    step["entry_id"] = supplied
+                    continue
+                step_method = str(step.get("method", "") or "").strip().upper() or None
+                resolved = (self._best_entry_for_url(step.get("url", ""), step_method)
+                            or self._best_entry_for_url(step.get("url", ""), None))
+                if resolved:
+                    step["entry_id"] = resolved
+                elif "entry_id" in step:
+                    step.pop("entry_id", None)
+
+        # 3) Fallback primary: best REAL entry for the url, ignoring method.
+        if primary_id is None:
+            primary_id = self._best_entry_for_url(url, None)
+        # Borrow a step's resolved real entry before fabricating anything.
+        if primary_id is None and isinstance(steps, list):
+            for step in steps:
+                if isinstance(step, dict) and step.get("entry_id"):
+                    primary_id = str(step["entry_id"])
                     break
-            if entry_id is None:
-                entry_id = f"copilot-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
-                self._entries[entry_id] = ProxyEntry(
-                    id=entry_id, method=method, url=url, host=host, path=path,
+
+        # 4) Last resort: a synthetic entry, clearly flagged.
+        synthetic = False
+        if primary_id is None:
+            synthetic = True
+            with self._lock:
+                primary_id = f"copilot-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+                self._entries[primary_id] = ProxyEntry(
+                    id=primary_id, method=method, url=url, host=host, path=path,
                     request_headers={}, request_body=None, source="copilot",
                 )
-                self._order.append(entry_id)
+                self._order.append(primary_id)
+            finding["evidence_synthetic"] = True
+            finding.setdefault(
+                "evidence_note",
+                "No captured request matched this finding's url, so a placeholder entry "
+                "was created — it has no real request/response. Re-run the proof through "
+                "send_request/browser_fetch and cite evidence_entry_ids so the finding is "
+                "grounded in real traffic.",
+            )
+
         # add_finding re-acquires the lock and notifies listeners — call it outside
         # the lock block above (the lock is not reentrant).
-        self.add_finding(entry_id, finding, "vulnerable")
-        return entry_id
+        self.add_finding(primary_id, finding, "vulnerable")
+        logger.info("record_manual_finding linked finding to entry",
+                    entry_id=primary_id, synthetic=synthetic,
+                    evidence_entry_ids=linked_ids or None,
+                    title=str(finding.get("title", ""))[:80])
+        return primary_id
 
     def remove_finding(self, entry_id: str, finding_index: int) -> bool:
         """Remove a single finding by index. Returns True if removed."""

@@ -71,7 +71,6 @@
   <div class="tab-group-sep"></div>
   <div class="tab-group" title="Analyze">
     <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg></span>
-    <div class="mtab"     id="mt-ai"       onclick="switchMain('ai')">AI</div>
     <div class="mtab"     id="mt-scan"     onclick="switchMain('scan')">Scan</div>
     <div class="mtab"     id="mt-graphql"  onclick="switchMain('graphql')">GraphQL</div>
     <div class="mtab"     id="mt-plugins"  onclick="switchMain('plugins')">Plugins</div>
@@ -80,6 +79,7 @@
   <div class="tab-group" title="Tools">
     <span class="tab-group-icon" aria-hidden="true"><svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M10.5 2.5a3 3 0 00-4 4L2 11v3h3l4.5-4.5a3 3 0 004-4l-2 2-2-2z"/></svg></span>
     <div class="mtab"     id="mt-logs"     onclick="switchMain('logs')">Logs</div>
+    <div class="mtab"     id="mt-settings" onclick="switchMain('settings')">Settings</div>
     <div class="mtab"     id="mt-extras"   onclick="switchMain('extras')">Extras</div>
   </div>
 </div>
@@ -174,7 +174,6 @@
         Intercept<span id="intercept-badge"></span>
       </div>
       <div class="stab"    id="st-sitemap"   onclick="switchProxySub('sitemap')">Site map</div>
-      <div class="stab"    id="st-psettings" onclick="switchProxySub('psettings')">Settings</div>
       <div class="sp"></div>
       <button id="intercept-toggle-btn" class="intercept-btn" onclick="interceptToggle()"
               title="Pause matching requests for manual review">Intercept</button>
@@ -318,299 +317,6 @@
         <!-- Original-vs-modified diff view, shown when the Diff toggle is on. -->
         <div id="intercept-diff" style="display:none;flex:1;overflow:auto;background:var(--bg);
              font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11.5px;padding:10px 0"></div>
-      </div>
-    </div>
-
-    <!-- Proxy Settings -->
-    <div id="proxy-settings" style="display:none;flex:1;overflow:hidden;">
-      <div class="settings-body">
-        <h2>Proxy Settings</h2>
-
-        <!-- Settings save/load bar -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--bdr)">
-          <span style="font-size:11px;color:var(--txt2);white-space:nowrap">Settings:</span>
-          <input id="inp-project-name" placeholder="settings name"
-                 style="width:160px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
-          <button class="tbtn pri" style="white-space:nowrap" onclick="saveProject()">Save</button>
-          <button class="tbtn" style="white-space:nowrap" onclick="document.getElementById('settings-file-input').click()">Import</button>
-          <select id="sel-preset" onchange="loadPreset(this)"
-                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px;cursor:pointer">
-            <option value="">Load preset...</option>
-          </select>
-        </div>
-
-        <!-- Section jump-nav: every settings section is listed here so nothing is
-             hidden below the fold (Match & Replace used to be easy to miss). -->
-        <div id="settings-nav">
-          <button class="settings-nav-link" onclick="settingsJump('sec-scope')">Scope</button>
-          <button class="settings-nav-link" onclick="settingsJump('sec-bypass')">Bypass &amp; Extensions</button>
-          <button class="settings-nav-link" onclick="settingsJump('sec-matchreplace')">Match &amp; Replace<span id="mr-active-badge" class="settings-nav-badge" style="display:none">0</span></button>
-          <button class="settings-nav-link" onclick="settingsJump('sec-setup')">Setup</button>
-        </div>
-
-        <!-- Include in scope -->
-        <div id="sec-scope" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
-          <h3 style="margin:0">Include in scope</h3>
-          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('include')">+ Add rule</button>
-        </div>
-        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">
-          Leave empty to record everything. Host/port/file: wildcards (<code style="color:var(--orange)">*.example.com</code>) or regex.
-        </p>
-        <div id="add-include-form" style="display:none;margin-bottom:4px"></div>
-        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:14px">
-          <table id="tbl-include" style="width:100%;border-collapse:collapse;font-size:11px">
-            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
-              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
-                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
-                <th style="width:26px;padding:3px 4px"></th>
-              </tr>
-            </thead>
-            <tbody id="tbody-include"></tbody>
-          </table>
-          <div id="empty-include" style="font-size:11px;color:var(--green);padding:5px 8px">All URLs included (no filter active)</div>
-        </div>
-
-        <!-- Exclude from scope -->
-        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-          <h3 style="margin:0">Exclude from scope</h3>
-          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('exclude')">+ Add rule</button>
-        </div>
-        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">Exclude rules take priority over include rules.</p>
-        <div id="add-exclude-form" style="display:none;margin-bottom:4px"></div>
-        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:18px">
-          <table id="tbl-exclude" style="width:100%;border-collapse:collapse;font-size:11px">
-            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
-              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
-                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
-                <th style="width:26px;padding:3px 4px"></th>
-              </tr>
-            </thead>
-            <tbody id="tbody-exclude"></tbody>
-          </table>
-          <div id="empty-exclude" style="font-size:11px;color:var(--txt2);padding:5px 8px">No exclusions configured</div>
-        </div>
-
-        <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:14px">
-
-        <!-- Bypass + Hidden Ext side by side -->
-        <h3 id="sec-bypass" style="scroll-margin-top:8px;margin:0 0 8px">Bypass &amp; Extensions</h3>
-        <div style="display:flex;gap:20px">
-          <div style="flex:1;min-width:0">
-            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
-              <h3 style="margin:0">Bypass Domains</h3>
-            </div>
-            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Forwarded as-is — no MITM, no recording.</p>
-            <div style="display:flex;gap:5px;margin-bottom:5px">
-              <input id="inp-bypass" placeholder="e.g. accounts.google.com"
-                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addBypass()">Add</button>
-            </div>
-            <div id="list-bypass" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0"></div>
-          </div>
-
-          <div style="flex:1;min-width:0">
-            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
-              <h3 style="margin:0">Hidden Extensions</h3>
-            </div>
-            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Not recorded in HTTP history.</p>
-            <div style="display:flex;gap:5px;margin-bottom:5px">
-              <input id="inp-ext" placeholder="e.g. .js or js"
-                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addExt()">Add</button>
-            </div>
-            <div id="list-ext" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0;display:flex;flex-wrap:wrap;gap:3px;align-content:flex-start"></div>
-          </div>
-        </div>
-
-        <hr style="border:none;border-top:1px solid var(--bdr);margin:14px 0">
-
-        <!-- Match & Replace -->
-        <div id="sec-matchreplace" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
-          <h3 style="margin:0">Match and Replace</h3>
-          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddMrForm()">+ Add rule</button>
-        </div>
-        <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">
-          Automatically rewrite requests and responses matching a regex. Applies to all proxied traffic (scanner probes excluded).
-        </p>
-        <div id="add-mr-form" style="display:none;margin-bottom:8px;padding:10px;border:1px solid var(--bdr);border-radius:3px;background:var(--bg2)">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Scope</label>
-              <select id="mr-scope" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
-                <option value="request">Request</option>
-                <option value="response">Response</option>
-                <option value="both">Both</option>
-              </select>
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Type</label>
-              <select id="mr-type" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
-                <option value="header">Header</option>
-                <option value="body">Body</option>
-                <option value="url">URL</option>
-              </select>
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Match (regex)</label>
-              <input id="mr-match" placeholder="e.g. Authorization: .*" spellcheck="false"
-                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Replace</label>
-              <input id="mr-replace" placeholder="e.g. Authorization: Bearer token123" spellcheck="false"
-                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Host matcher (optional)</label>
-              <input id="mr-host" placeholder="api.example.com or *.example.com" spellcheck="false"
-                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-            </div>
-            <div>
-              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">URL matcher (optional regex over path+query)</label>
-              <input id="mr-url-regex" placeholder="e.g. ^/api/v2/" spellcheck="false"
-                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-            </div>
-          </div>
-          <div style="margin-bottom:8px">
-            <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Comment (optional)</label>
-            <input id="mr-comment" placeholder="e.g. inject test auth token"
-                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
-          </div>
-          <div style="display:flex;gap:8px;justify-content:flex-end">
-            <button class="tbtn" onclick="document.getElementById('add-mr-form').style.display='none'">Cancel</button>
-            <button class="tbtn pri" onclick="saveMrRule()">Add Rule</button>
-          </div>
-        </div>
-        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
-          <table id="tbl-mr" style="width:100%;border-collapse:collapse;font-size:11px">
-            <thead style="background:var(--bg3)">
-              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
-                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Scope</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Type</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Match</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Replace</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Scope matchers</th>
-                <th style="padding:3px 8px;text-align:right;font-weight:500" title="times this rule changed a request/response">Hits</th>
-                <th style="padding:3px 8px;text-align:left;font-weight:500">Comment</th>
-                <th style="width:26px;padding:3px 4px"></th>
-              </tr>
-            </thead>
-            <tbody id="tbody-mr"></tbody>
-          </table>
-          <div id="empty-mr" style="font-size:11px;color:var(--txt2);padding:6px 8px">No rules configured</div>
-        </div>
-
-        <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
-
-        <!-- ── Setup (formerly its own top-level tab) ── -->
-        <h2 id="sec-setup" style="scroll-margin-top:8px">Setup</h2>
-
-        <h3>1. Configure browser proxy</h3>
-        <p style="color:var(--txt2);font-size:11px;margin:0 0 8px">
-          The proxy uses a listener to receive requests from your browser. Point your
-          browser's HTTP/HTTPS proxy at the interface shown below.
-        </p>
-
-        <!-- Proxy listener table (Burp-style) -->
-        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
-          <table style="width:100%;border-collapse:collapse;font-size:11px">
-            <thead style="background:var(--bg3)">
-              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
-                <th style="width:70px;padding:4px 8px;text-align:left;font-weight:500">Running</th>
-                <th style="padding:4px 8px;text-align:left;font-weight:500">Interface</th>
-                <th style="padding:4px 8px;text-align:left;font-weight:500;white-space:nowrap">Certificate</th>
-                <th style="width:70px;padding:4px 8px;text-align:right;font-weight:500"></th>
-              </tr>
-            </thead>
-            <tbody id="tbody-listeners">
-              <tr>
-                <td style="padding:6px 8px"><span id="listener-running" style="display:inline-flex;align-items:center;gap:6px">
-                  <span style="width:8px;height:8px;border-radius:50%;background:var(--green)"></span></span></td>
-                <td style="padding:6px 8px"><code id="listener-interface" style="color:var(--orange);font-size:12px">…</code></td>
-                <td style="padding:6px 8px;color:var(--txt2)">Per-host</td>
-                <td style="padding:6px 8px;text-align:right">
-                  <button class="tbtn" style="font-size:10px;padding:2px 10px" onclick="openListenerEditor()">Edit</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <!-- Edit listener editor (hidden until Edit clicked) -->
-        <div id="listener-editor" style="display:none;margin-top:8px;background:var(--bg2);
-             border:1px solid var(--bdr);border-radius:4px;padding:12px 14px">
-          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
-            <label style="font-size:11px;color:var(--txt2)">Bind to port:</label>
-            <input id="bind-port-input" type="number" min="1" max="65535" placeholder="8080"
-                   style="width:100px;background:var(--bg1);border:1px solid var(--bdr);
-                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px">
-          </div>
-          <div style="font-size:11px;color:var(--txt2);margin-bottom:8px">Bind to address:</div>
-          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
-            <input type="radio" name="bind-mode" value="loopback" onchange="onBindModeChange()">
-            Loopback only <span style="color:var(--txt2)">(127.0.0.1 — this machine only)</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
-            <input type="radio" name="bind-mode" value="all" onchange="onBindModeChange()">
-            All interfaces <span style="color:var(--txt2)">(0.0.0.0 — reachable by other devices)</span>
-          </label>
-          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:2px;cursor:pointer">
-            <input type="radio" name="bind-mode" value="specific" onchange="onBindModeChange()">
-            Specific address:
-            <input id="bind-host-input" type="text" placeholder="192.168.0.1"
-                   style="width:150px;background:var(--bg1);border:1px solid var(--bdr);
-                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px"
-                   oninput="_refreshBindHostWarning()">
-          </label>
-          <div id="bind-host-warning" style="display:none;font-size:11px;margin:8px 0 0;
-               color:var(--red);background:var(--bg1);border:1px solid var(--red);
-               border-radius:4px;padding:6px 10px"></div>
-          <div style="margin-top:10px;display:flex;gap:8px">
-            <button class="tbtn pri" id="bind-host-apply" style="font-size:11px;padding:3px 12px">Apply</button>
-            <button class="tbtn" style="font-size:11px;padding:3px 12px" onclick="closeListenerEditor()">Cancel</button>
-          </div>
-        </div>
-
-        <p style="color:var(--txt2);font-size:11px;margin-top:10px">
-          Chrome/Edge: Settings → System → Open proxy settings → Manual proxy<br>
-          Firefox: Preferences → Network Settings → Manual proxy configuration
-        </p>
-
-        <h3>AI Engine Status</h3>
-        <div id="setup-ai-status" style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
-                  padding:10px 14px;margin-bottom:16px;font-size:11px;line-height:1.8"></div>
-
-        <h3>2. Install the CA certificate (once)</h3>
-        <p>Download and trust the CA so your browser accepts intercepted HTTPS:</p>
-        <a class="dlbtn" href="/ca.crt" download="dast-ai-ca.crt">Download CA Certificate</a>
-        <p style="color:var(--txt2);font-size:11px;margin-top:8px">
-          The certificate is stored at <code style="color:var(--orange)">~/.dast-ai/ca.crt</code>
-          and reused on every restart — you only need to install it once.
-        </p>
-
-        <h3>macOS (Chrome / Edge / Safari)</h3>
-        <div class="cblk">sudo security add-trusted-cert -d -r trustRoot \
-  -k /Library/Keychains/System.keychain \
-  ~/Downloads/dast-ai-ca.crt</div>
-
-        <h3>Firefox (any OS)</h3>
-        <div class="cblk">about:preferences#privacy
-→ Certificates → View Certificates → Authorities
-→ Import → dast-ai-ca.crt
-→ check "Trust this CA to identify websites"</div>
-
-        <h3>Windows</h3>
-        <div class="cblk">certutil -addstore -f Root dast-ai-ca.crt</div>
-
       </div>
     </div>
 
@@ -1137,7 +843,16 @@
 
   <!-- ══ PLUGINS PANEL ══ -->
   <!-- ══ AI PANEL ══ -->
-  <div class="tpanel" id="panel-ai" style="flex-direction:column">
+  <div class="tpanel" id="panel-settings" style="flex-direction:column;overflow:hidden">
+
+    <!-- Settings sub-tabs: AI & Models (provider/model/scan-engine) and Scope &
+         Rules (scope/bypass/match-replace/presets/setup). Relocated here from the
+         old AI top-level tab and the Proxy sub-tab; all ids/handlers are
+         unchanged, so every existing save/load keeps working. -->
+    <div class="subtab-bar">
+      <div class="stab on" id="st-set-ai"    onclick="switchSettingsSub('ai')">AI &amp; Models</div>
+      <div class="stab"    id="st-set-proxy" onclick="switchSettingsSub('proxy')">Scope &amp; Rules</div>
+    </div>
 
     <!-- ── AI Settings ── -->
     <div id="ai-sub-settings" style="flex:1;overflow-y:auto">
@@ -1489,7 +1204,301 @@
 
     </div>
     </div><!-- end ai-sub-settings -->
-  </div><!-- end panel-ai -->
+
+    <!-- Proxy Settings -->
+    <div id="proxy-settings" style="display:none;flex:1;overflow:hidden;">
+      <div class="settings-body">
+        <h2>Proxy Settings</h2>
+
+        <!-- Settings save/load bar -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--bdr)">
+          <span style="font-size:11px;color:var(--txt2);white-space:nowrap">Settings:</span>
+          <input id="inp-project-name" placeholder="settings name"
+                 style="width:160px;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:4px 8px;border-radius:3px;font-family:inherit;font-size:11px">
+          <button class="tbtn pri" style="white-space:nowrap" onclick="saveProject()">Save</button>
+          <button class="tbtn" style="white-space:nowrap" onclick="document.getElementById('settings-file-input').click()">Import</button>
+          <select id="sel-preset" onchange="loadPreset(this)"
+                  style="background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px;cursor:pointer">
+            <option value="">Load preset...</option>
+          </select>
+        </div>
+
+        <!-- Section jump-nav: every settings section is listed here so nothing is
+             hidden below the fold (Match & Replace used to be easy to miss). -->
+        <div id="settings-nav">
+          <button class="settings-nav-link" onclick="settingsJump('sec-scope')">Scope</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-bypass')">Bypass &amp; Extensions</button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-matchreplace')">Match &amp; Replace<span id="mr-active-badge" class="settings-nav-badge" style="display:none">0</span></button>
+          <button class="settings-nav-link" onclick="settingsJump('sec-setup')">Setup</button>
+        </div>
+
+        <!-- Include in scope -->
+        <div id="sec-scope" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Include in scope</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('include')">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">
+          Leave empty to record everything. Host/port/file: wildcards (<code style="color:var(--orange)">*.example.com</code>) or regex.
+        </p>
+        <div id="add-include-form" style="display:none;margin-bottom:4px"></div>
+        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:14px">
+          <table id="tbl-include" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-include"></tbody>
+          </table>
+          <div id="empty-include" style="font-size:11px;color:var(--green);padding:5px 8px">All URLs included (no filter active)</div>
+        </div>
+
+        <!-- Exclude from scope -->
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Exclude from scope</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddScopeForm('exclude')">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:4px">Exclude rules take priority over include rules.</p>
+        <div id="add-exclude-form" style="display:none;margin-bottom:4px"></div>
+        <div style="max-height:150px;overflow-y:auto;overflow-x:auto;border:1px solid var(--bdr);border-radius:3px;margin-bottom:18px">
+          <table id="tbl-exclude" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="position:sticky;top:0;background:var(--bg3);z-index:1">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Protocol</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Host / IP range</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Port</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">File</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-exclude"></tbody>
+          </table>
+          <div id="empty-exclude" style="font-size:11px;color:var(--txt2);padding:5px 8px">No exclusions configured</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin-bottom:14px">
+
+        <!-- Bypass + Hidden Ext side by side -->
+        <h3 id="sec-bypass" style="scroll-margin-top:8px;margin:0 0 8px">Bypass &amp; Extensions</h3>
+        <div style="display:flex;gap:20px">
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+              <h3 style="margin:0">Bypass Domains</h3>
+            </div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Forwarded as-is — no MITM, no recording.</p>
+            <div style="display:flex;gap:5px;margin-bottom:5px">
+              <input id="inp-bypass" placeholder="e.g. accounts.google.com"
+                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addBypass()">Add</button>
+            </div>
+            <div id="list-bypass" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0"></div>
+          </div>
+
+          <div style="flex:1;min-width:0">
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+              <h3 style="margin:0">Hidden Extensions</h3>
+            </div>
+            <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">Not recorded in HTTP history.</p>
+            <div style="display:flex;gap:5px;margin-bottom:5px">
+              <input id="inp-ext" placeholder="e.g. .js or js"
+                     style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+              <button class="tbtn pri" style="font-size:10px;padding:2px 8px;white-space:nowrap" onclick="addExt()">Add</button>
+            </div>
+            <div id="list-ext" style="max-height:120px;overflow-y:auto;border:1px solid var(--bdr);border-radius:3px;padding:2px 0;display:flex;flex-wrap:wrap;gap:3px;align-content:flex-start"></div>
+          </div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:14px 0">
+
+        <!-- Match & Replace -->
+        <div id="sec-matchreplace" style="scroll-margin-top:8px;display:flex;align-items:center;gap:8px;margin-bottom:4px">
+          <h3 style="margin:0">Match and Replace</h3>
+          <button class="tbtn pri" style="font-size:10px;padding:2px 8px;margin-left:auto" onclick="showAddMrForm()">+ Add rule</button>
+        </div>
+        <p style="color:var(--txt2);font-size:10px;margin-bottom:6px">
+          Automatically rewrite requests and responses matching a regex. Applies to all proxied traffic (scanner probes excluded).
+        </p>
+        <div id="add-mr-form" style="display:none;margin-bottom:8px;padding:10px;border:1px solid var(--bdr);border-radius:3px;background:var(--bg2)">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Scope</label>
+              <select id="mr-scope" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+                <option value="request">Request</option>
+                <option value="response">Response</option>
+                <option value="both">Both</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Type</label>
+              <select id="mr-type" style="width:100%;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 6px;border-radius:3px;font-family:inherit;font-size:11px">
+                <option value="header">Header</option>
+                <option value="body">Body</option>
+                <option value="url">URL</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Match (regex)</label>
+              <input id="mr-match" placeholder="e.g. Authorization: .*" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Replace</label>
+              <input id="mr-replace" placeholder="e.g. Authorization: Bearer token123" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Host matcher (optional)</label>
+              <input id="mr-host" placeholder="api.example.com or *.example.com" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+            <div>
+              <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">URL matcher (optional regex over path+query)</label>
+              <input id="mr-url-regex" placeholder="e.g. ^/api/v2/" spellcheck="false"
+                     style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+            </div>
+          </div>
+          <div style="margin-bottom:8px">
+            <label style="font-size:10px;color:var(--txt2);display:block;margin-bottom:3px">Comment (optional)</label>
+            <input id="mr-comment" placeholder="e.g. inject test auth token"
+                   style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--bdr);color:var(--txt);padding:3px 7px;border-radius:3px;font-family:inherit;font-size:11px">
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="tbtn" onclick="document.getElementById('add-mr-form').style.display='none'">Cancel</button>
+            <button class="tbtn pri" onclick="saveMrRule()">Add Rule</button>
+          </div>
+        </div>
+        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
+          <table id="tbl-mr" style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="background:var(--bg3)">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:24px;padding:3px 6px;text-align:center;font-weight:500"></th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Scope</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500;white-space:nowrap">Type</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Match</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Replace</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Scope matchers</th>
+                <th style="padding:3px 8px;text-align:right;font-weight:500" title="times this rule changed a request/response">Hits</th>
+                <th style="padding:3px 8px;text-align:left;font-weight:500">Comment</th>
+                <th style="width:26px;padding:3px 4px"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-mr"></tbody>
+          </table>
+          <div id="empty-mr" style="font-size:11px;color:var(--txt2);padding:6px 8px">No rules configured</div>
+        </div>
+
+        <hr style="border:none;border-top:1px solid var(--bdr);margin:20px 0">
+
+        <!-- ── Setup (formerly its own top-level tab) ── -->
+        <h2 id="sec-setup" style="scroll-margin-top:8px">Setup</h2>
+
+        <h3>1. Configure browser proxy</h3>
+        <p style="color:var(--txt2);font-size:11px;margin:0 0 8px">
+          The proxy uses a listener to receive requests from your browser. Point your
+          browser's HTTP/HTTPS proxy at the interface shown below.
+        </p>
+
+        <!-- Proxy listener table (Burp-style) -->
+        <div style="border:1px solid var(--bdr);border-radius:3px;overflow:hidden">
+          <table style="width:100%;border-collapse:collapse;font-size:11px">
+            <thead style="background:var(--bg3)">
+              <tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+                <th style="width:70px;padding:4px 8px;text-align:left;font-weight:500">Running</th>
+                <th style="padding:4px 8px;text-align:left;font-weight:500">Interface</th>
+                <th style="padding:4px 8px;text-align:left;font-weight:500;white-space:nowrap">Certificate</th>
+                <th style="width:70px;padding:4px 8px;text-align:right;font-weight:500"></th>
+              </tr>
+            </thead>
+            <tbody id="tbody-listeners">
+              <tr>
+                <td style="padding:6px 8px"><span id="listener-running" style="display:inline-flex;align-items:center;gap:6px">
+                  <span style="width:8px;height:8px;border-radius:50%;background:var(--green)"></span></span></td>
+                <td style="padding:6px 8px"><code id="listener-interface" style="color:var(--orange);font-size:12px">…</code></td>
+                <td style="padding:6px 8px;color:var(--txt2)">Per-host</td>
+                <td style="padding:6px 8px;text-align:right">
+                  <button class="tbtn" style="font-size:10px;padding:2px 10px" onclick="openListenerEditor()">Edit</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Edit listener editor (hidden until Edit clicked) -->
+        <div id="listener-editor" style="display:none;margin-top:8px;background:var(--bg2);
+             border:1px solid var(--bdr);border-radius:4px;padding:12px 14px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+            <label style="font-size:11px;color:var(--txt2)">Bind to port:</label>
+            <input id="bind-port-input" type="number" min="1" max="65535" placeholder="8080"
+                   style="width:100px;background:var(--bg1);border:1px solid var(--bdr);
+                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px">
+          </div>
+          <div style="font-size:11px;color:var(--txt2);margin-bottom:8px">Bind to address:</div>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="loopback" onchange="onBindModeChange()">
+            Loopback only <span style="color:var(--txt2)">(127.0.0.1 — this machine only)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:5px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="all" onchange="onBindModeChange()">
+            All interfaces <span style="color:var(--txt2)">(0.0.0.0 — reachable by other devices)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:7px;font-size:12px;margin-bottom:2px;cursor:pointer">
+            <input type="radio" name="bind-mode" value="specific" onchange="onBindModeChange()">
+            Specific address:
+            <input id="bind-host-input" type="text" placeholder="192.168.0.1"
+                   style="width:150px;background:var(--bg1);border:1px solid var(--bdr);
+                          border-radius:4px;color:var(--txt);padding:3px 8px;font-size:12px"
+                   oninput="_refreshBindHostWarning()">
+          </label>
+          <div id="bind-host-warning" style="display:none;font-size:11px;margin:8px 0 0;
+               color:var(--red);background:var(--bg1);border:1px solid var(--red);
+               border-radius:4px;padding:6px 10px"></div>
+          <div style="margin-top:10px;display:flex;gap:8px">
+            <button class="tbtn pri" id="bind-host-apply" style="font-size:11px;padding:3px 12px">Apply</button>
+            <button class="tbtn" style="font-size:11px;padding:3px 12px" onclick="closeListenerEditor()">Cancel</button>
+          </div>
+        </div>
+
+        <p style="color:var(--txt2);font-size:11px;margin-top:10px">
+          Chrome/Edge: Settings → System → Open proxy settings → Manual proxy<br>
+          Firefox: Preferences → Network Settings → Manual proxy configuration
+        </p>
+
+        <h3>AI Engine Status</h3>
+        <div id="setup-ai-status" style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                  padding:10px 14px;margin-bottom:16px;font-size:11px;line-height:1.8"></div>
+
+        <h3>2. Install the CA certificate (once)</h3>
+        <p>Download and trust the CA so your browser accepts intercepted HTTPS:</p>
+        <a class="dlbtn" href="/ca.crt" download="dast-ai-ca.crt">Download CA Certificate</a>
+        <p style="color:var(--txt2);font-size:11px;margin-top:8px">
+          The certificate is stored at <code style="color:var(--orange)">~/.dast-ai/ca.crt</code>
+          and reused on every restart — you only need to install it once.
+        </p>
+
+        <h3>macOS (Chrome / Edge / Safari)</h3>
+        <div class="cblk">sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/Downloads/dast-ai-ca.crt</div>
+
+        <h3>Firefox (any OS)</h3>
+        <div class="cblk">about:preferences#privacy
+→ Certificates → View Certificates → Authorities
+→ Import → dast-ai-ca.crt
+→ check "Trust this CA to identify websites"</div>
+
+        <h3>Windows</h3>
+        <div class="cblk">certutil -addstore -f Root dast-ai-ca.crt</div>
+
+      </div>
+    </div>
+
+  </div><!-- end panel-settings -->
 
   <!-- ══ SCAN PANEL ══ -->
   <!-- The scan queue is its own top-level tab: scanning is AI-driven but is not
@@ -2233,11 +2242,9 @@
       <div id="cp-hypotheses" style="display:none;padding:10px 18px;border-bottom:1px solid var(--bdr);max-height:150px;overflow-y:auto"></div>
 
       <div id="cp-messages" style="flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px">
+        <!-- Starter prompts render here via cpRender(null); this is the pre-JS paint. -->
         <div class="empty" style="margin:auto;text-align:center;color:var(--txt2);max-width:440px;line-height:1.6">
-          Ask the copilot to explore or exploit something in scope.<br>
-          It drives the same tools the scanner uses, reports findings with evidence,
-          and tells you when it is blocked (a WAF, a login wall, or a value only you have)
-          so you can unblock it and it continues.
+          Start a new exploration, or pick an example below to prefill the composer.
         </div>
       </div>
 

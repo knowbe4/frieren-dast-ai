@@ -188,8 +188,16 @@ function _dpRequestSections(d) {
   return html;
 }
 
+// True when the entry carries any response data (status, body, or headers). Used so a
+// captured entry that has a response but no numeric status (e.g. a tool-issued request
+// recorded without a status line) is still rendered instead of a stale "No response yet".
+function _dpHasResponse(d) {
+  return !!(d && (d.status || d.response_body
+    || (d.response_headers && Object.keys(d.response_headers).length)));
+}
+
 function _dpResponseSections(d) {
-  if (!d.status) return '<div class="dp-none">No response yet</div>';
+  if (!_dpHasResponse(d)) return '<div class="dp-none">No response yet</div>';
   const pairs = _dpHeaderPairs(d.response_headers);
   const headerRows = pairs.filter(([name]) => name.toLowerCase() !== 'set-cookie');
   const setCookies = pairs.filter(([name]) => name.toLowerCase() === 'set-cookie')
@@ -238,4 +246,97 @@ function buildRRHtml(d) {
       </div>
     </div>
   </div>`;
+}
+
+// ── shared Request|Response viewer (Burp-style, Pretty/Raw subtabs) ──────────
+// A self-contained viewer that renders ONE captured entry (request + response) with
+// independent Pretty/Raw subtabs, used by the Findings view to show a finding's real
+// linked request/response and to open any evidence-chain step. State is kept per
+// container id so several viewers (multiple finding cards) coexist without clobbering
+// the proxy detail pane (which uses the shared _paneViewMode). It reuses the SAME render
+// primitives as the detail pane (fmtReq/fmtResp + _dpRequestSections/_dpResponseSections),
+// so there is one request/response renderer, not a fork.
+const _rrvState = {};  // containerId -> { entry, req: 'pretty'|'raw'|'gql', resp: 'pretty'|'raw' }
+
+function _rrvHeader(d) {
+  let host = d.host || '', pathAndQuery = d.path || '';
+  try {
+    const u = new URL(d.url);
+    host = `${u.protocol}//${u.host}`;
+    pathAndQuery = u.pathname + u.search;
+  } catch (_) { /* keep store values */ }
+  const statusTxt = d.status ? String(d.status) : (_dpHasResponse(d) ? '200' : 'no response');
+  return `<div class="dp-summary"><div class="dp-sum-row">
+      <span class="dp-method">${esc(d.method || '')}</span>
+      <span class="dp-status ${_dpStatusClass(d.status)}">${esc(statusTxt)}</span>
+    </div>
+    <div class="dp-url" title="${esc(d.url || '')}"><span class="dp-host">${esc(host)}</span><span class="dp-path">${esc(pathAndQuery)}</span></div>
+  </div>`;
+}
+
+function _rrvRenderInto(containerId) {
+  const st = _rrvState[containerId];
+  const el = document.getElementById(containerId);
+  if (!st || !el || !st.entry) return;
+  const d = st.entry;
+  const isGQL = _isGraphQLBody(d.request_body);
+  const reqContent = (isGQL && st.req === 'gql')
+    ? _buildGQLView(d.request_body, d.response_body)
+    : st.req === 'raw'
+      ? `<pre class="dp-raw">${fmtReq(d, 'raw')}</pre>`
+      : _dpRequestSections(d);
+  const respContent = !_dpHasResponse(d)
+    ? '<div class="dp-none">No response captured</div>'
+    : st.resp === 'raw'
+      ? `<pre class="dp-raw">${fmtResp(d, 'raw')}</pre>`
+      : _dpResponseSections(d);
+  const btn = (pane, mode, label, cls) =>
+    `<button class="${cls || ''}${st[pane] === mode ? ' on' : ''}" onclick="_rrvSet(${jsArg(containerId)},${jsArg(pane)},${jsArg(mode)})">${label}</button>`;
+  const reqToggle = `<div class="pane-view-toggle">${btn('req', 'pretty', 'Pretty')}${btn('req', 'raw', 'Raw')}${isGQL ? btn('req', 'gql', 'GraphQL', 'gql-btn') : ''}</div>`;
+  const respToggle = `<div class="pane-view-toggle">${btn('resp', 'pretty', 'Pretty')}${btn('resp', 'raw', 'Raw')}</div>`;
+  el.innerHTML = `<div class="dp">${_rrvHeader(d)}
+    <div class="split-wrap">
+      <div class="pane"><div class="pane-hdr">Request${reqToggle}</div><div class="code-area">${reqContent}</div></div>
+      <div class="pane"><div class="pane-hdr">Response${respToggle}</div><div class="code-area">${respContent}</div></div>
+    </div>
+  </div>`;
+}
+
+function _rrvSet(containerId, pane, mode) {
+  const st = _rrvState[containerId];
+  if (!st) return;
+  st[pane] = mode;
+  _rrvRenderInto(containerId);
+}
+
+// Fetch a captured entry by id and render it into the container as a Request|Response viewer.
+async function _rrvLoadEntry(containerId, entryId) {
+  const el = document.getElementById(containerId);
+  if (!el || !entryId) return;
+  // Mark state synchronously so a concurrent <details> ontoggle does not also load the
+  // primary entry over this one (see _rrvChainClick).
+  _rrvState[containerId] = _rrvState[containerId] || { entry: null, req: 'pretty', resp: 'pretty' };
+  el.innerHTML = '<div class="dp-none" style="padding:10px">Loading request…</div>';
+  try {
+    const r = await fetch('/api/entry/' + encodeURIComponent(entryId));
+    const d = await r.json();
+    if (!r.ok || !d || d.error) {
+      el.innerHTML = '<div class="dp-none" style="padding:10px">This request is no longer in history (the proxy may have been restarted or history cleared).</div>';
+      return;
+    }
+    _rrvState[containerId] = { entry: d, req: 'pretty', resp: 'pretty' };
+    _rrvRenderInto(containerId);
+  } catch (_) {
+    el.innerHTML = '<div class="dp-none" style="padding:10px">Could not load the captured request.</div>';
+  }
+}
+
+// An evidence-chain row was clicked: open the HTTP viewer section (if collapsed) and load
+// the clicked step's real entry into the shared viewer. State is set synchronously first so
+// the details ontoggle (which lazy-loads the PRIMARY entry) sees it and skips.
+function _rrvChainClick(containerId, detailsId, entryId) {
+  _rrvState[containerId] = _rrvState[containerId] || { entry: null, req: 'pretty', resp: 'pretty' };
+  const det = document.getElementById(detailsId);
+  if (det && !det.open) det.open = true;
+  _rrvLoadEntry(containerId, entryId);
 }

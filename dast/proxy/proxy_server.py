@@ -288,8 +288,14 @@ class ProxyServer:
         if hidden:
             entry_id = None
         elif out_of_scope:
+            # Keep source="out-of-scope" (the authoritative scope tag every deny/scope
+            # consumer keys on) but record the x-dast-source as the entry ORIGIN, so a
+            # tool-originated out-of-scope request (e.g. a copilot PUT to an out-of-scope
+            # S3 host) is attributed to its tool instead of looking like stray traffic —
+            # dual-label, without changing what the request is excluded from.
             entry_id = self._store.new_entry(
-                method, url, dict(headers), body, source="out-of-scope"
+                method, url, dict(headers), body,
+                source="out-of-scope", origin=dast_source,
             )
         else:
             source = "crawler" if is_crawler else (dast_source or "proxy")

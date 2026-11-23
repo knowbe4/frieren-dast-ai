@@ -95,6 +95,46 @@ def _reject_reason(title: str, evidence: str, reasoning: str) -> Optional[str]:
                 "re-verify before recording.")
     return None
 
+# Soft reclassification hint (HINT ONLY — never blocks, never refuses, never mutates the stored
+# finding). idor (CWE-639) is cross-tenant OBJECT access; bfla (CWE-862) is a same-tenant role
+# bypass. A business-logic / data-integrity / consent / server-side-validation flaw on your OWN
+# tenant's own object is NEITHER — if the title/attack_type says idor/BOLA but the evidence reads
+# same-tenant/same-object with no cross-tenant access, nudge an honest reclassification.
+_IDOR_CLAIM_MARKERS = ("idor", "bola", "object-level", "object level")
+_SAME_TENANT_MARKERS = (
+    "same tenant", "same-tenant", "own tenant", "own account", "same account",
+    "same object", "same user", "consent", "business logic", "business-logic",
+    "data integrity", "data-integrity", "integrity", "locked field", "locked-field",
+    "linked field", "linked-field", "server-side validation", "server side validation",
+)
+_CROSS_TENANT_MARKERS = (
+    "cross-tenant", "cross tenant", "foreign", "another tenant", "other tenant",
+    "another user", "other user", "another account", "other account",
+    "different account", "different tenant", "different user",
+)
+
+
+def _reclassification_hint(title: str, attack_type: str, evidence: str,
+                           reasoning: str) -> Optional[str]:
+    """Return a non-fatal nudge when a finding is labeled idor/BOLA but its own evidence reads
+    same-tenant / same-object with no cross-tenant access. A HINT only — the caller records the
+    finding exactly as submitted; this never blocks or edits it."""
+    claim = f"{title} {attack_type}".lower()
+    if not any(m in claim for m in _IDOR_CLAIM_MARKERS):
+        return None
+    body = f"{title}\n{evidence}\n{reasoning}".lower()
+    if any(m in body for m in _CROSS_TENANT_MARKERS):
+        return None  # a genuine cross-tenant object access is claimed — leave idor/BOLA as-is
+    if not any(m in body for m in _SAME_TENANT_MARKERS):
+        return None
+    return ("this reads as a business-logic / data-integrity / consent / server-side-validation "
+            "flaw on your OWN tenant's own object, not cross-tenant object access — idor/BOLA "
+            "(CWE-639) may be the wrong label. If no OTHER tenant's/user's object was reached, "
+            "consider an honest attack_type (e.g. 'business-logic') with the real CWE (e.g. "
+            "CWE-345 insufficient data authenticity, CWE-284 improper access control, CWE-602 "
+            "server-side validation) and a title stating the actual weakness. (Hint only — the "
+            "finding was recorded as submitted.)")
+
 _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -121,6 +161,18 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                            "multi-request proof keep this a SHORT mechanism summary and put "
                            "the per-request detail in 'steps'.",
         },
+        "evidence_entry_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The REAL proxy-history entry ids of the exact requests that "
+                           "prove this finding, in order — take them from the 'entry_id' "
+                           "returned by send_request / browser_fetch (or get_history). The "
+                           "first is the primary request the verdict rests on. ALWAYS pass "
+                           "these, especially for a multi-request proof (e.g. create, "
+                           "upload, before/after read): it links the finding to the real "
+                           "captured request+response so 'Go to request' opens real traffic, "
+                           "not an empty stub. Do not invent ids.",
+        },
         "steps": {
             "type": "array",
             "description": "The ordered request chain that proves the finding, when it "
@@ -136,6 +188,10 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                     "url": {"type": "string", "description": "Full request URL."},
                     "status": {"type": "integer", "description": "Observed response status code."},
                     "note": {"type": "string", "description": "Short observed result, e.g. 'returned the value written in step 1'."},
+                    "entry_id": {"type": "string", "description": "The real proxy-history entry id for "
+                                 "this step's request (from send_request/browser_fetch/get_history), so "
+                                 "the row opens the real request+response. If omitted, the backend "
+                                 "resolves it from this step's url+method."},
                 },
                 "required": ["method", "url"],
             },
@@ -146,7 +202,15 @@ _RECORD_FINDING_SCHEMA: Dict[str, Any] = {
                            "sensitive-param. For access control, pick precisely: 'idor' "
                            "(object-level/BOLA — reaching ANOTHER tenant's/user's object, "
                            "CWE-639) vs 'bfla' (function-level — a SAME-tenant action your "
-                           "role should not allow / vertical privilege escalation, CWE-862).",
+                           "role should not allow / vertical privilege escalation, CWE-862). "
+                           "But a flaw that is NEITHER cross-tenant object access NOR a "
+                           "role/privilege bypass — a business-logic / data-integrity / "
+                           "consent / server-side-validation failure on your OWN tenant's "
+                           "own object (e.g. a locked/linked field editable anyway, asset "
+                           "bytes swappable after consent) — is NOT idor/BOLA: use an honest "
+                           "type such as 'business-logic' and the real CWE (e.g. CWE-345 "
+                           "insufficient data authenticity, CWE-284 improper access control, "
+                           "CWE-602 server-side validation).",
         },
         "cwe": {"type": "string", "description": "Optional CWE id, e.g. CWE-284."},
         "method": {"type": "string", "description": "HTTP method of the request (default GET)."},
@@ -173,14 +237,25 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
         for step in steps_raw:
             if not isinstance(step, dict) or not str(step.get("url", "")).strip():
                 continue
-            steps.append({
+            built_step = {
                 "label": str(step.get("label", "")).strip(),
                 "method": str(step.get("method", "GET")).strip().upper() or "GET",
                 "url": str(step.get("url", "")).strip(),
                 "status": step.get("status"),
                 "note": str(step.get("note", "")).strip(),
-            })
-    return {
+            }
+            step_entry_id = str(step.get("entry_id", "") or "").strip()
+            if step_entry_id:
+                built_step["entry_id"] = step_entry_id
+            steps.append(built_step)
+    evidence_entry_ids = []
+    raw_evidence_ids = args.get("evidence_entry_ids")
+    if isinstance(raw_evidence_ids, list):
+        for raw in raw_evidence_ids:
+            eid = str(raw or "").strip()
+            if eid and eid not in evidence_entry_ids:
+                evidence_entry_ids.append(eid)
+    finding = {
         "title": str(args.get("title", "")).strip(),
         "severity": severity,
         "evidence": str(args.get("evidence", "")).strip(),
@@ -194,6 +269,9 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
         "validated_by": ["copilot"],
         "source": "copilot",
     }
+    if evidence_entry_ids:
+        finding["evidence_entry_ids"] = evidence_entry_ids
+    return finding
 
 
 async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -234,10 +312,32 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
             entry_id = ctx.store.record_manual_finding(finding, url, method)
             if not entry_id:
                 return {"ok": False, "error": "could not record finding (missing url)"}
+            linked_ids = finding.get("evidence_entry_ids") or [entry_id]
+            synthetic = bool(finding.get("evidence_synthetic"))
             logger.info("record_finding: recorded", entry_id=entry_id,
-                        title=title, severity=finding["severity"])
-            return {"ok": True, "entry_id": entry_id, "title": title,
-                    "severity": finding["severity"]}
+                        title=title, severity=finding["severity"],
+                        evidence_entry_ids=linked_ids, grounded=not synthetic)
+            result: Dict[str, Any] = {"ok": True, "entry_id": entry_id, "title": title,
+                                      "severity": finding["severity"],
+                                      "evidence_entry_ids": linked_ids}
+            # C2 guard: surface (non-fatal) when the finding could not be grounded to a
+            # real captured request, so an empty-stub evidence is visible, not silent.
+            if synthetic:
+                result["warning"] = (
+                    "this finding is NOT grounded in a real captured request — a placeholder "
+                    "entry was created, so 'Go to request' would open an empty stub. Re-run the "
+                    "proof through send_request/browser_fetch and pass their 'entry_id' values as "
+                    "evidence_entry_ids so the finding cites the real request/response.")
+                logger.warning("record_finding: ungrounded finding (synthetic evidence)",
+                               title=title, url=url)
+            reclass = _reclassification_hint(title, finding.get("attack_type", ""), evidence,
+                                             str(args.get("reasoning", "")))
+            if reclass:
+                result["warning"] = (
+                    f"{result['warning']}\n{reclass}" if result.get("warning") else reclass)
+                logger.info("record_finding: reclassification hint (same-tenant labeled idor)",
+                            title=title, attack_type=finding.get("attack_type", ""))
+            return result
         except Exception as exc:
             return {"ok": False, "error": f"record failed: {str(exc)[:200]}"}
 
@@ -267,6 +367,13 @@ register(Tool(
         "linked to the request it was found on, not just a chat message. Provide a clear "
         "title, severity (critical/high/medium/low/info), the url it was confirmed on, and "
         "concrete evidence; redact any raw secret/token values.\n"
+        "GROUND THE FINDING IN REAL TRAFFIC: pass evidence_entry_ids = the real 'entry_id' "
+        "values returned by send_request / browser_fetch (or get_history) for the exact "
+        "requests that prove it, in order (the first is the primary). For a multi-request "
+        "proof (e.g. create, upload, before/after read) list every request's entry_id, and/or "
+        "give each steps[] entry its own entry_id — do NOT just narrate the chain. Grounding "
+        "makes 'Go to request' open the real request+response instead of an empty stub; "
+        "recording without it warns and may link to a placeholder.\n"
         "Only record CONFIRMED issues — a false positive that wastes the operator's time is "
         "a failure. Use get_findings first to avoid recording a duplicate.\n"
         "Do NOT use this to: send or re-test a request (use send_request) or read existing "

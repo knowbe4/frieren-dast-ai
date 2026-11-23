@@ -907,13 +907,43 @@ def _provider_candidates(provider: str, model: str) -> List[str]:
     return candidates or [model]
 
 
+# Process-level memory of (provider, model) pairs the upstream safety classifier
+# has refused (AiContentBlockedError). A refusal is content-policy-based and
+# model-stable, so the SAME primary (e.g. claude-opus-5-5) would otherwise be
+# re-tried — and re-refused, re-paying the blocked round-trip + latency — on
+# EVERY later decision. We remember it and deprioritise it in the candidate walk
+# so the first attempt goes straight to a model that has not been refused. Only
+# safety refusals land here — transient errors/timeouts never do, so a model that
+# merely glitched once keeps its normal position. Process lifetime; never
+# persisted (a fresh process starts with an empty set).
+_refused_models: set = set()
+
+
+def _mark_model_refused(provider: str, model: str) -> None:
+    """Record that ``model`` was refused by ``provider``'s safety classifier."""
+    _refused_models.add((provider, model))
+
+
+def _order_candidates(provider: str, candidates: List[str]) -> List[str]:
+    """Push cached-refused models to the back so the first attempt is a model that
+    has not been safety-refused this process. Every candidate is kept (fail-open:
+    if ALL are cached-refused the walk still runs, surfacing the block as before);
+    only their ORDER changes."""
+    if not _refused_models:
+        return candidates
+    fresh = [c for c in candidates if (provider, c) not in _refused_models]
+    refused = [c for c in candidates if (provider, c) in _refused_models]
+    return fresh + refused
+
+
 def _invoke_provider(provider: str, body: Dict[str, Any], model: str) -> Dict[str, Any]:
     """Walk one provider's model fallback chain and return the first success;
     raise the last error when every candidate fails. A credential/SSO
     exhaustion (AiUnavailableError) is not model-specific — raised immediately
     so the PROVIDER-level walk in _invoke_raw can fail over instead of burning
-    the remaining candidates."""
-    candidates = _provider_candidates(provider, model)
+    the remaining candidates. Models previously refused by the safety classifier
+    are tried last (see _order_candidates) so a refused primary is not re-paid."""
+    candidates = _order_candidates(provider, _provider_candidates(provider, model))
     last_exc: Optional[Exception] = None
     for index, candidate in enumerate(candidates):
         try:
@@ -928,6 +958,10 @@ def _invoke_provider(provider: str, body: Dict[str, Any], model: str) -> Dict[st
             # operator may configure e.g. a stricter model first and a permissive
             # one as the last fallback), so try the next candidate. Only when the
             # whole chain is exhausted does the block surface (as safety_blocked).
+            # Remember the refusal so later calls deprioritise this model (only
+            # content blocks are cached — a transient error never is).
+            if isinstance(exc, AiContentBlockedError):
+                _mark_model_refused(provider, candidate)
             last_exc = exc
             if index < len(candidates) - 1:
                 logger.warning(

@@ -70,6 +70,32 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   low-noise note (precision over volume, no parallel bursts); with `off` the
   prompt is byte-for-byte identical to before.
 
+### Added (coverage ledger round 3-H)
+- **Coverage ledger** (`dast/coverage/ledger.py`) — a durable record of what
+  scans EXAMINED / RULED OUT / LEFT OPEN per (endpoint, attack class),
+  distilled from ARTEX's coverage ledger (#207). Closed outcome vocabulary
+  (`reported` / `no_issue_found` / `ruled_out` / `not_applicable` /
+  `needs_follow_up`), upsert last-write-wins with bounded history, ARTEX caps
+  enforced as errors (never silent truncation), and every stored field
+  normalised to one line (entries reach the planner prompt — anti-injection).
+  Two central invariants: **a class with no entry is UNEXAMINED, never
+  clean**, and an incomplete run always carries a caveat — the absence of a
+  finding is never a clean bill.
+- **Machine-observed recording** — the Coordinator writes one entry per
+  dispatched attack_type (findings → reported with titles as evidence; the
+  agent's own waf/rate-limit/structural observations → needs_follow_up; a
+  clean run → no_issue_found with probe-count evidence). Until now "ran and
+  found nothing" only lived in a rotating 200-line activity log.
+- **Planner coverage feed** — a gated `[Coverage ledger]` section in the
+  planner prompt (top gaps, unrecorded classes first, lines fenced untrusted)
+  so a replan or rescan tests like a human: covered classes are labelled
+  EXAMINED — not skipped — and the untested ones lead. With an empty ledger
+  the prompt is byte-for-byte identical to before.
+- **Persistence + dashboard** — the scan worker copies the endpoint's rows
+  onto the history entry (survives session save/restore), `GET /api/coverage`
+  serves the per-host aggregation, and the AI panel gains a Coverage card
+  (outcome chips, open follow-ups in orange).
+
 ### Added (new agents round 3-E)
 - **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
   framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours

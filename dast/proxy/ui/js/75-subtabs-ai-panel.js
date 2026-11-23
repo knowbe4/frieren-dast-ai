@@ -29,18 +29,20 @@ function switchBrowseSub(sub) {
 // ── AI panel (settings) ────────────────────────────────────────────────
 async function loadAiPanel() {
   try {
-    const [agentsR, graphR, ctxR, tmR, usageR] = await Promise.all([
+    const [agentsR, graphR, ctxR, tmR, usageR, covR] = await Promise.all([
       fetch('/api/ai/agents'),
       fetch('/api/service-graph'),
       fetch('/api/ai/app-context'),
       fetch('/api/ai/threat-models'),
       fetch('/api/ai/usage'),
+      fetch('/api/coverage'),
     ]);
     const agentsData = await agentsR.json();
     const graphData = await graphR.json();
     const ctxData   = ctxR.ok ? await ctxR.json() : {};
     const tmData    = tmR.ok  ? await tmR.json()  : {};
     const usageData = usageR.ok ? await usageR.json() : {};
+    const covData   = covR.ok ? await covR.json() : {};
 
     // App context
     const ctxEl = document.getElementById('ai-app-context');
@@ -248,6 +250,7 @@ async function loadAiPanel() {
         `;
       }
     }
+    renderCoverage(covData);
 
   } catch(e) {
     console.error('loadAiPanel:', e);
@@ -258,6 +261,37 @@ async function clearAiUsage() {
   const r = await fetch('/api/ai/usage/clear', {method: 'POST'});
   if (r.ok) { showToast('LLM usage counters cleared'); loadAiPanel(); }
   else showToast('Clear failed');
+}
+
+// ── Coverage ledger (3-H) ─────────────────────────────────────────────────────
+async function renderCoverage(covData) {
+  const covEl = document.getElementById('ai-coverage');
+  if (!covEl || !covData || !covData.hosts) return;
+  const hosts = Object.keys(covData.hosts);
+  if (!hosts.length) {
+    covEl.innerHTML = '<div style="color:var(--txt2);font-size:11px">No coverage recorded yet — run a scan.</div>';
+    return;
+  }
+  const _oc = {reported:'var(--green)', no_issue_found:'var(--blue)', ruled_out:'var(--txt)',
+               not_applicable:'var(--txt3)', needs_follow_up:'var(--orange)'};
+  covEl.innerHTML = hosts.map(h => {
+    const d = covData.hosts[h];
+    const chips = Object.entries(d.outcomes).map(([k, v]) =>
+      `<span style="background:var(--bg3);border:1px solid var(--bdr);border-radius:3px;padding:1px 6px;margin-right:4px;color:${_oc[k]||'var(--txt)'}">${esc(k)}: ${v}</span>`).join('');
+    const gaps = (d.needs_follow_up || []).map(g =>
+      `<div style="color:var(--orange);font-size:10px;padding:1px 0;font-family:monospace">${esc(g)}</div>`).join('');
+    return `<div style="background:var(--bg2);border:1px solid var(--bdr);border-radius:4px;
+                        padding:12px 14px;margin-bottom:12px;font-size:11px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+        <span style="font-weight:700;color:var(--blue)">${esc(h)}</span>
+        <span style="color:var(--txt2)">${d.entries} covered class${d.entries === 1 ? '' : 'es'}</span>
+        <span style="color:var(--green)">${d.findings} finding${d.findings === 1 ? '' : 's'}</span>
+        <span style="color:var(--txt3);font-size:10px;margin-left:auto">updated ${esc(d.last_updated_at)}</span>
+      </div>
+      <div style="margin-bottom:6px">${chips}</div>
+      ${gaps ? `<div style="font-weight:600;color:var(--txt2);margin-bottom:2px">Open follow-ups (covered, but not settled)</div>${gaps}` : ''}
+    </div>`;
+  }).join('');
 }
 
 async function mergeHosts() {

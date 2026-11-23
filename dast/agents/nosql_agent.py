@@ -88,7 +88,11 @@ class NosqlAgent(VulnAgent):
         baseline_len = len(baseline_body)
 
         operator_payloads = get_payloads("nosql", "mongodb_operator") or []
-        where_payloads = get_payloads("nosql", "where_injection") or []
+        # 4-A: the old group name "where_injection" never existed in nosql.yaml —
+        # the agent silently fell back to 3 hardcoded strings. The real JS-injection
+        # group is mongodb_js_injection. (elasticsearch/redis_crlf groups remain
+        # unwired pending tech-stack hints — see payload_filter.)
+        where_payloads = get_payloads("nosql", "mongodb_js_injection") or []
 
         for param in params[:6]:
             param_name = param.get("name", "")

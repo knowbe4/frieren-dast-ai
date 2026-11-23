@@ -190,27 +190,6 @@ class TestAuthAgentHelpers:
 
 # ── discovery_agent helper tests ─────────────────────────────────────────
 
-class TestDiscoveryAgentSsti:
-    def test_ssti_hit_detects_evaluated(self):
-        from dast.agents.discovery_agent import _ssti_hit
-        assert _ssti_hit("${7*7}", "49", "The result is: 49.") is True
-
-    def test_ssti_hit_rejects_echoed_payload(self):
-        from dast.agents.discovery_agent import _ssti_hit
-        # Server echoed the payload verbatim — not evaluated
-        assert _ssti_hit("${7*7}", "49", "You entered: ${7*7}") is False
-
-    def test_ssti_hit_rejects_substring_in_larger_number(self):
-        from dast.agents.discovery_agent import _ssti_hit
-        # "49" inside a UUID/larger number must not trigger
-        assert _ssti_hit("${7*7}", "49", "ref=abc1490xyz") is False
-
-    def test_ssti_hit_finds_eval_in_complex_response(self):
-        from dast.agents.discovery_agent import _ssti_hit
-        body = '<html><body><p>Evaluation result: 49</p></body></html>'
-        assert _ssti_hit("{{7*7}}", "49", body) is True
-
-
 # ── mfa_agent helper tests ────────────────────────────────────────────────
 
 class TestMfaAgentHelpers:

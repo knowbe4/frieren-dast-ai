@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
+from dast.payloads.loader import get_payloads
 from dast.proxy.plugin_manager import log_event
 from dast.scanners.active_checks import _fmt_http_pair, _send
 from dast.utils.logger import get_logger
@@ -74,9 +75,15 @@ class PrototypePollutionAgent(VulnAgent):
             return []
         baseline_body = baseline.text[:4000]
 
-        # Phase 1: Query string pollution
+        # Phase 1: Query string pollution. 4-A: shapes come from the
+        # prototype_pollution.yaml query_string group (bracket/constructor/nested/
+        # URL-encoded variants) with the detection marker substituted into the
+        # value — the yaml's own values (admin=true) are invisible to _check_response.
         if has_params:
+            qs_templates = get_payloads("prototype_pollution", "query_string") or []
             qs_payloads = [
+                re.sub(r"=([^=]*)$", f"={_MARKER}", t) for t in qs_templates
+            ] or [
                 f"__proto__[polluted]={_MARKER}",
                 f"constructor[prototype][polluted]={_MARKER}",
                 f"__pro%74o__[polluted]={_MARKER}",
@@ -125,7 +132,18 @@ class PrototypePollutionAgent(VulnAgent):
 
         # Phase 2: JSON body pollution
         if has_json and target.method in ("POST", "PUT", "PATCH"):
-            json_payloads = [
+            # 4-A: json shapes from the yaml json_body group (direct/constructor/
+            # deep-merge/array/unicode-escape) with the marker as the value.
+            json_templates = get_payloads("prototype_pollution", "json_body") or []
+            json_payloads = []
+            for t in json_templates:
+                try:
+                    marked = re.sub(
+                        r':\s*(true|false|\d+|"[^"]*")', f': "{_MARKER}"', str(t))
+                    json_payloads.append(json.loads(marked))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            json_payloads = json_payloads or [
                 {"__proto__": {"polluted": _MARKER}},
                 {"constructor": {"prototype": {"polluted": _MARKER}}},
             ]
@@ -150,6 +168,24 @@ class PrototypePollutionAgent(VulnAgent):
                 if finding:
                     findings.append(finding)
                     return findings
+
+        # Phase 3: header-vector pollution (4-A) — frameworks that merge request
+        # headers into objects (yaml headers group: "name: value" pairs).
+        header_entries = get_payloads("prototype_pollution", "headers") or []
+        for entry in header_entries[:3]:
+            name, _, value = str(entry).partition(": ")
+            if not name:
+                continue
+            marked = re.sub(r'"(true|false|\d+|admin)"', f'"{_MARKER}"', value) or value
+            hdrs = {**target.headers, name.strip(): marked}
+            resp = await _send(client, target.method, target.url, hdrs, target.body,
+                               payload=f"{name.strip()}: {marked}"[:100])
+            if not resp:
+                continue
+            finding = self._check_response(resp, target, f"{name}: {marked}", "header", baseline_body)
+            if finding:
+                findings.append(finding)
+                return findings
 
         return findings
 

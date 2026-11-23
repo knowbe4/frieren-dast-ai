@@ -750,6 +750,17 @@ def _select_attack_types_for_params(
     if has_jwt_target(target):
         candidate_types.add("jwt")
 
+    # LLM-endpoint markers (4-A): llm_injection was the only registered agent
+    # with NO deterministic dispatch rule — it only ever ran via the evidence
+    # router's focus list. Coarse markers in the URL/body make it dispatchable
+    # without that path; the agent's own probes stay the source of truth.
+    _llm_haystack = f"{target.url} {(target.body or '')[:400]}".lower()
+    if any(_m in _llm_haystack for _m in (
+        "/chat/completions", "/completions", "/v1/messages",
+        "chatmessages", "chat/messages", "openai", "anthropic", "llm/",
+    )):
+        candidate_types.add("llm_injection")
+
     # XML surfaces are XXE candidates (XML content-type or XML-shaped body). The
     # canary pass already carries an xxe payload — it was dead code until this rule
     # existed, because nothing ever added "xxe" to the candidates (the agent

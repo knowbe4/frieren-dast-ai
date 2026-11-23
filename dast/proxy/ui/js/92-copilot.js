@@ -447,6 +447,18 @@ const CP_STARTER_PROMPTS = [
         body: 'Authenticate as "<profile-slug>" and confirm whether <target-url> parameter "<param>" is vulnerable to <vuln-class>. Reproduce it through the proxy with the matching deterministic probe, and if it holds, record the finding with evidence. If it does not reproduce, tell me why.' },
     ],
   },
+  {
+    group: 'Full pentest',
+    icon: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1L1 5l7 4 7-4-7-4z"/><path d="M1 8l7 4 7-4"/><path d="M1 11l7 4 7-4"/></svg>',
+    cards: [
+      { title: 'Full pentest on a target',
+        body: 'Log in with profile "<profile-slug>" and run a full penetration test on <target-url> within scope <scope>. Start by mapping the attack surface: crawl the authenticated app, identify endpoints, parameters, and state-changing operations. Then test systematically for the OWASP Top 10 — injection (SQLi, XSS, command injection), broken access control (IDOR, privilege escalation, BFLA), authentication/session flaws, SSRF, and business-logic issues. Use the deterministic probes (sqli_probe, xss_probe, idor_probe, authz_differential_probe) to confirm every finding. Record each confirmed vulnerability with request/response evidence. Pause and ask me before any destructive action or if you hit a blocker.' },
+      { title: 'Full pentest on a GraphQL API',
+        body: 'Authenticate as "<profile-slug>" and run a full penetration test on the GraphQL API at <target-url>. Start by introspecting the schema to map all queries, mutations, and types. Then test systematically: injection in every string/ID argument (sqli_probe), broken access control across operations (idor_probe, authz_differential_probe), excessive data exposure in responses, batching/DoS vectors, and business-logic flaws in state-changing mutations. Confirm every finding with the deterministic probes and record it with evidence. Pause before any destructive mutation.' },
+      { title: 'Confirm a list of SAST findings',
+        body: 'Log in with profile "<profile-slug>" and confirm the following SAST/code-review findings on <target-url> through the proxy. For each finding, reproduce the vulnerable condition end to end: build the request, send it through the proxy, and use the matching deterministic probe to confirm or rule it out. Record confirmed findings with evidence and tell me which ones could not be reproduced and why. Findings to confirm:\n• <finding-1>\n• <finding-2>\n• <finding-3>' },
+    ],
+  },
 ];
 
 // Substitute a real slug for the <profile-slug> placeholder only when exactly

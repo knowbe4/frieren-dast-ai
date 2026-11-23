@@ -346,7 +346,7 @@ class SessionStore:
         """
         if not self.pending_import_findings:
             return
-        if entry.source in ("out-of-scope", "agent", "imported"):
+        if entry.source in ("out-of-scope", "agent", "imported", "replay"):
             return
 
         entry_path = (entry.path or "").split("?")[0].lower()
@@ -531,7 +531,7 @@ class SessionStore:
             # reflect the target application, not third-party hosts or scanner noise.
             _settings_ref = getattr(store_ref, "_settings", None)
             _intel_in_scope = (
-                entry.source not in ("imported", "out-of-scope", "agent", "scanner")
+                entry.source not in ("imported", "out-of-scope", "agent", "scanner", "replay")
                 and entry.host
                 and (_settings_ref is None or _settings_ref.is_in_scope(entry.url))
             )

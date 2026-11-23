@@ -652,6 +652,7 @@ const _SRC_TAG = {
   scan:           '<span class="src-tag src-scan"     title="Deterministic scan probe (code-driven)">scan</span>',
   copilot:        '<span class="src-tag src-copilot"  title="Autonomous copilot request">copilot</span>',
   imported:       '<span class="src-tag src-imported" title="Imported finding replay">import</span>',
+  replay:         '<span class="src-tag src-proxy"    title="Operator replay through the proxy (mini-Repeater)">replay</span>',
   'out-of-scope': '<span class="src-tag src-oos"      title="Outside configured scope">oos</span>',
 };
 

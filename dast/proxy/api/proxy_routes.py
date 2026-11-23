@@ -8,6 +8,7 @@ import asyncio
 import json
 from html import escape as _esc
 from importlib.metadata import version as _pkg_version
+from typing import Optional
 from urllib.parse import parse_qsl
 
 from fastapi import APIRouter
@@ -289,6 +290,91 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         if not e:
             return JSONResponse({"error": "not found"}, status_code=404)
         return e.to_dict(include_bodies=True)
+
+    @router.post("/api/replay/{entry_id}")
+    async def replay_entry(entry_id: str, body: Optional[dict] = None):
+        """Re-send a captured request THROUGH the MITM proxy (3-I mini-Repeater).
+
+        Unlike /api/repeater/send (httpx direct, no history), the replay goes out
+        proxy-routed so it is RECORDED in history with source 'replay', the
+        operator's match&replace rules apply (attributed via rewritten_by), and
+        the cookie jar stays in the loop. The rebuilt request comes from the raw
+        stored fields (no lossy to_dict roundtrip); hop-by-hop/computed headers
+        and the scanner's internal headers are stripped."""
+        import time as _time
+
+        import httpx
+
+        entry = store.get_entry(entry_id)
+        if not entry:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        opts = body or {}
+        req_body = entry.request_body or b""
+        if len(req_body) > 8 * 1024 * 1024:
+            return JSONResponse(
+                {"error": "request body too large to replay (8 MiB cap)"}, status_code=413)
+
+        from dast.proxy.api.http_utils import strip_recomputed_headers
+
+        headers = strip_recomputed_headers(dict(entry.request_headers or {}))
+        for _internal in ("x-dast-source", "x-dast-crawler", "x-dast-payload"):
+            headers.pop(_internal, None)
+        if opts.get("fresh_cookie"):
+            try:
+                from dast.proxy.auth_headers import freshest_cookie_header_for_host
+                fresh = freshest_cookie_header_for_host(store, entry.host)
+                if fresh:
+                    old = headers.get("cookie")
+                    headers["cookie"] = f"{old}; {fresh}" if old else fresh
+            except Exception as exc:
+                logger.debug("replay fresh-cookie lookup failed", host=entry.host, error=str(exc))
+        headers["x-dast-source"] = "replay"
+
+        # Route through our own MITM listener when the runner is wired; direct
+        # send otherwise (recorded=false, ARTEX semantics).
+        runner = getattr(ctx, "runner", None)
+        proxy_port = getattr(runner, "_proxy_port", None) if runner is not None else None
+        proxy_url = f"http://127.0.0.1:{proxy_port}" if proxy_port else None
+
+        started = _time.monotonic()
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url, verify=False,
+                follow_redirects=bool(opts.get("follow_redirects", False)),
+                timeout=60.0,
+            ) as client:
+                resp = await client.request(
+                    entry.method, entry.url, headers=headers,
+                    content=req_body if req_body else None,
+                )
+        except httpx.HTTPError as exc:
+            return JSONResponse({"error": f"replay failed: {str(exc)[:200]}"}, status_code=502)
+        duration_ms = (_time.monotonic() - started) * 1000.0
+
+        raw = resp.content or b""
+        truncated = len(raw) > 2 * 1024 * 1024
+        text = raw[:2 * 1024 * 1024].decode("utf-8", errors="replace")
+        # The proxy pipeline recorded the replay — surface the fresh entry id
+        # (last matching 'replay' entry for this URL) so the UI can jump to it.
+        new_entry_id = None
+        try:
+            candidates = [e for e in store.all_entries()
+                          if getattr(e, "source", "") == "replay" and e.url == entry.url]
+            if candidates:
+                new_entry_id = max(candidates, key=lambda e: e.ts).id
+        except Exception:
+            new_entry_id = None
+        return {
+            "ok": True,
+            "status": resp.status_code,
+            "headers": {k: v for k, v in resp.headers.items()},
+            "body": text,
+            "truncated": truncated,
+            "duration_ms": round(duration_ms, 1),
+            "recorded": proxy_url is not None,
+            "replayed_from": entry_id,
+            "entry_id": new_entry_id,
+        }
 
     @router.get("/api/reproduce/{entry_id}")
     async def reproduce_entry(entry_id: str):

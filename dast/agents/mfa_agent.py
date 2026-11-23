@@ -131,7 +131,16 @@ class MFABypassAgent(VulnAgent):
         if findings:
             return findings  # no point continuing if rate limit is missing
 
-        # ── Check 2: OTP parameter removal ────────────────────────────────
+        # ── Check 2: OTP reuse (4-B — promised in the docstring) ───────────
+        # The captured body's OTP was already submitted once through the proxy;
+        # two consecutive re-submissions BOTH succeeding means the code is not
+        # single-use (CWE-294). The rate-limit check has already run, so a
+        # lockout cannot mask the verdict.
+        findings += await self._check_otp_reuse(target, client, otp_param, baseline)
+        if findings:
+            return findings
+
+        # ── Check 2b: OTP parameter removal ────────────────────────────────
         findings += await self._check_param_removal(target, client, otp_param, baseline)
 
         # ── Check 3: Backup code brute-force (only if no rate limit found) ─
@@ -195,6 +204,49 @@ class MFABypassAgent(VulnAgent):
             probe_request=f"POST {target.url} with {otp_param}={_INVALID_OTPS[-1]}",
             probe_response=last_resp_text,
             confirmed=False,
+        )]
+
+    async def _check_otp_reuse(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        otp_param: str,
+        baseline: "httpx.Response",
+    ) -> List[AgentFinding]:
+        """Re-submit the captured body unchanged, twice. A previously-submitted
+        OTP accepted on BOTH consecutive replays is not single-use."""
+        first = await _send(client, target.method, target.url, target.headers, target.body)
+        second = await _send(client, target.method, target.url, target.headers, target.body)
+        if first is None or second is None:
+            return []
+        if first.status_code not in _AUTH_SUCCESS_CODES \
+                or second.status_code not in _AUTH_SUCCESS_CODES:
+            return []
+        raw_req, raw_resp = _fmt_http_pair(second)
+        log_event("agent", "finding",
+                  f"MFA OTP reuse: a submitted code was accepted twice on {target.url}",
+                  url=target.url, finding="OTP reuse", source="agent")
+        return [AgentFinding(
+            title="MFA OTP Reuse — Code Accepted on Consecutive Submissions",
+            severity="medium",
+            cwe="CWE-294",
+            attack_type="mfa_bypass",
+            evidence=(
+                "The OTP value carried by the captured request was submitted "
+                "TWICE in a row and BOTH submissions succeeded "
+                f"({first.status_code}, {second.status_code}) — the code is not "
+                "single-use, so an attacker who captures one OTP can replay it "
+                "within the validity window.\n\n"
+                f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+            ),
+            confirmed=True,
+            payload=str(target.body)[:200],
+            parameter=otp_param,
+            url=target.url,
+            request_method=target.method,
+            bypass_validation=True,
+            raw_request=raw_req,
+            raw_response=raw_resp[:2000],
         )]
 
     async def _check_param_removal(

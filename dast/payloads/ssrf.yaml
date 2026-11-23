@@ -56,6 +56,11 @@ url_param_keywords:
   - to
   - from
   - location
+    - import
+    - avatar
+    - feed
+    - attachment
+    - document
 
 # Signatures for inline SSRF responses (no OOB needed)
 internal_response_signatures:

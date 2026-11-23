@@ -5,6 +5,36 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (agents heavy round 4-B)
+- **cswsh_agent** (`cswsh`, CWE-346) — the generic Cross-Site WebSocket
+  Hijacking check nobody performed: a RAW `Upgrade: websocket` handshake with
+  an attacker Origin over a direct socket (the smuggling transport idiom —
+  httpx cannot speak WS and the MITM re-frames upgrades). A 101 with a valid
+  `Sec-WebSocket-Accept` for OUR key proves no Origin validation: HIGH +
+  confirmed when session cookies ride along, informational otherwise.
+  `websocket_observer` now tags 101 entries with
+  `focus_attack_types=['cswsh']` so the autonomous pipeline dispatches it.
+- **deserialization_agent** (`deserialization`, CWE-502) — closes the total
+  gap SAFELY: never re-sends captured bodies (a captured object could
+  re-execute a gadget) and never sends executable gadgets. Reflection probe
+  (malformed Java header → deser exception = unconfirmed sink) plus URLDNS
+  OOB CONFIRMATION with an OPERATOR-PROVIDED fixture
+  (`dast/payloads/urldns.bin`, ysoserial-generated with the documented
+  placeholder): the agent splices the Collaborator URL into every TC_STRING
+  occurrence (patching length prefixes) and confirms on
+  `collaborator.was_hit`. URLDNS is DNS-only.
+- **bfla_agent** (`bfla`, CWE-862) — Broken Function-Level Authorization with
+  GET/HEAD ONLY (never a state-changing method): admin-looking surfaces
+  replayed with non-admin named sessions, and API version downgrade
+  (/v2 forbidden while /v1 serves, same credentials).
+- **Improvements**: jwt_agent gained the RS256→HS256 key-confusion variants
+  (same-host jwks as the HMAC secret; silent skip when unreachable);
+  mfa_agent implemented the docstring-promised OTP REUSE check (the captured
+  OTP accepted on TWO consecutive re-submissions = CWE-294); xss_agent gained
+  a fragment second chance (DOM sinks reading location.hash — confirmed in
+  the agent's own browser pass); ssrf.yaml sink keywords += import/avatar/
+  feed/attachment/document. Registry: 31 → **34 agents**.
+
 ### Added (agents expansion round 4-A)
 - **Five new agents** (registry 26 → 31), techniques from ARTEX api-security:
   **cors_agent** (one crafted-Origin probe: reflected attacker origin with

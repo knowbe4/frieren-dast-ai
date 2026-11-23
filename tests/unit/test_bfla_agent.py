@@ -127,7 +127,7 @@ async def test_state_changing_target_is_never_probed(monkeypatch):
 async def test_non_admin_path_skipped(monkeypatch):
     from dast.agents.bfla_agent import BflaAgent
 
-    sent = _install(monkeypatch, lambda url, method: _r(200, _ADMIN_BODY))
+    _install(monkeypatch, lambda url, method: _r(200, _ADMIN_BODY))
     target = _target(url="https://app.example.com/v2/admin/users")  # downgrade path only
     findings = await BflaAgent().run(target, MagicMock(), None)
     assert findings == []

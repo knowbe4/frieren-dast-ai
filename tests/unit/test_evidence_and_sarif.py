@@ -416,6 +416,7 @@ class TestMatchReplace:
             ps._on_change = None
             for r in rules:
                 ps._match_replace.append({
+                    "id": f"r{len(ps._match_replace)}",
                     "enabled": r.get("enabled", True),
                     "scope": r["scope"],
                     "type": r["type"],
@@ -432,11 +433,12 @@ class TestMatchReplace:
             "scope": "request", "type": "header",
             "match": r"authorization: .*", "replace": "authorization: Bearer newtoken",
         }])
-        url, hdrs, body = ps.apply_to_request(
+        url, hdrs, body, fired = ps.apply_to_request(
             "https://api.example.com/data",
             {"authorization": "Bearer oldtoken", "accept": "application/json"},
-            None,
+            None, method="GET",
         )
+        assert fired == ["r0"]  # 3-I trace
         assert hdrs["authorization"] == "Bearer newtoken"
         assert hdrs["accept"] == "application/json"
 
@@ -445,10 +447,10 @@ class TestMatchReplace:
             "scope": "request", "type": "body",
             "match": r"password=\w+", "replace": "password=REDACTED",
         }])
-        _, _, body = ps.apply_to_request(
+        _, _, body, _ = ps.apply_to_request(
             "https://api.example.com/login",
             {"content-type": "application/x-www-form-urlencoded"},
-            b"username=admin&password=hunter2",
+            b"username=admin&password=hunter2", method="POST",
         )
         assert b"REDACTED" in body
         assert b"hunter2" not in body
@@ -458,9 +460,9 @@ class TestMatchReplace:
             "scope": "request", "type": "url",
             "match": r"/v1/", "replace": "/v2/",
         }])
-        url, _, _ = ps.apply_to_request(
+        url, _, _, _ = ps.apply_to_request(
             "https://api.example.com/v1/users",
-            {}, None,
+            {}, None, method="GET",
         )
         assert "/v2/users" in url
 
@@ -469,9 +471,10 @@ class TestMatchReplace:
             "scope": "response", "type": "header",
             "match": r"x-frame-options: .*", "replace": "x-frame-options: SAMEORIGIN",
         }])
-        hdrs, _ = ps.apply_to_response(
+        hdrs, _, _ = ps.apply_to_response(
+            "https://api.example.com/data",
             {"x-frame-options": "ALLOW-FROM https://evil.com", "content-type": "text/html"},
-            b"<html></html>",
+            b"<html></html>", method="GET", status=200,
         )
         assert hdrs["x-frame-options"] == "SAMEORIGIN"
 
@@ -481,9 +484,9 @@ class TestMatchReplace:
             "match": r"secret", "replace": "REDACTED",
             "enabled": False,
         }])
-        _, _, body = ps.apply_to_request(
+        _, _, body, _ = ps.apply_to_request(
             "https://api.example.com/data",
-            {}, b"my secret value",
+            {}, b"my secret value", method="GET",
         )
         assert b"secret" in body
 
@@ -492,9 +495,9 @@ class TestMatchReplace:
             "scope": "response", "type": "header",
             "match": r"authorization: .*", "replace": "authorization: REMOVED",
         }])
-        _, hdrs, _ = ps.apply_to_request(
+        _, hdrs, _, _ = ps.apply_to_request(
             "https://api.example.com/data",
-            {"authorization": "Bearer token"}, None,
+            {"authorization": "Bearer token"}, None, method="GET",
         )
         assert hdrs["authorization"] == "Bearer token"
 
@@ -503,8 +506,9 @@ class TestMatchReplace:
             "scope": "both", "type": "body",
             "match": r"internal", "replace": "FILTERED",
         }])
-        _, _, req_body = ps.apply_to_request("https://x.com/", {}, b"internal data")
-        _, resp_body  = ps.apply_to_response({}, b"internal data")
+        _, _, req_body, _ = ps.apply_to_request("https://x.com/", {}, b"internal data", method="GET")
+        _, resp_body, _ = ps.apply_to_response(
+            "https://x.com/", {}, b"internal data", method="GET", status=200)
         assert b"FILTERED" in req_body
         assert b"FILTERED" in resp_body
 

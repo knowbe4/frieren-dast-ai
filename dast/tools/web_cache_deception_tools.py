@@ -29,7 +29,6 @@ from urllib.parse import urlparse, urlunparse
 from dast.session.auth_provider import attach as _attach
 from dast.tools.base import Tool, register
 from dast.tools.context import ToolContext
-from dast.tools.sqli_probe_tools import _resolve_auth
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -221,6 +220,8 @@ async def _web_cache_deception_probe(ctx: ToolContext, args: Dict[str, Any]) -> 
         variants = _wcd_variants(url)
 
     source_label = getattr(ctx, "source_label", None)
+    from dast.tools.sqli_probe_tools import _resolve_auth  # local: avoids the
+    # web_cache -> sqli_probe -> dast.agents -> web_cache import cycle
     auth = await _resolve_auth(ctx, url, method)
 
     def _authed_headers() -> Dict[str, str]:

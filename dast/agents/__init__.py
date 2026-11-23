@@ -10,6 +10,7 @@ from dast.agents import (  # noqa: F401
     cache_deception_agent,
     cmdi_agent,
     cors_agent,
+    bfla_agent,
     business_logic_agent,
     cross_session_idor_agent,
     csrf_agent,

@@ -397,6 +397,10 @@ _CONTEXTUAL_TYPES = frozenset({
 
 # Which attack types are relevant for each param classification.
 # Only listed types will be attempted on a param of that class.
+# 4-B bfla dispatch helpers: admin-looking surfaces + versioned API paths
+_ADMIN_PATH_RE_BFLA = _re.compile(r"/(?:admin|manage|console|backoffice|internal)(?:/|$)", _re.IGNORECASE)
+_VERSION_RE_BFLA = _re.compile(r"^(.*?)/v(\d+)(/.*|$)", _re.IGNORECASE)
+
 _PARAM_ATTACK_MAP: Dict[str, List[str]] = {
     "numeric_id": ["sqli", "idor", "business_logic"],
     "uuid":       ["idor", "business_logic"],
@@ -787,6 +791,13 @@ def _select_attack_types_for_params(
     # lights up the cross-tenant coverage dimension deterministically.
     if len(getattr(target, "named_sessions", None) or []) >= 2:
         candidate_types.add("cross_session_idor")
+        # bfla (4-B): admin-looking surfaces replayed with the other session —
+        # GET/HEAD only (the agent hard-gates; state-changing methods never sent).
+        if _ADMIN_PATH_RE_BFLA.search(target.url):
+            candidate_types.add("bfla")
+    # bfla version-downgrade half: /vN/ URLs answer with the SAME credentials
+    if _VERSION_RE_BFLA.match(target.url):
+        candidate_types.add("bfla")
 
     # GET endpoints are candidates for cache poisoning — an unkeyed request
     # header reflected into a cacheable response. Header-based, no param canary;
@@ -820,9 +831,9 @@ def _select_attack_types_for_params(
         _ct_lower = (target.headers or {}).get("content-type", "").lower()
         if (_body_head == b"\xac\xed\x00\x05"
                 or "serial" in _ct_lower or "octet-stream" in _ct_lower
-                or any(_p.get("name") and re.search(
+                or any(_p.get("name") and _re.search(
                     r"data|state|viewstate|payload|serial|session|blob|object",
-                    _p["name"], re.IGNORECASE)
+                    _p["name"], _re.IGNORECASE)
                     for _p in (target.params or []))):
             candidate_types.add("deserialization")
 

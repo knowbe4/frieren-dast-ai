@@ -8,6 +8,7 @@ from dast.agents import (  # noqa: F401
     blazor_agent,
     cache_poisoning_agent,
     cmdi_agent,
+    cors_agent,
     business_logic_agent,
     cross_session_idor_agent,
     csrf_agent,

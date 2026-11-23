@@ -802,6 +802,10 @@ def _select_attack_types_for_params(
     # Always include secrets scanning — passive, low noise
     candidate_types.add("sensitive_data")
 
+    # CORS validation (4-A) — one crafted-Origin probe per endpoint; the agent
+    # returns after the first probe unless an attacker origin is reflected.
+    candidate_types.add("cors")
+
     # Auth bypass for any authenticated endpoint
     auth_headers = {k.lower() for k in (target.headers or {})}
     if "authorization" in auth_headers or "cookie" in auth_headers:

@@ -144,3 +144,14 @@ def _isolate_provider_health():
     provider_health.reset()
     yield
     provider_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_noise_governor():
+    """Back to the off profile around every test. Tests that pace probes set
+    a real noise profile; without the reset one of those profiles leaked into
+    later tests and silently changed their pacing/timing."""
+    from dast.scanners import noise_governor  # noqa: PLC0415
+    noise_governor.reset()
+    yield
+    noise_governor.reset()

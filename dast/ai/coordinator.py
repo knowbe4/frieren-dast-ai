@@ -778,6 +778,9 @@ def _select_attack_types_for_params(
     # body_graphql-located ID-shaped params and bails otherwise.
     if is_graphql or any(p.get("location") == "body_graphql" for p in (target.params or [])):
         candidate_types.add("graphql_idor")
+        # graphql_abuse (4-A): introspection/alias/batching/GET-depth probes own
+        # exactly the half the IDOR agent excludes.
+        candidate_types.add("graphql_abuse")
 
     # Cross-session IDOR needs TWO named sessions to replay between — the agent
     # hard-gates on the same prerequisite; adding it when the prerequisite exists

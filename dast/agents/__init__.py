@@ -14,6 +14,7 @@ from dast.agents import (  # noqa: F401
     csrf_agent,
     discovery_agent,
     file_read_agent,
+    graphql_abuse_agent,
     graphql_agent,
     hpp_agent,
     host_header_agent,

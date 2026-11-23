@@ -190,9 +190,14 @@ gargalo — dispatch e evidência contextual são.
 5. **Transcript durável por intent** (WorkerSessionID + Resume) — login pela
    metade é retomável
 6. Já roubado na rodada 1: wrap-up (`agent/wrapup.go`) e llmpool (health)
+7. **Noise governor / target noise profile** (0.7.0, #205/#212/#233): token
+   bucket por host + jitter, caps in-flight, pausa do host inteiro em
+   429/503, UA configurável, chaveável em runtime — ✅ roubado na rodada 3-G
+   (o "sem rate limit" de cima caiu; ver linha 3-G do §5)
 
 Fraco no ARTEX (não imitar): guardrails prompt-first desativáveis, sem rate
-limit, plaintext creds no Postgres, sem multi-user.
+limit (⚠ desatualizado no 0.7.0 — corrigido pelo noise governor, item 7),
+plaintext creds no Postgres, sem multi-user.
 
 ---
 
@@ -206,9 +211,11 @@ limit, plaintext creds no Postgres, sem multi-user.
 | **2-D Agentless auth-bypass (ARTEX)** — ✅ FEITA (2026-11-16): `a32cf0d` (`dast/browser/auth_gates.py`: detecção estática + storage hook + route stub; wiring em `proxied_browser_context`), `f04468a` (modo `bypass_auth` no SpaExplorer em 2 rodadas + tool `explore` + worker; teste de integração com SPA guardada client-side). Browse (agent_browser) documentado como follow-up | three auth gates no JS + hook/stub das APIs de auth no browser → pós-login sem credenciais, gravando o tráfego de API — novo modo do browse/spa_explorer | `dast/proxy/spa_explorer.py`, `dast/browser/*`, novo módulo de auth-gates |
 | **3-E Novos agents** — ✅ FEITA (2026-11-16): `571e11b` (`smuggling_agent`: raw-socket CL.TE/TE.CL por diferencial de resposta + hints → `focus_attack_types` + regra CL+TE + coverage), `6a52276` (`jwt_agent`: alg:none/weak-secret/escalation/kid via probe_common proxy-routed + `_PARAM_ATTACK_MAP["token"]: ["jwt"]` + regra JWT-bearing). Detalhe de design: smuggling exige cliente raw direto (proxy/_send re-enquadram CL/TE); detecção por contagem de respostas vs controle (não timing) | request smuggling ativo (CL.TE/TE.CL com o time-oracle existente, disparado pelos hints de `dast/plugins/request_smuggling_hints.py`) + JWT como VulnAgent registrado | novo `dast/agents/smuggling_agent.py`, `dast/agents/jwt_agent.py`, `dast/agents/__init__.py`, `dast/ai/coordinator.py` |
 | **3-F Gravador de LLM** | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
+| **3-G Noise governor (ARTEX 4.7)** — ✅ FEITA (2026-11-23, branch `feat/noise-governor`): `6d0c77a` (`dast/scanners/noise_governor.py`: perfis quiet/balanced/aggressive com os números do ARTEX, token bucket lazy por host, slots in-flight host+global — ordem host→bucket→global, pausa `notBefore` do host inteiro em 429/503 com Retry-After capado, UA configurável, wait fail-open 60s; off = passthrough; clock injetável p/ testes), `5521605` (wiring no chokepoint `_send` com kwarg `pace` — slot paced ANTES da concorrência de scan, delay fixo subsumido, UA no `forward_headers`, race agent com `pace=False` pois o burst É o experimento; `_send_value` do sqli_probe_tools + 2 sites do http_tools paced), `bfecdd4` (chaves `noise_profile`/`noise_user_agent` no scan-config + `GET /api/noise-status` com contadores por host + card Target Noise no dashboard com poll 10s), `2b8107f` (nota low-noise no prompt do planner, code-owned; off = prompt byte-a-byte igual). v1 mínimo: sem GET-dedup e sem retry (seguem os oráculos de tempo); crawler e browsing do operador fora do pacing | rate limit pró-ativo de egress por perfil de operador para targets frágeis (o ARTEX 0.7.0 corrigiu o próprio "sem rate limit") | novo `dast/scanners/noise_governor.py`, `dast/scanners/active_checks.py`, `dast/tools/sqli_probe_tools.py`, `dast/tools/http_tools.py`, `dast/agents/race_condition_agent.py`, `dast/proxy/api/{context,settings_routes,status_routes}.py`, `dast/ai/coordinator.py`, UI scan-config |
 
 **Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → ~~2-C~~ ✅ →
-~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F (última).
+~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F → ~~3-G~~ ✅ → 3-H (coverage
+ledger) → 3-I (match&replace + replay).
 
 **Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
 (`copilot_service._gate_check_account_state`) agora delega para

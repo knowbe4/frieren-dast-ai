@@ -652,6 +652,7 @@ const _SRC_TAG = {
   scan:           '<span class="src-tag src-scan"     title="Deterministic scan probe (code-driven)">scan</span>',
   copilot:        '<span class="src-tag src-copilot"  title="Autonomous copilot request">copilot</span>',
   imported:       '<span class="src-tag src-imported" title="Imported finding replay">import</span>',
+  replay:         '<span class="src-tag src-proxy"    title="Operator replay through the proxy (mini-Repeater)">replay</span>',
   'out-of-scope': '<span class="src-tag src-oos"      title="Outside configured scope">oos</span>',
 };
 
@@ -1002,3 +1003,9 @@ function renderSmDetail() {
   document.getElementById('sm-detail-body').innerHTML = buildRRHtml(smDetail);
 }
 
+
+// ── HAR export (3-I): download the in-scope history as a HAR 1.2 file ──
+function exportHistoryHar() {
+  // Plain navigation — the route answers with Content-Disposition attachment.
+  window.location.href = '/api/history/export/har';
+}

@@ -96,6 +96,39 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   serves the per-host aggregation, and the AI panel gains a Coverage card
   (outcome chips, open follow-ups in orange).
 
+### Added (rewrite rules + replay + HAR round 3-I)
+- **Rewrite rules** — the proxy match&replace evolved toward ARTEX-style
+  rewrite rules: every rule gains a stable id (no more index-based toggle that
+  broke on removal), optional matchers (methods list, host exact or
+  `*.suffix`-excluding-apex, url regex over path+query, response-only status
+  `404`/`4xx` — AND semantics), persisted hit counters, and validation as
+  ERRORS (invalid regex/enum/status and the ARTEX caps of 100 rules / 50
+  enabled return 400 instead of the old silent regex fallback). Body rules
+  skip whole on oversized (>1 MiB) or encoded bodies and no-body responses
+  (HEAD/1xx/204/304). `apply_to_response` finally receives a real URL (url
+  rules in response scope never worked) and the response gate now excludes
+  crawler traffic like the request gate. Every exchange records WHICH rules
+  fired: `ProxyEntry.rewritten_by` (persisted) replaces the fragile
+  header-diff heuristic; the settings UI gains matcher inputs, a matchers
+  column and a Hits column. Legacy rules without ids are migrated on load.
+- **Entry replay (mini-Repeater)** — `POST /api/replay/{entry_id}` re-sends a
+  captured request THROUGH the MITM proxy, so it is RECORDED in history with
+  source `replay` and the operator's rewrite rules apply (attributed via
+  `rewritten_by`) — unlike `/api/repeater/send`, which bypasses the proxy.
+  Rebuilt from the raw stored fields, hop-by-hop/internal headers stripped,
+  fresh-cookie opt-in, 8 MiB body cap / 60 s timeout / 2 MiB response cap /
+  502 on upstream error, and the response carries the fresh entry id to jump
+  to. Excluded from pending-import matching and session intelligence
+  (operator verification, not discovery). UI: context-menu item, ↻ Replay
+  button in the detail-pane summary, `replay` source tag.
+- **HAR 1.2 export** — `dast/proxy/har_export.py` (pure generator) +
+  `GET /api/history/export/har`: in-scope history as a spec-compliant HAR
+  file with stable (ts, id) ordering, explicit placeholders for unrecorded
+  timings, multi-Set-Cookie pairs, text-vs-base64 body encoding, userinfo
+  redaction, and never-silent truncation (1000 entries / 20 MiB raw / 31 MiB
+  marshalled caps reported via `X-DAST-HAR-*` headers and log fields). A ⇩ HAR
+  button sits in the history filter bar.
+
 ### Added (new agents round 3-E)
 - **Active request-smuggling agent** (`request_smuggling_agent`) — the passive
   framing-ambiguity hints now arm `focus_attack_types` (the coordinator honours

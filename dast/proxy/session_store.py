@@ -112,6 +112,10 @@ class ProxyEntry:
     # risk_area, outcome, evidence, reason, updated_at}], copied from the ledger store
     # by the scan worker so the per-endpoint record survives session save/restore.
     coverage_ledger: List[dict] = field(default_factory=list)
+    # rewrite trace (3-I): ids of the match&replace rules that FIRED on this
+    # exchange (changed something), set by the proxy server — replaces the old
+    # header-diff heuristic and survives session save/restore.
+    rewritten_by: List[str] = field(default_factory=list)
     # hints from imported reports: [{parameter, payload, attack_type}]
     import_hints: List[dict] = field(default_factory=list)
     # payload injected by an agent probe (for display in HTTP history)
@@ -141,6 +145,7 @@ class ProxyEntry:
             "scanned_attack_types": self.scanned_attack_types or [],
             "scan_outcome": self.scan_outcome,
             "coverage_ledger": self.coverage_ledger or [],
+            "rewritten_by": self.rewritten_by or [],
             "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
@@ -182,6 +187,7 @@ class ProxyEntry:
             scanned_attack_types=d.get("scanned_attack_types") or [],
             scan_outcome=d.get("scan_outcome"),
             coverage_ledger=d.get("coverage_ledger") or [],
+            rewritten_by=d.get("rewritten_by") or [],
             import_hints=d.get("import_hints") or [],
             ai_queued=d.get("ai_queued", False),
             manual_note=d.get("manual_note"),
@@ -346,7 +352,7 @@ class SessionStore:
         """
         if not self.pending_import_findings:
             return
-        if entry.source in ("out-of-scope", "agent", "imported"):
+        if entry.source in ("out-of-scope", "agent", "imported", "replay"):
             return
 
         entry_path = (entry.path or "").split("?")[0].lower()
@@ -531,7 +537,7 @@ class SessionStore:
             # reflect the target application, not third-party hosts or scanner noise.
             _settings_ref = getattr(store_ref, "_settings", None)
             _intel_in_scope = (
-                entry.source not in ("imported", "out-of-scope", "agent", "scanner")
+                entry.source not in ("imported", "out-of-scope", "agent", "scanner", "replay")
                 and entry.host
                 and (_settings_ref is None or _settings_ref.is_in_scope(entry.url))
             )

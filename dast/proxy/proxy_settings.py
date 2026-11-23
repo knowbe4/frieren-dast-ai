@@ -12,6 +12,8 @@ import fnmatch
 import json
 import re
 import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
@@ -23,6 +25,14 @@ logger = get_logger(__name__)
 
 _SETTINGS_PATH = Path.home() / ".dast-ai" / "proxy-settings.json"
 _PROJECTS_DIR  = Path.home() / ".dast-ai" / "projects"
+
+# Rewrite-rule caps (ARTEX parity): over-limit is an ERROR, never a silent drop.
+_MAX_MR_RULES = 100
+_MAX_MR_ENABLED = 50
+# Integrity guard: body-targeting rules are SKIPPED (whole rule) on oversized or
+# encoded bodies instead of corrupting the stream (ARTEX rewrite engine).
+_MR_BODY_LIMIT = 1024 * 1024
+_MR_BODYLESS_STATUS = range(100, 300)  # 1xx/2xx-no-content-ish guard handled per-call
 
 # Bundled scope presets — one per organization, auto-discovered from
 # dast/scope_presets/*.json and written to ~/.dast-ai/projects/ on first run
@@ -142,8 +152,12 @@ def _apply_rule(
     url: str,
     headers: dict,
     body: Optional[bytes],
-) -> Tuple[str, dict, Optional[bytes]]:
-    """Apply a single match/replace rule to the given url/headers/body."""
+) -> Tuple[str, dict, Optional[bytes], bool]:
+    """Apply a single match/replace rule to the given url/headers/body.
+
+    Returns (url, headers, body, fired) — ``fired`` is True only when the rule
+    actually CHANGED something (a rule that matches but produces identical
+    output does not count as a hit, unlike the old diff-based inference)."""
     rtype   = rule.get("type", "header")
     pattern = rule.get("match", "")
     repl    = rule.get("replace", "")
@@ -160,15 +174,22 @@ def _apply_rule(
             return text
 
     if rtype == "url":
-        url = _sub(url)
+        new_url = _sub(url)
+        fired = new_url != url
+        url = new_url
 
     elif rtype == "header":
         new_headers = {}
+        fired = False
         for k, v in headers.items():
             subbed = _sub(f"{k}: {v}")
             if ": " in subbed:
                 nk, nv = subbed.split(": ", 1)
-                new_headers[nk.strip().lower()] = nv.strip()
+                nk = nk.strip().lower()
+                nv = nv.strip()
+                if nk != k or nv != v:
+                    fired = True
+                new_headers[nk] = nv
             else:
                 new_headers[k] = v
         headers = new_headers
@@ -176,12 +197,123 @@ def _apply_rule(
     elif rtype == "body" and body is not None:
         try:
             text = body.decode("utf-8", errors="replace")
-            text = _sub(text)
-            body = text.encode("utf-8")
+            new_text = _sub(text)
+            fired = new_text != text
+            if fired:
+                body = new_text.encode("utf-8")
         except Exception as exc:
             logger.debug("failed to apply match/replace to request body", error=str(exc))
+            fired = False
+    else:
+        fired = False
 
-    return url, headers, body
+    return url, headers, body, fired
+
+
+def _validate_mr_rule(rule: dict) -> dict:
+    """Normalise + validate one rewrite rule. Raises ValueError on anything
+    invalid (bad enum, uncompilable regex, bad status shape) — the API turns
+    that into a 400 instead of the old silent regex fallback."""
+    normalized = {
+        "id": str(rule.get("id") or uuid.uuid4()),
+        "enabled": bool(rule.get("enabled", True)),
+        "scope":   str(rule.get("scope",   "request")).lower(),
+        "type":    str(rule.get("type",    "header")).lower(),
+        "match":   str(rule.get("match",   "")),
+        "replace": str(rule.get("replace", "")),
+        "comment": str(rule.get("comment", "")),
+        # Matchers (3-I): all optional — absent/empty matcher matches everything.
+        "methods": [str(m).upper() for m in (rule.get("methods") or []) if str(m).strip()],
+        "host":    str(rule.get("host", "")).strip().lower(),
+        "url_regex": str(rule.get("url_regex", "")),
+        "status":  str(rule.get("status", "")).strip(),
+        # Trace (3-I): hit counters, persisted with the rule.
+        "hits": max(0, int(rule.get("hits", 0) or 0)),
+        "last_applied_at": str(rule.get("last_applied_at", "")),
+    }
+    if normalized["scope"] not in ("request", "response", "both"):
+        raise ValueError(f"invalid scope: {normalized['scope']!r}")
+    if normalized["type"] not in ("header", "body", "url"):
+        raise ValueError(f"invalid type: {normalized['type']!r}")
+    if normalized["scope"] == "request" and normalized["status"]:
+        raise ValueError("status matcher is response-only")
+    for field in ("match", "url_regex"):
+        pattern = normalized[field]
+        if pattern:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid {field} regex: {exc}") from exc
+    if normalized["status"]:
+        m = re.fullmatch(r"([1-5])xx|([1-5]\d{2})", normalized["status"])
+        if not m:
+            raise ValueError(f"invalid status matcher: {normalized['status']!r}")
+    if normalized["host"] and "*" in normalized["host"] and not normalized["host"].startswith("*."):
+        raise ValueError("host matcher supports exact host or a leading '*.suffix' glob")
+    return normalized
+
+
+def _host_matches(rule_host: str, host: str) -> bool:
+    """Exact (case-insensitive) or leading '*.suffix' glob — ``*.example.com``
+    matches sub.example.com but NOT example.com itself (ARTEX semantics)."""
+    rule_host = (rule_host or "").lower()
+    host = (host or "").lower()
+    if not rule_host:
+        return True
+    if rule_host.startswith("*."):
+        suffix = rule_host[1:]  # ".example.com"
+        return host.endswith(suffix) and len(host) > len(suffix)
+    return host == rule_host
+
+
+def _rule_matches(rule: dict, method: str, host: str,
+                  path_query: str, status: int = 0) -> bool:
+    """Rule-level matchers — AND; an absent matcher matches everything."""
+    methods = rule.get("methods") or []
+    if methods and str(method).upper() not in methods:
+        return False
+    if rule.get("host") and not _host_matches(rule["host"], host):
+        return False
+    url_re = rule.get("url_regex") or ""
+    if url_re:
+        try:
+            if not re.search(url_re, path_query):
+                return False
+        except re.error:
+            return False
+    status_m = str(rule.get("status") or "")
+    if status_m:
+        m = re.fullmatch(r"([1-5])xx|([1-5]\d{2})", status_m)
+        if not m:
+            return False
+        if m.group(1):  # "4xx" → half-open class range
+            lo = int(m.group(1)) * 100
+            if not (lo <= status < lo + 100):
+                return False
+        elif status != int(m.group(2)):
+            return False
+    return True
+
+
+def _body_eligible(headers: dict, body: Optional[bytes],
+                   method: str, status: int) -> bool:
+    """Integrity guard for body-targeting rules (ARTEX rewrite engine): skip
+    the WHOLE rule on oversized/encoded/no-body responses instead of corrupting
+    the stream. Returns False when a body rule must not run."""
+    if body is None:
+        return True  # nothing to rewrite — a body rule will simply not fire
+    if len(body) > _MR_BODY_LIMIT:
+        return False
+    enc = ""
+    for k, v in (headers or {}).items():
+        if k.lower() == "content-encoding" and str(v).strip().lower() not in ("identity", ""):
+            enc = str(v)
+            break
+    if enc:
+        return False
+    if str(method).upper() == "HEAD" or 100 <= status < 200 or status in (204, 304):
+        return False
+    return True
 
 
 def _convert_old_scope_pattern(pattern: str) -> dict:
@@ -235,6 +367,17 @@ class ProxySettings:
                         _convert_old_scope_pattern(p) for p in data["scope"]
                     ]
                 self._match_replace = list(data.get("match_replace", []))
+                # 3-I migration: legacy rules (no id/matchers/counters) get the
+                # new fields so stable ids work from the first run.
+                for _mr in self._match_replace:
+                    if not _mr.get("id"):
+                        _mr["id"] = str(uuid.uuid4())
+                    _mr.setdefault("methods", [])
+                    _mr.setdefault("host", "")
+                    _mr.setdefault("url_regex", "")
+                    _mr.setdefault("status", "")
+                    _mr.setdefault("hits", 0)
+                    _mr.setdefault("last_applied_at", "")
                 self._bind_host = str(data.get("bind_host", "127.0.0.1")) or "127.0.0.1"
                 try:
                     self._bind_port = int(data.get("bind_port", 0) or 0)
@@ -344,38 +487,66 @@ class ProxySettings:
         with self._lock:
             return list(self._match_replace)
 
-    def add_match_replace(self, rule: dict) -> None:
+    def add_match_replace(self, rule: dict) -> dict:
         """
-        Add a match & replace rule.
+        Add a rewrite rule (3-I: matchers + stable id + hit counters).
 
-        rule keys: enabled, scope, type, match, replace
-          scope: "request" | "response" | "both"
-          type:  "header"  | "body"     | "url"
-          match: regex string (empty = always matches, acts as plain insert/replace)
-          replace: replacement string (regex substitution with capture groups supported)
+        rule keys: enabled, scope, type, match, replace, comment, and the
+        optional matchers methods[]/host/url_regex/status:
+          scope:  "request" | "response" | "both"
+          type:   "header"  | "body"     | "url"
+          match:  regex string (empty = always matches, acts as plain insert/replace)
+          replace: replacement string (regex substitution with capture groups)
+          methods: ["GET", "POST"] — empty = any
+          host:   "api.example.com" or "*.example.com" (subdomains only) — empty = any
+          url_regex: regex over path+query — empty = any
+          status: "404" or "4xx" — response rules only
+        Raises ValueError on invalid input or over the ARTEX caps (100 rules,
+        50 enabled) — the API maps that to a 400. Returns the normalized rule.
         """
-        normalized = {
-            "enabled": bool(rule.get("enabled", True)),
-            "scope":   str(rule.get("scope",   "request")).lower(),
-            "type":    str(rule.get("type",    "header")).lower(),
-            "match":   str(rule.get("match",   "")),
-            "replace": str(rule.get("replace", "")),
-            "comment": str(rule.get("comment", "")),
-        }
+        normalized = _validate_mr_rule(rule)
         with self._lock:
+            if len(self._match_replace) >= _MAX_MR_RULES:
+                raise ValueError(f"rewrite-rule cap reached ({_MAX_MR_RULES} rules)")
+            if normalized["enabled"]:
+                enabled = sum(1 for r in self._match_replace if r.get("enabled"))
+                if enabled >= _MAX_MR_ENABLED:
+                    raise ValueError(f"enabled rewrite-rule cap reached ({_MAX_MR_ENABLED})")
             self._match_replace.append(normalized)
         self._save()
+        return dict(normalized)
 
-    def remove_match_replace(self, index: int) -> None:
+    def _find_mr_index(self, identifier) -> int:
+        """Locate a rule by id (3-I) or legacy list index. Raises KeyError when
+        unknown — the API turns that into a 404."""
         with self._lock:
-            if 0 <= index < len(self._match_replace):
-                self._match_replace.pop(index)
+            if isinstance(identifier, int):
+                if not 0 <= identifier < len(self._match_replace):
+                    raise KeyError(identifier)
+                return identifier
+            for i, r in enumerate(self._match_replace):
+                if r.get("id") == str(identifier):
+                    return i
+        raise KeyError(identifier)
+
+    def remove_match_replace(self, identifier) -> None:
+        try:
+            idx = self._find_mr_index(identifier)
+        except KeyError:
+            return
+        with self._lock:
+            if 0 <= idx < len(self._match_replace):
+                self._match_replace.pop(idx)
         self._save()
 
-    def toggle_match_replace(self, index: int, enabled: bool) -> None:
+    def toggle_match_replace(self, identifier, enabled: bool) -> None:
+        try:
+            idx = self._find_mr_index(identifier)
+        except KeyError:
+            return
         with self._lock:
-            if 0 <= index < len(self._match_replace):
-                self._match_replace[index]["enabled"] = bool(enabled)
+            if 0 <= idx < len(self._match_replace):
+                self._match_replace[idx]["enabled"] = bool(enabled)
         self._save()
 
     def apply_to_request(
@@ -383,25 +554,86 @@ class ProxySettings:
         url: str,
         headers: dict,
         body: Optional[bytes],
+        method: str = "",
+        content_encoding: str = "identity",
     ) -> tuple:
-        """Apply all enabled request-scope match/replace rules. Returns (url, headers, body)."""
+        """Apply enabled request-scope rewrite rules whose matchers accept this
+        request. Returns (url, headers, body, fired_ids) — fired_ids carries the
+        stable rule ids that CHANGED something (the trace the old diff-based
+        detection approximated)."""
+        from urllib.parse import urlparse as _up
+        _parsed = _up(url)
+        _host = _parsed.hostname or ""
+        _path_query = _parsed.path or "/"
+        if _parsed.query:
+            _path_query += "?" + _parsed.query
         with self._lock:
-            rules = [r for r in self._match_replace if r.get("enabled") and r.get("scope") in ("request", "both")]
+            rules = [dict(r) for r in self._match_replace
+                     if r.get("enabled") and r.get("scope") in ("request", "both")]
+        fired_ids: List[str] = []
+        changed = False
         for rule in rules:
-            url, headers, body = _apply_rule(rule, url, headers, body)
-        return url, headers, body
+            if rule.get("type") == "body" and (
+                    (body is not None and len(body) > _MR_BODY_LIMIT)
+                    or (content_encoding and content_encoding.lower() not in ("identity", ""))
+                    or not _rule_matches(rule, method, _host, _path_query)):
+                continue
+            if not _rule_matches(rule, method, _host, _path_query):
+                continue
+            url, headers, body, fired = _apply_rule(rule, url, headers, body)
+            if fired:
+                changed = True
+                fired_ids.append(rule.get("id") or "")
+        if changed:
+            self._record_hits(fired_ids)
+        return url, headers, body, fired_ids
 
     def apply_to_response(
         self,
+        url: str,
         headers: dict,
         body: Optional[bytes],
+        method: str = "",
+        status: int = 0,
+        content_encoding: str = "identity",
     ) -> tuple:
-        """Apply all enabled response-scope match/replace rules. Returns (headers, body)."""
+        """Apply enabled response-scope rewrite rules. Returns (headers, body,
+        fired_ids). The url is now REAL (pre-3-I it was always "" so url-type
+        response rules could never fire) and response matchers (status) work."""
+        from urllib.parse import urlparse as _up
+        _parsed = _up(url)
+        _host = _parsed.hostname or ""
+        _path_query = _parsed.path or "/"
+        if _parsed.query:
+            _path_query += "?" + _parsed.query
         with self._lock:
-            rules = [r for r in self._match_replace if r.get("enabled") and r.get("scope") in ("response", "both")]
+            rules = [dict(r) for r in self._match_replace
+                     if r.get("enabled") and r.get("scope") in ("response", "both")]
+        fired_ids: List[str] = []
+        changed = False
         for rule in rules:
-            _, headers, body = _apply_rule(rule, "", headers, body)
-        return headers, body
+            if rule.get("type") == "body" and not _body_eligible(
+                    headers, body, method, status):
+                continue
+            if not _rule_matches(rule, method, _host, _path_query, status):
+                continue
+            _, headers, body, fired = _apply_rule(rule, url, headers, body)
+            if fired:
+                changed = True
+                fired_ids.append(rule.get("id") or "")
+        if changed:
+            self._record_hits(fired_ids)
+        return headers, body, fired_ids
+
+    def _record_hits(self, rule_ids: List[str]) -> None:
+        """Bump hit counters for the rules that fired (persisted with _save by
+        the caller's next save; counters are advisory trace, best-effort)."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with self._lock:
+            for r in self._match_replace:
+                if r.get("id") in rule_ids:
+                    r["hits"] = max(0, int(r.get("hits", 0) or 0)) + 1
+                    r["last_applied_at"] = now
 
     # ── scope rule mutations ───────────────────────────────────────────
 

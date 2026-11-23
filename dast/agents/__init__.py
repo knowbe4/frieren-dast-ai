@@ -13,6 +13,7 @@ from dast.agents import (  # noqa: F401
     business_logic_agent,
     cross_session_idor_agent,
     csrf_agent,
+    cswsh_agent,
     discovery_agent,
     file_read_agent,
     graphql_abuse_agent,

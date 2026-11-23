@@ -63,6 +63,12 @@ class WebsocketObserverPlugin(ProxyPlugin):
             # Failed handshake (4xx/3xx) — not a live WS endpoint.
             return
 
+        # 4-B discovery channel: tag the entry so the coordinator's additive
+        # focus path dispatches cswsh_agent against this endpoint (same
+        # mechanism the request-smuggling hints use).
+        entry.focus_attack_types = list(dict.fromkeys(
+            list(getattr(entry, "focus_attack_types", None) or []) + ["cswsh"]))
+
         endpoint_key = (entry.host or "", entry.path or "")
         first_seen = endpoint_key not in _seen_endpoints
         _seen_endpoints.add(endpoint_key)

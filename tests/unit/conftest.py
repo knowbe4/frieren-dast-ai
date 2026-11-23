@@ -144,3 +144,14 @@ def _isolate_provider_health():
     provider_health.reset()
     yield
     provider_health.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_coverage_ledger():
+    """Empty the coverage ledger around every test — the store is process-wide
+    and the coordinator writes into it during scans; without the reset one
+    test's entries leaked into another test's planner prompts and snapshots."""
+    from dast.coverage import ledger  # noqa: PLC0415
+    ledger.reset()
+    yield
+    ledger.reset()

@@ -190,9 +190,13 @@ gargalo — dispatch e evidência contextual são.
 5. **Transcript durável por intent** (WorkerSessionID + Resume) — login pela
    metade é retomável
 6. Já roubado na rodada 1: wrap-up (`agent/wrapup.go`) e llmpool (health)
+7. **Coverage ledger** (#207): o worker registra o que examinou / descartou /
+   deixou aberto por superfície e classe de risco; gaps alimentam o planner —
+   ✅ roubado na rodada 3-H (v1 machine-observed; ver linha 3-H do §5)
 
 Fraco no ARTEX (não imitar): guardrails prompt-first desativáveis, sem rate
-limit, plaintext creds no Postgres, sem multi-user.
+limit (⚠ corrigido no upstream 0.7.0 pelo noise governor), plaintext creds no
+Postgres, sem multi-user.
 
 ---
 
@@ -206,9 +210,11 @@ limit, plaintext creds no Postgres, sem multi-user.
 | **2-D Agentless auth-bypass (ARTEX)** — ✅ FEITA (2026-11-16): `a32cf0d` (`dast/browser/auth_gates.py`: detecção estática + storage hook + route stub; wiring em `proxied_browser_context`), `f04468a` (modo `bypass_auth` no SpaExplorer em 2 rodadas + tool `explore` + worker; teste de integração com SPA guardada client-side). Browse (agent_browser) documentado como follow-up | three auth gates no JS + hook/stub das APIs de auth no browser → pós-login sem credenciais, gravando o tráfego de API — novo modo do browse/spa_explorer | `dast/proxy/spa_explorer.py`, `dast/browser/*`, novo módulo de auth-gates |
 | **3-E Novos agents** — ✅ FEITA (2026-11-16): `571e11b` (`smuggling_agent`: raw-socket CL.TE/TE.CL por diferencial de resposta + hints → `focus_attack_types` + regra CL+TE + coverage), `6a52276` (`jwt_agent`: alg:none/weak-secret/escalation/kid via probe_common proxy-routed + `_PARAM_ATTACK_MAP["token"]: ["jwt"]` + regra JWT-bearing). Detalhe de design: smuggling exige cliente raw direto (proxy/_send re-enquadram CL/TE); detecção por contagem de respostas vs controle (não timing) | request smuggling ativo (CL.TE/TE.CL com o time-oracle existente, disparado pelos hints de `dast/plugins/request_smuggling_hints.py`) + JWT como VulnAgent registrado | novo `dast/agents/smuggling_agent.py`, `dast/agents/jwt_agent.py`, `dast/agents/__init__.py`, `dast/ai/coordinator.py` |
 | **3-F Gravador de LLM** | toda chamada LLM persistida (request/response/tokens/latência/refusal reason) + painel de uso — essencial para debugar safeguards/refusals do copilot | `dast/ai/bedrock_client.py` (chokepoint único), novo `dast/ai/llm_recorder.py`, rota no dashboard |
+| **3-H Coverage ledger (ARTEX 4.8)** — ✅ FEITA (2026-11-23, branch `feat/coverage-ledger`): `70bc647` (`dast/coverage/ledger.py`: entradas por (superfície=chave de scan, risk_area=attack_type) com outcome fechado reported/no_issue_found/ruled_out/not_applicable/needs_follow_up; upsert última-vence + histórico limitado; caps do ARTEX como ERRO nunca truncamento; campos normalizados a uma linha — anti-injection, vão para o prompt; gaps derivados com o invariante central primeiro: **classe sem entrada = unexamined, nunca clean**; completude com caveat nunca vazio — ausência de finding ≠ alvo limpo), `8947cbf` (`Coordinator._record_coverage` machine-observed por attack_type despachado + seção `[Coverage ledger]` gated no `_plan` com top-3 gaps fenced untrusted — prompt byte-a-byte igual sem entradas), `fbfc5d7` (`ProxyEntry.coverage_ledger` persistido pelo scan_worker no finally + `GET /api/coverage` + card Coverage no AI panel). v1 machine-observed: a tool `record_coverage` de LLM para o copilot fica de follow-up | registro durável de EXAMINADO/DESCARTADO/ABERTO por endpoint×classe (hoje "rodou e não achou" é efêmero no log rotativo) → planner testa como humano (não repete classe limpa, segue o gap aberto) e dashboard mostra o que falta testar | novo `dast/coverage/ledger.py`, `dast/ai/coordinator.py`, `dast/proxy/session_store.py`, `dast/proxy/workers/scan_worker.py`, `dast/proxy/api/status_routes.py`, UI AI panel |
 
 **Ordem recomendada:** ~~commitar rodada 1~~ ✅ → ~~2-A~~ ✅ → ~~2-C~~ ✅ →
-~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F (última).
+~~2-B~~ ✅ → ~~2-D~~ ✅ → ~~3-E~~ ✅ → 3-F → ~~3-H~~ ✅ → 3-I (match&replace
++ replay).
 
 **Descoberta da 2-A que muda a 2-B:** o gate-check do copilot
 (`copilot_service._gate_check_account_state`) agora delega para

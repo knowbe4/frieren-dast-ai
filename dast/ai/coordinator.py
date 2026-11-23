@@ -398,6 +398,7 @@ _CONTEXTUAL_TYPES = frozenset({
 # Which attack types are relevant for each param classification.
 # Only listed types will be attempted on a param of that class.
 # 4-B bfla dispatch helpers: admin-looking surfaces + versioned API paths
+_AUTHZ_PATH_RE_OAUTH = _re.compile(r"/(authorize|oauth2?/|openid|auth)(?:[/?]|$)", _re.IGNORECASE)
 _ADMIN_PATH_RE_BFLA = _re.compile(r"/(?:admin|manage|console|backoffice|internal)(?:/|$)", _re.IGNORECASE)
 _VERSION_RE_BFLA = _re.compile(r"^(.*?)/v(\d+)(/.*|$)", _re.IGNORECASE)
 
@@ -753,6 +754,12 @@ def _select_attack_types_for_params(
     from dast.agents.jwt_agent import has_jwt_target
     if has_jwt_target(target):
         candidate_types.add("jwt")
+
+    # OAuth/OIDC authorization flows (4-C): authorize-shaped requests go to the
+    # flow agent (state/PKCE/redirect_uri/implicit); it self-gates further.
+    if _AUTHZ_PATH_RE_OAUTH.search(target.url) or "response_type=" in target.url \
+            or ("client_id=" in target.url and "redirect_uri=" in target.url):
+        candidate_types.add("oauth")
 
     # LLM-endpoint markers (4-A): llm_injection was the only registered agent
     # with NO deterministic dispatch rule — it only ever ran via the evidence

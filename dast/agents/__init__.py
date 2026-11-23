@@ -28,6 +28,7 @@ from dast.agents import (  # noqa: F401
     llm_injection_agent,
     mfa_agent,
     nosql_agent,
+    oauth_agent,
     open_redirect_agent,
     password_reset_agent,
     prototype_pollution_agent,

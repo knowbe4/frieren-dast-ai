@@ -221,8 +221,15 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     # process ctx.store is None -> no cookie/Bearer source; use browser_fetch there.)
     trusted_cookies = headers.pop("x-dast-cookies-injected", None)
     jar_cookie_map: Dict[str, str] = {}
+    caller_stripped: List[str] = []
     if not trusted_cookies:
-        headers = {k: v for k, v in headers.items() if k.lower() != "cookie"}
+        # Drop ALL caller-pasted auth (Cookie/Authorization/X-CSRF-Token/X-XSRF-Token): the
+        # managed session is the source of truth, and a hand-pasted (usually stale) value
+        # overrides it and breaks the request. attach() below re-seeds the live session's
+        # Cookie/CSRF and a cached Bearer. (A copilot-engine inject carrying the trusted marker
+        # is OURS — skipped here and kept.)
+        from dast.proxy.auth_headers import strip_caller_auth_headers
+        caller_stripped = strip_caller_auth_headers(headers)
         if ctx.store is not None:
             _host = urlparse(url).hostname or ""
             try:
@@ -290,9 +297,10 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
     _res = _attach(headers, transport="api", cookies=(jar_cookie_map or None),
                    bearer_rec=rec, trusted_marker=bool(trusted_cookies),
                    drop_all_authorization=True, csrf_token=csrf_token)
-    if _res.stripped:
+    all_stripped = list(dict.fromkeys(caller_stripped + _res.stripped))
+    if all_stripped:
         logger.warning("send_request stripped hand-pasted/caller auth header(s)",
-                       headers=",".join(_res.stripped))
+                       headers=",".join(all_stripped))
     headers.pop("x-dast-cookies-injected", None)
 
     body = args.get("body") or ""
@@ -366,10 +374,6 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
             "length": len(full_text),
             "final_url": str(resp.url),
         }
-        # Resolve the REAL proxy-history entry_id of the request just issued (like
-        # browser_fetch), so the caller can pass it to record_finding as grounded
-        # evidence. The proxy records the entry (request+response) before our httpx
-        # client sees the response, so it exists by now.
         if known_entry_ids is not None:
             try:
                 eid = ctx.store.resolve_sent_entry_id(url, method, known_entry_ids)
@@ -377,7 +381,7 @@ async def _send_request(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any
                     result["entry_id"] = eid
             except Exception as exc:
                 logger.debug("send_request: entry_id resolution failed", error=str(exc)[:120])
-        _flagged = list(dict.fromkeys(_res.stripped))
+        _flagged = all_stripped
         if _flagged:
             result["note"] = (
                 f"stripped caller-supplied auth header(s) ({', '.join(_flagged)}) — do not set "

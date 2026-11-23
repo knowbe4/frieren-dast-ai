@@ -12,7 +12,7 @@ with the proxy cookie jar (starts authenticated).
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 from dast.tools.base import Tool, register
@@ -225,6 +225,21 @@ async def _resolve_url(page: Any, raw: str) -> str:
     return raw
 
 
+def _same_origin(url: str, page_url: str) -> bool:
+    """True when *url* and *page_url* share scheme+host+port (same browser origin).
+
+    A same-origin request can ride the in-page fetch path, which the browser stamps with the
+    page's Origin/Referer — what a CSRF/origin-gated endpoint needs to return 200. A bad parse
+    returns False (prefer the no-CORS network transport over a wrong same-origin assumption)."""
+    try:
+        a, b = urlparse(url), urlparse(page_url)
+        if not a.hostname or not b.hostname:
+            return False
+        return (a.scheme, a.hostname, a.port) == (b.scheme, b.hostname, b.port)
+    except Exception:
+        return False
+
+
 async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     browser = _browser(ctx)
     if browser is None:
@@ -243,6 +258,17 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     method = str(args.get("method", "POST")).upper()
     headers = dict(args.get("headers") or {"Content-Type": "application/json"})
     body = args.get("body")
+
+    # Drop any caller-pasted auth (Cookie/Authorization/X-CSRF-Token/X-XSRF-Token): the
+    # browser session owns the jar + CSRF, and a stale hand-pasted value overrides it and
+    # breaks the request (THE recurring copilot failure). Keep every other caller header
+    # (Origin/Referer/Content-Type/Accept/X-Requested-With/...). attach() below re-injects
+    # the live session's cookie/CSRF/Bearer.
+    from dast.proxy.auth_headers import strip_caller_auth_headers
+    dropped_auth = strip_caller_auth_headers(headers)
+    if dropped_auth:
+        logger.debug("browser_fetch dropped caller-supplied auth header(s)",
+                     headers=",".join(dropped_auth))
 
     # Primary path: Playwright's network-level fetch (bypasses CORS entirely, carries the
     # browser context's cookies automatically). The shared attach() handles the browser
@@ -282,52 +308,84 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         logger.debug("browser_fetch: attached captured Bearer",
                      host=urlparse(url).hostname)
 
-    primary_error = ""
-    try:
-        fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}
-        if body and method in ("POST", "PUT", "PATCH", "DELETE"):
-            fetch_kwargs["data"] = body
-        response = await page.request.fetch(url, **fetch_kwargs)
-        text = await response.text()
-        resp_headers = {k: v for k, v in response.headers.items()}
-        return {
-            "ok": True,
-            "status": response.status,
-            "headers": resp_headers,
-            "body": text[:50000],
-            "length": len(text),
-        }
-    except Exception as exc:
-        primary_error = str(exc)[:100]
-        logger.debug("browser_fetch: page.request.fetch failed, trying in-page fallback",
-                     error=primary_error)
+    # Two transports:
+    #  - page.request.fetch (APIRequestContext): carries the context jar but does NOT run in
+    #    the page, so the browser adds no Origin/Referer. A CSRF/origin-gated endpoint rejects
+    #    it (403) even though the app's own calls get 200.
+    #  - in-page fetch (page.evaluate, credentials:'include'): the browser runs it IN the page,
+    #    so it auto-adds the page's Origin/Referer — this is what a same-origin CSRF/origin gate
+    #    accepts. Subject to CORS for cross-origin.
+    # So: for a SAME-ORIGIN request (url origin == page.url origin) use the in-page path as the
+    # PRIMARY; for cross-origin use page.request.fetch (no CORS wall). If the primary comes back
+    # 401/403 — or throws — fall back to the in-page path (adds Origin/Referer + credentials),
+    # which is the combination that gets origin-gated same-origin endpoints to 200.
+    errors: list = []
 
-    # Fallback: in-page JS fetch (works for same-origin; subject to CORS).
-    try:
-        result = await page.evaluate("""async (args) => {
-            try {
-                const opts = {
-                    method: args.method,
-                    headers: args.headers,
-                    credentials: 'include',
-                };
-                if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
-                    opts.body = args.body;
-                }
-                const resp = await fetch(args.url, opts);
-                const text = await resp.text();
-                const respHdrs = {};
-                resp.headers.forEach((v, k) => { respHdrs[k] = v; });
-                return { ok: true, status: resp.status, headers: respHdrs,
-                         body: text.substring(0, 50000), length: text.length };
-            } catch (e) {
-                return { ok: false, error: e.message };
+    async def _via_apirequest() -> Optional[Dict[str, Any]]:
+        try:
+            fetch_kwargs: Dict[str, Any] = {"method": method, "headers": fetch_headers}
+            if body and method in ("POST", "PUT", "PATCH", "DELETE"):
+                fetch_kwargs["data"] = body
+            response = await page.request.fetch(url, **fetch_kwargs)
+            text = await response.text()
+            return {
+                "ok": True,
+                "status": response.status,
+                "headers": {k: v for k, v in response.headers.items()},
+                "body": text[:50000],
+                "length": len(text),
             }
-        }""", {"url": url, "method": method, "headers": fetch_headers, "body": body})
-        return result
-    except Exception as fallback_exc:
-        return {"ok": False, "error": f"fetch failed: {primary_error}; "
-                f"fallback also failed: {str(fallback_exc)[:100]}"}
+        except Exception as exc:
+            errors.append(f"page.request.fetch: {str(exc)[:100]}")
+            return None
+
+    async def _via_inpage() -> Optional[Dict[str, Any]]:
+        try:
+            return await page.evaluate("""async (args) => {
+                try {
+                    const opts = {
+                        method: args.method,
+                        headers: args.headers,
+                        credentials: 'include',
+                    };
+                    if (args.body && ['POST','PUT','PATCH','DELETE'].includes(args.method)) {
+                        opts.body = args.body;
+                    }
+                    const resp = await fetch(args.url, opts);
+                    const text = await resp.text();
+                    const respHdrs = {};
+                    resp.headers.forEach((v, k) => { respHdrs[k] = v; });
+                    return { ok: true, status: resp.status, headers: respHdrs,
+                             body: text.substring(0, 50000), length: text.length };
+                } catch (e) {
+                    return { ok: false, error: e.message };
+                }
+            }""", {"url": url, "method": method, "headers": fetch_headers, "body": body})
+        except Exception as exc:
+            errors.append(f"in-page fetch: {str(exc)[:100]}")
+            return None
+
+    same_origin = _same_origin(url, page.url)
+    if same_origin:
+        result = await _via_inpage()
+        if result is None:  # the evaluate itself threw — try the network transport
+            result = await _via_apirequest()
+    else:
+        result = await _via_apirequest()
+        # 401/403 (origin/CSRF gate) or a transport exception -> retry in-page.
+        if result is None or result.get("status") in (401, 403):
+            fb = await _via_inpage()
+            if fb is not None and (result is None or fb.get("ok")):
+                result = fb
+
+    if result is None:
+        return {"ok": False, "error": "fetch failed: " + "; ".join(errors)}
+    if dropped_auth and isinstance(result, dict):
+        result["note"] = (
+            "dropped caller-supplied auth headers "
+            f"({', '.join(dropped_auth)}) — the session provides them"
+        )
+    return result
 
 
 register(Tool(name="browser_fetch", input_schema=_FETCH_SCHEMA, handler=_fetch, tags=["browser", "active"],

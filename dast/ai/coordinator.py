@@ -812,6 +812,20 @@ def _select_attack_types_for_params(
     # Rate-limit trust confusion (4-A) — 2 XFF probes + path variants, low noise.
     candidate_types.add("rate_limit_trust")
 
+    # Deserialization sink (4-B): state-changing requests with serialized-shape
+    # signals (magic bytes, content types, param names). The agent self-gates
+    # further and never re-sends captured bodies.
+    if (target.method or "").upper() in ("POST", "PUT", "PATCH"):
+        _body_head = (target.body or b"")[:4]
+        _ct_lower = (target.headers or {}).get("content-type", "").lower()
+        if (_body_head == b"\xac\xed\x00\x05"
+                or "serial" in _ct_lower or "octet-stream" in _ct_lower
+                or any(_p.get("name") and re.search(
+                    r"data|state|viewstate|payload|serial|session|blob|object",
+                    _p["name"], re.IGNORECASE)
+                    for _p in (target.params or []))):
+            candidate_types.add("deserialization")
+
     # HPP (4-A) — only when a security-relevant parameter name is present
     # (role/admin/priv/level/debug…); the agent self-gates further.
     import re as _hpp_re

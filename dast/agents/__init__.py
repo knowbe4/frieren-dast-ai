@@ -14,6 +14,7 @@ from dast.agents import (  # noqa: F401
     cross_session_idor_agent,
     csrf_agent,
     cswsh_agent,
+    deserialization_agent,
     discovery_agent,
     file_read_agent,
     graphql_abuse_agent,

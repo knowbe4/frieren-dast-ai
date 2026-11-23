@@ -806,6 +806,16 @@ def _select_attack_types_for_params(
     # returns after the first probe unless an attacker origin is reflected.
     candidate_types.add("cors")
 
+    # Rate-limit trust confusion (4-A) — 2 XFF probes + path variants, low noise.
+    candidate_types.add("rate_limit_trust")
+
+    # HPP (4-A) — only when a security-relevant parameter name is present
+    # (role/admin/priv/level/debug…); the agent self-gates further.
+    import re as _hpp_re
+    if any(_hpp_re.search(r"role|admin|priv|is_|level|debug|user_type|access",
+                          p.get("name", "")) for p in (target.params or [])):
+        candidate_types.add("hpp")
+
     # Auth bypass for any authenticated endpoint
     auth_headers = {k.lower() for k in (target.headers or {})}
     if "authorization" in auth_headers or "cookie" in auth_headers:

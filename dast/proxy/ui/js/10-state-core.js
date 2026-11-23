@@ -1003,3 +1003,9 @@ function renderSmDetail() {
   document.getElementById('sm-detail-body').innerHTML = buildRRHtml(smDetail);
 }
 
+
+// ── HAR export (3-I): download the in-scope history as a HAR 1.2 file ──
+function exportHistoryHar() {
+  // Plain navigation — the route answers with Content-Disposition attachment.
+  window.location.href = '/api/history/export/har';
+}

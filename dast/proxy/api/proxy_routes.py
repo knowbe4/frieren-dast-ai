@@ -284,6 +284,28 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         ids = await asyncio.to_thread(search_entries, store.all_entries(), q)
         return {"query": q, "ids": ids}
 
+    @router.get("/api/history/export/har")
+    async def export_history_har():
+        """Download the in-scope history as a HAR 1.2 file (3-I). Stable (ts, id)
+        order; caps of 1000 entries / 20 MiB raw / 31 MiB marshalled with
+        never-silent truncation reporting (X-DAST-HAR-* headers + log fields)."""
+        import json as _json
+
+        from dast.proxy.har_export import entries_to_har, truncation_headers
+
+        entries = sorted(store.in_scope_entries(),
+                         key=lambda e: (getattr(e, "ts", 0.0), getattr(e, "id", "")))
+        log, truncation = entries_to_har(entries)
+        payload = _json.dumps(log, ensure_ascii=False).encode("utf-8")
+        return Response(
+            content=payload,
+            media_type="application/json; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="dast-history.har"',
+                **truncation_headers(truncation, len(log["log"]["entries"]), len(entries)),
+            },
+        )
+
     @router.get("/api/entry/{entry_id}")
     async def get_entry(entry_id: str):
         e = store.get_entry(entry_id)

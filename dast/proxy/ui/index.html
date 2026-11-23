@@ -206,6 +206,8 @@
           <label title="Autonomous copilot requests"><input type="checkbox" id="chk-src-copilot" checked onchange="applyFilter()"> <span class="src-tag src-copilot">copilot</span></label>
           <input type="checkbox" id="chk-src-oos" style="display:none" onchange="applyFilter()">
           <div class="sep" style="margin:0 2px"></div>
+          <button class="tbtn" title="Download the in-scope history as a HAR 1.2 file"
+                  onclick="exportHistoryHar()">⇩ HAR</button>
           <label><input type="checkbox" id="chk-conn" checked onchange="applyFilter()"> Hide CONNECT</label>
           <label><input type="checkbox" id="chk-vuln" onchange="applyFilter()"> Vuln only</label>
           <label title="Show requests outside configured scope" style="color:var(--txt2)">

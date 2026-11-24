@@ -27,6 +27,7 @@ from dast.tools import extract_tools as _extract_tools  # noqa: F401
 from dast.tools import graphql_fuzz_tools as _graphql_fuzz_tools  # noqa: F401
 from dast.tools import encoding_tools as _encoding_tools  # noqa: F401
 from dast.tools import findings_tools as _findings_tools  # noqa: F401
+from dast.tools import graphql_scope_probe_tools as _graphql_scope_probe_tools  # noqa: F401
 from dast.tools import graphql_sweep_tools as _graphql_sweep_tools  # noqa: F401
 from dast.tools import graphql_tools as _graphql_tools  # noqa: F401
 from dast.tools import history_tools as _history_tools  # noqa: F401

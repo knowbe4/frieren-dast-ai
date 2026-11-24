@@ -269,6 +269,8 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     if dropped_auth:
         logger.debug("browser_fetch dropped caller-supplied auth header(s)",
                      headers=",".join(dropped_auth))
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = "application/json"
 
     # Primary path: Playwright's network-level fetch (bypasses CORS entirely, carries the
     # browser context's cookies automatically). The shared attach() handles the browser
@@ -299,6 +301,12 @@ async def _fetch(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
                 ctx.store, _parsed.hostname or "", _parsed.path or "/")
         except Exception as exc:
             logger.debug("browser_fetch: bearer resolution failed", error=str(exc)[:120])
+    # When the browser already has session cookies for this host, skip the
+    # captured Bearer — cookie-auth endpoints (e.g. KMSAT /graphql) reject
+    # the extra Authorization header even though the cookies are valid.
+    if bearer_rec and cookie_map:
+        logger.debug("browser_fetch: skipping captured Bearer (session cookies present)")
+        bearer_rec = None
 
     fetch_headers = dict(headers)
     from dast.session.auth_provider import attach as _attach

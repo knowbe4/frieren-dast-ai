@@ -356,28 +356,22 @@ async def _activate_login_profile(ctx: ToolContext, args: Dict[str, Any]) -> Dic
 
     # A saved session goes stale — there is no live session between tests, so the persisted
     # cookies are usually expired. Reusing them strands the copilot in an expired/guest session.
-    # When the profile also carries a credential, VALIDATE the reused session and, if it is
-    # stale/guest, log in FRESH from the saved credential instead (self-heal — mirrors the
-    # autonomous run's gate-check backstop). A genuinely valid session is kept (fast path).
+    # When the profile carries a credential AND a browser is available, ALWAYS log in fresh
+    # from the saved credential: the saved cookies are almost never valid across test sessions,
+    # and the session-is-authenticated probe can be fooled by SPA apps that return 200 for
+    # everything (the probe sees a 200 root + a session-looking cookie and concludes "valid"
+    # when the app is actually serving a guest SPA shell). A fresh login is cheap; a stranded
+    # guest session blocks the entire copilot run.
     creds0 = getattr(profile, "credentials", None) or []
     auth_url0 = (getattr(profile, "auth_url", "") or "").strip()
     has_creds = bool(auth_url0 and creds0 and getattr(creds0[0], "username", "")
                      and getattr(creds0[0], "secret", ""))
     browser = getattr(ctx, "browser", None)
     if has_creds and browser is not None:
-        try:
-            from dast.session.account_state import AuthProbeConfig, session_is_authenticated
-            await browser.resync_cookies()  # pull the just-imported jar into the browser context
-            verdict = await session_is_authenticated(browser, auth_url0,
-                                                     AuthProbeConfig.from_profile(profile))
-        except Exception as exc:
-            verdict = None
-            logger.debug("activate_login_profile: session validity probe failed",
-                         slug=slug, error=str(exc)[:120])
-        if verdict is False:
-            logger.info("activate_login_profile: saved session stale/guest — logging in fresh "
-                        "from the saved credential", slug=slug)
-            return await _login_profile_with_credentials(ctx, store, profile)
+        logger.info("activate_login_profile: saved session present — logging in fresh "
+                    "from the saved credential (saved cookies are usually stale)",
+                    slug=slug)
+        return await _login_profile_with_credentials(ctx, store, profile)
 
     engine = getattr(ctx, "_session", None) or getattr(ctx, "session", None)
     if engine is not None:

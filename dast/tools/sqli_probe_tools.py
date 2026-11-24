@@ -335,9 +335,13 @@ async def _resolve_auth(ctx: ToolContext, url: str, method: str) -> Dict[str, An
     parsed = urlparse(url)
     host, path = parsed.hostname or "", parsed.path or "/"
     jar_cookie_map: Dict[str, str] = {}
+    session_name = getattr(getattr(ctx, "_session", None), "session_name", None)
     if store is not None:
         try:
-            jar = store.get_cookies_for_host(host) or []
+            if session_name and hasattr(store, "get_named_session_cookies_for_host"):
+                jar = store.get_named_session_cookies_for_host(session_name, host) or []
+            else:
+                jar = store.get_cookies_for_host(host) or []
             jar_cookie_map = {c.get("name"): c.get("value", "") for c in jar if c.get("name")}
         except Exception as exc:
             logger.debug("sqli_probe: cookie jar lookup failed", host=host, error=str(exc))

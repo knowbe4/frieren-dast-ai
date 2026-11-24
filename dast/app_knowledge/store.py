@@ -25,7 +25,7 @@ from dast.utils.logger import get_logger
 logger = get_logger(__name__)
 
 _KNOWLEDGE_DIR = Path.home() / ".dast-ai" / "app_knowledge"
-_MAX_LOAD_CHARS = 3000  # keep a single host's block well under the context-brief budget
+_MAX_LOAD_CHARS = 20000  # operator-curated knowledge; must fit the full host note (schemas + auth + gotchas)
 
 
 def knowledge_dir() -> Path:

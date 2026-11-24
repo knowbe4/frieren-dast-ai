@@ -837,7 +837,10 @@ class CopilotService:
         # execute concurrently without clobbering each other's page or auth. Created
         # lazily, recreated if closed/crashed, and closed when the session is cleaned up.
         browser = session.get("_agent_browser")
-        if browser is None or getattr(browser, "_browser", None) is None:
+        if browser is not None and getattr(browser, "_browser", None) is None:
+            spawn_tracked(browser.close(), name="close-orphaned-browser")
+            browser = None
+        if browser is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
                 browser = AgentBrowser(
@@ -1819,6 +1822,14 @@ class CopilotService:
         the surface is covered — a dead session at the end costs nothing, a dead
         session at the start wastes the whole run."""
         seed = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        if profile_slug and not seed:
+            try:
+                from dast.profiles.store import load_profile
+                p = load_profile(profile_slug)
+                if p and p.host_pattern and not p.host_pattern.startswith("*"):
+                    seed.add(p.host_pattern.split(":")[0].lower())
+            except Exception:
+                pass
         hosts = set(seed)
         store = self._ctx.store
         if store is None:

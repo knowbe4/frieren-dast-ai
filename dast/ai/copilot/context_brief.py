@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 # Bound how many hosts and how much text the brief carries so a long-lived
 # session cannot blow the model's context budget with accumulated intelligence.
 _MAX_BRIEF_HOSTS = 3
-_MAX_BRIEF_CHARS = 4000
+_MAX_BRIEF_CHARS = 28000
 
 
 def _host_block(store: Any, host: str) -> str:
@@ -80,7 +80,8 @@ def _named_sessions_block() -> str:
         host = p.host_pattern or "(no host)"
         captured = ("session captured" if p.saved_session
                     else "credentials only (logs in on use)")
-        lines.append(f"  - {p.name} (slug={p.slug}, privilege={level}, host={host}, {captured})")
+        test_tag = ", TEST ACCOUNT (disposable)" if getattr(p, "test_account", False) else ""
+        lines.append(f"  - {p.name} (slug={p.slug}, privilege={level}, host={host}, {captured}{test_tag})")
     return "Named login profiles available:\n" + "\n".join(lines)
 
 
@@ -193,6 +194,10 @@ def build_context_brief(
     if scope_block:
         blocks.append(scope_block)
 
+    sessions_block = _named_sessions_block()
+    if sessions_block:
+        blocks.append(sessions_block)
+
     ordered: List[str] = []
     for raw in hosts:
         host = (raw or "").strip().lower()
@@ -215,10 +220,6 @@ def build_context_brief(
     # Credentials observed in traffic (redacted) — the multi-token landscape per host.
     token_blocks = [b for b in (_token_inventory_block(store, host) for host in ordered) if b]
     blocks.extend(token_blocks)
-
-    sessions_block = _named_sessions_block()
-    if sessions_block:
-        blocks.append(sessions_block)
 
     if not blocks:
         return ""

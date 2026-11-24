@@ -274,6 +274,30 @@ def _build_finding(args: Dict[str, Any]) -> Dict[str, Any]:
     return finding
 
 
+def _mirror_finding_intel(ctx: ToolContext, url: str, finding: Dict[str, Any]) -> None:
+    """Mirror a recorded finding into session_intelligence (5-A write-back).
+
+    The deterministic agents feed the coordinator's planner hint/router on every
+    scan; a copilot-confirmed verdict lived only in the Findings tab, so the
+    brief kept suggesting attack types the copilot had already PROVEN (or kept
+    ignoring ones it had ruled out). Writing back through ``record_scan_complete``
+    puts both on the same ground truth. Never raises — a missing store (MCP
+    caller) or intel service is a no-op, not an error."""
+    intel_svc = getattr(getattr(ctx, "store", None), "session_intelligence", None)
+    if intel_svc is None:
+        return
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    attack_type = str(finding.get("attack_type", "")).strip()
+    if not host or not attack_type:
+        return
+    param = str(finding.get("parameter", "")).strip()
+    intel_svc.record_scan_complete(
+        host, parsed.path or "/", attack_type, found=True,
+        confirmed_param=param or None,
+    )
+
+
 async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     title = str(args.get("title", "")).strip()
     url = str(args.get("url", "")).strip()
@@ -312,6 +336,12 @@ async def _record_finding(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, A
             entry_id = ctx.store.record_manual_finding(finding, url, method)
             if not entry_id:
                 return {"ok": False, "error": "could not record finding (missing url)"}
+            # 5-A write-back: the coordinator learns what the copilot proved.
+            try:
+                _mirror_finding_intel(ctx, url, finding)
+            except Exception as exc:
+                logger.debug("record_finding: intel write-back skipped",
+                             error=str(exc)[:120])
             linked_ids = finding.get("evidence_entry_ids") or [entry_id]
             synthetic = bool(finding.get("evidence_synthetic"))
             logger.info("record_finding: recorded", entry_id=entry_id,

@@ -1286,10 +1286,18 @@ class CopilotSession:
 
         # Ground the turn in what the scanner already learned about the hosts in
         # play (seeded focus + any the copilot has touched). Built once per turn:
-        # it is background context, not a per-step signal.
+        # it is background context, not a per-step signal. The most recent
+        # scratchpad path per host scopes the intel block to the endpoint the
+        # copilot is actually working (per-path structural errors).
+        brief_paths: Dict[str, str] = {}
+        for entry in reversed(self._scratchpad):
+            host = (entry.get("host") or "").strip().lower()
+            if host and host not in brief_paths:
+                brief_paths[host] = entry.get("path", "/")
         context_brief = build_context_brief(
             getattr(tool_ctx, "store", None),
             self._focus_hosts + sorted(self._context_hosts),
+            paths=brief_paths,
         )
 
         turn_transcript: List[Dict[str, Any]] = []
@@ -2042,6 +2050,8 @@ class CopilotSession:
             self._scratchpad.append({
                 "line": f"{method} {path} -> {note}",
                 "tool": tool_name,
+                "host": urlparse(url).hostname or "" if url else "",
+                "path": path,
             })
             if len(self._scratchpad) > _SCRATCHPAD_MAX_ENTRIES:
                 del self._scratchpad[:len(self._scratchpad) - _SCRATCHPAD_MAX_ENTRIES]

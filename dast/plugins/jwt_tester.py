@@ -197,6 +197,9 @@ class JwtTesterPlugin(ProxyPlugin):
                     if baseline_status in (401, 403) and resp.status_code == 200:
                         return True  # auth bypass: was protected, now open
                     return False
+                # Both returned a rejection status — the JWT was refused, not accepted
+                if resp.status_code in (401, 403):
+                    return False
                 # Response must be non-trivially long
                 if len(resp.text) < 50:
                     return False

@@ -22,6 +22,7 @@ from dast.agents import (  # noqa: F401
     graphql_agent,
     hpp_agent,
     host_header_agent,
+    http2_agent,
     rate_limit_trust_agent,
     smuggling_agent,
     idor_agent,

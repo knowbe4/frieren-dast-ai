@@ -21,6 +21,7 @@ from dast.tools import browser_tools as _browser_tools  # noqa: F401
 from dast.tools import chain_tools as _chain_tools  # noqa: F401
 from dast.tools import code_tools as _code_tools  # noqa: F401
 from dast.tools import copilot_tools as _copilot_tools  # noqa: F401
+from dast.tools import coverage_tools as _coverage_tools  # noqa: F401
 from dast.tools import crawl_tools as _crawl_tools  # noqa: F401
 from dast.tools import explore_tools as _explore_tools  # noqa: F401
 from dast.tools import extract_tools as _extract_tools  # noqa: F401

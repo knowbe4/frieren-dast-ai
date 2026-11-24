@@ -40,7 +40,7 @@ flowchart TD
 | **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors), no extra traffic | `dast/plugins/passive_scanner.py`, `dast/passive_rules/**` |
 | **Coordinator → Vuln Agents** | LLM selects which of ~37 agents to run per endpoint, runs them in parallel, validates the output | `dast/ai/coordinator.py`, `dast/agents/**` |
 | **AI Copilot** | Interactive/autonomous loop — reads app knowledge, plans with the LLM, drives a Playwright browser + tools to confirm issues by hand | `dast/ai/copilot/**` |
-| **Tool layer + AI Gateway** | 42 shared tools and a multi-provider LLM gateway, shared by the copilot, agents, and the MCP server | `dast/tools/**`, `dast/ai/providers.py`, `dast/mcp/server.py` |
+| **Tool layer + AI Gateway** | 66 shared tools and a multi-provider LLM gateway, shared by the copilot, agents, and the MCP server | `dast/tools/**`, `dast/ai/providers.py`, `dast/mcp/server.py` |
 | **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, history, copilot panel, runtime config | `dast/proxy/dashboard_server.py` |
 
 The rest of this document details each box below.
@@ -619,7 +619,7 @@ dast/
 │       └── wrapup.py         Salvage + scratchpad persistence before a forced end
 │
 ├── tools/                    Shared tool registry — used by the copilot AND the MCP server
-│                             42 tools: send_request, browser_fetch, sqli_probe,
+│                             66 tools: send_request, browser_fetch, sqli_probe,
 │                             graphql_scope_probe, login profiles, app_knowledge, ...
 │
 ├── payloads/                 Seed payloads in YAML — edit without touching code

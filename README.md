@@ -34,33 +34,40 @@ block the leak, and CI will fail the build.
 
 ## How it works
 
+You point a browser or tool at the proxy. Everything flowing through it is stored
+once, then **two engines** work on that traffic: an automated scanner and an AI
+copilot. Both read the same store, share the same tools and LLM gateway, and push
+findings to the dashboard in real time.
+
+```mermaid
+flowchart TD
+    client["Browser · tool · CI"] -->|"HTTP/S via proxy :8080"| proxy["MITM Proxy"]
+    proxy --> store[("Session Store")]
+
+    store --> passive["Passive Scanner<br/>91 rules · no extra requests"]
+    store --> coord["Coordinator<br/>LLM: plan → run → validate"]
+    coord --> agents["Vuln Agents<br/>~37, parallel per endpoint"]
+
+    copilot["AI Copilot<br/>interactive / autonomous"] -.->|"replays through"| proxy
+
+    passive --> findings[("Findings")]
+    agents --> findings
+    copilot --> findings
+    findings --> dash["Dashboard :8088<br/>live via WebSocket"]
+
+    agents --> shared["Tool layer + AI Gateway"]
+    copilot --> shared
 ```
-Browser / tool (configured to use proxy :8080)
-    |
-    v
-[HTTPS MITM Proxy]         Intercepts all HTTP/HTTPS, TLS termination per host
-    |
-    v
-[Session Store]            Every request/response stored in memory
-    |
-    +---> [Passive Scanner]    Zero-request checks fire on every response
-    |     (YAML rule engine)   91 rules: headers, cookies, CORS, secrets,
-    |                          error pages, LLM endpoints, OWASP Top 10
-    |
-    +---> [Scan Queue]         In-scope entries queued for active scanning
-              |
-              v
-         [Coordinator]         LLM planner → agents → LLM validator
-              |
-              v
-         [VulnAgents]          25 agents run in parallel per endpoint (the
-              |                planner selects per endpoint): xss, sqli,
-              |                ssrf, file_read, auth_bypass, idor, secrets,
-              |                discovery, llm_injection, business_logic,
-              |                blazor, graphql, mfa, race_condition, ...
-              v
-         [Findings]            Real-time push to dashboard via WebSocket
-```
+
+| Component | What it does |
+|---|---|
+| **MITM Proxy** (:8080) | Terminates TLS per host; every browser/tool request flows through it |
+| **Session Store** | In-memory requests/responses + cookie jar — the single source both engines read |
+| **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors) with no extra traffic |
+| **Coordinator → Vuln Agents** | The LLM picks which of ~37 agents to run per endpoint, runs them in parallel, then validates the output |
+| **AI Copilot** | Interactive or autonomous AI loop — reads app knowledge, plans with the LLM, and drives a real (Playwright) browser plus the tools to confirm issues by hand |
+| **Tool layer + AI Gateway** | 42 shared tools (send_request, sqli_probe, login profiles, …) and a multi-provider LLM gateway, shared by the copilot, the agents, and the MCP server |
+| **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, request history, the copilot panel, runtime config |
 
 ## Quick start
 

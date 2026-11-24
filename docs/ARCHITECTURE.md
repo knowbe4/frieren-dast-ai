@@ -1,7 +1,49 @@
 # Frieren DAST-AI Architecture
 
 **Version:** 0.9.0
-**Last Updated:** 2026-11-10
+**Last Updated:** 2026-11-24
+
+---
+
+## Architecture at a glance
+
+Point a browser or tool at the proxy. Traffic is captured once into the Session
+Store, then **two engines** consume it — an automated scanner (passive rules +
+the LLM-driven agent coordinator) and the AI copilot (an interactive/autonomous
+loop that drives a real browser and the tools). Both share one store, one tool
+layer, and one AI gateway, and both stream findings to the dashboard.
+
+```mermaid
+flowchart TD
+    client["Browser · tool · CI"] -->|"HTTP/S via proxy :8080"| proxy["MITM Proxy"]
+    proxy --> store[("Session Store")]
+
+    store --> passive["Passive Scanner<br/>91 rules · no extra requests"]
+    store --> coord["Coordinator<br/>LLM: plan → run → validate"]
+    coord --> agents["Vuln Agents<br/>~37, parallel per endpoint"]
+
+    copilot["AI Copilot<br/>interactive / autonomous"] -.->|"replays through"| proxy
+
+    passive --> findings[("Findings")]
+    agents --> findings
+    copilot --> findings
+    findings --> dash["Dashboard :8088<br/>live via WebSocket"]
+
+    agents --> shared["Tool layer + AI Gateway"]
+    copilot --> shared
+```
+
+| Component | What it does | Code |
+|---|---|---|
+| **MITM Proxy** (:8080) | Terminates TLS per host; all browser/tool traffic flows through it | `dast/proxy/proxy_server.py` |
+| **Session Store** | In-memory requests/responses + cookie jar — the single source both engines read | `dast/proxy/session_store.py` |
+| **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors), no extra traffic | `dast/plugins/passive_scanner.py`, `dast/passive_rules/**` |
+| **Coordinator → Vuln Agents** | LLM selects which of ~37 agents to run per endpoint, runs them in parallel, validates the output | `dast/ai/coordinator.py`, `dast/agents/**` |
+| **AI Copilot** | Interactive/autonomous loop — reads app knowledge, plans with the LLM, drives a Playwright browser + tools to confirm issues by hand | `dast/ai/copilot/**` |
+| **Tool layer + AI Gateway** | 42 shared tools and a multi-provider LLM gateway, shared by the copilot, agents, and the MCP server | `dast/tools/**`, `dast/ai/providers.py`, `dast/mcp/server.py` |
+| **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, history, copilot panel, runtime config | `dast/proxy/dashboard_server.py` |
+
+The rest of this document details each box below.
 
 ---
 
@@ -567,8 +609,18 @@ dast/
 │   ├── bedrock_client.py     Bedrock Claude wrapper (schema-forced output, temperature, prompt caching, tiered models)
 │   ├── schemas.py            JSON Schemas for structured LLM output
 │   ├── prompt_safety.py      Structural prompt-injection defense (XML fencing of untrusted content)
+│   ├── providers.py          Multi-provider AI gateway (gateway default, bedrock/local fallback)
 │   ├── payload_generator.py  Standalone scan mode
-│   └── response_analyzer.py  Standalone scan mode (legacy)
+│   ├── response_analyzer.py  Standalone scan mode (legacy)
+│   └── copilot/              Interactive/autonomous AI pentester
+│       ├── session.py        The turn loop: plan → call tools → observe → record
+│       ├── context_brief.py  Builds the per-turn brief (app knowledge, scope, leads)
+│       ├── prompt_blocks.py  Reusable prompt sections (router, leads, coverage)
+│       └── wrapup.py         Salvage + scratchpad persistence before a forced end
+│
+├── tools/                    Shared tool registry — used by the copilot AND the MCP server
+│                             42 tools: send_request, browser_fetch, sqli_probe,
+│                             graphql_scope_probe, login profiles, app_knowledge, ...
 │
 ├── payloads/                 Seed payloads in YAML — edit without touching code
 │   ├── loader.py             Cached YAML loader
@@ -584,7 +636,7 @@ dast/
 │   ├── nosql.yaml            NoSQL injection (MongoDB, Elasticsearch, Redis)
 │   └── prototype_pollution.yaml
 │
-├── passive_rules/            YAML-driven passive scanner rules (62 rules, 11+ files)
+├── passive_rules/            YAML-driven passive scanner rules (91 rules across 17 files)
 │   ├── headers/              security_headers.yaml, info_disclosure.yaml, cache_control.yaml
 │   ├── cookies/              cookie_flags.yaml
 │   ├── cors/                 cors.yaml

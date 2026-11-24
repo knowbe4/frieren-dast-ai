@@ -229,6 +229,15 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         from dast.ai import llm_recorder
         return llm_recorder.usage_snapshot()
 
+
+    @router.get("/api/ai/context")
+    async def ai_context():
+        """Per-purpose prompt-size telemetry (4-F context telemetry): calls,
+        prompt byte totals/averages and p50/p90 per purpose — what cost and
+        safeguard investigations need per call type."""
+        from dast.ai import llm_recorder
+        return llm_recorder.context_summary()
+
     @router.post("/api/ai/usage/clear")
     async def ai_usage_clear():
         """Reset the in-memory usage counters/ring (the JSONL record is kept)."""

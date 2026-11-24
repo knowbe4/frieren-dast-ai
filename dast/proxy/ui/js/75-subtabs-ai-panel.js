@@ -29,13 +29,14 @@ function switchBrowseSub(sub) {
 // ── AI panel (settings) ────────────────────────────────────────────────
 async function loadAiPanel() {
   try {
-    const [agentsR, graphR, ctxR, tmR, usageR, covR] = await Promise.all([
+    const [agentsR, graphR, ctxR, tmR, usageR, covR, teleR] = await Promise.all([
       fetch('/api/ai/agents'),
       fetch('/api/service-graph'),
       fetch('/api/ai/app-context'),
       fetch('/api/ai/threat-models'),
       fetch('/api/ai/usage'),
       fetch('/api/coverage'),
+      fetch('/api/ai/context'),
     ]);
     const agentsData = await agentsR.json();
     const graphData = await graphR.json();
@@ -43,6 +44,7 @@ async function loadAiPanel() {
     const tmData    = tmR.ok  ? await tmR.json()  : {};
     const usageData = usageR.ok ? await usageR.json() : {};
     const covData   = covR.ok ? await covR.json() : {};
+    const teleData  = teleR.ok ? await teleR.json() : {};
 
     // App context
     const ctxEl = document.getElementById('ai-app-context');
@@ -247,6 +249,25 @@ async function loadAiPanel() {
               </tr>`).join('')}</tbody>
           </table>` : ''}
           ${usageData.response_cache ? `<div style="margin-top:8px;color:var(--txt3);font-size:10px">Response cache: ${usageData.response_cache.enabled?'on':'off'} · ${usageData.response_cache.entries} entries · ${usageData.response_cache.hits} hits / ${usageData.response_cache.misses} misses</div>` : ''}
+          ${teleData.purposes && Object.keys(teleData.purposes).length ? `
+          <div style="margin-top:10px;font-weight:600;color:var(--txt2);margin-bottom:4px">Prompt context by purpose (request bytes)</div>
+          <table style="width:100%;border-collapse:collapse;font-size:10px">
+            <thead><tr style="color:var(--txt2);border-bottom:1px solid var(--bdr)">
+              <th style="text-align:left;padding:3px 6px;font-weight:500">Purpose</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">Calls</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">Avg bytes</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">p50</th>
+              <th style="text-align:right;padding:3px 6px;font-weight:500">p90</th>
+            </tr></thead>
+            <tbody>${Object.entries(teleData.purposes).map(([k,v])=>`
+              <tr style="border-bottom:1px solid var(--bdr3,#252525)">
+                <td style="padding:3px 6px;color:var(--txt);font-family:monospace">${esc(k)}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${v.calls}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${v.prompt_bytes_avg}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${v.prompt_bytes_p50}</td>
+                <td style="padding:3px 6px;text-align:right;color:var(--txt2)">${v.prompt_bytes_p90}</td>
+              </tr>`).join('')}</tbody>
+          </table>` : ''}
         `;
       }
     }

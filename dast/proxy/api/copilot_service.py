@@ -1819,6 +1819,14 @@ class CopilotService:
         the surface is covered — a dead session at the end costs nothing, a dead
         session at the start wastes the whole run."""
         seed = {h.split(":")[0].lower() for h in (focus_hosts or []) if h and h.split(":")[0]}
+        if profile_slug and not seed:
+            try:
+                from dast.profiles.store import load_profile
+                p = load_profile(profile_slug)
+                if p and p.host_pattern and not p.host_pattern.startswith("*"):
+                    seed.add(p.host_pattern.split(":")[0].lower())
+            except Exception:
+                pass
         hosts = set(seed)
         store = self._ctx.store
         if store is None:

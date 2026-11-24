@@ -1508,3 +1508,36 @@ async def test_wrapup_salvage_falls_back_to_sole_approved_host():
         ctx.approved_hosts = {"x.test"}
         session._persist_scratchpad_knowledge(ctx)
         assert notes == ["x.test"]
+
+
+@pytest.mark.asyncio
+async def test_guidance_blocks_reach_the_interactive_prompt():
+    """5-A-3: the interactive step prompt carries the driver's routing blocks
+    (leads/router/coverage) when the stores have something to say — and stays
+    byte-identical (no fence) when they don't."""
+    session = CopilotSession("s-guidance")
+    _, on_event = _collector()
+    prompts: List[str] = []
+    steps = [
+        {"action": "reply", "thought": "assess", "message": "On it."},
+        {"action": "reply", "thought": "done", "message": "Done."},
+    ]
+
+    async def fake_step(system, user, model_override=None):
+        prompts.append(user)
+        return steps.pop(0)
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=AsyncMock()), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=fake_step)), \
+         patch("dast.ai.copilot.session.guidance_blocks",
+               return_value="App-context leads — chase and TEST these first:\n[api.test] idor"):
+        await session.send("what should I do", _FakeCtx(in_scope=True),
+                           on_event=on_event, wait_for_human=_deny_human())
+        assert "coordinator_guidance" in prompts[0]
+        assert "App-context leads" in prompts[0]
+
+        with patch("dast.ai.copilot.session.guidance_blocks", return_value=""):
+            await session.send("again", _FakeCtx(in_scope=True),
+                               on_event=on_event, wait_for_human=_deny_human())
+    assert "coordinator_guidance" not in prompts[1]

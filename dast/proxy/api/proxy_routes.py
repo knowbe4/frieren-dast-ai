@@ -311,15 +311,26 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
+        # Idempotency (4-C): an identical previous import (same har_key) is
+        # skipped instead of duplicated.
+        existing_keys = {e.import_key for e in store.all_entries() if e.import_key}
         for pl in payloads:
+            if pl["har_key"] in existing_keys:
+                continue
             eid = store.new_entry(pl["method"], pl["url"], pl["request_headers"],
                                   pl["request_body"] or None, source="imported")
             if eid:
+                entry = store.get_entry(eid)
+                if entry is not None:
+                    entry.import_key = pl["har_key"]
                 store.complete_entry(eid, status=pl["response_status"],
                                      response_headers=pl["response_headers"],
                                      response_body=pl["response_body"],
                                      duration_ms=0.0)
-        stats["skipped"] = len(payloads) - stats["imported"]
+        imported = len(payloads) - sum(1 for pl in payloads
+                                       if pl["har_key"] in existing_keys)
+        stats["imported"] = imported
+        stats["skipped"] = len(payloads) - imported
         return {"ok": True, **stats}
 
     @router.get("/api/history/export/har")

@@ -121,6 +121,10 @@ class ProxyEntry:
     # exchange (changed something), set by the proxy server — replaces the old
     # header-diff heuristic and survives session save/restore.
     rewritten_by: List[str] = field(default_factory=list)
+    # HAR import de-dup (4-C): deterministic har-<sha256> key from
+    # har_import.har_key — a re-import of the same file skips entries whose key
+    # is already present anywhere in the store.
+    import_key: Optional[str] = None
     # hints from imported reports: [{parameter, payload, attack_type}]
     import_hints: List[dict] = field(default_factory=list)
     # payload injected by an agent probe (for display in HTTP history)
@@ -152,6 +156,7 @@ class ProxyEntry:
             "scan_outcome": self.scan_outcome,
             "coverage_ledger": self.coverage_ledger or [],
             "rewritten_by": self.rewritten_by or [],
+            "import_key": self.import_key,
             "body_preview": body_preview(self.request_body, self.path),
             "probe_payload": self.probe_payload,
             "ai_queued": self.ai_queued,
@@ -194,6 +199,7 @@ class ProxyEntry:
             scan_outcome=d.get("scan_outcome"),
             coverage_ledger=d.get("coverage_ledger") or [],
             rewritten_by=d.get("rewritten_by") or [],
+            import_key=d.get("import_key"),
             import_hints=d.get("import_hints") or [],
             ai_queued=d.get("ai_queued", False),
             manual_note=d.get("manual_note"),

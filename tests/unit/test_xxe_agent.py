@@ -207,6 +207,56 @@ async def test_parameter_entity_payloads_are_sent():
     assert any("xi:include" in body.lower() for body in sent_bodies)
 
 
+# ── regression: XXE-SSRF echo of the submitted URL must NOT confirm ──────────
+# The metadata URL we submit (http://169.254.169.254/latest/meta-data/) contains
+# tokens like "latest/meta-data". A parser error that echoes our request URL must
+# not be mistaken for a genuine server-side metadata fetch (false CWE-918).
+
+@pytest.mark.asyncio
+async def test_ssrf_echoed_request_url_not_confirmed(monkeypatch):
+    target = _target()
+    monkeypatch.setattr(
+        "dast.agents.xxe_agent.get_payloads",
+        lambda category, group: (
+            ['<!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><root>&xxe;</root>']
+            if group == "ssrf_internal" else []
+        ),
+    )
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        # Server rejects the entity and echoes the submitted URL back verbatim.
+        return _resp(500, "XML parse: failed to resolve http://169.254.169.254/latest/meta-data/ (connection refused)")
+
+    with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
+        findings = await XxeAgent().run(target, MagicMock(), collaborator=None)
+
+    assert all("XXE-driven SSRF" not in f.title for f in findings)
+
+
+@pytest.mark.asyncio
+async def test_ssrf_genuine_metadata_response_confirmed(monkeypatch):
+    target = _target()
+    monkeypatch.setattr(
+        "dast.agents.xxe_agent.get_payloads",
+        lambda category, group: (
+            ['<!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://169.254.169.254/latest/meta-data/">]><root>&xxe;</root>']
+            if group == "ssrf_internal" else []
+        ),
+    )
+
+    async def fake_send(client, method, url, headers, body, payload=None):
+        # Genuine IMDS directory listing reflected into the XML response body.
+        return _resp(200, "<root>ami-id\nami-launch-index\nblock-device-mapping/\nhostname</root>")
+
+    with patch("dast.agents.xxe_agent._send", side_effect=fake_send):
+        findings = await XxeAgent().run(target, MagicMock(), collaborator=None)
+
+    ssrf = [f for f in findings if "XXE-driven SSRF" in f.title]
+    assert len(ssrf) == 1
+    assert ssrf[0].confirmed is True
+    assert ssrf[0].severity == "critical"
+
+
 # ── negative: clean XML response, no collaborator ────────────────────────────
 
 @pytest.mark.asyncio

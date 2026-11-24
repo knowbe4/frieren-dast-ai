@@ -113,6 +113,59 @@ async def test_implicit_flow_flagged(monkeypatch):
     assert any("Implicit" in f.title for f in findings)
 
 
+def _install_method(monkeypatch, responder):
+    """Like _install but the responder sees (method, url, body) so a test can
+    distinguish the authorize GET from the token-exchange POSTs."""
+    import dast.agents.oauth_agent as mod
+
+    async def fake_send(client, method, url, headers, body, **kw):
+        return responder(method, url, body)
+
+    monkeypatch.setattr(mod, "_send", fake_send)
+
+
+@pytest.mark.asyncio
+async def test_code_reuse_not_confirmed_when_second_exchange_dropped(monkeypatch):
+    """Regression: the second token exchange returns None (request dropped). A
+    single successful redemption must NOT be reported as 'redeemable twice'."""
+    from dast.agents.oauth_agent import OAuthAgent
+
+    token_posts = {"n": 0}
+
+    def responder(method, url, body):
+        if body is None:
+            # authorize GET → same-host redirect carrying a code
+            return _r(302, "", location="https://idp.example.com/authorize?code=abc123")
+        token_posts["n"] += 1
+        if token_posts["n"] == 1:
+            return _r(200, '{"access_token": "t"}')  # first succeeds
+        return None  # second exchange dropped on the wire
+
+    _install_method(monkeypatch, responder)
+    findings = await OAuthAgent()._check_code_single_use(_target(), MagicMock())
+
+    assert all("Redeemable Twice" not in f.title for f in findings)
+    assert token_posts["n"] >= 2  # both exchanges were actually attempted
+
+
+@pytest.mark.asyncio
+async def test_code_reuse_confirmed_when_both_exchanges_succeed(monkeypatch):
+    """Both exchanges complete and return an access_token → confirmed finding."""
+    from dast.agents.oauth_agent import OAuthAgent
+
+    def responder(method, url, body):
+        if body is None:
+            return _r(302, "", location="https://idp.example.com/authorize?code=abc123")
+        return _r(200, '{"access_token": "t"}')
+
+    _install_method(monkeypatch, responder)
+    findings = await OAuthAgent()._check_code_single_use(_target(), MagicMock())
+
+    reuse = [f for f in findings if "Redeemable Twice" in f.title]
+    assert len(reuse) == 1
+    assert reuse[0].confirmed is True
+
+
 @pytest.mark.asyncio
 async def test_plain_endpoint_skipped(monkeypatch):
     from dast.agents.oauth_agent import OAuthAgent

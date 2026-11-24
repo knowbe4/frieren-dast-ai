@@ -203,40 +203,6 @@ _STREAM_HEAD = 4096          # bytes scanned for the version field
 _STREAM_MAX_ENTRIES = 10000  # hard cap — the excess is counted as truncated
 
 
-def iter_har_entries(raw: bytes):
-    """Yield HAR entry dicts one at a time from raw bytes WITHOUT materializing
-    the whole document (``json.JSONDecoder.raw_decode`` walked sequentially over
-    the ``entries`` array). Validates the 1.2 version in the head bytes. Raises
-    ValueError for a non-HAR document; per-ENTRY problems surface via the
-    incremental importer's counter, never as exceptions."""
-    head = raw[:_STREAM_HEAD].lstrip()
-    if '"version"' not in head or '"entries"' not in head:
-        raise ValueError("not a HAR document (missing log/version/entries)")
-    # locate the entries array start (first '[' after '"entries"')
-    idx = raw.find(b'"entries"')
-    if idx < 0:
-        raise ValueError("log.entries missing")
-    idx = raw.find(b"[", idx)
-    if idx < 0:
-        raise ValueError("log.entries missing")
-    idx += 1  # past '['
-    decoder_i = json.JSONDecoder()
-    count = 0
-    while True:
-        while idx < len(raw) and raw[idx:idx + 1] in (b" ", b"\n", b"\r", b"\t", b","):
-            idx += 1
-        if idx >= len(raw) or raw[idx:idx + 1] == b"]":
-            break
-        obj, end = decoder_i.raw_decode(raw[idx:].decode("utf-8", errors="replace"))
-        idx += end
-        if not isinstance(obj, dict):
-            continue
-        count += 1
-        if count > _STREAM_MAX_ENTRIES:
-            raise ValueError(f"too many entries: >{_STREAM_MAX_ENTRIES}")
-        yield obj
-
-
 def import_har_incremental(raw: bytes, offset: int = 0, page: int = 500):
     """Generator over entry PAYLOADS for a raw HAR body, page by page —
     bounded memory for files too large for a single ``json.loads``.
@@ -282,12 +248,15 @@ def import_har_incremental(raw: bytes, offset: int = 0, page: int = 500):
                 done = True
                 break
             try:
-                obj, consumed = decoder.raw_decode(text[idx:])
+                # raw_decode(text, idx) walks from idx WITHOUT slicing the
+                # remaining text each iteration (the slice made this O(n^2)).
+                # It returns the absolute end index, so assign rather than add.
+                obj, end = decoder.raw_decode(text, idx)
             except ValueError:
                 done = True
                 truncated = True
                 break
-            idx += consumed
+            idx = end
             entries_seen += 1
             if entries_seen > _STREAM_MAX_ENTRIES:
                 truncated = True

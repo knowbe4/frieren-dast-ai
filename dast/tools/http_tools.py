@@ -666,3 +666,119 @@ register(Tool(
     handler=_get_bearer_token,
     tags=["auth"],
 ))
+
+
+# ── diff_responses (5-A): the deterministic "compare the two bodies" ─────────
+_DIFF_RESPONSES_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "entry_id_a": {
+            "type": "string",
+            "description": "Baseline proxy-history entry id (from send_request / "
+                           "browser_fetch / get_history) — the control request.",
+        },
+        "entry_id_b": {
+            "type": "string",
+            "description": "Comparison entry id — typically the request with the "
+                           "payload/tweak applied.",
+        },
+    },
+    "required": ["entry_id_a", "entry_id_b"],
+}
+
+_DIFF_KEY_HEADERS = ("content-type", "location", "www-authenticate",
+                     "server", "content-length", "allow")
+_DIFF_MAX_LINES = 8
+_DIFF_MAX_LINE_CHARS = 200
+
+
+def _diff_side(entry: Any) -> Dict[str, Any]:
+    body = (entry.response_body or b"").decode("utf-8", errors="replace")
+    return {
+        "method": entry.method,
+        "url": entry.url,
+        "status": entry.response_status,
+        "headers": {str(k).lower(): str(v) for k, v in (entry.response_headers or {}).items()},
+        "body": body,
+    }
+
+
+async def _diff_responses(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Structural diff of two captured responses (5-A-4). The system prompt asks
+    the model to 'compare the two bodies'; doing that by eye over two truncated
+    previews is where verdicts went wrong. This returns the deterministic delta:
+    status, key headers, body length and capped line-level added/removed."""
+    store = getattr(ctx, "store", None)
+    if store is None:
+        return {"ok": False,
+                "error": "diff_responses needs the in-process store (unavailable over MCP)"}
+    id_a = str(args.get("entry_id_a", "")).strip()
+    id_b = str(args.get("entry_id_b", "")).strip()
+    entry_a = store.get_entry(id_a) if id_a else None
+    entry_b = store.get_entry(id_b) if id_b else None
+    if entry_a is None or entry_b is None:
+        return {"ok": False,
+                "error": "entry not found — pass REAL entry_id values from "
+                         "send_request/browser_fetch/get_history (got "
+                         f"{id_a!r}, {id_b!r})"}
+
+    side_a, side_b = _diff_side(entry_a), _diff_side(entry_b)
+    out: Dict[str, Any] = {
+        "ok": True,
+        "a": {k: side_a[k] for k in ("method", "url", "status")},
+        "b": {k: side_b[k] for k in ("method", "url", "status")},
+        "status_changed": ([side_a["status"], side_b["status"]]
+                           if side_a["status"] != side_b["status"] else None),
+        "body_length": [len(side_a["body"]), len(side_b["body"])],
+    }
+
+    headers_changed: Dict[str, List[Any]] = {}
+    for header in _DIFF_KEY_HEADERS:
+        val_a = side_a["headers"].get(header, "")
+        val_b = side_b["headers"].get(header, "")
+        if val_a != val_b:
+            headers_changed[header] = [val_a[:120], val_b[:120]]
+    cookies_a = sum(1 for k in side_a["headers"] if k == "set-cookie")
+    cookies_b = sum(1 for k in side_b["headers"] if k == "set-cookie")
+    if cookies_a != cookies_b:
+        headers_changed["set-cookie_count"] = [cookies_a, cookies_b]
+    if headers_changed:
+        out["headers_changed"] = headers_changed
+
+    import difflib
+    lines_a = side_a["body"].splitlines()
+    lines_b = side_b["body"].splitlines()
+    added = [ln[1:] for ln in difflib.unified_diff(lines_a, lines_b, lineterm="", n=0)
+             if ln.startswith("+") and not ln.startswith("+++")]
+    removed = [ln[1:] for ln in difflib.unified_diff(lines_a, lines_b, lineterm="", n=0)
+               if ln.startswith("-") and not ln.startswith("---")]
+    out["body_lines_added_count"] = len(added)
+    out["body_lines_removed_count"] = len(removed)
+    if added:
+        out["body_lines_added"] = [ln[:_DIFF_MAX_LINE_CHARS] for ln in added[:_DIFF_MAX_LINES]]
+    if removed:
+        out["body_lines_removed"] = [ln[:_DIFF_MAX_LINE_CHARS] for ln in removed[:_DIFF_MAX_LINES]]
+
+    if (out["status_changed"] is None and not headers_changed
+            and not added and not removed):
+        out["verdict"] = ("responses are structurally identical "
+                          "(status, key headers, body lines)")
+    return out
+
+
+register(Tool(
+    name="diff_responses",
+    description=(
+        "Compare two captured responses (proxy-history entry ids) and return the "
+        "STRUCTURAL delta: status change, key header changes (content-type, location, "
+        "www-authenticate, server, content-length, allow, set-cookie count), body "
+        "lengths, and the body lines added/removed (capped). Use this instead of "
+        "eyeballing two send_request bodies: the baseline (control) as entry_id_a and "
+        "the payload/tweak request as entry_id_b — e.g. access granted vs denied, "
+        "reflected vs not, before vs after a state change. A response that differs "
+        "ONLY in body length may still leak data — read the added lines."
+    ),
+    input_schema=_DIFF_RESPONSES_SCHEMA,
+    handler=_diff_responses,
+    tags=["http", "read"],
+))

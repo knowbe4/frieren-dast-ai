@@ -167,6 +167,16 @@ _EXTRACT_FULL_OBSERVATION_CHARS = 12000
 # decisive compact signals (status, length, reflections) that follow it always
 # survive the _OBSERVATION_MAX_CHARS cut instead of being pushed out by the body.
 _OBSERVATION_BODY_CHARS = 900
+# 5-A-4: a SMALL body (≤4k chars) gets the wider window instead — cutting a
+# 1.5k JSON response to 900 chars was exactly how verdicts missed evidence.
+_OBSERVATION_BODY_SMALL_CHARS = 2000
+_OBSERVATION_BODY_FULL_MAX = 4000
+
+# Headers that decide how a response should be read (5-A-4) — surfaced at the
+# top of the observation; the raw headers dict stays out of the transcript.
+_KEY_HEADER_NAMES = frozenset({
+    "content-type", "location", "www-authenticate", "server", "content-length",
+})
 
 # Order in which a tool result's fields are serialized into an observation: the
 # small, decisive signals lead so truncation only ever eats the trailing body.
@@ -257,13 +267,34 @@ def _summarize_result(result: Any) -> str:
     for key, value in result.items():
         if key not in ordered and key not in ("body", "headers"):
             ordered[key] = value
+    # 5-A-4: key headers lead the observation — content-type decides how to read
+    # the body, location exposes redirect targets, www-authenticate names the
+    # auth scheme, and the set-cookie count flags session churn. The raw headers
+    # dict stays out (bulky, model-hostile); these are the decision signals.
+    headers = result.get("headers")
+    if isinstance(headers, dict) and headers:
+        key_headers: Dict[str, Any] = {}
+        for name, value in headers.items():
+            if str(name).lower() in _KEY_HEADER_NAMES:
+                key_headers[str(name)] = str(value)[:120]
+        # send_request returns the REAL per-cookie list ('set_cookies') — the
+        # headers dict collapses repeated Set-Cookie to one entry.
+        cookies = result.get("set_cookies")
+        if isinstance(cookies, list) and cookies:
+            key_headers["set-cookie"] = f"<{len(cookies)} cookie(s) issued>"
+        if key_headers:
+            ordered["headers"] = key_headers
     body = result.get("body")
     if isinstance(body, str):
         # When the body is trimmed, tell the model the full size and how to read it in full — the
         # whole body is captured in the store, so extract_response can pull fields/arrays out of it
         # instead of the model giving up on the truncated preview. These two fields lead the body so
-        # the observation trim never eats them.
-        if len(body) > _OBSERVATION_BODY_CHARS:
+        # the observation trim never eats them. Small bodies (≤4k) get the larger
+        # 2000-char window (5-A-4): halving a 1.5k JSON response was exactly how
+        # verdicts got made over missing evidence.
+        cap = (_OBSERVATION_BODY_SMALL_CHARS if len(body) <= _OBSERVATION_BODY_FULL_MAX
+               else _OBSERVATION_BODY_CHARS)
+        if len(body) > cap:
             target_url = result.get("final_url") or result.get("url") or ""
             ordered["body_truncated"] = True
             ordered["hint"] = (
@@ -271,7 +302,7 @@ def _summarize_result(result: Any) -> str:
                 f"extract_response(url={target_url!r}, path=...) (or regex=...) to read fields or "
                 f"enumerate arrays from the complete captured body."
             )
-        ordered["body"] = body[:_OBSERVATION_BODY_CHARS]
+        ordered["body"] = body[:cap]
     return json.dumps(ordered, default=str)
 
 # The conversation history sent to the model is capped to the most recent N

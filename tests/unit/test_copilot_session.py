@@ -1541,3 +1541,51 @@ async def test_guidance_blocks_reach_the_interactive_prompt():
             await session.send("again", _FakeCtx(in_scope=True),
                                on_event=on_event, wait_for_human=_deny_human())
     assert "coordinator_guidance" not in prompts[1]
+
+
+# --- 5-A-4: observation with key headers + small-body window ------------------
+
+
+def test_summarize_result_surfaces_key_headers():
+    """content-type/location/www-authenticate lead the observation; the raw
+    headers dict stays out; set-cookie collapses to a count."""
+    from dast.ai.copilot.session import _summarize_result
+
+    out = _summarize_result({
+        "ok": True, "status": 302,
+        "headers": {"Content-Type": "text/html", "Location": "https://h/login",
+                    "WWW-Authenticate": "Bearer realm=x",
+                    "Set-Cookie": "collapsed=1", "X-Bulk": "z" * 300},
+        "set_cookies": ["a=1", "b=2"],
+        "body": "found",
+    })
+    assert '"Location": "https://h/login"' in out
+    assert '"WWW-Authenticate": "Bearer realm=x"' in out
+    assert '"Content-Type": "text/html"' in out
+    assert "2 cookie(s) issued" in out  # from the real set_cookies list
+    assert "collapsed=1" not in out
+    assert "X-Bulk" not in out  # non-key headers stay out
+
+
+def test_summarize_result_small_body_gets_wide_window():
+    """A body ≤4000 chars shows up to 2000 chars (the old flat 900 cut half of
+    a small JSON response); a bigger body keeps the 900-char preview."""
+    from dast.ai.copilot.session import (
+        _OBSERVATION_BODY_CHARS,
+        _OBSERVATION_BODY_SMALL_CHARS,
+        _summarize_result,
+    )
+
+    small = "S" * 1500
+    out = _summarize_result({"ok": True, "status": 200, "body": small})
+    assert small in out  # 1500 ≤ 2000 — fully visible now
+
+    medium = "M" * 2000 + "UNIQUE_TAIL_CONTENT"
+    out = _summarize_result({"ok": True, "status": 200, "body": medium})
+    assert "M" * _OBSERVATION_BODY_SMALL_CHARS in out   # 2000-char window shown
+    assert "UNIQUE_TAIL_CONTENT" not in out             # past the cap — cut
+    assert "body_truncated" in out
+
+    big = "B" * (_OBSERVATION_BODY_CHARS + 3000)
+    out = _summarize_result({"ok": True, "status": 200, "body": big})
+    assert big[:_OBSERVATION_BODY_CHARS] in out  # large body → old preview cap

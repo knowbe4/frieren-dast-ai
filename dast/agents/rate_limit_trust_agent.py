@@ -21,8 +21,8 @@ Low noise: 2 XFF probes + up to 3 path variants, always-on-low like
 
 from __future__ import annotations
 
-import re
 from typing import TYPE_CHECKING, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.proxy.plugin_manager import log_event
@@ -40,10 +40,6 @@ _SPOOF_IP = "203.0.113.7"  # TEST-NET-3 — never a real third party
 _XFF_HEADERS = (
     ("x-forwarded-for", _SPOOF_IP),
     ("x-real-ip", _SPOOF_IP),
-)
-_REFLECTION_CONTEXT = re.compile(
-    r"(203\.0\.113\.7|client[_ -]?(ip|address)|forwarded[_ -]?(for|ip)|your[_ -]?ip)",
-    re.IGNORECASE,
 )
 
 
@@ -85,7 +81,10 @@ class RateLimitTrustAgent(VulnAgent):
         if not resp:
             return None
         body = resp.text[:4000]
-        if not _REFLECTION_CONTEXT.search(body):
+        # Confirmed only when the SPOOFED TEST-NET IP literal we injected is
+        # reflected back — a generic phrase like "your ip"/"client address" is
+        # not proof the client-controlled header reached trust-sensitive code.
+        if _SPOOF_IP not in body:
             return None
 
         raw_req, raw_resp = _fmt_http_pair(resp)
@@ -128,7 +127,11 @@ class RateLimitTrustAgent(VulnAgent):
         parsed = target.url.split("?", 1)
         base_path = parsed[0].rstrip("/")
         query = f"?{parsed[1]}" if len(parsed) > 1 else ""
-        variants = (f"{base_path}", f"{base_path}/", f"{base_path.upper()}")
+        # Uppercase ONLY the path component — scheme+host must stay intact, or we
+        # test host casing (HTTPS://EXAMPLE.COM) instead of path normalization.
+        pu = urlparse(base_path)
+        upper_variant = urlunparse(pu._replace(path=pu.path.upper()))
+        variants = (f"{base_path}", f"{base_path}/", upper_variant)
         seen = {baseline.status_code}
         captured_path = parsed[0]
         for variant in variants:

@@ -17,6 +17,21 @@ from dast.agents.ssrf_agent import SsrfAgent
 from dast.scanners.active_checks import CheckTarget
 
 
+# ── regression: url_param_keywords must be SEPARATE list entries ──────────────
+# A YAML indentation bug folded "import/avatar/feed/attachment/document" into
+# one mangled string under the previous "- location" item, so none of them were
+# usable as keywords. Loading the YAML must yield each as its own entry.
+
+def test_url_param_keywords_are_separate_entries():
+    from dast.payloads.loader import get_value
+
+    kws = get_value("ssrf", "url_param_keywords") or []
+    for expected in ("location", "import", "avatar", "feed", "attachment", "document"):
+        assert expected in kws, f"{expected!r} must be a separate keyword, got {kws!r}"
+    # the old mangled fold must never reappear
+    assert not any(" " in k for k in kws)
+
+
 def _target(url="https://example.com/fetch?url=http://example.com", method="GET", params=None, body=None):
     return CheckTarget(
         method=method,

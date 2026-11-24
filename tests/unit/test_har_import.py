@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from dast.proxy.har_import import har_key, import_har
+from dast.proxy.har_import import har_key, import_har, import_har_incremental
 
 
 def _har(entries, version="1.2"):
@@ -127,6 +127,27 @@ def test_deterministic_keys_and_stable_roundtrip():
     payloads1, _ = import_har(_har([e]))
     payloads2, _ = import_har(_har([e]))
     assert payloads1[0]["har_key"] == payloads2[0]["har_key"]
+
+
+# ── streaming import ──────────────────────────────────────────────────────────
+
+def test_incremental_import_streams_all_entries_in_order():
+    # Guards the O(n^2)->O(n) raw_decode(text, idx) change: many entries must
+    # still import completely, in order, across page boundaries.
+    entries = [_entry(f"https://a.com/{i}") for i in range(1500)]
+    raw = json.dumps(_har(entries)).encode("utf-8")
+
+    urls = []
+    last_stats = None
+    for payloads, stats in import_har_incremental(raw, page=400):
+        urls.extend(p["url"] for p in payloads)
+        last_stats = stats
+
+    assert len(urls) == 1500
+    assert urls == [f"https://a.com/{i}" for i in range(1500)]
+    assert last_stats["done"] is True  # final (partial) page carries done
+    assert last_stats["truncated"] is False
+    assert last_stats["total_entries"] == 1500
 
 
 # ── route ────────────────────────────────────────────────────────────────────

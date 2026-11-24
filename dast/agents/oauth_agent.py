@@ -223,7 +223,7 @@ class OAuthAgent(VulnAgent):
                     break
                 token_ok = r.status_code == 200 and "access_token" in r.text
                 outcomes.append(token_ok)
-            if outcomes and all(outcomes):
+            if len(outcomes) == 2 and all(outcomes):
                 raw_req, raw_resp = _fmt_http_pair(resp)
                 log_event("agent", "finding",
                           f"OAuth code redeemable twice on {path}",

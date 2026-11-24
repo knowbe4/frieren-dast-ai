@@ -207,8 +207,19 @@ class Http2Agent(VulnAgent):
         # backend answered in HTTP/1.1 — ideally echoing our marker path.
         plaintext_responses = data.count(b"HTTP/1.")
         smuggled_answered = marker_path.encode() in data
-        if plaintext_responses >= 1:
-            raw = data.decode("latin-1", errors="replace")[:3000]
+        if plaintext_responses < 1:
+            return findings
+
+        # Confirmed desync requires a STRONG signal: either our smuggled marker
+        # path was echoed back (the DATA frame was processed as a real request),
+        # or there are >= 2 plaintext HTTP/1 responses on the one connection (a
+        # legit response PLUS one from the forwarded DATA). A single plaintext
+        # response with no marker echo is almost always the server rejecting the
+        # malformed h2 with a plaintext `HTTP/1.1 400` — NOT a desync, so it is
+        # downgraded (informational, not confirmed) rather than flagged critical.
+        raw = data.decode("latin-1", errors="replace")[:3000]
+        confirmed = smuggled_answered or plaintext_responses >= 2
+        if confirmed:
             log_event("agent", "finding",
                       f"HTTP/2 CL/DATA desync confirmed on {target.url}",
                       url=target.url, finding="H2 desync", source="agent")
@@ -231,6 +242,29 @@ class Http2Agent(VulnAgent):
                 url=target.url,
                 request_method="GET",
                 bypass_validation=True,
+                raw_request=payload.decode("latin-1", errors="replace")[:2000],
+                raw_response=raw,
+            ))
+        else:
+            findings.append(AgentFinding(
+                title="HTTP/2 CL/DATA Probe — Single Plaintext Response (Inconclusive)",
+                severity="low",
+                cwe="CWE-444",
+                attack_type="http2",
+                evidence=(
+                    "The malformed h2 frame (HEADERS content-length: 0 + DATA) "
+                    "drew a single plaintext HTTP/1 response with no echo of the "
+                    "smuggled marker path. This is consistent with the server "
+                    "rejecting the frame (e.g. a plaintext 400) and is NOT proof "
+                    "of a desync — reported as a surface marker only.\n\n"
+                    f"Exchange:\n{raw}"
+                ),
+                confirmed=False,
+                payload=f"h2 HEADERS(CL:0) + DATA[{marker_path}]",
+                parameter="h2-frames",
+                url=target.url,
+                request_method="GET",
+                bypass_validation=False,
                 raw_request=payload.decode("latin-1", errors="replace")[:2000],
                 raw_response=raw,
             ))

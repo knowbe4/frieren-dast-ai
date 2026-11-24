@@ -121,18 +121,29 @@ class XxeAgent(VulnAgent):
         ]
         ssrf_payloads = [str(p).strip() for p in ssrf_internal_payloads if str(p).strip()]
 
-        # Phase 0: XXE-driven SSRF (4-A) — internal metadata signatures. Only an
-        # echoed METADATA signature counts; a parser error alone is not evidence.
+        # Phase 0: XXE-driven SSRF (4-A) — internal metadata signatures. Only a
+        # signature from a genuine metadata RESPONSE counts. A parser error that
+        # merely ECHOES our request (the entity URL itself contains tokens like
+        # "latest/meta-data" / "computeMetadata") must NOT confirm, or a
+        # reflected request masquerades as a server-side fetch (false CWE-918).
+        # Defense: (a) scrub echoes of the submitted entity URL(s) from the body
+        # before matching, and (b) match only on signatures that appear in a
+        # metadata RESPONSE body, never in the URLs we submit.
         _SSRF_SIGS = (
-            "ami-id", "latest/meta-data", "computeMetadata", "Metadata-Flavor",
-            "iam/security-credentials", "X-Appengine", "instance/service-accounts",
+            "ami-id", "ami-launch-index", "instance-identity",
+            "block-device-mapping", "AccessKeyId", "SecretAccessKey",
         )
         for payload in ssrf_payloads[:6]:
             resp = await _send(client, target.method, target.url, _headers, payload, payload=payload[:100])
             if not resp:
                 continue
             body = resp.text[:8000]
-            hit = next((sig for sig in _SSRF_SIGS if sig in body), None)
+            # Strip any echo of the entity URL(s) we submitted so a reflected
+            # request body cannot trip a signature.
+            scrubbed = body
+            for entity_url in re.findall(r'SYSTEM\s+["\']([^"\']+)["\']', payload):
+                scrubbed = scrubbed.replace(entity_url, "")
+            hit = next((sig for sig in _SSRF_SIGS if sig in scrubbed), None)
             if not hit:
                 continue
             raw_req, raw_resp = _fmt_http_pair(resp)

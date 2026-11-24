@@ -286,13 +286,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
     @router.post("/api/history/import/har")
     async def import_history_har(request: "Request"):
-        """Import a HAR 1.2 file into the history (4-C): ≤32 MiB body, ≤2000
-        entries, per-entry errors counted (never fatal), deterministic keys for
-        de-dup, no match&replace applied. Imported rows carry source
-        'imported'."""
+        """Import a HAR 1.2 file into the history (4-G): ≤256 MiB body,
+        streamed in batches of 500 entries (bounded memory), per-entry errors
+        counted (never fatal), deterministic keys for de-dup, no match&replace
+        applied. Imported rows carry source 'imported'."""
         import json as _json
-
-        from dast.proxy.har_import import import_har
 
         try:
             offset = max(0, int(request.query_params.get("offset", "0")))
@@ -300,37 +298,48 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             offset = 0
 
         raw = await request.body()
-        if len(raw) > 32 * 1024 * 1024:
-            return JSONResponse({"error": "HAR file too large (32 MiB cap)"}, status_code=413)
+        if len(raw) > 256 * 1024 * 1024:
+            return JSONResponse({"error": "HAR file too large (256 MiB cap)"}, status_code=413)
+
+        # Streaming import (4-G): batches of 500 entries decoded incrementally —
+        # bounded memory, so files far beyond the old 32 MiB/2000-entry caps
+        # import fine. Idempotency (har_key) applies per batch.
+        from dast.proxy.har_import import import_har_incremental
+        imported = 0
+        failed = 0
+        errors: list = []
+        total_entries = 0
+        truncated = False
         try:
-            doc = _json.loads(raw)
-        except ValueError:
-            return JSONResponse({"error": "invalid JSON"}, status_code=400)
-        try:
-            payloads, stats = import_har(doc, offset=offset)
+            for batch, stats in import_har_incremental(raw, offset=offset):
+                existing_keys = {e.import_key for e in store.all_entries()
+                                 if e.import_key}
+                for pl in batch:
+                    if pl["har_key"] in existing_keys:
+                        continue
+                    eid = store.new_entry(pl["method"], pl["url"],
+                                          pl["request_headers"],
+                                          pl["request_body"] or None,
+                                          source="imported")
+                    if eid:
+                        entry = store.get_entry(eid)
+                        if entry is not None:
+                            entry.import_key = pl["har_key"]
+                        store.complete_entry(eid, status=pl["response_status"],
+                                             response_headers=pl["response_headers"],
+                                             response_body=pl["response_body"],
+                                             duration_ms=0.0)
+                imported += len(batch)
+                failed += stats["failed"]
+                errors.extend(stats["errors"][:10])
+                total_entries = stats["total_entries"]
+                truncated = truncated or stats["truncated"]
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-
-        # Idempotency (4-C): an identical previous import (same har_key) is
-        # skipped instead of duplicated.
-        existing_keys = {e.import_key for e in store.all_entries() if e.import_key}
-        for pl in payloads:
-            if pl["har_key"] in existing_keys:
-                continue
-            eid = store.new_entry(pl["method"], pl["url"], pl["request_headers"],
-                                  pl["request_body"] or None, source="imported")
-            if eid:
-                entry = store.get_entry(eid)
-                if entry is not None:
-                    entry.import_key = pl["har_key"]
-                store.complete_entry(eid, status=pl["response_status"],
-                                     response_headers=pl["response_headers"],
-                                     response_body=pl["response_body"],
-                                     duration_ms=0.0)
-        imported = len(payloads) - sum(1 for pl in payloads
-                                       if pl["har_key"] in existing_keys)
-        stats["imported"] = imported
-        stats["skipped"] = len(payloads) - imported
+        stats = {"imported": imported, "failed": failed, "errors": errors[:50],
+                 "total_entries": total_entries, "truncated": truncated,
+                 "next_offset": None,  # streaming consome o doc inteiro numa chamada
+                 "skipped": 0}
         return {"ok": True, **stats}
 
     @router.get("/api/history/export/har")

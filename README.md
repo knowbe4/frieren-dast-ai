@@ -34,33 +34,40 @@ block the leak, and CI will fail the build.
 
 ## How it works
 
+You point a browser or tool at the proxy. Everything flowing through it is stored
+once, then **two engines** work on that traffic: an automated scanner and an AI
+copilot. Both read the same store, share the same tools and LLM gateway, and push
+findings to the dashboard in real time.
+
+```mermaid
+flowchart TD
+    client["Browser · tool · CI"] -->|"HTTP/S via proxy :8080"| proxy["MITM Proxy"]
+    proxy --> store[("Session Store")]
+
+    store --> passive["Passive Scanner<br/>91 rules · no extra requests"]
+    store --> coord["Coordinator<br/>LLM: plan → run → validate"]
+    coord --> agents["Vuln Agents<br/>~37, parallel per endpoint"]
+
+    copilot["AI Copilot<br/>interactive / autonomous"] -.->|"replays through"| proxy
+
+    passive --> findings[("Findings")]
+    agents --> findings
+    copilot --> findings
+    findings --> dash["Dashboard :8088<br/>live via WebSocket"]
+
+    agents --> shared["Tool layer + AI Gateway"]
+    copilot --> shared
 ```
-Browser / tool (configured to use proxy :8080)
-    |
-    v
-[HTTPS MITM Proxy]         Intercepts all HTTP/HTTPS, TLS termination per host
-    |
-    v
-[Session Store]            Every request/response stored in memory
-    |
-    +---> [Passive Scanner]    Zero-request checks fire on every response
-    |     (YAML rule engine)   91 rules: headers, cookies, CORS, secrets,
-    |                          error pages, LLM endpoints, OWASP Top 10
-    |
-    +---> [Scan Queue]         In-scope entries queued for active scanning
-              |
-              v
-         [Coordinator]         LLM planner → agents → LLM validator
-              |
-              v
-         [VulnAgents]          25 agents run in parallel per endpoint (the
-              |                planner selects per endpoint): xss, sqli,
-              |                ssrf, file_read, auth_bypass, idor, secrets,
-              |                discovery, llm_injection, business_logic,
-              |                blazor, graphql, mfa, race_condition, ...
-              v
-         [Findings]            Real-time push to dashboard via WebSocket
-```
+
+| Component | What it does |
+|---|---|
+| **MITM Proxy** (:8080) | Terminates TLS per host; every browser/tool request flows through it |
+| **Session Store** | In-memory requests/responses + cookie jar — the single source both engines read |
+| **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors) with no extra traffic |
+| **Coordinator → Vuln Agents** | The LLM picks which of ~37 agents to run per endpoint, runs them in parallel, then validates the output |
+| **AI Copilot** | Interactive or autonomous AI loop — reads app knowledge, plans with the LLM, and drives a real (Playwright) browser plus the tools to confirm issues by hand |
+| **Tool layer + AI Gateway** | 66 shared tools (send_request, sqli_probe, login profiles, …) and a multi-provider LLM gateway, shared by the copilot, the agents, and the MCP server |
+| **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, request history, the copilot panel, runtime config |
 
 ## Quick start
 
@@ -134,6 +141,54 @@ and the Phase 2 (self-contained binary) notes.
 | **Intruder** | Payload-position fuzzing across a request |
 | **Logs** | Rolling 500-event system log — agent, plugin, browser, and crawler events |
 | **Extras** | H1 Validator, Code (source-aware review), FedRAMP, Interactions (OOB/interactsh), Decoder/Encoder, JWT editor |
+
+## MCP server (drive Frieren from an AI client)
+
+Frieren exposes its whole tool layer over the [Model Context Protocol](https://modelcontextprotocol.io),
+so an AI client (Claude Desktop, Claude Code, …) can send requests, drive the browser,
+run probes, and read findings — all through the **already-running** proxy, with the same
+scope and payload-safety gates as the dashboard.
+
+Start the proxy first (`make proxy`), then register the MCP server in your client:
+
+```jsonc
+// Claude Desktop: claude_desktop_config.json   |   Claude Code: .mcp.json
+{
+  "mcpServers": {
+    "frieren": {
+      "command": "dast-ai",
+      "args": ["mcp", "--proxy-port", "8080", "--dashboard-port", "8088"]
+    }
+  }
+}
+```
+
+Claude Code one-liner: `claude mcp add frieren -- dast-ai mcp`. If `dast-ai` is not on
+your PATH, use the venv binary (`.venv/bin/dast-ai`) or `uv run dast-ai`. The server
+speaks over stdio — never point it at a port.
+
+### Available tools
+
+Out-of-scope targets and unsafe payloads are gated the same way as in the UI
+(`send_request` to an out-of-scope host prompts the dashboard operator for approval).
+
+| Group | Tools |
+|-------|-------|
+| **Requests & replay** | `send_request`, `test_unauth`, `diff_responses`, `extract_response`, `verify_reflection`, `validate_chain`, `match_replace`, `upload_to_presigned_url` |
+| **Agent browser** | `browser_navigate`, `browser_snapshot`, `browser_fill`, `browser_click`, `browser_extract`, `browser_wait_for`, `browser_fetch`, `browser_login`, `browser_login_adaptive`, `crawl`, `explore` |
+| **Auth & sessions** | `activate_login_profile`, `list_login_profiles`, `list_login_sessions`, `save_login_session`, `get_bearer_token`, `get_app_token`, `prime_session`, `token_inventory`, `get_transport_capability`, `record_transport_capability` |
+| **Recon & discovery** | `get_history`, `content_discovery`, `param_mining` |
+| **Probes (deterministic, no LLM)** | `sqli_probe`, `xss_probe`, `idor_probe`, `authz_differential_probe`, `run_multiuser_idor`, `prototype_pollution_probe`, `web_cache_deception_probe` |
+| **GraphQL** | `graphql_introspect`, `graphql_type_info`, `graphql_find_sensitive`, `graphql_fuzz`, `graphql_sweep`, `graphql_scope_probe` |
+| **Scans & agents** | `run_scan`, `scan_surface`, `dispatch_agents` |
+| **Findings & knowledge** | `get_findings`, `record_finding`, `record_app_knowledge`, `record_coverage`, `triage_report` |
+| **Code analysis** | `code_list`, `code_search`, `code_file`, `code_lookup_path` |
+| **Out-of-band (blind)** | `oob_generate`, `oob_poll` |
+| **Encoding** | `url_encode`, `url_decode`, `base64_encode`, `base64_decode`, `html_encode`, `html_decode` |
+| **Copilot** | `copilot_ask` |
+
+Every tool advertises its own JSON schema over MCP; run `dast-ai mcp` and your client
+lists them with full descriptions.
 
 ## Proxy > Settings
 

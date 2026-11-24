@@ -209,7 +209,6 @@ def iter_har_entries(raw: bytes):
     the ``entries`` array). Validates the 1.2 version in the head bytes. Raises
     ValueError for a non-HAR document; per-ENTRY problems surface via the
     incremental importer's counter, never as exceptions."""
-    decoder = json.JSONDecoder()
     head = raw[:_STREAM_HEAD].lstrip()
     if '"version"' not in head or '"entries"' not in head:
         raise ValueError("not a HAR document (missing log/version/entries)")
@@ -271,6 +270,7 @@ def import_har_incremental(raw: bytes, offset: int = 0, page: int = 500):
     entries_seen = 0
     done = False
     truncated = False
+    decoder = json.JSONDecoder()
     while not done:
         batch_payloads: List[Dict[str, Any]] = []
         batch_failed = 0

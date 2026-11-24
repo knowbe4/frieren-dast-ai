@@ -290,8 +290,6 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         streamed in batches of 500 entries (bounded memory), per-entry errors
         counted (never fatal), deterministic keys for de-dup, no match&replace
         applied. Imported rows carry source 'imported'."""
-        import json as _json
-
         try:
             offset = max(0, int(request.query_params.get("offset", "0")))
         except ValueError:

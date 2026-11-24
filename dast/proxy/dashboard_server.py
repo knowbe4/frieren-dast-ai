@@ -339,6 +339,8 @@ def build_app(
     app.include_router(repeater_router(ctx))
     app.include_router(intruder_router(ctx))
     app.include_router(status_router(ctx))
+    from dast.proxy.api.oauth_client_routes import make_router as _oauth_clients_router
+    app.include_router(_oauth_clients_router(ctx))
     app.include_router(code_router(ctx))
     app.include_router(intercept_router(ctx))
     app.include_router(graphql_router(ctx))

@@ -62,46 +62,37 @@ class _Ctx:
 
 
 @pytest.mark.asyncio
-async def test_activate_relogins_on_stale_guest(monkeypatch):
+async def test_activate_relogins_when_creds_and_browser(monkeypatch):
+    """With credentials + browser available, always do a fresh login."""
     import dast.tools.session_tools as st
 
-    # The handler imports load_profile from the store module locally — patch it there.
     import dast.profiles.store as store_mod
     monkeypatch.setattr(store_mod, "load_profile", lambda slug: _Profile())
 
-    # The reused session is guest.
-    async def _guest(browser, base_url, probe=None):
-        return False
     monkeypatch.setattr(st, "_login_profile_with_credentials",
                         _mk_async_return({"ok": True, "slug": "p", "logged_in": True,
                                           "_relogged": True}))
-    import dast.session.account_state as acct
-    monkeypatch.setattr(acct, "session_is_authenticated", _guest)
 
     ctx = _Ctx(_Store(), _Browser())
     result = await st._activate_login_profile(ctx, {"slug": "p"})
     assert result.get("_relogged") is True  # fell through to fresh credential login
-    assert ctx.browser.resynced is True
 
 
 @pytest.mark.asyncio
-async def test_activate_keeps_valid_session(monkeypatch):
+async def test_activate_always_relogins_with_creds_and_browser(monkeypatch):
+    """When credentials AND a browser are available, always do a fresh login —
+    saved sessions are usually stale and the probe can be fooled by SPAs."""
     import dast.tools.session_tools as st
     import dast.profiles.store as store_mod
     monkeypatch.setattr(store_mod, "load_profile", lambda slug: _Profile())
 
-    async def _real(browser, base_url):
-        return True
-    import dast.session.account_state as acct
-    monkeypatch.setattr(acct, "session_is_authenticated", _real)
-    # If it wrongly re-logs in, this sentinel would show up.
     monkeypatch.setattr(st, "_login_profile_with_credentials",
-                        _mk_async_return({"_relogged": True}))
+                        _mk_async_return({"ok": True, "slug": "p", "logged_in": True,
+                                          "_relogged": True}))
 
     ctx = _Ctx(_Store(), _Browser())
     result = await st._activate_login_profile(ctx, {"slug": "p"})
-    assert result.get("_relogged") is None  # kept the reused session
-    assert result.get("ok") is True
+    assert result.get("_relogged") is True  # always re-logs in with creds + browser
 
 
 @pytest.mark.asyncio
@@ -112,7 +103,7 @@ async def test_activate_cookie_only_profile_no_relogin(monkeypatch):
     monkeypatch.setattr(store_mod, "load_profile", lambda slug: _Profile(creds=False))
 
     called = {"probe": False}
-    async def _probe(browser, base_url):
+    async def _probe(browser, base_url, probe=None):
         called["probe"] = True
         return False
     import dast.session.account_state as acct

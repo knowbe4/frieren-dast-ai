@@ -541,6 +541,11 @@ Operational notes:
   guessing and avoids validation errors. Use graphql_find_sensitive to scan the schema
   for fields that may leak credentials or secrets (otpSecretKey, sharedSecret, etc.).
   Always introspect before testing a GraphQL target.
+- GraphQL access-control testing: after introspecting, use graphql_scope_probe to vary
+  enum arguments (especially permissionScope, scope, role, permissionLevel, or similar)
+  and detect if any value returns more records than the default. This catches fail-open
+  filter bypasses where the server skips authorization when the user has no grants for a
+  client-supplied scope. Works best with a medium-privilege test persona (not admin).
 - external retest objective ("retest H1 #XXXX"): (1) read the report with the
   triage tools to understand the vuln and endpoints; (2) you are already logged in
   (the proxy auto-authenticates) — verify with a quick request; (3) reproduce via

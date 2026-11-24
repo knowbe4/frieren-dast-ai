@@ -98,11 +98,12 @@ class XxeAgent(VulnAgent):
         logger.info("xxe: testing %s%s", target.url, " (CT forced to XML)" if _switched_ct else "")
 
         # Payload group names must match dast/payloads/xxe.yaml exactly.
-        # NOTE: the "ssrf_internal" group is intentionally not loaded here — its
-        # payloads reflect internal-service responses (cloud metadata, localhost)
-        # that need a dedicated signature matcher, not the file-read regex. Wiring
-        # XXE-driven SSRF detection is tracked as a separate follow-up.
+        # 4-A: the ssrf_internal group is now wired — payloads force the XML
+        # parser to fetch internal endpoints (cloud metadata, localhost) and the
+        # phase below detects the reflected metadata with a dedicated signature
+        # list (not the file-read regex).
         file_read_payloads = get_payloads("xxe", "basic_file_read") or []
+        ssrf_internal_payloads = get_payloads("xxe", "ssrf_internal") or []
         oob_dtd_payloads = get_payloads("xxe", "oob_dtd") or []
         parameter_payloads = get_payloads("xxe", "parameter_entity") or []
         cdata_payloads = get_payloads("xxe", "cdata_bypass") or []
@@ -118,6 +119,46 @@ class XxeAgent(VulnAgent):
             payload for payload in (oob_dtd_payloads + parameter_payloads + cdata_payloads)
             if "CALLBACK_URL" in str(payload)
         ]
+        ssrf_payloads = [str(p).strip() for p in ssrf_internal_payloads if str(p).strip()]
+
+        # Phase 0: XXE-driven SSRF (4-A) — internal metadata signatures. Only an
+        # echoed METADATA signature counts; a parser error alone is not evidence.
+        _SSRF_SIGS = (
+            "ami-id", "latest/meta-data", "computeMetadata", "Metadata-Flavor",
+            "iam/security-credentials", "X-Appengine", "instance/service-accounts",
+        )
+        for payload in ssrf_payloads[:6]:
+            resp = await _send(client, target.method, target.url, _headers, payload, payload=payload[:100])
+            if not resp:
+                continue
+            body = resp.text[:8000]
+            hit = next((sig for sig in _SSRF_SIGS if sig in body), None)
+            if not hit:
+                continue
+            raw_req, raw_resp = _fmt_http_pair(resp)
+            log_event("agent", "finding",
+                      f"XXE-driven SSRF confirmed on {target.url} (signature: {hit})",
+                      url=target.url, finding="XXE-SSRF internal metadata", source="agent")
+            findings.append(AgentFinding(
+                title="XXE-driven SSRF — Cloud Metadata / Internal Service Access",
+                severity="critical",
+                cwe="CWE-918",
+                attack_type="xxe",
+                evidence=(
+                    f"An XXE entity pointing at an internal endpoint ('{hit}' signature "
+                    f"in the response) proves the XML parser fetches attacker-controlled "
+                    f"URLs server-side.\n\nRequest:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                ),
+                confirmed=True,
+                payload=payload[:200],
+                parameter="",
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=raw_req,
+                raw_response=raw_resp[:2000],
+            ))
+            return findings
 
         # Phase 1: Inline file read (basic entities + inline parameter-entity variants)
         for payload in inline_payloads[:10]:

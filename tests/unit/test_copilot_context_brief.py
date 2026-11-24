@@ -187,3 +187,75 @@ async def test_send_injects_project_context_into_prompt():
     assert "project_context" in captured["user"]       # fenced as untrusted
     assert "api.example.com" in captured["user"]
     assert "shopping cart API" in captured["user"]
+
+
+# ── 5-A: the path in play scopes the intel block ─────────────────────────────
+def test_brief_scopes_intel_structural_errors_to_path_in_play():
+    """With paths=, the planner hint receives the real endpoint — its per-path
+    structural errors surface, and the brief names the endpoint in play."""
+    intelligence = SessionIntelligence()
+    intel = intelligence.get("api.example.com")
+    intel.record_scan_result("sqli", found=False, path="/api/login", operation="POST",
+                             structural_error="500: handler crashed")
+    store = _Store(intelligence=intelligence)
+
+    brief = build_context_brief(store, ["api.example.com"],
+                                paths={"api.example.com": "/api/login"})
+    assert "Endpoint in play: /api/login" in brief
+    assert "Structural error seen on /api/login [POST]" in brief
+
+    # Without the path, the same host's brief carries no per-path error section
+    # (the old `to_planner_hint("")` behaviour — nothing matches path "").
+    bare = build_context_brief(store, ["api.example.com"])
+    assert "Structural error seen on" not in bare
+    assert "Endpoint in play" not in bare
+
+
+@pytest.mark.asyncio
+async def test_send_derives_brief_paths_from_scratchpad():
+    """The turn's brief-build receives the most-recent scratchpad path per host,
+    so the intel block follows the endpoint the copilot is working."""
+    from dast.ai.copilot import session as session_mod
+    from unittest.mock import AsyncMock
+
+    intelligence = SessionIntelligence()
+    store = _Store(intelligence=intelligence)
+    tool_ctx = SimpleNamespace(store=store, approved_hosts=set())
+    tool_ctx.is_in_scope = lambda url: True
+    run_tool = AsyncMock(return_value={"ok": True, "status": 200,
+                                       "url": "https://api.example.com/api/orders"})
+    steps = [
+        # Turn 1: the request that puts the endpoint in the scratchpad.
+        {"action": "call_tool", "thought": "list orders", "tool_name": "send_request",
+         "tool_args": {"url": "https://api.example.com/api/orders", "method": "GET"}},
+        {"action": "reply", "thought": "done", "message": "listed."},
+        # Turn 2: its brief is built AFTER turn 1's scratchpad entry exists.
+        {"action": "reply", "thought": "next", "message": "continuing."},
+    ]
+    captured: dict = {}
+
+    def fake_brief(store_arg, hosts, *, max_hosts=3, paths=None):
+        captured["paths"] = dict(paths or {})
+        return ""
+
+    async def on_event(_payload: dict) -> None:
+        return None
+
+    async def wait_for_human(_kind: str, _payload: dict) -> dict:
+        return {}
+
+    session = session_mod.CopilotSession("s-paths")
+    with patch("dast.tools.all_tools", return_value=[
+            SimpleNamespace(name="send_request", description="send",
+                            tags=[], input_schema={})]), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step",
+               new=AsyncMock(side_effect=steps)), \
+         patch.object(session_mod, "build_context_brief", side_effect=fake_brief):
+        await session.send("list orders", tool_ctx,
+                           on_event=on_event, wait_for_human=wait_for_human)
+        assert captured["paths"] == {}  # nothing seen yet on turn 1's brief
+        await session.send("go deeper", tool_ctx,
+                           on_event=on_event, wait_for_human=wait_for_human)
+
+    assert captured["paths"] == {"api.example.com": "/api/orders"}

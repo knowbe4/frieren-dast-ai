@@ -1,21 +1,18 @@
 """
-Discovery agent — SSTI, open redirect, CRLF injection, HTTP method tampering.
-SSTI payloads loaded from ssti.yaml; LLM mutator generates WAF bypass variants.
-"""
+Discovery agent — CRLF injection and TRACE/TRACK method tampering.
+
+4-A de-dup: SSTI and open-redirect moved fully to their specialist agents
+(ssti_agent, open_redirect_agent), which have stronger payloads, engine
+fingerprinting and response-following. Discovery keeps only the checks no
+specialist covers."""
 
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from dast.agents import probe_common
 from dast.ai.agent_base import AgentFinding, VulnAgent
-from dast.ai.mutator import build_mutator_context, next_payload
-from dast.agents.block_detector import detect_block
-from dast.agents.payload_filter import get_filtered_payloads
-from dast.payloads.loader import get_detection_payloads
 from dast.scanners.active_checks import _fmt_http_pair, _inject_query, _send
-from dast.ai.canaries import OPEN_REDIRECT_CANARY_HOST, is_redirect_to_canary
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -25,27 +22,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-def _ssti_hit(payload: str, expected: str, response_text: str) -> bool:
-    """
-    True only when the expected value appears as a standalone evaluated result.
-
-    Two conditions must BOTH hold:
-      1. The raw payload is NOT present verbatim — if the server stored the expression
-         unchanged, it was never evaluated (storage ≠ template execution).
-      2. The expected product appears as an isolated integer — not as a substring
-         inside a UUID, larger number, or hex sequence.
-    """
-    if payload in response_text:
-        return False  # payload echoed back unchanged — not evaluated
-    # The expected value must be surrounded by non-digit, non-hex-letter, non-hyphen chars
-    # so "79032091" doesn't fire on "7903209100" or inside a UUID segment.
-    return bool(re.search(r'(?<![0-9a-fA-F\-])' + re.escape(expected) + r'(?![0-9a-fA-F\-])', response_text))
-
-
-_REDIRECT_URL_KEYWORDS = (
-    "url", "redirect", "next", "return", "goto", "dest", "destination",
-    "redir", "continue", "target",
-)
 _CRLF_PAYLOAD = "foo%0d%0aSet-Cookie:%20crlf=injected"
 _CRLF_MATCH = "crlf=injected"
 
@@ -53,7 +29,7 @@ _CRLF_MATCH = "crlf=injected"
 class DiscoveryAgent(VulnAgent):
     name = "Discovery Agent"
     attack_type = "discovery"
-    description = "Tests for SSTI, open redirect, CRLF injection, HTTP method tampering"
+    description = "Tests for CRLF injection and TRACE/TRACK method tampering"
 
     async def run(
         self,
@@ -62,152 +38,12 @@ class DiscoveryAgent(VulnAgent):
         collaborator: Optional["CollaboratorService"] = None,
     ) -> List[AgentFinding]:
         findings: List[AgentFinding] = []
-        findings.extend(await self._check_ssti(target, client))
-        findings.extend(await self._check_open_redirect(target, client))
+        # 4-A de-dup: the SSTI and open-redirect sub-sweeps are GONE — they
+        # duplicated ssti_agent / open_redirect_agent with strictly weaker
+        # payloads and detection. Discovery keeps the two checks no specialist
+        # covers: CRLF injection and TRACE/TRACK method tampering.
         findings.extend(await self._check_crlf(target, client))
         findings.extend(await self._check_http_methods(target, client))
-        return findings
-
-    async def _check_ssti(
-        self, target: "CheckTarget", client: "httpx.AsyncClient"
-    ) -> List[AgentFinding]:
-        ssti_payloads = get_filtered_payloads("ssti", target)
-        if not ssti_payloads:
-            # No evidence of server-side template rendering — skip SSTI entirely
-            return []
-        # detection_payloads are dicts with expected values; pass as seed, obfuscation as empty
-        detection_payloads = get_detection_payloads("ssti")
-        obfuscation_payloads: list = []
-
-        for param in target.params:
-            finding = await self._probe_ssti_param(
-                target, client, param, detection_payloads, obfuscation_payloads
-            )
-            if finding:
-                return [finding]
-        return []
-
-    async def _probe_ssti_param(
-        self,
-        target: "CheckTarget",
-        client: "httpx.AsyncClient",
-        param: dict,
-        seed_payloads: List[Dict[str, Any]],
-        obfuscation_payloads: List[Dict[str, Any]],
-    ) -> Optional[AgentFinding]:
-        all_seeds = seed_payloads + obfuscation_payloads
-        payloads_to_try = list(all_seeds)
-        tried: set = set()
-        mutation_iteration = 0
-        block_seen = False  # did an earlier probe on this param get blocked?
-        tech_context = build_mutator_context(target, "ssti")
-
-        for iteration, item in enumerate(payloads_to_try):
-            if isinstance(item, str):
-                payload = item
-                expected = None
-            else:
-                payload = item.get("payload", "")
-                expected = item.get("expected")
-
-            if not payload or payload in tried:
-                continue
-            tried.add(payload)
-
-            resp = await self._send_probe(target, client, param, payload)
-            if resp is None:
-                continue
-
-            hit = (
-                (expected is not None and _ssti_hit(payload, expected, resp.text))
-                or (expected is None and re.search(r"\b49\b|\buid=\d+\b", resp.text)
-                    and payload not in resp.text)
-            )
-            if hit:
-                if block_seen:
-                    self.observe("waf_bypass", payload=payload, signal="payload succeeded after prior block")
-                raw_request, raw_response = _fmt_http_pair(resp)
-                return AgentFinding(
-                    title="Server-Side Template Injection (SSTI)",
-                    severity="critical",
-                    cwe="CWE-94",
-                    attack_type="ssti",
-                    evidence=(
-                        f"Template expression {payload!r} evaluated"
-                        + (f" to {expected!r}" if expected else " — server-side execution confirmed")
-                        + f" in param '{param['name']}'"
-                    ),
-                    payload=payload,
-                    parameter=param["name"],
-                    url=target.url,
-                    request_method=target.method,
-                    raw_request=raw_request,
-                    raw_response=raw_response,
-                )
-
-            if iteration >= len(all_seeds) - 1:
-                verdict = detect_block(resp.status_code, resp.text)
-                if verdict.is_block:
-                    block_seen = True
-                    self.observe("waf_block", payload=payload, signal=verdict.signal)
-                mutation = await next_payload(
-                    attack_type="ssti",
-                    original_payload=payload,
-                    parameter=param["name"],
-                    response_status=resp.status_code,
-                    response_snippet=resp.text[:500],
-                    iteration=mutation_iteration,
-                    tried_payloads=list(tried),
-                    tech_context=tech_context,
-                )
-                mutation_iteration += 1
-                if mutation is None:
-                    break
-                logger.debug(
-                    "SSTI mutator", param=param["name"], action=mutation.action,
-                    rationale=mutation.rationale,
-                )
-                payloads_to_try.append({"payload": mutation.payload, "expected": "79032091"})
-
-        return None
-
-    async def _check_open_redirect(
-        self, target: "CheckTarget", client: "httpx.AsyncClient"
-    ) -> List[AgentFinding]:
-        findings = []
-        redirect_payloads = [
-            f"https://{OPEN_REDIRECT_CANARY_HOST}",
-            f"//{OPEN_REDIRECT_CANARY_HOST}",
-            f"/\\{OPEN_REDIRECT_CANARY_HOST}",
-        ]
-        for param in target.params:
-            if not any(kw in param["name"].lower() for kw in _REDIRECT_URL_KEYWORDS):
-                continue
-            for payload in redirect_payloads:
-                if param["location"] != "query":
-                    continue
-                url = _inject_query(target.url, param["name"], payload)
-                resp = await _send(client, target.method, url, target.headers, target.body)
-                if resp and resp.status_code in (301, 302, 303, 307, 308):
-                    loc = resp.headers.get("location", "")
-                    # Parse the destination host — a substring match fired on
-                    # same-site redirects like /login?next=https://canary.
-                    if is_redirect_to_canary(loc):
-                        raw_request, raw_response = _fmt_http_pair(resp)
-                        findings.append(AgentFinding(
-                            title="Open Redirect",
-                            severity="medium",
-                            cwe="CWE-601",
-                            attack_type="open_redirect",
-                            evidence=f"Server redirected to {loc!r}",
-                            payload=payload,
-                            parameter=param["name"],
-                            url=target.url,
-                            request_method=target.method,
-                            raw_request=raw_request,
-                            raw_response=raw_response,
-                        ))
-                        break
         return findings
 
     async def _check_crlf(

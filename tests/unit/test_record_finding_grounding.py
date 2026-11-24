@@ -145,3 +145,34 @@ def test_send_request_returns_entry_id():
     assert result["ok"] is True
     assert result.get("entry_id")
     assert store.get_entry(result["entry_id"]) is not None
+
+
+# ── 5-A write-back: confirmed findings mirror into session_intelligence ──────
+
+def test_record_finding_mirrors_confirmed_vuln_into_intel():
+    """A recorded finding with an attack_type lands in session_intelligence as a
+    confirmed vuln — the coordinator's planner hint/router learns what the
+    copilot PROVED, the same ground truth the deterministic agents feed."""
+    store = SessionStore()
+    assert store.session_intelligence.peek("shop.example.net") is None
+    result = asyncio.run(record_finding_tools._record_finding(_ctx(store), {
+        "title": "IDOR on user object", "severity": "high",
+        "url": "https://shop.example.net/api/users/42", "evidence": "foreign object returned",
+        "attack_type": "idor", "parameter": "user_id",
+    }))
+    assert result["ok"] is True
+    intel = store.session_intelligence.peek("shop.example.net")
+    assert intel is not None
+    assert "idor" in intel.effective_attack_types
+    assert intel.confirmed_vulns.get(("/api/users/42", "user_id")) == ["idor"]
+
+
+def test_record_finding_without_attack_type_skips_intel_mirror():
+    """No attack_type → nothing to classify → no intel entry created."""
+    store = SessionStore()
+    result = asyncio.run(record_finding_tools._record_finding(_ctx(store), {
+        "title": "Business logic flaw", "severity": "medium",
+        "url": "https://shop.example.net/checkout", "evidence": "consent bypassed",
+    }))
+    assert result["ok"] is True
+    assert store.session_intelligence.peek("shop.example.net") is None

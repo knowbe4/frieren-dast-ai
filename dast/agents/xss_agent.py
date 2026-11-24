@@ -272,6 +272,20 @@ class XssAgent(VulnAgent):
                 # A compact view of the reflected region, so the evidence
                 # string itself carries proof the payload rendered unencoded.
                 reflected_context = " ".join(snippet.split())[:200]
+
+                # 4-B: fragment second chance — DOM sinks often read
+                # location.hash, and the fragment never reaches the server
+                # (same delivery the copilot xss_probe tool uses). Only tried
+                # when the query-reflection did not execute in the browser.
+                if not browser_confirmed:
+                    base_no_query = target.url.split("?")[0]
+                    fragment_url = f"{base_no_query}#{param['name']}={confirm_payload}"
+                    frag_confirmed, frag_reason = await _browser_confirm(
+                        fragment_url, self._proxy_port, cookie_header)
+                    if frag_confirmed:
+                        browser_confirmed = True
+                        browser_reason = "confirmed via #fragment delivery (DOM sink reads location.hash)"
+
                 if browser_confirmed:
                     evidence = (
                         f"Payload reflected unencoded and JS executed in browser "

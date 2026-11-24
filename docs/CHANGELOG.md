@@ -5,6 +5,172 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (copilot intelligence round 5-A)
+- **Progress scratchpad** (5-A-1) — the per-turn transcript died at every
+  finalize, so the copilot re-derived endpoints from scratch each turn. One
+  compact line per tool step (`METHOD /path -> status/err`, ring cap 120) is
+  now rendered into the step prompt as a *progress ledger* (last 25 lines /
+  4k chars, fenced untrusted) so the model builds on earlier turns instead of
+  repeating navigations. Forced endings also salvage navigation: the
+  un-persisted scratchpad tail is written as an `app_knowledge` note on the
+  focus host (sole approved host fallback; idempotent via a persisted index)
+  — the next run's context brief starts where this one stopped.
+- **Intel write-back** (5-A-2) — a copilot-confirmed finding lived only in the
+  Findings tab; the coordinator's planner hint kept recommending attack types
+  the copilot had already PROVEN. `record_finding` now mirrors confirmed
+  verdicts into `session_intelligence` (`record_scan_complete` found=True +
+  confirmed_param) — the same ground truth the deterministic agents feed.
+  The context brief also passes the endpoint in play (most recent scratchpad
+  path per host) to `to_planner_hint`, so per-path structural errors finally
+  surface, prefixed with `Endpoint in play:`.
+- **Router/leads/coverage in the interactive prompt** (5-A-3) — the
+  `{leads}`/`{router}`/`{coverage}` blocks existed only in the autonomous
+  driver's templates. Extracted into `dast/ai/copilot/prompt_blocks.py` as
+  pure `(store, hosts)` builders — app-context leads, evidence-router
+  recommended-next/avoid, and coverage-ledger outcomes with the
+  unexamined-is-not-clean invariant — and the interactive turn now renders
+  them (fail-open, fenced `coordinator_guidance`). The driver delegates to
+  the same builders, keeping its nudge-on-empty shape.
+- **diff_responses + honest observations** (5-A-4) — the system prompt asked
+  the model to "compare the two bodies" while it saw two truncated 900-char
+  previews with no headers. New `diff_responses` tool: two proxy-history
+  entry ids in, the deterministic delta out (status change, key headers,
+  body lengths, line-level added/removed with true counts + capped samples,
+  explicit identical verdict). `_summarize_result` now surfaces the key
+  response headers and the real `set_cookies` count ahead of the body, and
+  small bodies (≤4k chars) get a 2000-char window instead of the flat 900
+  cut that halved a 1.5k JSON response.
+
+### Fixed (HAR import recovery)
+- `import_har_incremental` referenced an undefined `decoder` (the
+  volume-reset recovery restored the streaming generator without its
+  decoder instantiation — NameError on the first decoded entry). Also
+  dropped the unused `import json as _json` in the import route.
+
+### Added (vault + streaming round 4-G)
+- **OAuth client-credentials vault** — `dast/profiles/oauth_clients.py`:
+  per-IDP-host `client_id`/`client_secret` pairs under
+  `~/.dast-ai/oauth_clients/` (0700 dir, 0600 files), secret Fernet-encrypted
+  at rest with the login-profile key material (`DAST_PROFILES_KEY`);
+  plaintext never leaves the module except for the agent's token-exchange
+  request, and every read API masks it (`client_secret_set`). Dashboard API:
+  `GET/PUT/DELETE /api/oauth-clients` (masked) + credential presence check.
+  `oauth_agent`'s code single-use check (`CWE-294`) now redeems the captured
+  code with vault credentials — valid for CONFIDENTIAL clients (previously
+  only public flows could be verified); token endpoint discovered via
+  `/.well-known/openid-configuration` with same-origin fallbacks (4-E).
+- **HAR import paginado** — `import_har_incremental(raw, offset, page)`:
+  streaming generator with bounded memory (no whole-document `json.loads`),
+  `?offset` on the import route for files ≥2k entries, 256 MiB body cap,
+  per-batch `har_key` idempotency, cumulative `total_entries` and explicit
+  `done`/`truncated` flags; 10k-entry hard cap never truncates silently.
+  JS importer loops pages automatically.
+
+### Added (telemetry + pagination round 4-F)
+- **Context telemetry** — `req_bytes` (system+user payload size) and cache
+  tokens (`cache_read`/`cache_creation`/`cached_tokens`, both Anthropic and
+  OpenAI shapes) recorded per LLM entry in `llm_recorder`; `usage_snapshot()`
+  adds averages, `context_summary()` gives p50/p90 prompt sizes by purpose;
+  `GET /api/ai/context` exposes the breakdown for tuning prompt budgets.
+- **HTTP/2 agent hardening** (with 4-D's `h2` dependency) — hand-crafted
+  h2 framing (the `h2` client library refuses to send the RFC-violating
+  DATA frame the CL/DATA desync probe needs): preface + SETTINGS + HEADERS
+  (`content-length: 0`) + DATA carrying a smuggled `GET` via `hpack`;
+  detection by plaintext HTTP/1.x responses on one connection.
+
+### Added (agents heavy + flows round 4-D/4-E)
+- **http2_agent** (`http2`, CWE-444) — ALPN `h2` detection (informational)
+  plus the CL/DATA desync probe: HEADERS declaring `content-length: 0`
+  followed by a DATA frame with an embedded request; a backend that answers
+  the smuggled request in plaintext HTTP/1.x = critical, confirmed. Read
+  counts only — no Rapid-Reset floods (DoS, out of scope by policy).
+- **cswsh/deserialization/bfla recovery** — content lost in the volume-reset
+  incident restored (raw WS handshake with attacker Origin, URLDNS
+  DNS-only deserialization probe, GET/HEAD-only BFLA surface probe).
+- **oauth_agent code single-use** (4-E) — authorize → capture the same-host
+  code → redeem it TWICE at the token endpoint; both exchanges returning an
+  `access_token` proves codes are not single-use (CWE-294, confirmed; the
+  code is the session's own, redemption is issuance not state change).
+
+### Added (flows & HAR import round 4-C)
+- **mfa_agent TOTP plumbing** — the OTP reuse check now resolves the target
+  host's login profile at agent-run time (`profiles.store.resolve_for_host`):
+  when the profile is a flagged TEST account with a TOTP seed, a FRESH code is
+  submitted, accepted, and submitted AGAIN unchanged — both succeeding proves
+  the code is not invalidated after first use (CWE-294, confirmed against a
+  provably-valid code rather than the stale captured-value fallback, which
+  stays for unseeded profiles).
+- **oauth_agent** (`oauth`) — authorize-flow checks from ARTEX api-security
+  P2, GET-only, nothing redeemed: **redirect_uri takeover CONFIRMED** (swap to
+  an attacker origin; 3xx with the attacker Location = CWE-601 high; rejected
+  swap = no finding), plus mechanism findings for missing `state`
+  (authorization CSRF), missing PKCE on code flows, and implicit token flow.
+  Dispatch: contextual on authorize-shaped requests.
+- **HAR 1.2 import** — `dast/proxy/har_import.py` + `POST
+  /api/history/import/har` + ⇧ HAR button: 1.2-only (400), ≤2000 entries /
+  ≤32 MiB body (400/413), per-entry problems counted and never fatal (≤50
+  details), cookies arrays synthesize Cookie/Set-Cookie wire headers,
+  postData.params rebuilds urlencoded bodies, base64 content decoded, URL
+  userinfo redacted, deterministic `har-<sha256>` de-dup keys; imported rows
+  are plain history entries (source `imported`) — match&replace never applies
+  to them (ARTEX invariant). Round-trips with the 3-I exporter.
+
+### Added (agents heavy round 4-B)
+- **cswsh_agent** (`cswsh`, CWE-346) — the generic Cross-Site WebSocket
+  Hijacking check nobody performed: a RAW `Upgrade: websocket` handshake with
+  an attacker Origin over a direct socket (the smuggling transport idiom —
+  httpx cannot speak WS and the MITM re-frames upgrades). A 101 with a valid
+  `Sec-WebSocket-Accept` for OUR key proves no Origin validation: HIGH +
+  confirmed when session cookies ride along, informational otherwise.
+  `websocket_observer` now tags 101 entries with
+  `focus_attack_types=['cswsh']` so the autonomous pipeline dispatches it.
+- **deserialization_agent** (`deserialization`, CWE-502) — closes the total
+  gap SAFELY: never re-sends captured bodies (a captured object could
+  re-execute a gadget) and never sends executable gadgets. Reflection probe
+  (malformed Java header → deser exception = unconfirmed sink) plus URLDNS
+  OOB CONFIRMATION with an OPERATOR-PROVIDED fixture
+  (`dast/payloads/urldns.bin`, ysoserial-generated with the documented
+  placeholder): the agent splices the Collaborator URL into every TC_STRING
+  occurrence (patching length prefixes) and confirms on
+  `collaborator.was_hit`. URLDNS is DNS-only.
+- **bfla_agent** (`bfla`, CWE-862) — Broken Function-Level Authorization with
+  GET/HEAD ONLY (never a state-changing method): admin-looking surfaces
+  replayed with non-admin named sessions, and API version downgrade
+  (/v2 forbidden while /v1 serves, same credentials).
+- **Improvements**: jwt_agent gained the RS256→HS256 key-confusion variants
+  (same-host jwks as the HMAC secret; silent skip when unreachable);
+  mfa_agent implemented the docstring-promised OTP REUSE check (the captured
+  OTP accepted on TWO consecutive re-submissions = CWE-294); xss_agent gained
+  a fragment second chance (DOM sinks reading location.hash — confirmed in
+  the agent's own browser pass); ssrf.yaml sink keywords += import/avatar/
+  feed/attachment/document. Registry: 31 → **34 agents**.
+
+### Added (agents expansion round 4-A)
+- **Five new agents** (registry 26 → 31), techniques from ARTEX api-security:
+  **cors_agent** (one crafted-Origin probe: reflected attacker origin with
+  `Access-Control-Allow-Credentials: true` = critical CWE-942; same-site
+  origins never count), **hpp_agent** (duplicated security-relevant parameters
+  with an escalated CANARY value — confirmed only by reflection, CWE-436),
+  **rate_limit_trust_agent** (XFF/X-Real-IP reflection = trust-boundary
+  CWE-345; path-normalization variants answering differently = CWE-436 — the
+  mechanism, never a bypass demonstrated under load), **graphql_abuse_agent**
+  (introspection escalation full→reduced→minimal, field-suggestion schema
+  disclosure, 60-alias overload, batch acceptance, GraphQL-over-GET, bounded
+  depth probing — the half the IDOR agent explicitly excludes), and
+  **cache_deception_agent** (the copilot WCD three-step probe promoted:
+  authenticated path-mapping → cacheable signal → anonymous re-read, confirmed
+  iff victim markers survive, CWE-525, secrets redacted).
+- **Silent coverage bugs fixed**: nosql_agent requested the NONEXISTENT yaml
+  group `where_injection` and degraded to 3 hardcoded strings (now the real
+  `mongodb_js_injection` group); prototype_pollution_agent ignored its own
+  40+-payload yaml (5 hardcoded — now adopted, plus a NEW header vector);
+  xxe_agent refused to load the ready-made `ssrf_internal` group (now wired —
+  cloud-metadata signatures → XXE-driven SSRF, CWE-918, critical);
+  llm_injection was the only registered agent with no dispatch rule (now
+  marker-gated); discovery_agent's SSTI/open-redirect sub-sweeps duplicated
+  the specialist agents with weaker payloads (removed — it keeps CRLF +
+  TRACE/TRACK; 298 → 138 lines).
+
 ### Added (LLM recorder round 3-F)
 - **LLM-call recorder** (`dast/ai/llm_recorder.py`) — every LLM attempt (failover
   candidates, repair retries, cache hits, model-resolution failures) is persisted

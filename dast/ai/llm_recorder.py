@@ -56,6 +56,7 @@ _totals: Dict[str, Any] = {
     "calls": 0, "ok": 0, "cache_hit": 0, "safety_block": 0, "throttled": 0,
     "provider_error": 0, "unavailable": 0, "caller_error": 0,
     "input_tokens": 0, "output_tokens": 0, "latency_ms_total": 0.0,
+    "cache_tokens": 0, "req_bytes_total": 0,
 }
 _by_purpose: Dict[str, int] = {}
 _by_model: Dict[str, int] = {}
@@ -91,32 +92,41 @@ def _take_safety_block() -> str:
 
 
 def _normalize_usage(usage: Optional[Dict[str, Any]]) -> tuple:
-    """(input_tokens, output_tokens) from either usage shape — Anthropic
-    (input_tokens/output_tokens) or OpenAI/GLM (prompt_tokens/completion_tokens)."""
+    """(input_tokens, output_tokens, cache_tokens) from either usage shape —
+    Anthropic (input_tokens/output_tokens [+ cache_read/_creation]) or
+    OpenAI/GLM (prompt_tokens/completion_tokens [+ cached_tokens])."""
     usage = usage or {}
     if not isinstance(usage, dict):
-        return 0, 0
+        return 0, 0, 0
     inp = usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0
     out = usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0
+    details = usage.get("prompt_tokens_details") or {}
+    cache = (usage.get("cache_read_input_tokens", 0) or 0) \
+        + (usage.get("cache_creation_input_tokens", 0) or 0) \
+        + (details.get("cached_tokens", 0) if isinstance(details, dict) else 0)
     try:
-        return int(inp), int(out)
+        return int(inp), int(out), int(cache)
     except (TypeError, ValueError):
-        return 0, 0
+        return 0, 0, 0
 
 
 def record_call(*, purpose: str = "", provider: str = "", model: str = "",
                 usage: Optional[Dict[str, Any]] = None, latency_ms: float = 0.0,
                 outcome: str = "ok", error_excerpt: str = "",
                 cache_hit: bool = False, req_excerpt: str = "",
-                resp_excerpt: str = "") -> Optional[Dict[str, Any]]:
+                resp_excerpt: str = "", req_bytes: int = 0) -> Optional[Dict[str, Any]]:
     """Record one LLM attempt. Never raises; failures to persist only log."""
-    inp, out = _normalize_usage(None if cache_hit else usage)
+    inp, out, cache = _normalize_usage(None if cache_hit else usage)
     try:
         latency = float(latency_ms or 0.0)
     except (TypeError, ValueError):
         latency = 0.0
     if not math.isfinite(latency) or latency < 0:
         latency = 0.0  # NaN/inf/negative would poison the totals and the average
+    try:
+        req_b = max(0, int(req_bytes or 0))
+    except (TypeError, ValueError):
+        req_b = 0
     entry: Dict[str, Any] = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "purpose": (purpose or "other")[:40],
@@ -125,8 +135,10 @@ def record_call(*, purpose: str = "", provider: str = "", model: str = "",
         "outcome": outcome,
         "input_tokens": inp,
         "output_tokens": out,
+        "cache_tokens": cache,
         "latency_ms": round(latency, 1),
         "cache_hit": bool(cache_hit),
+        "req_bytes": req_b,
         "error_excerpt": (error_excerpt or "")[:_ERROR_EXCERPT_CAP],
         "req_excerpt": (req_excerpt or "")[:_EXCERPT_CAP],
         "resp_excerpt": (resp_excerpt or "")[:_EXCERPT_CAP],
@@ -137,6 +149,8 @@ def record_call(*, purpose: str = "", provider: str = "", model: str = "",
         _totals[outcome] = _totals.get(outcome, 0) + 1
         _totals["input_tokens"] += inp
         _totals["output_tokens"] += out
+        _totals["cache_tokens"] += cache
+        _totals["req_bytes_total"] += req_b
         _totals["latency_ms_total"] += entry["latency_ms"]
         _by_purpose[entry["purpose"]] = _by_purpose.get(entry["purpose"], 0) + 1
         model_key = entry["model"] or "unknown"
@@ -158,6 +172,8 @@ def usage_snapshot() -> Dict[str, Any]:
         totals["latency_ms_avg"] = (round(_totals["latency_ms_total"] / calls, 1)
                                     if calls else 0.0)
         totals.pop("latency_ms_total", None)
+        totals["req_bytes_avg"] = (round(_totals["req_bytes_total"] / calls, 1)
+                                   if calls else 0.0)
         snapshot = {
             "totals": totals,
             "by_purpose": dict(_by_purpose),
@@ -172,6 +188,38 @@ def usage_snapshot() -> Dict[str, Any]:
     return snapshot
 
 
+def context_summary(min_calls: int = 1) -> Dict[str, Any]:
+    """Per-purpose prompt-size telemetry (4-F follow-up to ARTEX's context
+    telemetry): for each purpose with >= ``min_calls`` recorded, the request
+    byte sizes over the ring with p50/p90 (sorted-index percentiles) — what a
+    cost/safeguard investigation needs to see per call type. Never raises."""
+    with _lock:
+        entries = list(_ring)
+    by_purpose: Dict[str, List[int]] = {}
+    for e in entries:
+        by_purpose.setdefault(e["purpose"], []).append(int(e.get("req_bytes", 0) or 0))
+
+    def _pct(sorted_vals: List[int], pct: float) -> int:
+        if not sorted_vals:
+            return 0
+        idx = min(len(sorted_vals) - 1, max(0, int(round((len(sorted_vals) - 1) * pct))))
+        return sorted_vals[idx]
+
+    purposes: Dict[str, Any] = {}
+    for purpose, sizes in sorted(by_purpose.items()):
+        if len(sizes) < min_calls:
+            continue
+        ordered = sorted(sizes)
+        purposes[purpose] = {
+            "calls": len(ordered),
+            "prompt_bytes_total": sum(ordered),
+            "prompt_bytes_avg": round(sum(ordered) / len(ordered), 1),
+            "prompt_bytes_p50": _pct(ordered, 0.50),
+            "prompt_bytes_p90": _pct(ordered, 0.90),
+        }
+    return {"purposes": purposes, "ring_size": len(entries)}
+
+
 def clear() -> None:
     """Reset the in-memory ring + counters (the JSONL file is kept — it is the
     durable record). Used by POST /api/ai/usage/clear and by tests."""
@@ -182,6 +230,8 @@ def clear() -> None:
             _totals[key] = 0
         _totals["input_tokens"] = 0
         _totals["output_tokens"] = 0
+        _totals["cache_tokens"] = 0
+        _totals["req_bytes_total"] = 0
         _totals["latency_ms_total"] = 0.0
         _by_purpose.clear()
         _by_model.clear()

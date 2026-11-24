@@ -397,6 +397,11 @@ _CONTEXTUAL_TYPES = frozenset({
 
 # Which attack types are relevant for each param classification.
 # Only listed types will be attempted on a param of that class.
+# 4-B bfla dispatch helpers: admin-looking surfaces + versioned API paths
+_AUTHZ_PATH_RE_OAUTH = _re.compile(r"/(authorize|oauth2?/|openid|auth)(?:[/?]|$)", _re.IGNORECASE)
+_ADMIN_PATH_RE_BFLA = _re.compile(r"/(?:admin|manage|console|backoffice|internal)(?:/|$)", _re.IGNORECASE)
+_VERSION_RE_BFLA = _re.compile(r"^(.*?)/v(\d+)(/.*|$)", _re.IGNORECASE)
+
 _PARAM_ATTACK_MAP: Dict[str, List[str]] = {
     "numeric_id": ["sqli", "idor", "business_logic"],
     "uuid":       ["idor", "business_logic"],
@@ -750,6 +755,23 @@ def _select_attack_types_for_params(
     if has_jwt_target(target):
         candidate_types.add("jwt")
 
+    # OAuth/OIDC authorization flows (4-C): authorize-shaped requests go to the
+    # flow agent (state/PKCE/redirect_uri/implicit); it self-gates further.
+    if _AUTHZ_PATH_RE_OAUTH.search(target.url) or "response_type=" in target.url \
+            or ("client_id=" in target.url and "redirect_uri=" in target.url):
+        candidate_types.add("oauth")
+
+    # LLM-endpoint markers (4-A): llm_injection was the only registered agent
+    # with NO deterministic dispatch rule — it only ever ran via the evidence
+    # router's focus list. Coarse markers in the URL/body make it dispatchable
+    # without that path; the agent's own probes stay the source of truth.
+    _llm_haystack = f"{target.url} {(target.body or '')[:400]}".lower()
+    if any(_m in _llm_haystack for _m in (
+        "/chat/completions", "/completions", "/v1/messages",
+        "chatmessages", "chat/messages", "openai", "anthropic", "llm/",
+    )):
+        candidate_types.add("llm_injection")
+
     # XML surfaces are XXE candidates (XML content-type or XML-shaped body). The
     # canary pass already carries an xxe payload — it was dead code until this rule
     # existed, because nothing ever added "xxe" to the candidates (the agent
@@ -767,12 +789,22 @@ def _select_attack_types_for_params(
     # body_graphql-located ID-shaped params and bails otherwise.
     if is_graphql or any(p.get("location") == "body_graphql" for p in (target.params or [])):
         candidate_types.add("graphql_idor")
+        # graphql_abuse (4-A): introspection/alias/batching/GET-depth probes own
+        # exactly the half the IDOR agent excludes.
+        candidate_types.add("graphql_abuse")
 
     # Cross-session IDOR needs TWO named sessions to replay between — the agent
     # hard-gates on the same prerequisite; adding it when the prerequisite exists
     # lights up the cross-tenant coverage dimension deterministically.
     if len(getattr(target, "named_sessions", None) or []) >= 2:
         candidate_types.add("cross_session_idor")
+        # bfla (4-B): admin-looking surfaces replayed with the other session —
+        # GET/HEAD only (the agent hard-gates; state-changing methods never sent).
+        if _ADMIN_PATH_RE_BFLA.search(target.url):
+            candidate_types.add("bfla")
+    # bfla version-downgrade half: /vN/ URLs answer with the SAME credentials
+    if _VERSION_RE_BFLA.match(target.url):
+        candidate_types.add("bfla")
 
     # GET endpoints are candidates for cache poisoning — an unkeyed request
     # header reflected into a cacheable response. Header-based, no param canary;
@@ -791,8 +823,41 @@ def _select_attack_types_for_params(
     # Always include secrets scanning — passive, low noise
     candidate_types.add("sensitive_data")
 
+    # CORS validation (4-A) — one crafted-Origin probe per endpoint; the agent
+    # returns after the first probe unless an attacker origin is reflected.
+    candidate_types.add("cors")
+
+    # Rate-limit trust confusion (4-A) — 2 XFF probes + path variants, low noise.
+    candidate_types.add("rate_limit_trust")
+
+    # Deserialization sink (4-B): state-changing requests with serialized-shape
+    # signals (magic bytes, content types, param names). The agent self-gates
+    # further and never re-sends captured bodies.
+    if (target.method or "").upper() in ("POST", "PUT", "PATCH"):
+        _body_head = (target.body or b"")[:4]
+        _ct_lower = (target.headers or {}).get("content-type", "").lower()
+        if (_body_head == b"\xac\xed\x00\x05"
+                or "serial" in _ct_lower or "octet-stream" in _ct_lower
+                or any(_p.get("name") and _re.search(
+                    r"data|state|viewstate|payload|serial|session|blob|object",
+                    _p["name"], _re.IGNORECASE)
+                    for _p in (target.params or []))):
+            candidate_types.add("deserialization")
+
+    # HPP (4-A) — only when a security-relevant parameter name is present
+    # (role/admin/priv/level/debug…); the agent self-gates further.
+    import re as _hpp_re
+    if any(_hpp_re.search(r"role|admin|priv|is_|level|debug|user_type|access",
+                          p.get("name", "")) for p in (target.params or [])):
+        candidate_types.add("hpp")
+
     # Auth bypass for any authenticated endpoint
     auth_headers = {k.lower() for k in (target.headers or {})}
+
+    # Cache deception (4-A): GET + authenticated — the agent self-gates on the
+    # authed-vs-anonymous marker diff, so a coarse rule is safe.
+    if auth_headers & {"cookie", "authorization"}:
+        candidate_types.add("cache_deception")
     if "authorization" in auth_headers or "cookie" in auth_headers:
         candidate_types.add("auth_bypass")
 

@@ -1,0 +1,38 @@
+# GraphQL abuse payloads (4-A) — techniques from ARTEX api-security P1/P4.
+# All probes are read-only (__typename/__schema based) except where an original
+# query field is nested — no mutation is ever sent via these payloads.
+
+payloads:
+  introspection_full:
+    - '{"query":"query IntrospectionQuery { __schema { queryType { name } mutationType { name } types { kind name fields { name } } } }"}'
+
+  introspection_reduced:
+    - '{"query":"query { __schema { queryType { name } types { kind name } } }"}'
+
+  introspection_minimal:
+    - '{"query":"query { __schema { types { name } } }"}'
+
+# Invalid field — GraphQL servers with suggestions enabled answer
+# 'Did you mean "known_field"?' which discloses the schema even with
+# introspection disabled.
+  field_suggestion:
+    - '{"query":"query { __typename nonexistentfieldzzz }"}'
+
+# Alias overload: N aliases of a zero-cost field in ONE request —
+# response carrying all N aliases proves the batch/alias execution is on.
+  alias_overload:
+    - '{"query":"query { __typename }"}'
+
+# Batching: array-of-operations body. Two operations in, two answers out.
+  batching:
+    - '[{"query":"query { __typename }"},{"query":"query { __typename }"}]'
+
+# GET-style probe: query delivered via the query string (?query=...) —
+# GraphQL-over-GET is the CSRF surface for state-changing operations.
+  get_query:
+    - "query { __typename }"
+
+# Deep nesting uses the ORIGINAL query's root field; template is filled by the
+# agent (root_field + depth), kept here to document the shape.
+  deep_nesting_template:
+    - "query { {root_field} {depth_nesting} }"

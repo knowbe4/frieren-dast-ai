@@ -30,7 +30,7 @@ _MAX_BRIEF_HOSTS = 3
 _MAX_BRIEF_CHARS = 28000
 
 
-def _host_block(store: Any, host: str) -> str:
+def _host_block(store: Any, host: str, path: str = "") -> str:
     """One host's brief, or "" if the store has nothing to say. Never raises —
     a lookup failure on one host must not break the copilot turn."""
     try:
@@ -46,8 +46,13 @@ def _host_block(store: Any, host: str) -> str:
         intelligence = getattr(store, "session_intelligence", None)
         intel = intelligence.peek(host) if intelligence is not None else None
         if intel is not None:
-            hint = intel.to_planner_hint("", [])
+            # The real path in play (5-A): with it, the intel's per-path
+            # structural errors — the "this endpoint answered X last time"
+            # signal — actually surface; with "" they never matched.
+            hint = intel.to_planner_hint(path, [])
             if hint:
+                if path:
+                    hint = f"Endpoint in play: {path}\n" + hint
                 parts.append(hint)
 
         if not parts:
@@ -178,12 +183,16 @@ def build_context_brief(
     hosts: Sequence[str],
     *,
     max_hosts: int = _MAX_BRIEF_HOSTS,
+    paths: Any = None,
 ) -> str:
     """Assemble a compact, per-host project-context brief for the copilot turn.
 
     ``hosts`` is de-duplicated and lowercased, preserving order, and capped at
-    ``max_hosts``. Returns "" when there is no store, no hosts, or nothing the
-    scanner has learned about them. Never raises.
+    ``max_hosts``. ``paths`` optionally maps host → the endpoint path the
+    copilot is currently working (most recent first), which scopes the intel's
+    per-path structural errors to the endpoint in play. Returns "" when there
+    is no store, no hosts, or nothing the scanner has learned about them.
+    Never raises.
     """
     if store is None or not hosts:
         return ""
@@ -206,7 +215,11 @@ def build_context_brief(
         if len(ordered) >= max_hosts:
             break
 
-    host_blocks = [block for block in (_host_block(store, host) for host in ordered) if block]
+    host_blocks = [
+        block for block in
+        (_host_block(store, host, (paths or {}).get(host, "")) for host in ordered)
+        if block
+    ]
     blocks.extend(host_blocks)
 
     # Locally-learned per-host app knowledge (auth model, token locations, entitlements).

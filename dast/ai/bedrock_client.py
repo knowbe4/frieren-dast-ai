@@ -1023,6 +1023,7 @@ def _invoke_raw(
     from dast.ai import llm_recorder
     _started_ms = time.monotonic()
     _req_excerpt = f"{system}\n·\n{user}"
+    _req_bytes = len(_req_excerpt.encode("utf-8", errors="replace"))
 
     def _record(provider_name: str, result: Optional[Dict[str, Any]],
                 outcome: str, error_excerpt: str = "") -> None:
@@ -1032,7 +1033,8 @@ def _invoke_raw(
             latency_ms=(time.monotonic() - _started_ms) * 1000.0,
             outcome=outcome, error_excerpt=error_excerpt,
             req_excerpt=_req_excerpt,
-            resp_excerpt=_extract_text_safe(result) if result else "")
+            resp_excerpt=_extract_text_safe(result) if result else "",
+            req_bytes=_req_bytes)
 
     try:
         model = _resolve_model(model_id)

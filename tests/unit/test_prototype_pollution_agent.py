@@ -58,13 +58,11 @@ async def test_marker_reflected_via_query_string():
 @pytest.mark.asyncio
 async def test_persistent_pollution_detected_on_clean_get():
     target = _target()
-    # Call sequence: 1=baseline, 2-4=the three query-string probes, 5=the
-    # clean re-fetch (no query string at all) that checks for persistence.
-    calls = {"n": 0}
-
+    # Shape-based dispatch: probes carry the payload in the query string; the
+    # persistence re-fetch is the bare URL with NO query string (4-A: the qs
+    # probe count comes from the yaml group, so counting calls is brittle).
     async def fake_send(client, method, url, headers, body, payload=None):
-        calls["n"] += 1
-        if calls["n"] == 5:
+        if method == "GET" and "?" not in url and "&" not in url:
             return _resp(200, json.dumps({"polluted": _MARKER}))
         return _resp(200, json.dumps({"theme": "dark"}))
 

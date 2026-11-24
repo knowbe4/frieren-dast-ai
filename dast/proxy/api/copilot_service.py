@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 from dast.ai.prompt_safety import wrap_untrusted
 from dast.session.account_state import AuthProbeConfig
 from dast.tools.context import AgentToolContext
+from dast.ai.copilot import prompt_blocks
 from dast.utils.logger import get_logger
 from dast.utils.tasks import spawn_tracked
 
@@ -1852,50 +1853,19 @@ class CopilotService:
     def _leads_label(self, hosts: List[str]) -> str:
         """Compact, prioritised app-context leads for the focus hosts, injected into the
         autonomous turn prompt so the copilot chases concrete hypotheses ITSELF instead of
-        escalating to a human. Reuses AppProfile.to_coordinator_hint() (already
-        prompt-injection sanitised). Empty-safe: returns a nudge when nothing is profiled yet."""
+        escalating to a human. Pure builder in prompt_blocks (shared with the interactive
+        session); this wrapper keeps the autonomous template's nudge when nothing is
+        profiled yet."""
         nudge = ("Leads: none from app-context analysis yet — map the surface "
                  "(crawl, graphql_introspect, get_history) to surface concrete hypotheses.")
-        store = self._ctx.store
-        if store is None:
-            return nudge
-        try:
-            profiles = store.discovery_engine.all_app_profiles()
-        except Exception as exc:  # noqa: BLE001 — leads are best-effort, never crash the run
-            logger.debug("autonomous leads unavailable", error=str(exc))
-            return nudge
-        focus_names = {h.split(":")[0] for h in (hosts or [])}
-        blocks: List[str] = []
-        for host, profile in profiles.items():
-            if focus_names and host.split(":")[0] not in focus_names:
-                continue
-            hint = profile.to_coordinator_hint()
-            if hint:
-                blocks.append(f"[{host}]\n{hint}")
-        if not blocks:
-            return nudge
-        return "App-context leads — chase and TEST these first:\n" + "\n\n".join(blocks[:3])
+        return prompt_blocks.leads_block(self._ctx.store, hosts) or nudge
 
     def _router_block(self, hosts: List[str]) -> str:
         """Evidence-driven 'recommended next actions / AVOID' block for the turn prompt.
-        Deterministic routing from observed signals (id -> sqli/idor, AI endpoint ->
-        llm_injection, MySQL -> avoid MSSQL, GraphQL -> sweep) that shrinks as things get
-        tested. Best-effort; empty string when there is nothing to recommend yet."""
-        store = self._ctx.store
-        if store is None:
-            return ""
-        try:
-            from dast.ai.evidence_router import RouterEvidence, route
-            parts: List[str] = []
-            for host in (hosts or []):
-                plan = route(RouterEvidence.from_store(store, host.split(":")[0]))
-                block = plan.to_prompt_block()
-                if block:
-                    parts.append(block)
-            return ("\n\n".join(parts) + "\n\n") if parts else ""
-        except Exception as exc:  # noqa: BLE001 — routing is advisory, never crash the run
-            logger.debug("router block unavailable", error=str(exc))
-            return ""
+        Pure builder in prompt_blocks (shared with the interactive session); the
+        autonomous templates expect a trailing blank line after this block."""
+        block = prompt_blocks.router_block(self._ctx.store, hosts)
+        return (block + "\n\n") if block else ""
 
     def _without_deferred_identity(self, hosts: set) -> set:
         """Drop identity-provider hosts while the run defers them, so auto-targeting

@@ -1191,3 +1191,35 @@ function exportHistoryHar() {
   // Plain navigation — the route answers with Content-Disposition attachment.
   window.location.href = '/api/history/export/har';
 }
+
+
+// ── HAR import (4-C) ──────────────────────────────────────────────────────────
+async function importHistoryHarFile(input) {
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    // Paged import (4-C): files >2000 entries import in repeated calls using
+    // the next_offset the route reports (capped at 50 pages defensively).
+    let imported = 0, failed = 0, page = 0, offset = 0, last = null;
+    while (page < 50) {
+      const r = await fetch('/api/history/import/har?offset=' + offset, {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: text,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { showToast(`HAR import failed: ${d.error || r.status}`, true); return; }
+      imported += d.imported || 0;
+      failed += d.failed || 0;
+      last = d;
+      if (d.next_offset == null) break;
+      offset = d.next_offset;
+      page += 1;
+    }
+    showToast(`HAR imported: ${imported} entries (${failed} failed)`);
+    if (typeof loadAllEntries === 'function') await loadAllEntries();
+  } catch (e) {
+    showToast('HAR import failed', true);
+  } finally {
+    input.value = '';
+  }
+}

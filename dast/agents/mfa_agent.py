@@ -95,6 +95,27 @@ def _status_changed_to_success(baseline_status: int, probe_status: int) -> bool:
     return False
 
 
+def _fresh_totp_for_host(host_or_url: str):
+    """Fresh TOTP code from the operator's TEST-ACCOUNT profile for this host.
+
+    4-C plumbing: the seed lives in the login profiles and was unreachable from
+    CheckTarget — resolve it at agent-run time. HARD gate honored: only
+    profiles flagged test_account (dast.profiles.totp.may_use_totp)."""
+    try:
+        from dast.profiles.store import resolve_for_host
+        from dast.profiles import totp as _totp
+        profile = resolve_for_host(host_or_url)
+        if profile is None or not getattr(profile, "test_account", False):
+            return None
+        for cred in (profile.credentials or []):
+            if cred.totp_secret and _totp.is_valid_secret(cred.totp_secret) \
+                    and _totp.may_use_totp(profile.test_account, cred.username):
+                return _totp.current_code(cred.totp_secret)
+    except Exception as exc:
+        logger.debug("mfa: fresh TOTP lookup failed", error=str(exc))
+    return None
+
+
 class MFABypassAgent(VulnAgent):
     name = "MFA Bypass Agent"
     attack_type = "mfa_bypass"
@@ -131,7 +152,16 @@ class MFABypassAgent(VulnAgent):
         if findings:
             return findings  # no point continuing if rate limit is missing
 
-        # ── Check 2: OTP parameter removal ────────────────────────────────
+        # ── Check 2: OTP reuse (4-B — promised in the docstring) ───────────
+        # The captured body's OTP was already submitted once through the proxy;
+        # two consecutive re-submissions BOTH succeeding means the code is not
+        # single-use (CWE-294). The rate-limit check has already run, so a
+        # lockout cannot mask the verdict.
+        findings += await self._check_otp_reuse(target, client, otp_param, baseline)
+        if findings:
+            return findings
+
+        # ── Check 2b: OTP parameter removal ────────────────────────────────
         findings += await self._check_param_removal(target, client, otp_param, baseline)
 
         # ── Check 3: Backup code brute-force (only if no rate limit found) ─
@@ -195,6 +225,92 @@ class MFABypassAgent(VulnAgent):
             probe_request=f"POST {target.url} with {otp_param}={_INVALID_OTPS[-1]}",
             probe_response=last_resp_text,
             confirmed=False,
+        )]
+
+    async def _check_otp_reuse(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        otp_param: str,
+        baseline: "httpx.Response",
+    ) -> List[AgentFinding]:
+        """Single-use verification for the OTP on this endpoint.
+
+        4-C: when the operator's TEST profile carries a TOTP seed for this
+        host, a FRESH code is used — submit it once (must succeed, else the
+        window is off and we degrade silently), then submit the SAME code
+        again (a single-use implementation must reject). Both succeeding =
+        reuse CONFIRMED. Without a seed, fall back to the captured-value path:
+        the captured OTP was already submitted once through the proxy, so two
+        consecutive unchanged re-submissions succeeding is the same signal."""
+        fresh = _fresh_totp_for_host(target.url)
+        if fresh and otp_param:
+            body_a = _replace_otp(target.body, otp_param, fresh)
+            r_a = await _send(client, target.method, target.url, target.headers, body_a)
+            r_b = await _send(client, target.method, target.url, target.headers, body_a)
+            if r_a is None or r_b is None:
+                return []
+            if (r_a.status_code in _AUTH_SUCCESS_CODES
+                    and r_b.status_code in _AUTH_SUCCESS_CODES):
+                raw_req, raw_resp = _fmt_http_pair(r_b)
+                log_event("agent", "finding",
+                          f"MFA OTP reuse confirmed with a FRESH test-account code on {target.url}",
+                          url=target.url, finding="OTP reuse (fresh TOTP)", source="agent")
+                return [AgentFinding(
+                    title="MFA OTP Reuse — Fresh Test-Account Code Accepted Twice",
+                    severity="medium",
+                    cwe="CWE-294",
+                    attack_type="mfa_bypass",
+                    evidence=(
+                        "A FRESH TOTP code (test account, generated this second) was "
+                        "submitted, accepted, and then submitted AGAIN unchanged — "
+                        "both attempts succeeded, proving the implementation does "
+                        "not invalidate a code after first use (CWE-294)."
+                        f"\n\nRequest:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+                    ),
+                    confirmed=True,
+                    payload=f"{otp_param}={fresh} (twice)",
+                    parameter=otp_param,
+                    url=target.url,
+                    request_method=target.method,
+                    bypass_validation=True,
+                    raw_request=raw_req,
+                    raw_response=raw_resp[:2000],
+                )]
+            return []  # fresh-path inconclusive — the captured fallback adds noise
+
+        first = await _send(client, target.method, target.url, target.headers, target.body)
+        second = await _send(client, target.method, target.url, target.headers, target.body)
+        if first is None or second is None:
+            return []
+        if first.status_code not in _AUTH_SUCCESS_CODES \
+                or second.status_code not in _AUTH_SUCCESS_CODES:
+            return []
+        raw_req, raw_resp = _fmt_http_pair(second)
+        log_event("agent", "finding",
+                  f"MFA OTP reuse: a submitted code was accepted twice on {target.url}",
+                  url=target.url, finding="OTP reuse", source="agent")
+        return [AgentFinding(
+            title="MFA OTP Reuse — Code Accepted on Consecutive Submissions",
+            severity="medium",
+            cwe="CWE-294",
+            attack_type="mfa_bypass",
+            evidence=(
+                "The OTP value carried by the captured request was submitted "
+                "TWICE in a row and BOTH submissions succeeded "
+                f"({first.status_code}, {second.status_code}) — the code is not "
+                "single-use, so an attacker who captures one OTP can replay it "
+                "within the validity window.\n\n"
+                f"Request:\n{raw_req}\n\nResponse:\n{raw_resp[:2000]}"
+            ),
+            confirmed=True,
+            payload=str(target.body)[:200],
+            parameter=otp_param,
+            url=target.url,
+            request_method=target.method,
+            bypass_validation=True,
+            raw_request=raw_req,
+            raw_response=raw_resp[:2000],
         )]
 
     async def _check_param_removal(

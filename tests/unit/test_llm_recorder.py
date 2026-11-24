@@ -322,3 +322,61 @@ def test_invoke_json_repair_carries_purpose(monkeypatch):
     assert len(entries) == 2
     assert all(e["purpose"] == "verdict" for e in entries)
     assert all(e["outcome"] == "ok" for e in entries)
+
+
+# ── 4-F context telemetry ────────────────────────────────────────────────────
+
+def test_req_bytes_recorded_and_averaged():
+    llm_recorder.record_call(purpose="a", req_bytes=100)
+    llm_recorder.record_call(purpose="a", req_bytes=300)
+    snap = _snap()
+    assert snap["totals"]["req_bytes_total"] == 400
+    assert snap["totals"]["req_bytes_avg"] == 200.0
+    assert snap["recent"][-1]["req_bytes"] == 300
+
+
+def test_cache_tokens_normalized_both_shapes():
+    llm_recorder.record_call(purpose="a", usage={
+        "input_tokens": 10, "cache_read_input_tokens": 40,
+        "cache_creation_input_tokens": 5})
+    llm_recorder.record_call(purpose="a", usage={
+        "prompt_tokens": 7, "prompt_tokens_details": {"cached_tokens": 3}})
+    assert _snap()["totals"]["cache_tokens"] == 48  # 45 + 3
+
+
+def test_context_summary_percentiles():
+    for size in (100, 200, 300, 400):
+        llm_recorder.record_call(purpose="planner", req_bytes=size)
+    summary = llm_recorder.context_summary()
+    p = summary["purposes"]["planner"]
+    assert p["calls"] == 4
+    assert p["prompt_bytes_total"] == 1000
+    assert p["prompt_bytes_avg"] == 250.0
+    assert p["prompt_bytes_p50"] in (200, 300)   # even count — index rounding
+    assert p["prompt_bytes_p90"] == 400
+    assert summary["purposes"].get("other-purpose") is None
+
+
+def test_context_summary_min_calls_gates(monkeypatch):
+    llm_recorder.record_call(purpose="solo", req_bytes=50)
+    assert llm_recorder.context_summary(min_calls=2)["purposes"] == {}
+    assert llm_recorder.context_summary(min_calls=1)["purposes"]["solo"]["calls"] == 1
+
+
+def test_context_route_round_trip():
+    from types import SimpleNamespace
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from dast.proxy.api.status_routes import make_router
+
+    ctx = SimpleNamespace(scan_queue_state=None, mcp_last_heartbeat=[0.0])
+    app = FastAPI()
+    app.include_router(make_router(ctx))
+    client = TestClient(app)
+
+    llm_recorder.record_call(purpose="validator", req_bytes=1200)
+    body = client.get("/api/ai/context").json()
+    assert body["purposes"]["validator"]["prompt_bytes_p90"] == 1200
+    assert body["ring_size"] == 1

@@ -837,7 +837,10 @@ class CopilotService:
         # execute concurrently without clobbering each other's page or auth. Created
         # lazily, recreated if closed/crashed, and closed when the session is cleaned up.
         browser = session.get("_agent_browser")
-        if browser is None or getattr(browser, "_browser", None) is None:
+        if browser is not None and getattr(browser, "_browser", None) is None:
+            spawn_tracked(browser.close(), name="close-orphaned-browser")
+            browser = None
+        if browser is None:
             try:
                 from dast.browser.agent_browser import AgentBrowser
                 browser = AgentBrowser(

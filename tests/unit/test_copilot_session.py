@@ -1391,3 +1391,120 @@ def test_summarize_result_passes_full_value_result_through():
     token = "J" * 1500
     out = _summarize_result({"ok": True, "values": [token], "full_value": True})
     assert token in out
+
+
+# --- 5-A-1: progress scratchpad (cross-turn memory) --------------------------
+
+
+def test_note_step_extracts_method_path_and_status():
+    """The scratchpad line is a compact `METHOD /path -> status` record."""
+    session = CopilotSession("s-scratch")
+    session._note_step("send_request", {"url": "https://h.test/api/x", "method": "post"},
+                       {"status": 403})
+    session._note_step("send_request", {"url": "https://h.test/api/y"},
+                       {"error": "timeout"})
+    session._note_step("get_history", {}, {"ok": True})
+    lines = [e["line"] for e in session._scratchpad]
+    assert lines[0] == "POST /api/x -> 403"
+    assert lines[1] == "GET /api/y -> err (timeout)"
+    assert lines[2] == "GET / -> ok"
+
+
+def test_scratchpad_caps_entries_and_prompt_block():
+    """The store caps at _SCRATCHPAD_MAX_ENTRIES; the prompt render caps at
+    _SCRATCHPAD_PROMPT_ENTRIES lines / _SCRATCHPAD_PROMPT_CHARS."""
+    from dast.ai.copilot.session import (
+        _SCRATCHPAD_MAX_ENTRIES,
+        _SCRATCHPAD_PROMPT_CHARS,
+        _SCRATCHPAD_PROMPT_ENTRIES,
+    )
+
+    session = CopilotSession("s-cap")
+    for i in range(_SCRATCHPAD_MAX_ENTRIES + 30):
+        session._note_step("send_request", {"url": f"https://h.test/p{i}"}, {"status": 200})
+    assert len(session._scratchpad) == _SCRATCHPAD_MAX_ENTRIES
+    assert session._scratchpad[0]["line"].endswith("/p30 -> 200")  # oldest trimmed
+
+    block = session._render_scratchpad()
+    assert len(block) <= _SCRATCHPAD_PROMPT_CHARS
+    assert block.count("\n") + 1 == _SCRATCHPAD_PROMPT_ENTRIES
+    assert "/p149 -> 200" in block  # the most recent step is in view
+
+
+@pytest.mark.asyncio
+async def test_progress_ledger_reaches_the_step_prompt():
+    """After a tool call, the NEXT step decision carries the progress-ledger
+    section — the cross-turn memory the per-turn transcript lacks."""
+    session = CopilotSession("s-ledger")
+    _, on_event = _collector()
+    run_tool = AsyncMock(return_value={"ok": True, "status": 403,
+                                       "url": "https://in.scope/admin"})
+    prompts: List[str] = []
+    steps = [
+        {"action": "call_tool", "thought": "probe admin", "tool_name": "send_request",
+         "tool_args": {"url": "https://in.scope/admin", "method": "GET"}},
+        {"action": "reply", "thought": "done", "message": "403 on /admin."},
+    ]
+
+    async def fake_step(system, user, model_override=None):
+        prompts.append(user)
+        return steps.pop(0)
+
+    with patch("dast.tools.all_tools", return_value=_TOOLS), \
+         patch("dast.tools.run_tool", new=run_tool), \
+         patch("dast.ai.copilot.session._llm_step", new=AsyncMock(side_effect=fake_step)):
+        await session.send("check admin", _FakeCtx(in_scope=True),
+                           on_event=on_event, wait_for_human=_deny_human())
+
+    assert "Progress ledger" in prompts[-1]
+    assert "GET /admin -> 403" in prompts[-1]
+    # The turn BEFORE any tool call has no ledger section at all.
+    assert "Progress ledger" not in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_wrapup_persists_scratchpad_note_once():
+    """A forced ending writes the scratchpad tail into app_knowledge for the
+    focus host; a second pass must NOT re-write the same entries."""
+    session = CopilotSession("s-salvage", focus_hosts=["target.test"])
+    session._note_step("send_request", {"url": "https://target.test/a"}, {"status": 403})
+    session._note_step("send_request", {"url": "https://target.test/b"},
+                       {"status": 200})
+    ctx = _FakeCtx(in_scope=True)
+    notes: List[tuple] = []
+
+    def fake_append(host, note):
+        notes.append((host, note))
+        return host
+
+    with patch("dast.app_knowledge.store.append_note", side_effect=fake_append):
+        session._persist_scratchpad_knowledge(ctx)
+        session._persist_scratchpad_knowledge(ctx)  # idempotent on the same tail
+
+    assert len(notes) == 1
+    host, note = notes[0]
+    assert host == "target.test"
+    assert "copilot navigation (2 steps)" in note
+    assert "GET /a -> 403" in note and "GET /b -> 200" in note
+
+
+@pytest.mark.asyncio
+async def test_wrapup_salvage_falls_back_to_sole_approved_host():
+    """No focus hosts → the single approved host receives the note; several
+    approved hosts → nothing is written (ambiguous)."""
+    session = CopilotSession("s-salvage2")
+    session._note_step("send_request", {"url": "https://x.test/p"}, {"status": 200})
+    notes: List[str] = []
+
+    def fake_append(host, note):
+        notes.append(host)
+        return host
+
+    with patch("dast.app_knowledge.store.append_note", side_effect=fake_append):
+        session._persist_scratchpad_knowledge(_FakeCtx(in_scope=True))
+        assert notes == []  # empty approved set → nothing written
+
+        ctx = _FakeCtx(in_scope=True)
+        ctx.approved_hosts = {"x.test"}
+        session._persist_scratchpad_knowledge(ctx)
+        assert notes == ["x.test"]

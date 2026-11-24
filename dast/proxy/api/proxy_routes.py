@@ -294,6 +294,11 @@ def make_router(ctx: DashboardContext) -> APIRouter:
 
         from dast.proxy.har_import import import_har
 
+        try:
+            offset = max(0, int(request.query_params.get("offset", "0")))
+        except ValueError:
+            offset = 0
+
         raw = await request.body()
         if len(raw) > 32 * 1024 * 1024:
             return JSONResponse({"error": "HAR file too large (32 MiB cap)"}, status_code=413)
@@ -302,7 +307,7 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         except ValueError:
             return JSONResponse({"error": "invalid JSON"}, status_code=400)
         try:
-            payloads, stats = import_har(doc)
+            payloads, stats = import_har(doc, offset=offset)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 

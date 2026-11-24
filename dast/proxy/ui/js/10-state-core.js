@@ -1199,12 +1199,23 @@ async function importHistoryHarFile(input) {
   if (!file) return;
   try {
     const text = await file.text();
-    const r = await fetch('/api/history/import/har', {
-      method: 'POST', headers: {'content-type': 'application/json'}, body: text,
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) { showToast(`HAR import failed: ${d.error || r.status}`, true); return; }
-    showToast(`HAR imported: ${d.imported} entries (${d.failed} failed)`);
+    // Paged import (4-C): files >2000 entries import in repeated calls using
+    // the next_offset the route reports (capped at 50 pages defensively).
+    let imported = 0, failed = 0, page = 0, offset = 0, last = null;
+    while (page < 50) {
+      const r = await fetch('/api/history/import/har?offset=' + offset, {
+        method: 'POST', headers: {'content-type': 'application/json'}, body: text,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { showToast(`HAR import failed: ${d.error || r.status}`, true); return; }
+      imported += d.imported || 0;
+      failed += d.failed || 0;
+      last = d;
+      if (d.next_offset == null) break;
+      offset = d.next_offset;
+      page += 1;
+    }
+    showToast(`HAR imported: ${imported} entries (${failed} failed)`);
     if (typeof loadAllEntries === 'function') await loadAllEntries();
   } catch (e) {
     showToast('HAR import failed', true);

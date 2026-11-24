@@ -86,8 +86,11 @@ def urlencode_pairs(params: List[Dict[str, Any]]) -> str:
 
 
 
-def import_har(doc: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def import_har(doc: Any, offset: int = 0) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Parse a HAR document → (entry payloads, stats).
+    ``offset`` pages through files larger than the per-call cap: each call
+    processes entries[offset:offset+_MAX_ENTRIES] and the stats carry
+    ``total_entries``/``next_offset`` so the caller loops until done.
 
     Each payload is a dict ready for ``SessionStore.new_entry`` +
     ``complete_entry``: {har_key, method, url, request_headers, request_body,
@@ -106,11 +109,19 @@ def import_har(doc: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     raw_entries = log.get("entries")
     if not isinstance(raw_entries, list):
         raise ValueError("log.entries missing")
-    if len(raw_entries) > _MAX_ENTRIES:
-        raise ValueError(f"too many entries: {len(raw_entries)} > {_MAX_ENTRIES}")
+    total = len(raw_entries)
+    try:
+        offset = max(0, int(offset))
+    except (TypeError, ValueError):
+        offset = 0
+    page = raw_entries[offset:offset + _MAX_ENTRIES]
+    next_offset = offset + _MAX_ENTRIES if total > offset + _MAX_ENTRIES else None
+    stats["total_entries"] = total
+    stats["next_offset"] = next_offset
 
     payloads: List[Dict[str, Any]] = []
-    for i, entry in enumerate(raw_entries):
+    for i, entry in enumerate(page):
+        abs_i = offset + i  # absolute entry index for error reporting
         try:
             req = entry["request"]
             resp = entry.get("response") or {}
@@ -166,7 +177,7 @@ def import_har(doc: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         except Exception as exc:
             stats["failed"] += 1
             if len(stats["errors"]) < _MAX_ERROR_DETAILS:
-                stats["errors"].append(f"entry[{i}]: {str(exc)[:160]}")
+                stats["errors"].append(f"entry[{abs_i}]: {str(exc)[:160]}")
     return payloads, stats
 
 

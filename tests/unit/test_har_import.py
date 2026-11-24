@@ -60,9 +60,19 @@ def test_non_har_and_bad_version_raise():
         import_har({"nope": True})
 
 
-def test_entry_cap_is_an_error():
-    with pytest.raises(ValueError):
-        import_har(_har([_entry(f"https://a.com/{i}") for i in range(2001)]))
+def test_large_file_paginates_instead_of_erroring():
+    # 4-C: >2000 entries no longer 400s — the first call imports the first
+    # page and reports next_offset for the follow-up call.
+    entries = [_entry(f"https://a.com/{i}") for i in range(2500)]
+    doc = _har(entries)
+    payloads, stats = import_har(doc)
+    assert len(payloads) == 2000
+    assert stats["next_offset"] == 2000
+    payloads2, stats2 = import_har(doc, offset=stats["next_offset"])
+    assert len(payloads2) == 500
+    assert stats2["next_offset"] is None
+    # no overlap between pages
+    assert {p["har_key"] for p in payloads}.isdisjoint({p["har_key"] for p in payloads2})
 
 
 def test_per_entry_errors_never_abort():
@@ -168,3 +178,30 @@ class TestHarImportRoute:
         with TestClient(app, base_url="http://127.0.0.1") as c:
             resp = c.post("/api/history/import/har", content=b"{oops")
         assert resp.status_code == 400
+
+
+def test_route_offset_paginates_imports():
+    """?offset skips the first N entries of the doc — the >=2k file imports in
+    repeated calls (the 2500-entry page math is covered by the pure test)."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from dast.proxy.dashboard_server import build_app
+    from dast.proxy.session_store import SessionStore
+
+    doc = _har([_entry(f"https://a.com/{i}") for i in range(30)])
+    store = SessionStore()
+    app = build_app(store=store, scan_queue=asyncio.Queue())
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        r1 = c.post("/api/history/import/har?offset=20",
+                    content=json.dumps(doc), headers={"content-type": "application/json"})
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1["imported"] == 10
+        assert d1["next_offset"] is None
+        assert d1["total_entries"] == 30
+
+        entries = store.all_entries()
+        assert len(entries) == 10
+        assert len({e.import_key for e in entries if e.import_key}) == 10

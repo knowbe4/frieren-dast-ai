@@ -62,6 +62,31 @@ class MissionTodoList:
                  prerequisites=["chains"])
         return todo
 
+    @classmethod
+    def from_dict(cls, items: List[dict]) -> "MissionTodoList":
+        """Rebuild a todolist from ``to_dict()`` output (session resume 6-A-1).
+        Preserves ids, statuses, prerequisites, details and ordering; the
+        revision counter restarts at the item count (history is not durable)."""
+        todo = cls()
+        for raw in items or []:
+            if not isinstance(raw, dict):
+                continue
+            item_id = str(raw.get("id", "")).strip()
+            if not item_id:
+                continue
+            todo.add(
+                item_id,
+                str(raw.get("title", item_id)),
+                detail=str(raw.get("detail", "")),
+                prerequisites=[str(p) for p in (raw.get("prerequisites") or [])],
+            )
+            status = str(raw.get("status", "pending"))
+            if status in _STATUSES:
+                item = todo._items[item_id]
+                item.status = status  # direct set — mark() would gate on prereqs
+        todo.revision = len(todo._items)
+        return todo
+
     # ── mutations ────────────────────────────────────────────────────────
     def add(self, id: str, title: str, detail: str = "",
             prerequisites: Optional[List[str]] = None) -> TodoItem:

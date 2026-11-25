@@ -749,7 +749,7 @@ def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
 _TOOL_PHASES: Dict[str, set] = {
     "recon": {"crawl", "explore", "content_discovery", "param_mining", "get_history",
               "browser_navigate", "browser_snapshot", "browser_extract", "code_search",
-              "code_file", "code_list", "code_lookup_path"},
+              "code_file", "code_list", "code_lookup_path", "import_scan_output"},
     "auth": {"browser_login", "browser_login_adaptive", "activate_login_profile",
              "list_login_profiles", "list_login_sessions", "save_login_session",
              "prime_session", "get_bearer_token", "get_app_token", "token_inventory",

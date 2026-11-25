@@ -75,7 +75,7 @@ def _script_llm(monkeypatch, steps):
     """invoke_json double returning the scripted steps in order."""
     calls = {"n": 0}
 
-    async def fake_invoke_json(**kwargs):
+    def fake_invoke_json(**kwargs):
         index = calls["n"]
         calls["n"] += 1
         if index < len(steps):

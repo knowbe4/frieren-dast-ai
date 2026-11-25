@@ -82,6 +82,15 @@ def _isolate_activation_recipe(tmp_path, monkeypatch):
     monkeypatch.setattr(activation_recipe, "_DIR", tmp_path / "activation_recipe")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_copilot_snapshots(tmp_path, monkeypatch):
+    """Redirect copilot session snapshots to a per-test tmp dir (6-A-1) so tests
+    never read/write the developer's real ~/.dast-ai/copilot_sessions — the
+    CopilotService now restores snapshots in its constructor."""
+    from dast.proxy.api import copilot_persist  # noqa: PLC0415
+    monkeypatch.setattr(copilot_persist, "_DIR", tmp_path / "copilot_sessions")
+
+
 # Generic PLACEHOLDER sub-app map for the whole unit suite — never real target topology.
 # Two prefixed apps (alpha/beta) + one prefix-less app (gamma) exercise prefix resolution and
 # the app->jwt-field map. 'beta' also declares a 'prime' descriptor so session-prime tests have a

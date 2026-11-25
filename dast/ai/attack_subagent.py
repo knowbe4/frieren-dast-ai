@@ -25,6 +25,7 @@ are skipped by ``is_escalatable``.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Dict, List, Optional, Set
 
@@ -50,7 +51,7 @@ ESCALATABLE_ATTACK_TYPES: Set[str] = {
     "open_redirect", "cors", "host_header", "prototype_pollution", "graphql_idor",
     "graphql_abuse", "cache_poisoning", "cache_deception", "mfa_bypass",
     "password_reset", "business_logic", "race_condition", "llm_injection",
-    "request_smuggling", "http2", "cswsh", "deserialization", "hpp",
+    "request_smuggling", "http2", "cswsh", "deserialization",
 }
 
 # The restricted menu: escalation primitives + recording + coverage. The
@@ -233,11 +234,13 @@ class AttackSubagent:
             ) or "(no tool calls yet)"
             step_user = f"{user}\n\nProgress so far:\n{history}"
             try:
-                step = await bedrock_client.invoke_json(
-                    system=_SYSTEM, user=step_user, model_id=self._model_id,
-                    max_tokens=1500, temperature=0, cache_system=True,
-                    schema=_ATTACK_STEP_SCHEMA, purpose="attack_subagent_step",
-                )
+                loop = asyncio.get_running_loop()
+                step = await loop.run_in_executor(
+                    None, lambda: bedrock_client.invoke_json(
+                        system=_SYSTEM, user=step_user, model_id=self._model_id,
+                        max_tokens=1500, temperature=0, cache_system=True,
+                        schema=_ATTACK_STEP_SCHEMA, purpose="attack_subagent_step",
+                    ))
             except Exception as exc:
                 logger.warning("attack subagent step failed", error=str(exc))
                 consecutive_failures += 1

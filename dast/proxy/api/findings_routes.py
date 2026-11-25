@@ -354,6 +354,129 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         store._notify(entry)
         return {"ok": True}
 
+    def _retest_ts() -> str:
+        import time as _t
+        return _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime())
+
+    @router.post("/api/findings/{entry_id}/{finding_index}/retest")
+    async def retest_finding(entry_id: str, finding_index: int):
+        """ARTEX retester (5-B-5): replay the finding's proof request against the
+        live target and record a verdict on the finding (``retest_state``) —
+        Still-reproducible / Fixed / Cannot-confirm. The original evidence is
+        never modified; only the retest verdict is added."""
+        import time as _time
+
+        import httpx
+
+        entry = store.get_entry(entry_id)
+        if not entry:
+            return JSONResponse({"error": "entry not found"}, status_code=404)
+        findings = entry.findings or []
+        if finding_index < 0 or finding_index >= len(findings):
+            return JSONResponse({"error": "finding not found"}, status_code=404)
+        finding = findings[finding_index]
+
+        # Which request IS the proof? An explicit evidence entry id wins (the
+        # probe the pipeline captured), else the attached entry itself.
+        evidence_ids = finding.get("evidence_entry_ids") or []
+        probe_entry = None
+        for eid in evidence_ids:
+            candidate = store.get_entry(eid)
+            if candidate is not None:
+                probe_entry = candidate
+                break
+        if probe_entry is None:
+            probe_entry = entry
+        probe_url = probe_entry.url
+        if not probe_url:
+            return JSONResponse({"error": "finding has no replayable request"},
+                                status_code=400)
+
+        from dast.proxy.api.http_utils import strip_recomputed_headers
+
+        runner = getattr(ctx, "runner", None)
+        proxy_port = getattr(runner, "_proxy_port", None) if runner is not None else None
+        proxy_url = f"http://127.0.0.1:{proxy_port}" if proxy_port else None
+        started = _time.monotonic()
+        replay_error = ""
+        resp = None
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url, verify=False, follow_redirects=False, timeout=30.0,
+            ) as client:
+                resp = await client.request(
+                    probe_entry.method or "GET", probe_url,
+                    headers=strip_recomputed_headers(dict(probe_entry.request_headers or {})),
+                    content=probe_entry.request_body or None,
+                )
+        except httpx.HTTPError as exc:
+            replay_error = str(exc)[:160]
+            logger.warning("retest replay failed", entry_id=entry_id,
+                           finding_index=finding_index, error=replay_error)
+
+        if resp is None:
+            findings[finding_index]["retest_state"] = {
+                "verdict": "cannot_confirm",
+                "at": _retest_ts(),
+                "reason": f"replay failed: {replay_error}",
+            }
+            store._notify(entry)
+            return {"ok": True, "verdict": "cannot_confirm"}
+
+        body = resp.text or ""
+        payload = str(finding.get("payload", "") or "")
+        original_status = probe_entry.response_status
+        original_len = len(probe_entry.response_body or b"")
+        payload_present = bool(payload) and payload[:120] in body
+        if resp.status_code in (401, 403, 404, 410) and not payload_present:
+            verdict = "fixed"
+        elif payload_present:
+            verdict = "still_reproducible"
+        elif original_status and resp.status_code == original_status \
+                and abs(len(body) - original_len) <= max(64, int(0.15 * original_len)):
+            verdict = "still_reproducible"  # structurally identical response
+        else:
+            verdict = "cannot_confirm"
+
+        duration_ms = (_time.monotonic() - started) * 1000.0
+        findings[finding_index]["retest_state"] = {
+            "verdict": verdict,
+            "at": _retest_ts(),
+            "replayed_entry_id": probe_entry.id,
+            "status": resp.status_code,
+            "duration_ms": round(duration_ms, 1),
+        }
+        store._notify(entry)
+        logger.info("finding retested", entry_id=entry_id,
+                    finding_index=finding_index, verdict=verdict,
+                    status=resp.status_code)
+        return {"ok": True, "verdict": verdict, "status": resp.status_code,
+                "replayed_entry_id": probe_entry.id}
+
+    @router.get("/api/report/pentest.md")
+    async def export_pentest_report():
+        """The deliverable pentest report (5-B-5): executive summary + one block
+        per finding with PoC curl, POE level and retest verdict."""
+        from dast.report.pentest_report import build_pentest_report
+        from dast.tools.findings_tools import flatten_findings
+
+        entry_dicts = [e.to_dict() for e in store.in_scope_entries()]
+        rows = flatten_findings(entry_dicts, include_poc=True)
+        target_label = ""
+        settings = getattr(ctx, "settings", None)
+        hosts_getter = getattr(settings, "get_scope_hosts", None)
+        if callable(hosts_getter):
+            try:
+                target_label = ", ".join(sorted(hosts_getter())[:5])
+            except Exception:
+                target_label = ""
+        report = build_pentest_report(rows, target_label=target_label)
+        return Response(
+            content=report,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="pentest-report.md"'},
+        )
+
     @router.post("/api/findings/manual")
     async def record_manual_finding_api(request: Request):
         """Persist a finding produced outside the scan pipeline (the record_finding

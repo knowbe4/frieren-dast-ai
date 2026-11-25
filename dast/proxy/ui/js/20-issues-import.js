@@ -238,6 +238,17 @@ function _buildIssueCard(host, f, globalIdx) {
       : 'Detection method: ' + lbl;
     return `<span class="vbdg ${cls}" title="${tip}">${lbl}</span>`;
   }).join('');
+  // 5-B-5: POE proof level + retest verdict badges (server computes `poe` on
+  // every /api/findings row; retest_state arrives after a retest runs).
+  const poeBadge = (f.poe != null && f.poe >= 2)
+    ? `<span class="vbdg vbdg-imported" title="Proof-of-Exploit level: 2 evidence linked · 3 validated · 4 impact demonstrated">POE-${f.poe}</span>`
+    : '';
+  const _rt = f.retest_state;
+  const _rtLabel = { still_reproducible: 'Still-reproducible', fixed: 'Fixed (retest)', cannot_confirm: 'Cannot-confirm' };
+  const retestBadge = (_rt && _rt.verdict)
+    ? `<span class="vbdg ${_rt.verdict === 'fixed' ? 'vbdg-dismissed' : (_rt.verdict === 'still_reproducible' ? 'vbdg-oob_callback' : 'vbdg-pattern')}"
+        title="Retest ${esc(_rt.at || '')}: proof request replayed — ${esc(_rt.verdict)}${_rt.status ? ' (HTTP ' + _rt.status + ')' : ''}">${_rtLabel[_rt.verdict] || esc(_rt.verdict)}</span>`
+    : '';
   const importStatus = f.import_status;
   const _importTip = esc(f.reasoning || '');
   const importBadge = importStatus
@@ -353,6 +364,11 @@ function _buildIssueCard(host, f, globalIdx) {
         title="Ask the Red-Team Validator (LLM) to confirm or reject this finding"
         onclick="event.stopPropagation();validateFindingWithAI(${jsArg(entryId)},${fidx},${jsArg(uid)})">Validate with AI</button>`
     : '';
+  const retestBtn = (hasRealEntry && !f.dismissed)
+    ? `<button class="tbtn" id="rtbtn-${uid}" style="font-size:9px;padding:1px 7px;flex-shrink:0;color:var(--acc2,var(--acc))"
+        title="Replay the proof request against the live target — verdict: Still-reproducible / Fixed / Cannot-confirm (original evidence preserved)"
+        onclick="event.stopPropagation();retestFinding(${jsArg(entryId)},${fidx},${jsArg(uid)})">Retest</button>`
+    : '';
   const dismissBtn = f.dismissed
     ? `<button class="tbtn" style="font-size:9px;padding:1px 7px;margin-left:auto;flex-shrink:0;color:#4caf50;border-color:#2a5a2a"
         title="Restore to active findings"
@@ -364,10 +380,11 @@ function _buildIssueCard(host, f, globalIdx) {
     <div class="iissue-row">
       <span class="iissue-sev s${sc}">${_SEV_LABEL[sev]}</span>
       <div class="iissue-info">
-        <div class="iissue-title">${esc(f.title || 'Finding')}${vBadge}${browserBadge}${importBadge}</div>
+        <div class="iissue-title">${esc(f.title || 'Finding')}${vBadge}${poeBadge}${retestBadge}${browserBadge}${importBadge}</div>
         <div class="iissue-meta">${esc(f.attack_type || 'passive')} · ${esc(f._path)}${hostBadge}</div>
       </div>
       ${validateBtn}
+      ${retestBtn}
       ${dismissBtn}
       <span class="iissue-arrow" style="margin-left:6px">▶</span>
     </div>
@@ -444,6 +461,24 @@ async function validateFindingWithAI(entryId, fidx, uid) {
     showToast('Validation error', 'error');
   } finally {
     if (btn) { btn.disabled = false; }
+  }
+}
+
+async function retestFinding(entryId, fidx, uid) {
+  const btn = document.getElementById('rtbtn-' + uid);
+  if (btn) { btn.disabled = true; btn.textContent = 'Retesting...'; }
+  try {
+    const r = await fetch(`/api/findings/${encodeURIComponent(entryId)}/${fidx}/retest`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { showToast(d.error || 'Retest failed', 'error'); return; }
+    const label = { still_reproducible: 'Still-reproducible', fixed: 'Fixed', cannot_confirm: 'Cannot-confirm' }[d.verdict] || d.verdict;
+    showToast('Retest: ' + label);
+    _buildIssuesList();
+    _renderIssuesPage();
+  } catch (e) {
+    showToast('Retest error', 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Retest'; }
   }
 }
 

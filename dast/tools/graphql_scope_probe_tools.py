@@ -112,43 +112,10 @@ def _find_enum_arguments(schema: dict, operation_kind: str, field_name: str) -> 
 # ---------------------------------------------------------------------------
 
 async def _resolve_auth(ctx: ToolContext, url: str, method: str) -> Dict[str, Any]:
-    store = getattr(ctx, "store", None)
-    parsed = urlparse(url)
-    host, path = parsed.hostname or "", parsed.path or "/"
-    jar_cookie_map: Dict[str, str] = {}
-    session_name = getattr(getattr(ctx, "_session", None), "session_name", None)
-    if store is not None:
-        try:
-            if session_name and hasattr(store, "get_named_session_cookies_for_host"):
-                jar = store.get_named_session_cookies_for_host(session_name, host) or []
-            else:
-                jar = store.get_cookies_for_host(host) or []
-            jar_cookie_map = {c.get("name"): c.get("value", "") for c in jar if c.get("name")}
-        except Exception as exc:
-            logger.debug("graphql_scope_probe: cookie jar lookup failed", host=host, error=str(exc))
-    rec = None
-    session = getattr(ctx, "_session", None)
-    try:
-        from dast.session.auth_provider import scan_history_bearer
-        if session is not None and store is not None and hasattr(session, "_ensure_fresh_bearer"):
-            rec = await session._ensure_fresh_bearer(
-                store, host, path, browser=getattr(ctx, "browser", None))
-        elif session is not None and hasattr(session, "_select_bearer"):
-            if store is not None and hasattr(session, "_capture_bearer_tokens"):
-                session._capture_bearer_tokens(store, host)
-            rec = session._select_bearer(host, path)
-        elif store is not None:
-            rec = scan_history_bearer(store, host, path)
-    except Exception as exc:
-        logger.debug("graphql_scope_probe: bearer resolution failed", host=host, error=str(exc))
-    csrf_token = None
-    if store is not None and method in ("POST", "PUT", "PATCH", "DELETE"):
-        try:
-            from dast.session.auth_provider import scan_history_csrf
-            csrf_token = scan_history_csrf(store, host, exclude_source="copilot")
-        except Exception as exc:
-            logger.debug("graphql_scope_probe: csrf resolution failed", host=host, error=str(exc))
-    return {"cookies": jar_cookie_map or None, "bearer_rec": rec, "csrf_token": csrf_token}
+    """Delegates to the shared ``resolve_request_auth`` (one implementation across the raw
+    tools: named-session cookies + per-sub-app Bearer + CSRF). Never raises."""
+    from dast.session.auth_provider import resolve_request_auth
+    return await resolve_request_auth(ctx, url, method)
 
 
 # ---------------------------------------------------------------------------

@@ -106,7 +106,7 @@ _INTRA_TURN_KEEPALIVE_INTERVAL = 120.0
 _MAX_COMPLETE_REJECTIONS = 8
 # How many times the engine may report a stuck_loop (an agent repeating the same
 # normalized call) before the coordinator KILLS the run instead of re-prompting it.
-_MAX_STUCK_LOOPS = 2
+_MAX_STUCK_LOOPS = 3
 
 # GraphQL schema buckets, matching the compact schema stored by graphql_introspection.
 _GQL_BUCKETS = {"query": "queries", "mutation": "mutations"}
@@ -433,6 +433,8 @@ def _normalise_budget(budget: Optional[dict]) -> Dict[str, object]:
 class CopilotService:
     """Owns copilot session state, the turn runner, and block escalation."""
 
+    _SESSION_BROWSER_TTL_S = 600  # 10 min idle → browser reaped
+
     def __init__(self, ctx: "DashboardContext") -> None:
         self._ctx = ctx
         self._sessions: Dict[str, dict] = {}
@@ -445,6 +447,7 @@ class CopilotService:
         # Browsers are per-session now (session["_agent_browser"]); this legacy handle
         # is kept only so an older caller setting it still gets closed on shutdown.
         self._shared_browser: Any = None
+        self._reaper_task: Any = None
 
     async def _close_session_browser(self, session: dict) -> None:
         """Close and detach this session's own AgentBrowser, if any."""
@@ -455,8 +458,36 @@ class CopilotService:
             except Exception as exc:
                 logger.debug("session AgentBrowser close error", error=str(exc))
 
+    async def _session_reaper(self) -> None:
+        """Periodically close browsers for sessions idle/blocked longer than the TTL."""
+        while True:
+            await asyncio.sleep(300)
+            now = time.time()
+            for sid, session in list(self._sessions.items()):
+                status = session.get("status")
+                updated = session.get("updated_at", 0)
+                browser = session.get("_agent_browser")
+                if (browser is not None
+                        and status in ("idle", "blocked", "error")
+                        and now - updated > self._SESSION_BROWSER_TTL_S):
+                    self._cleanup_session(session)
+                    logger.info("session reaper: closed idle browser",
+                                session_id=sid,
+                                idle_seconds=int(now - updated))
+
+    def _ensure_reaper(self) -> None:
+        """Lazy-start the session reaper on first session creation."""
+        if self._reaper_task is None or self._reaper_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._reaper_task = loop.create_task(self._session_reaper())
+
     async def close_browser(self) -> None:
         """Close every live session's AgentBrowser (e.g. on proxy shutdown)."""
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
         for session in list(self._sessions.values()):
             await self._close_session_browser(session)
         if self._shared_browser is not None:
@@ -526,6 +557,7 @@ class CopilotService:
             "autonomous": None,
         }
         self._gc()
+        self._ensure_reaper()
         return sid
 
     def session_dict(self, sid: str) -> dict:
@@ -946,6 +978,8 @@ class CopilotService:
             }
             session["status"] = "blocked" if reply.blocked_reason else "idle"
             session["updated_at"] = time.time()
+            if reply.blocked_reason in ("stuck_loop", "error", "safety_blocked"):
+                self._cleanup_session(session)
         except asyncio.CancelledError:
             session["status"] = "idle"
         except Exception as exc:
@@ -953,6 +987,7 @@ class CopilotService:
             session["status"] = "error"
             session["last_reply"] = {"message": f"Internal error: {str(exc)[:300]}",
                                      "blocked_reason": "error"}
+            self._cleanup_session(session)
 
     # ── Autonomous orchestrator run ──────────────────────────────────────────────
     def run_autonomous(

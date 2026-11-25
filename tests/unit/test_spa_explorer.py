@@ -123,7 +123,7 @@ def _patched_launcher(monkeypatch):
     """Replace the proxied launcher with a plain local Chromium (no proxy)."""
     @asynccontextmanager
     async def _ctx(store, proxy_port, session_id, *, read_only=False, headless=True,
-                   log_cb=None, auth_bypass=None):
+                   log_cb=None, auth_bypass=None, session_name=None, target_host=None):
         async with playwright.async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
             try:

@@ -1716,6 +1716,29 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous broadcast failed", session_id=sid, error=str(exc))
 
+    async def _auto_invent_chains(self, sid: str, session: dict) -> None:
+        """5-B-4: at the accepted end of an autonomous run with >=2 findings on a
+        host, run the chain inventor once — one attempt, small budget, before
+        the run closes. Confirmed chains become findings; refuted ones are
+        closed as ruled_out in the coverage ledger. Best-effort: never blocks
+        the run from finishing and never raises."""
+        auto = session.get("autonomous") or {}
+        if auto.get("validation_only") or auto.get("read_only"):
+            return
+        try:
+            from dast.ai.chain_inventor import run_inventor
+            out = await asyncio.wait_for(
+                run_inventor(self._ctx, host=None), timeout=120)
+            if out.get("ok") and (out.get("confirmed") or out.get("ruled_out")):
+                await self._broadcast_autonomous(sid, "chain_inventory", {
+                    "host": out.get("host"),
+                    "confirmed": len(out.get("confirmed") or []),
+                    "ruled_out": len(out.get("ruled_out") or []),
+                    "names": [c.get("name") for c in (out.get("confirmed") or [])],
+                })
+        except Exception as exc:
+            logger.debug("chain inventor pass failed", error=str(exc))
+
     def _finish_autonomous(self, session: dict, status: str, detail: str) -> None:
         auto = session.get("autonomous")
         if auto is not None:
@@ -2559,6 +2582,7 @@ class CopilotService:
                             )
                             continue
                         # Fully-covered surface, or nothing mapped to cover — honor it.
+                        await self._auto_invent_chains(sid, session)  # 5-B-4 salvage pass
                         message = ("objective complete; full surface covered"
                                    if coverage["has_surface"]
                                    else "objective complete")
@@ -2580,6 +2604,7 @@ class CopilotService:
                                    session_id=sid,
                                    rest_untested=len(coverage["rest_untested"]),
                                    gql_untested=len(coverage["gql_untested"]))
+                    await self._auto_invent_chains(sid, session)  # 5-B-4 salvage pass
                     self._finish_autonomous(session, "complete", detail)
                     await self._broadcast_autonomous(sid, "finished", {
                         "status": "complete", "message": reply.message,

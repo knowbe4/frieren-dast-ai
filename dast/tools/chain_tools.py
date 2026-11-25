@@ -247,3 +247,49 @@ register(Tool(
     handler=_validate_chain,
     tags=["triage", "http"],
 ))
+
+
+# ── invent_chain (5-B-4): COMPOSE chains from the host's own findings ────────
+
+_INVENT_CHAIN_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "host": {
+            "type": "string",
+            "description": (
+                "Host to compose chains for. Omit to pick the host with the most "
+                "confirmed findings (minimum 2 findings required either way)."
+            ),
+        },
+    },
+}
+
+
+async def _invent_chain(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Compose up to 2 attack chains from the host's confirmed findings (5-B-4)
+    and validate each with ChainEngine. Confirmed chains become ``chain``
+    findings; refuted ones are recorded as ruled_out in the coverage ledger."""
+    from dast.ai.chain_inventor import run_inventor
+
+    host = str(args.get("host", "")).strip() or None
+    return await run_inventor(ctx, host=host)
+
+
+register(Tool(
+    name="invent_chain",
+    description=(
+        "COMPOSE attack chains from this target's own confirmed findings and validate "
+        "each candidate with the real chain engine: e.g. SSRF -> cloud metadata, "
+        "IDOR -> foreign object read, open-redirect -> OAuth theft, unauth bootstrap -> "
+        "privileged read. Requires a host with >=2 findings (pass 'host' or omit to "
+        "pick the richest host). Every candidate is scope-gated, payload-safety gated "
+        "and must carry a mandatory IMPACT assertion on its final sensitive step. A "
+        "confirmed chain is recorded as a 'chain' finding; a refuted one is closed as "
+        "ruled_out in the coverage ledger so it is not re-invented.\n"
+        "Use this after several findings exist on one host and you want compound "
+        "impact; use validate_chain when you already HAVE the chain steps."
+    ),
+    input_schema=_INVENT_CHAIN_SCHEMA,
+    handler=_invent_chain,
+    tags=["triage", "http", "chain"],
+))

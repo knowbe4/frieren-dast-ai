@@ -87,6 +87,7 @@ class SpaCrawler:
         headless: bool = True,
         extra_seeds: Optional[List[str]] = None,
         read_only: bool = False,
+        session_name: Optional[str] = None,
     ) -> None:
 
         self._read_only = read_only
@@ -117,6 +118,7 @@ class SpaCrawler:
         async with proxied_browser_context(
             self._store, self._proxy_port, self.session_id,
             read_only=read_only, headless=headless, log_cb=self._log,
+            session_name=session_name, target_host=parsed.hostname,
         ) as (context, page, request_count):
 
             # If the scanner already declared this host unreachable, don't spend a

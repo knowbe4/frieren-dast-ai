@@ -131,6 +131,7 @@ class SpaExplorer:
         max_routes: Optional[int] = None,
         vision: bool = False,
         bypass_auth: bool = False,
+        session_name: Optional[str] = None,
     ) -> None:
         self._read_only = read_only
         self._submit_forms = submit_forms and not read_only
@@ -185,6 +186,7 @@ class SpaExplorer:
                         self._store, self._proxy_port, self.session_id,
                         read_only=read_only, headless=headless, log_cb=self._log,
                         auth_bypass=self._bypass_plan,
+                        session_name=session_name, target_host=parsed.hostname,
                     ) as (context, page, request_count):
                         from dast.scanners.active_checks import is_host_dead
                         if is_host_dead(parsed.hostname or base_host):

@@ -85,6 +85,11 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     vision = bool(args.get("vision", False))
     bypass_auth = bool(args.get("bypass_auth", False))
 
+    # Seed the explorer's browser context with the active copilot login-profile
+    # session so it explores authenticated (None for non-copilot callers →
+    # legacy Browse-jar seeding).
+    session_name = getattr(getattr(ctx, "_session", None), "session_name", None)
+
     before = _in_scope_url_set(store)
     done_event = asyncio.Event()
     logger.info("explore tool: starting", url=url, submit_forms=submit_forms,
@@ -99,6 +104,7 @@ async def _explore(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "vision": vision,
             "session_safe": bool(getattr(ctx, "session_safe", False)),
             "bypass_auth": bypass_auth,
+            "session_name": session_name,
             "done_event": done_event,
         })
     except Exception as exc:

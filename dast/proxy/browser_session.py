@@ -27,6 +27,36 @@ logger = get_logger(__name__)
 CRAWLER_HEADER = "x-dast-crawler"
 
 
+def _named_session_cookies(
+    store: "SessionStore", session_name: Optional[str], target_host: Optional[str]
+) -> List[dict]:
+    """Cookies of the active login-profile session to seed the crawler with.
+
+    When a copilot run has authenticated via ``activate_login_profile`` the
+    resulting session's cookies live in ``store.named_sessions[session_name]``,
+    NOT in the shared Browse jar / ``auth_storage_state``. Pull them here so the
+    crawl/explore browser context rides that session and crawls AUTHENTICATED.
+
+    Host-scoped (same matching as the raw-tool auth path) when the target host is
+    known, falling back to the session's full cookie set when the host-scoped view
+    is empty (the browser still domain-gates each cookie). Returns [] for a
+    non-copilot caller (no ``session_name``) so the legacy Browse-flow seeding is
+    left untouched. Never raises."""
+    if not session_name:
+        return []
+    try:
+        if target_host and hasattr(store, "get_named_session_cookies_for_host"):
+            scoped = store.get_named_session_cookies_for_host(session_name, target_host) or []
+            if scoped:
+                return scoped
+        if hasattr(store, "get_named_session_cookies"):
+            return store.get_named_session_cookies(session_name) or []
+    except Exception as exc:  # noqa: BLE001 — fall back to the Browse jar on any error
+        logger.warning("browser_session: named-session cookie read failed",
+                       session_name=session_name, error=str(exc))
+    return []
+
+
 async def _auth_storage_state(store: "SessionStore") -> Optional[dict]:
     """The authenticated Playwright storage_state to seed the crawler with, if any.
 
@@ -64,6 +94,8 @@ async def proxied_browser_context(
     headless: bool = True,
     log_cb: Optional[Callable[[str], None]] = None,
     auth_bypass: Optional["AuthBypassPlan"] = None,
+    session_name: Optional[str] = None,
+    target_host: Optional[str] = None,
 ):
     """Launch a proxied, authenticated browser context.
 
@@ -71,6 +103,14 @@ async def proxied_browser_context(
     one-element list whose ``[0]`` is the running request total. Closes the
     browser on exit. ``log_cb`` (optional) receives human-readable progress
     lines for the read-only block counter and cookie-injection summary.
+
+    ``session_name`` (optional, in-process copilot): the active login-profile
+    session's name. When set and that named session has cookies (host-scoped to
+    ``target_host`` when given), the context is seeded with THOSE cookies and they
+    take priority over the Browse ``auth_storage_state`` — so a crawl/explore run
+    started under an ``activate_login_profile`` session crawls authenticated
+    instead of landing on the login page. With no ``session_name`` (non-copilot /
+    MCP callers) the legacy Browse-flow seeding is used unchanged.
 
     ``auth_bypass`` (optional, agentless mode): an
     ``dast.browser.auth_gates.AuthBypassPlan`` — the pre-navigation storage hook
@@ -91,11 +131,14 @@ async def proxied_browser_context(
     proxy_url = f"http://127.0.0.1:{proxy_port}"
     request_count: List[int] = [0]
 
-    # Prefer the REAL authenticated session from a live/last Browse login: its
-    # Playwright storage_state carries httpOnly session cookies AND localStorage
-    # that the proxy's Set-Cookie jar never captured (OIDC callbacks, token-in-
-    # storage SPAs). Without this the crawler loads logged-out and sees no app.
-    storage_state = await _auth_storage_state(store)
+    # When a copilot run has an active login-profile (named) session, that session
+    # is the authoritative auth and its cookies seed the context directly (below).
+    # Otherwise prefer the REAL authenticated session from a live/last Browse
+    # login: its Playwright storage_state carries httpOnly session cookies AND
+    # localStorage that the proxy's Set-Cookie jar never captured (OIDC callbacks,
+    # token-in-storage SPAs). Without either the crawler loads logged-out.
+    named_cookies = _named_session_cookies(store, session_name, target_host)
+    storage_state = None if named_cookies else await _auth_storage_state(store)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -154,14 +197,17 @@ async def proxied_browser_context(
                 yield context, page, request_count
                 return
 
-            # Fallback (no live Browse login): seed cookies captured by the proxy.
-            # get_crawl_cookies() also surfaces NAMED/headless-login cookies that
-            # live in named_sessions and are invisible to the shared jar.
-            cookies = store.get_crawl_cookies()
+            # Seed cookies: the active login-profile session's cookies take
+            # priority (copilot path); otherwise fall back to the proxy's merged
+            # crawl jar. get_crawl_cookies() also surfaces NAMED/headless-login
+            # cookies that live in named_sessions and are invisible to the shared jar.
+            cookies = named_cookies or store.get_crawl_cookies()
+            _cookie_src = "active login-profile session" if named_cookies else "proxy session jar"
             if cookies:
                 try:
                     await context.add_cookies(cookies)
-                    _log(f"Injected {len(cookies)} session cookie(s) — browse will use the authenticated session")
+                    _log(f"Injected {len(cookies)} session cookie(s) from the {_cookie_src} — "
+                         "browse will use the authenticated session")
                 except Exception as exc:
                     # add_cookies is atomic: one bad cookie rejects the batch.
                     # Retry individually so a single bad entry doesn't strand auth.

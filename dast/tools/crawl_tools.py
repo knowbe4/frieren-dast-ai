@@ -131,6 +131,11 @@ async def _crawl(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
         max_clicks = _SESSION_SAFE_MAX_CLICKS
         extra_seeds = None
 
+    # The crawler runs in its own browser context; pass the active copilot
+    # login-profile session so it seeds that session's cookies and crawls
+    # authenticated (None for non-copilot callers → legacy Browse-jar seeding).
+    session_name = getattr(getattr(ctx, "_session", None), "session_name", None)
+
     before = _in_scope_url_set(store)
     done_event = asyncio.Event()
     logger.info("crawl tool: starting crawl", url=url, max_clicks=max_clicks)
@@ -141,6 +146,7 @@ async def _crawl(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
             "max_clicks": max_clicks,
             "extra_seeds": extra_seeds,
             "read_only": bool(getattr(ctx, "read_only", False)),
+            "session_name": session_name,
             "done_event": done_event,
         })
     except Exception as exc:

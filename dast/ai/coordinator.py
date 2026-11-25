@@ -749,6 +749,13 @@ def _select_attack_types_for_params(
     if "content-length" in _lower_headers and "transfer-encoding" in _lower_headers:
         candidate_types.add("request_smuggling")
 
+    # HTTP/2 (4-D): TLS targets are h2 candidates — the agent negotiates ALPN
+    # itself and memoizes per (host, port), so exactly one handshake + desync
+    # probe happens per server no matter how many endpoints dispatch it.
+    # Plain-http targets never negotiate ALPN; don't dispatch there.
+    if target.url.startswith(("https://", "wss://")):
+        candidate_types.add("http2")
+
     # JWT-bearing requests (Authorization/cookie/param) are candidates for the
     # JWT verification agent; it self-gates via _find_jwts on the same detector.
     from dast.agents.jwt_agent import has_jwt_target

@@ -26,6 +26,7 @@ from dast.agents import (  # noqa: F401
     rate_limit_trust_agent,
     smuggling_agent,
     idor_agent,
+    jwt_agent,
     llm_injection_agent,
     mfa_agent,
     nosql_agent,

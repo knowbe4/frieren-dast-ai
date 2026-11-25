@@ -311,6 +311,7 @@ _AUTONOMOUS_CONTINUE = (
     "{leads}\n\n"
     "{router}"
     "{coverage}\n\n"
+    "{todolist}\n\n"
     "If a request fails (401/timeout/302-to-login), retry with a different approach "
     "(re-login, different cookies, correct URL from get_history) before blocking. Only "
     "block for genuinely unresolvable issues (captcha, missing credentials, MFA in headless).\n"
@@ -1021,6 +1022,7 @@ class CopilotService:
             cfg["max_stuck_turns"] = 50
         pause_gate = asyncio.Event()
         pause_gate.set()  # set = running; cleared = paused
+        from dast.ai.copilot.todolist import MissionTodoList
         session["autonomous"] = {
             "objective": objective,
             "config": cfg,
@@ -1039,6 +1041,8 @@ class CopilotService:
             "turns": 0,
             "errors": 0,
             "complete_rejections": 0,
+            "escalations_run": 0,
+            "todo": MissionTodoList.seed_default(objective),
             "started_at": time.time(),
             "status": "starting",
             "detail": "",
@@ -1716,6 +1720,84 @@ class CopilotService:
         except Exception as exc:
             logger.warning("autonomous broadcast failed", session_id=sid, error=str(exc))
 
+    @staticmethod
+    def _todo_block(session: dict) -> str:
+        """The mission todolist rendered for the autonomous prompt (5-C-2): the
+        stable backbone the loop plans against, with the next legal action."""
+        todo = (session.get("autonomous") or {}).get("todo")
+        if todo is None:
+            return ""
+        return todo.render()
+
+    async def _escalate_candidates(self, sid: str, session: dict, ctx: Any,
+                                   hosts: set) -> None:
+        """5-C-2 fan-out: after scan outcomes are consumed, collect the
+        UNCONFIRMED replay-verifiable findings on the focus hosts and run
+        AttackSubagent on them — at most 2 candidates per turn, 6 per run.
+        Each verdict is broadcast; confirmed candidates are already recorded by
+        the subagent itself (record_finding), refuted ones land as ruled_out.
+        Best-effort, stop-aware, never raises."""
+        auto = session["autonomous"]
+        if auto.get("read_only") or auto.get("validation_only"):
+            return
+        stop_event: asyncio.Event = auto["stop_event"]
+        run_cap = 6
+        if auto.get("escalations_run", 0) >= run_cap:
+            todo = auto.get("todo")
+            if todo is not None:
+                todo.mark("escalate", "done", detail="run escalation cap reached")
+            return
+        store = self._ctx.store
+        if store is None:
+            return
+        from dast.ai.attack_subagent import AttackSubagent, is_escalatable
+
+        bare_hosts = {str(h).split(":")[0] for h in hosts}
+        candidates = []
+        try:
+            for entry in store.all_entries():
+                host = (urlparse(entry.url).hostname or "")
+                if host not in bare_hosts:
+                    continue
+                for finding in (entry.findings or []):
+                    if finding.get("dismissed") or finding.get("confirmed"):
+                        continue
+                    if finding.get("_escalated"):
+                        continue  # already spawned for this candidate
+                    finding["_escalated"] = True  # idempotency marker on the stored dict
+                    candidate = {**finding, "url": entry.url, "method": entry.method}
+                    if is_escalatable(candidate):
+                        candidates.append(candidate)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("escalate: candidate scan failed", error=str(exc))
+            return
+        if not candidates:
+            return
+
+        todo = auto.get("todo")
+        if todo is not None:
+            todo.mark("escalate", "in_progress",
+                      detail=f"{auto.get('escalations_run', 0)} run so far")
+        budget = min(2, run_cap - auto.get("escalations_run", 0), len(candidates))
+        for candidate in candidates[:budget]:
+            if stop_event.is_set():
+                return
+            try:
+                result = await asyncio.wait_for(
+                    AttackSubagent(ctx, candidate).run(), timeout=300)
+                auto["escalations_run"] = auto.get("escalations_run", 0) + 1
+                await self._broadcast_autonomous(sid, "escalation_result", {
+                    "title": candidate.get("title", ""),
+                    "url": candidate.get("url", ""),
+                    "verdict": result.get("verdict", ""),
+                    "reasoning": (result.get("reasoning") or "")[:300],
+                    "run_total": auto["escalations_run"],
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("escalation run failed", error=str(exc))
+        if auto.get("escalations_run", 0) >= run_cap and todo is not None:
+            todo.mark("escalate", "done", detail="run escalation cap reached")
+
     async def _auto_invent_chains(self, sid: str, session: dict) -> None:
         """5-B-4: at the accepted end of an autonomous run with >=2 findings on a
         host, run the chain inventor once — one attempt, small budget, before
@@ -1725,6 +1807,9 @@ class CopilotService:
         auto = session.get("autonomous") or {}
         if auto.get("validation_only") or auto.get("read_only"):
             return
+        todo = auto.get("todo")
+        if todo is not None:
+            todo.mark("chains", "in_progress")
         try:
             from dast.ai.chain_inventor import run_inventor
             out = await asyncio.wait_for(
@@ -1738,6 +1823,9 @@ class CopilotService:
                 })
         except Exception as exc:
             logger.debug("chain inventor pass failed", error=str(exc))
+        if todo is not None:
+            todo.mark("chains", "done")
+            todo.mark("wrapup", "done", detail="findings recorded, chains inventoried")
 
     def _finish_autonomous(self, session: dict, status: str, detail: str) -> None:
         auto = session.get("autonomous")
@@ -2066,6 +2154,18 @@ class CopilotService:
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("consume-outcomes: broadcast failed", error=str(exc))
 
+        # 5-C-2: keep the mission todolist honest about deterministic facts —
+        # traffic exists (surface mapped) and scan outcomes were consumed (the
+        # scan phase actually ran). The escalate/chains items are marked by
+        # their own phases (_escalate_candidates / _auto_invent_chains).
+        todo = auto.get("todo")
+        if todo is not None:
+            if todo.get("map") is not None and todo.get("map").status != "done":
+                todo.mark("map", "done")
+            if consumed and todo.get("scan") is not None \
+                    and todo.get("scan").status != "done":
+                todo.mark("scan", "done", detail="scan outcomes consumed")
+
     async def _deterministic_recon_scan_sweep(self, sid: str, session: dict) -> None:
         """Drive breadth deterministically in complete mode so it is never left to
         LLM discretion: per in-scope host (focus hosts expanded with every in-scope
@@ -2372,6 +2472,7 @@ class CopilotService:
                         leads=self._leads_label(effective_hosts),
                         router=self._router_block(effective_hosts),
                         coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    todolist=self._todo_block(session),
                         read_only=read_only_note,
                     )
                     continue
@@ -2419,6 +2520,15 @@ class CopilotService:
                     # follow-up agents, surface blockers) — a code re-plan, not free text.
                     await self._consume_scan_outcomes(sid, session, turn_ctx,
                                                       set(effective_hosts))
+                    # Phase 3.5 (5-C-2): fan the XBOW-style attack subagents out
+                    # over the unconfirmed candidates the scans produced, and
+                    # keep the mission todolist honest about what already ran.
+                    todo = auto.get("todo")
+                    if todo is not None and todo.get("map") is not None \
+                            and todo.get("map").status == "pending":
+                        todo.mark("map", "in_progress")
+                    await self._escalate_candidates(sid, session, turn_ctx,
+                                                    set(effective_hosts))
 
                 # ── Progress / stuck accounting ──────────────────────────────────
                 progress = self._progress_snapshot(scope_hosts)
@@ -2578,6 +2688,7 @@ class CopilotService:
                                 leads=self._leads_label(effective_hosts),
                                 router=self._router_block(effective_hosts),
                                 coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    todolist=self._todo_block(session),
                                 read_only=read_only_note,
                             )
                             continue
@@ -2688,6 +2799,7 @@ class CopilotService:
                     leads=self._leads_label(effective_hosts),
                     router=self._router_block(effective_hosts),
                     coverage=self._coverage_block(self._surface_coverage(effective_hosts)),
+                    todolist=self._todo_block(session),
                     read_only=read_only_note,
                 )
         except asyncio.CancelledError:

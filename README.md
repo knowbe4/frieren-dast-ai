@@ -46,7 +46,7 @@ flowchart TD
 
     store --> passive["Passive Scanner<br/>91 rules · no extra requests"]
     store --> coord["Coordinator<br/>LLM: plan → run → validate"]
-    coord --> agents["Vuln Agents<br/>~37, parallel per endpoint"]
+    coord --> agents["Vuln Agents<br/>38, parallel per endpoint"]
 
     copilot["AI Copilot<br/>interactive / autonomous"] -.->|"replays through"| proxy
 
@@ -64,9 +64,9 @@ flowchart TD
 | **MITM Proxy** (:8080) | Terminates TLS per host; every browser/tool request flows through it |
 | **Session Store** | In-memory requests/responses + cookie jar — the single source both engines read |
 | **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors) with no extra traffic |
-| **Coordinator → Vuln Agents** | The LLM picks which of ~37 agents to run per endpoint, runs them in parallel, then validates the output |
+| **Coordinator → Vuln Agents** | The LLM picks which of the 38 agents to run per endpoint, runs them in parallel, then validates the output |
 | **AI Copilot** | Interactive or autonomous AI loop — reads app knowledge, plans with the LLM, and drives a real (Playwright) browser plus the tools to confirm issues by hand |
-| **Tool layer + AI Gateway** | 66 shared tools (send_request, sqli_probe, login profiles, …) and a multi-provider LLM gateway, shared by the copilot, the agents, and the MCP server |
+| **Tool layer + AI Gateway** | 68 shared tools (send_request, sqli_probe, login profiles, …) and a multi-provider LLM gateway, shared by the copilot, the agents, and the MCP server |
 | **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, request history, the copilot panel, runtime config |
 
 ## Quick start
@@ -181,6 +181,7 @@ Out-of-scope targets and unsafe payloads are gated the same way as in the UI
 | **Probes (deterministic, no LLM)** | `sqli_probe`, `xss_probe`, `idor_probe`, `authz_differential_probe`, `run_multiuser_idor`, `prototype_pollution_probe`, `web_cache_deception_probe` |
 | **GraphQL** | `graphql_introspect`, `graphql_type_info`, `graphql_find_sensitive`, `graphql_fuzz`, `graphql_sweep`, `graphql_scope_probe` |
 | **Scans & agents** | `run_scan`, `scan_surface`, `dispatch_agents` |
+| **Attack escalation (XBOW-style)** | `attack_finding` (spawn a bounded attack subagent that proves or rules out ONE candidate finding), `invent_chain` (compose + validate attack chains from a host's confirmed findings) |
 | **Findings & knowledge** | `get_findings`, `record_finding`, `record_app_knowledge`, `record_coverage`, `triage_report` |
 | **Code analysis** | `code_list`, `code_search`, `code_file`, `code_lookup_path` |
 | **Out-of-band (blind)** | `oob_generate`, `oob_poll` |

@@ -119,5 +119,6 @@ def test_continue_template_has_objective():
     from dast.proxy.api import copilot_service as cs
     msg = cs._AUTONOMOUS_CONTINUE.format(
         objective="validate SQLi on training", progress="p", budget="b",
-        leads="L", router="", coverage="C", read_only="")
+        leads="L", router="", coverage="C", read_only="",
+        todolist="")  # 5-C-2: the checkpoint template renders the mission todolist
     assert "Original objective: validate SQLi on training" in msg

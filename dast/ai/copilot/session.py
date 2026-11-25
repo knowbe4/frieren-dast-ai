@@ -740,6 +740,81 @@ def _render_arg_signature(schema: Optional[Dict[str, Any]]) -> str:
     return ", ".join(parts)
 
 
+# ── phase-aware tool menu (5-C-3) ────────────────────────────────────────────
+# A full registry listing is ~68 tools of prompt noise every step. The phase
+# the copilot is IN (inferred from its recent tool calls — the ordered
+# scratchpad already records the tool per step) decides which tools render in
+# full; the rest compress to one name line. Signal instead of noise.
+
+_TOOL_PHASES: Dict[str, set] = {
+    "recon": {"crawl", "explore", "content_discovery", "param_mining", "get_history",
+              "browser_navigate", "browser_snapshot", "browser_extract", "code_search",
+              "code_file", "code_list", "code_lookup_path"},
+    "auth": {"browser_login", "browser_login_adaptive", "activate_login_profile",
+             "list_login_profiles", "list_login_sessions", "save_login_session",
+             "prime_session", "get_bearer_token", "get_app_token", "token_inventory",
+             "get_transport_capability", "record_transport_capability"},
+    "scan": {"run_scan", "scan_surface", "dispatch_agents", "sqli_probe", "xss_probe",
+             "idor_probe", "run_multiuser_idor", "authz_differential_probe",
+             "prototype_pollution_probe", "web_cache_deception_probe",
+             "graphql_introspect", "graphql_type_info", "graphql_find_sensitive",
+             "graphql_fuzz", "graphql_sweep", "graphql_scope_probe"},
+    "escalate": {"send_request", "test_unauth", "diff_responses", "extract_response",
+                 "verify_reflection", "oob_generate", "oob_poll", "upload_to_presigned_url",
+                 "match_replace", "browser_fill", "browser_click", "browser_fetch",
+                 "browser_wait_for", "attack_finding", "invent_chain", "validate_chain",
+                 "get_findings", "url_encode", "url_decode", "base64_encode",
+                 "base64_decode", "html_encode", "html_decode"},
+    "report": {"record_finding", "record_coverage", "triage_report",
+               "record_app_knowledge", "get_findings", "test_unauth"},
+}
+# Escalation/reporting core that stays fully rendered in EVERY phase — the
+# XBOW pivot (prove it or rule it out) must never be buried in the compact list.
+_ALWAYS_PRIORITY = {"send_request", "get_findings", "record_finding",
+                    "record_coverage", "diff_responses", "attack_finding"}
+_PHASE_ORDER = ["recon", "auth", "scan", "escalate", "report"]
+_FULL_MENU_TOOL_COUNT = 24  # at or below this, a full menu IS the clean menu
+
+
+def infer_phase(recent_tools: List[str]) -> Optional[str]:
+    """The phase the copilot is in: the phase of its LAST phase-mapped tool
+    call — what the agent is doing NOW. A deliberately-issued escalation or
+    reporting call pivots the phase even after a long recon burst (the stuck-
+    loop escape hatch). For a tool that lives in several buckets, the window's
+    weighted majority among those buckets decides."""
+    window = [name for name in reversed(recent_tools[-8:])]
+    for name in window:
+        matches = [phase for phase in _PHASE_ORDER if name in _TOOL_PHASES[phase]]
+        if not matches:
+            continue
+        if len(matches) == 1:
+            return matches[0]
+        counts: Dict[str, int] = {}
+        for other in window:
+            for phase in matches:
+                if other in _TOOL_PHASES[phase]:
+                    counts[phase] = counts.get(phase, 0) + (2 if other == name else 1)
+        return max(counts.items(), key=lambda kv: (kv[1], -matches.index(kv[0])))[0]
+    return None
+
+
+def _render_phased_menu(tool_defs: List[Dict[str, Any]], phase: Optional[str]) -> str:
+    """Phase-aware menu: the current phase's tools (+ the always-priority
+    escalation/reporting core) render in full; everything else compresses to a
+    single name line. Unknown phase or a small registry → full menu."""
+    if phase is None or len(tool_defs) <= _FULL_MENU_TOOL_COUNT:
+        return _render_tool_menu(tool_defs)
+    phase_set = set(_TOOL_PHASES.get(phase, set())) | _ALWAYS_PRIORITY
+    priority = [d for d in tool_defs if d["name"] in phase_set]
+    rest = [d["name"] for d in tool_defs if d["name"] not in phase_set]
+    lines = [f"## Current phase: {phase.upper()} — tools for this phase in full:",
+             _render_tool_menu(priority)]
+    if rest:
+        lines.append("Also available (switch phases when the plan needs them): "
+                     + ", ".join(rest))
+    return "\n".join(lines)
+
+
 def _render_tool_menu(tool_defs: List[Dict[str, Any]]) -> str:
     lines: List[str] = []
     for definition in tool_defs:
@@ -1340,7 +1415,12 @@ class CopilotSession:
             t["name"]: list(t["input_schema"].get("required") or []) for t in tool_defs
         }
         schema_by_tool = {t["name"]: t["input_schema"] for t in tool_defs}
-        tool_menu = _render_tool_menu(tool_defs)
+        # 5-C-3: the menu adapts to the phase the copilot is in (recon → auth →
+        # scan → escalate → report), inferred from the ordered scratchpad.
+        tool_menu = _render_phased_menu(
+            tool_defs,
+            infer_phase([entry.get("tool", "") for entry in self._scratchpad[-8:]]),
+        )
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
         # Ground the turn in what the scanner already learned about the hosts in

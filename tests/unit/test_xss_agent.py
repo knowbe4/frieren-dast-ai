@@ -264,3 +264,100 @@ async def test_browser_confirm_receives_session_cookie(monkeypatch):
         await XssAgent().run(target, MagicMock())
 
     assert seen.get("cookie_header") == "PHPSESSID=abc123; security=low"
+
+
+# ── blind XSS via OOB callback (5-B-1) ──────────────────────────────────────
+
+class _FakeCollaborator:
+    """Minimal CollaboratorService double: issue_token/was_hit backed by a set."""
+
+    def __init__(self, host="127.0.0.1", port=8777):
+        self.host = host
+        self.port = port
+        self._tokens: list = []
+        self.hits: set = set()
+
+    def issue_token(self) -> str:
+        token = f"dast{100000 + len(self._tokens)}"
+        self._tokens.append(token)
+        return token
+
+    def was_hit(self, token: str) -> bool:
+        return token in self.hits
+
+
+@pytest.fixture(autouse=True)
+def _fast_oob_settle(monkeypatch):
+    monkeypatch.setattr("dast.agents.xss_agent._OOB_SETTLE_SECONDS", 0)
+
+
+@pytest.mark.asyncio
+async def test_blind_oob_callback_confirms_finding(monkeypatch):
+    """No in-band reflection anywhere; a blind_oob payload's token is hit by the
+    collaborator → confirmed high CWE-79 finding, bypass_validation=True."""
+    collab = _FakeCollaborator()
+    sent_payloads: list = []
+
+    async def fake_send(client, method, url, headers, body):
+        sent_payloads.append(unquote(str(url) + str(body or "")))
+        return _resp(200, "<html>nothing reflected</html>")
+
+    monkeypatch.setattr("dast.agents.xss_agent._send", fake_send)
+    monkeypatch.setattr("dast.agents.xss_agent.get_filtered_payloads",
+                        lambda *a, **k: ["<img src=x onerror=alert(1)>"])
+    # issue_token is deterministic (dast{100000+n}) — the agent's FIRST token
+    # (the script-src payload) is the one the collaborator receives.
+    collab.hits.add("dast100000")
+
+    findings = await XssAgent().run(_target(), MagicMock(), collaborator=collab)
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.cwe == "CWE-79" and f.severity == "high"
+    assert f.confirmed is True and f.bypass_validation is True
+    assert "Blind" in f.title
+    # every injected blind payload carried a live collaborator token
+    oob_sent = [p for p in sent_payloads if f"//{collab.host}:{collab.port}/" in p]
+    assert len(oob_sent) >= 6  # the whole blind_oob group was injected
+    assert any("dast100000" in p for p in oob_sent)  # the hit token was among them
+
+
+@pytest.mark.asyncio
+async def test_blind_oob_silent_without_callback(monkeypatch):
+    """Tokens never hit → no finding (the blind channel never invents one)."""
+    collab = _FakeCollaborator()
+
+    async def fake_send(client, method, url, headers, body):
+        return _resp(200, "<html>nothing reflected</html>")
+
+    monkeypatch.setattr("dast.agents.xss_agent._send", fake_send)
+    monkeypatch.setattr("dast.agents.xss_agent.get_filtered_payloads",
+                        lambda *a, **k: ["<img src=x onerror=alert(1)>"])
+
+    findings = await XssAgent().run(_target(), MagicMock(), collaborator=collab)
+    assert findings == []
+
+
+@pytest.mark.asyncio
+async def test_blind_oob_visits_render_pages_when_stored(monkeypatch):
+    """JSON/204 inject response (stored) → the likely render pages are fetched
+    in the browser (via proxy) to trigger the callback now."""
+    collab = _FakeCollaborator()
+    visited: list = []
+
+    async def fake_send(client, method, url, headers, body):
+        return _resp(204, "", content_type="application/json")
+
+    async def fake_browser_confirm(url, proxy_port, cookie_header=""):
+        visited.append(url)
+        return False, "csp_or_sink"
+
+    monkeypatch.setattr("dast.agents.xss_agent._send", fake_send)
+    monkeypatch.setattr("dast.agents.xss_agent._browser_confirm", fake_browser_confirm)
+    monkeypatch.setattr("dast.agents.xss_agent.get_filtered_payloads",
+                        lambda *a, **k: ["<img src=x onerror=alert(1)>"])
+
+    findings = await XssAgent().run(_target(url="https://shop.test/api/comments"), MagicMock(),
+                                    collaborator=collab)
+    assert findings == []  # no callback fired
+    assert "https://shop.test/api/comments" in visited  # same-URL GET render check

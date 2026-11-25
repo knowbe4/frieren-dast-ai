@@ -79,11 +79,46 @@ def test_diff_rejects_unknown_and_missing_store():
     assert out["ok"] is False
     assert "entry not found" in out["error"]
 
-    bare = ToolContext(store=None)
-    out = asyncio.run(http_tools._diff_responses(bare, {
+
+def test_diff_works_over_mcp_via_dashboard_fallback(monkeypatch):
+    """No in-process store (MCP process): both entries are fetched from the
+    running dashboard (/api/entry/{id}, the same route get_history uses) and the
+    deterministic delta is still produced."""
+    remote = {
+        "ea": {"method": "GET", "url": "https://shop.test/api/users/42",
+               "status": 200, "response_headers": {"content-type": "application/json"},
+               "response_body": '{"user": "me", "email": "me@shop.test"}'},
+        "eb": {"method": "GET", "url": "https://shop.test/api/users/42",
+               "status": 200, "response_headers": {"content-type": "application/json"},
+               "response_body": '{"user": "admin", "email": "admin@shop.test"}'},
+    }
+
+    async def fake_fetch(ctx, entry_id):
+        return remote.get(entry_id, {})
+
+    monkeypatch.setattr(http_tools, "_fetch_entry_remote", fake_fetch)
+    out = asyncio.run(http_tools._diff_responses(ToolContext(store=None), {
+        "entry_id_a": "ea", "entry_id_b": "eb"}))
+    assert out["ok"] is True
+    assert out["status_changed"] is None
+    assert out["body_lines_removed_count"] >= 1
+    assert any("me@shop.test" in ln for ln in out["body_lines_removed"])
+    assert any("admin@shop.test" in ln for ln in out["body_lines_added"])
+
+    # Unknown id on the remote path → the same entry-not-found error.
+    out_missing = asyncio.run(http_tools._diff_responses(ToolContext(store=None), {
+        "entry_id_a": "ea", "entry_id_b": "ghost"}))
+    assert out_missing["ok"] is False
+    assert "entry not found" in out_missing["error"]
+
+
+def test_diff_over_mcp_reports_dashboard_failure():
+    """Store-less context with no reachable dashboard → clean failure, not a
+    crash and not the old 'needs the in-process store' dead end."""
+    out = asyncio.run(http_tools._diff_responses(ToolContext(store=None), {
         "entry_id_a": "a", "entry_id_b": "b"}))
     assert out["ok"] is False
-    assert "in-process store" in out["error"]
+    assert "dashboard fetch failed" in out["error"]
 
 
 def test_diff_line_caps_keep_the_result_bounded():

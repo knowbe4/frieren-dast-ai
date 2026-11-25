@@ -703,26 +703,66 @@ def _diff_side(entry: Any) -> Dict[str, Any]:
     }
 
 
+async def _fetch_entry_remote(ctx: ToolContext, entry_id: str) -> Dict[str, Any]:
+    """Fetch one full entry (with bodies) from the running dashboard — the same
+    route get_history uses on the MCP path (no in-process store there)."""
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{ctx.dashboard_base_url}/api/entry/{entry_id}")
+    if resp.status_code == 404:
+        return {}
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _side_from_remote(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a diff side from a /api/entry/{id} dict (to_dict(include_bodies=True))."""
+    return {
+        "method": d.get("method", ""),
+        "url": d.get("url", ""),
+        "status": d.get("status"),
+        "headers": {str(k).lower(): str(v)
+                    for k, v in (d.get("response_headers") or {}).items()},
+        "body": d.get("response_body") or "",
+    }
+
+
 async def _diff_responses(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     """Structural diff of two captured responses (5-A-4). The system prompt asks
     the model to 'compare the two bodies'; doing that by eye over two truncated
     previews is where verdicts went wrong. This returns the deterministic delta:
     status, key headers, body length and capped line-level added/removed."""
     store = getattr(ctx, "store", None)
-    if store is None:
-        return {"ok": False,
-                "error": "diff_responses needs the in-process store (unavailable over MCP)"}
     id_a = str(args.get("entry_id_a", "")).strip()
     id_b = str(args.get("entry_id_b", "")).strip()
-    entry_a = store.get_entry(id_a) if id_a else None
-    entry_b = store.get_entry(id_b) if id_b else None
-    if entry_a is None or entry_b is None:
+    side_a: Optional[Dict[str, Any]] = None
+    side_b: Optional[Dict[str, Any]] = None
+    if store is not None:
+        entry_a = store.get_entry(id_a) if id_a else None
+        entry_b = store.get_entry(id_b) if id_b else None
+        if entry_a is not None:
+            side_a = _diff_side(entry_a)
+        if entry_b is not None:
+            side_b = _diff_side(entry_b)
+    else:
+        # MCP path: fetch both entries from the running dashboard instead of
+        # failing — the advertised tool must work for external clients too.
+        try:
+            remote_a = await _fetch_entry_remote(ctx, id_a) if id_a else {}
+            remote_b = await _fetch_entry_remote(ctx, id_b) if id_b else {}
+        except Exception as exc:
+            return {"ok": False,
+                    "error": f"dashboard fetch failed: {str(exc)[:200]}"}
+        if remote_a:
+            side_a = _side_from_remote(remote_a)
+        if remote_b:
+            side_b = _side_from_remote(remote_b)
+    if side_a is None or side_b is None:
         return {"ok": False,
                 "error": "entry not found — pass REAL entry_id values from "
                          "send_request/browser_fetch/get_history (got "
                          f"{id_a!r}, {id_b!r})"}
-
-    side_a, side_b = _diff_side(entry_a), _diff_side(entry_b)
     out: Dict[str, Any] = {
         "ok": True,
         "a": {k: side_a[k] for k in ("method", "url", "status")},

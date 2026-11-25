@@ -43,15 +43,26 @@ _FINDING_FIELDS = (
     "reasoning", "rule_id", "dismissed", "steps",
 )
 
+# Small fields added to every row (5-B-5): proof level + retest verdict. The
+# POE is derived from the FULL finding dict (before projection) so the score
+# sees evidence_entry_ids/browser flags even though those stay out of the row.
+_ROW_EXTRA_FIELDS = ("retest_state",)
 
-def flatten_findings(entry_dicts: List[dict]) -> List[dict]:
+
+def flatten_findings(entry_dicts: List[dict], include_poc: bool = False) -> List[dict]:
     """Flatten a list of ``ProxyEntry.to_dict()`` dicts into per-finding rows.
 
     Each row carries the finding-level fields plus the parent entry's context
     (``entry_id``, ``url``, ``host``, ``path``, ``method``, ``status``, ``source``,
     ``scan_result``) — mirroring how ``/api/overview`` joins findings to entries.
     Dismissed findings are kept but flagged; callers filter if they wish.
+
+    ``include_poc`` (5-B-5, pentest-report path only) additionally computes the
+    reproducible ``poc_curl`` from the finding's stored raw request — the big
+    ``raw_request``/``probe_request`` fields never enter the lean MCP shape.
     """
+    from dast.report.poc import build_poc_curl, derive_poe
+
     rows: List[dict] = []
     for entry in entry_dicts:
         findings = entry.get("findings") or []
@@ -68,7 +79,18 @@ def flatten_findings(entry_dicts: List[dict]) -> List[dict]:
                 "status":      entry.get("status"),
                 "source":      entry.get("source"),
                 "scan_result": entry.get("scan_result"),
+                "poe":         derive_poe(finding),
             })
+            for key in _ROW_EXTRA_FIELDS:
+                row[key] = finding.get(key)
+            if include_poc:
+                # The finding dict itself has no entry-level url/method — merge
+                # them in so the curl carries the absolute URL.
+                row["poc_curl"] = build_poc_curl({
+                    **finding,
+                    "url": entry.get("url", ""),
+                    "request_method": finding.get("request_method") or entry.get("method", "GET"),
+                })
             rows.append(row)
     return rows
 

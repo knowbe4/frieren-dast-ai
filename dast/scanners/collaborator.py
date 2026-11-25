@@ -19,11 +19,33 @@ from __future__ import annotations
 
 import asyncio
 import random
+import re
 from typing import Optional, Set
+from urllib.parse import unquote, urlparse
 
 from dast.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Redirect-chain targets (5-B-2) are restricted to internal/private space — the
+# collaborator must never become an open redirect to attacker infrastructure.
+# External `to` values get a 403 and no redirect.
+_INTERNAL_HOSTNAME_RE = re.compile(
+    r"^(localhost|127\.|10\.|192\.168\.|169\.254\.|100\.100\.100\.|"
+    r"172\.(1[6-9]|2\d|3[01])\.|\[::1\]|.*\.internal|.*\.localhost)",
+    re.IGNORECASE,
+)
+
+
+def _is_internal_redirect_target(to_url: str) -> bool:
+    """True when ``to_url`` is an http(s) URL to private/internal space."""
+    try:
+        parsed = urlparse(to_url)
+    except Exception:  # noqa: BLE001 — malformed values just fail the gate
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    return bool(_INTERNAL_HOSTNAME_RE.match(parsed.hostname.lower()))
 
 
 class CollaboratorService:
@@ -86,12 +108,38 @@ class CollaboratorService:
         try:
             data = await asyncio.wait_for(reader.read(512), timeout=2.0)
             line = data.decode("utf-8", errors="replace").split("\n")[0]
-            # Parse first line: "GET /TOKEN HTTP/1.1"
+            # Parse first line: "GET /TOKEN HTTP/1.1" or "GET /redirect/TOKEN?to=… HTTP/1.1"
             parts = line.strip().split()
             if len(parts) >= 2:
-                path = parts[1].lstrip("/")
-                if path:
-                    self._hits.add(path)
+                target_path = parts[1].lstrip("/")
+                if target_path:
+                    self._hits.add(target_path)
+                    # 5-B-2 redirect-chain: also record the bare token so
+                    # was_hit(token) matches both the initial /redirect/<token>
+                    # fetch and the followed /follow/<token> second stage.
+                    base = target_path.split("?", 1)[0]
+                    segment = base.split("/", 1)
+                    if len(segment) == 2 and segment[0] in ("redirect", "follow") and segment[1]:
+                        self._hits.add(segment[1])
+                if target_path.startswith("redirect/") and "?to=" in target_path:
+                    # Serve the 302 the redirect-chain payloads rely on: the
+                    # target's SSRF allowlist sees the collaborator (external),
+                    # the server-side fetch follows to the internal `to` target.
+                    # `to` is restricted to internal/private space — never an
+                    # open redirect to the outside.
+                    _, _, to_value = target_path.partition("?to=")
+                    to_url = unquote(to_value)
+                    if _is_internal_redirect_target(to_url):
+                        writer.write(
+                            f"HTTP/1.0 302 Found\r\nLocation: {to_url}\r\n"
+                            "Content-Length: 0\r\n\r\n".encode()
+                        )
+                    else:
+                        logger.debug("Collaborator: refused external redirect target",
+                                     to=to_url[:120])
+                        writer.write(b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    await writer.drain()
+                    return
             writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
             await writer.drain()
         except Exception as exc:

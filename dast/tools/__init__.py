@@ -16,6 +16,7 @@ from dast.tools.context import ToolContext
 
 # Import side effects register the built-in tools.
 from dast.tools import app_knowledge_tools as _app_knowledge_tools  # noqa: F401
+from dast.tools import attack_tools as _attack_tools  # noqa: F401
 from dast.tools import authz_diff_tools as _authz_diff_tools  # noqa: F401
 from dast.tools import browser_tools as _browser_tools  # noqa: F401
 from dast.tools import chain_tools as _chain_tools  # noqa: F401

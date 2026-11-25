@@ -5,6 +5,123 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added (sub-agents & mission loop round 5-C)
+- **AttackSubagent — the XBOW pattern** (5-C-1) — candidates the scan could not
+  fully confirm (`needs_review`, unconfirmed agent findings) used to sit in the
+  list until a human or the copilot escalated them by hand. New
+  `dast/ai/attack_subagent.py`: for ONE candidate, a purpose-built LLM subagent
+  gets the hypothesis, a RESTRICTED toolset (repeater primitives + the class's
+  deterministic probe + `record_finding`/`record_coverage`), hard budgets
+  (≤12 tool calls, 240s wall clock, normalized-signature no-progress watchdog,
+  consecutive-failure breaker) and the oracle contract hypothesis → probe →
+  verify → record. Every call goes through the shared registry (`run_tool`),
+  so scope gates, payload safety and the 5-A-2 intel write-back apply
+  unchanged. Closing is deterministic: a successful `record_finding` IS the
+  confirmed verdict; `record_coverage` with `ruled_out` IS the refutation —
+  the LLM never self-confirms. Non-replayable classes (`sensitive_data`) are
+  refused by `is_escalatable`. New `attack_finding` tool (explicit finding or
+  url+attack_type).
+- **Mission todolist with prerequisites** (5-C-2) — the autonomous driver was
+  "keep going until complete" with no ordered plan. New
+  `dast/ai/copilot/todolist.py`: ARTEX-style items with PREREQUISITES (map →
+  auth → scan → escalate → chains → wrapup), honest `mark` (done requires its
+  rungs), `next_actionable`, a revision counter for stuck detection and a
+  rendered prompt block. Seeded at run start; rendered in every checkpoint
+  prompt (`{todolist}`); the driver marks what it KNOWS deterministically
+  (map/scan from consumed scan outcomes, chains/wrapup at the chain-inventory
+  pass).
+- **Subagent fan-out in the driver** (5-C-2) — `_escalate_candidates` runs
+  after the scan outcomes are consumed: unconfirmed replay-verifiable findings
+  on the focus hosts go to `AttackSubagent` (≤2 per turn, 6 per run,
+  `_escalated` idempotency marker), each verdict broadcast as
+  `escalation_result`; confirmations/ruled-outs are already recorded by the
+  subagent itself.
+- **Phase-aware tool menu** (5-C-3) — every step rendered the whole ~68-tool
+  registry. The menu now adapts to the phase the copilot is in (recon → auth
+  → scan → escalate → report), inferred without an LLM from the ordered
+  scratchpad: the LAST phase-mapped call wins, so a deliberate escalation or
+  reporting call pivots the phase after a long recon burst. Current-phase
+  tools + the always-priority escalation/reporting core render in full; the
+  rest compress to one name line. A drift test requires every registered tool
+  to live in a phase bucket.
+
+### Added (offensive verification round 5-B)
+- **Blind XSS with OOB callback confirmation** (5-B-1) — XSS only confirmed
+  in-band (Playwright); sinks that render on another page (admin previews,
+  email renderers, queued viewers) were invisible. New `blind_oob` payload
+  group (`xss.yaml`: script/img/svg/iframe + attribute-breaking variants with
+  `{{COLLAB_HOST}}/{{COLLAB_PORT}}/{{TOKEN}}`, the ssrf.yaml template
+  convention); when a param fails in-band confirmation the `xss_agent` injects
+  the group with `CollaboratorService` tokens — a `was_hit(token)` callback is
+  a confirmed CWE-79 high with `bypass_validation` (remote execution proven
+  without a browser). When the inject response looks stored (JSON/204), the
+  likely render pages are visited in the headless browser via the proxy to
+  fire the callback now. interactsh fallback is a documented follow-up (the
+  `OobCorrelator` is a long-lived plugin construct).
+- **SSRF redirect-chain bypass + metadata impact** (5-B-2) — the collaborator
+  listener now answers `GET /redirect/<token>?to=<internal>` with a 302 (the
+  `to` target is restricted to internal/private space; external → 403 — never
+  an open redirect). New `redirect_chain` groups in `ssrf.yaml`, including a
+  `/follow/<token>` template whose second-stage callback deterministically
+  proves the fetch FOLLOWED the redirect (allowlist bypass, critical,
+  `bypass_validation`). When a metadata payload answers with an in-band
+  signature, the (capped, credential-shaped-redacted) body lands in
+  `AgentFinding.extracted_data` — detection with demonstrated impact.
+- **authz_ladder agent** (5-B-3) — authorization coverage was two-session
+  horizontal (cross-session IDOR) plus admin surfaces (BFLA); nobody composed
+  the role ladder. New `authz_ladder_agent` (agents 37 → 38): with ≥2 named
+  sessions on distinct roles (a recognizable privileged label orders the
+  ladder), the privileged URL set is replayed under each lower-privilege
+  session — GET/HEAD only — with the differential oracle privileged 200 vs
+  low-priv 200+substantial vs auth-stripped 401/403 → confirmed CWE-862,
+  `bypass_validation` (no LLM). Dispatched on hosts with ≥2 distinct-role
+  sessions.
+- **Chain inventor** (5-B-4) — `ChainEngine`/`validate_chain` executed chains
+  that were *described*; nothing proposed chains from local findings. New
+  `dast/ai/chain_inventor.py`: given a host's confirmed findings (≥2), the LLM
+  proposes ≤2 candidate chains (schema-forced, `{{var}}` extractors
+  compatible with the engine), each validated by the real engine under the
+  existing scope/payload-safety gates PLUS a mandatory impact assertion on the
+  final sensitive step (status-only candidates are rejected before any
+  traffic). A confirmed chain becomes a `chain` finding (grounded via
+  `record_manual_finding`); a refuted one is recorded `ruled_out` in the
+  coverage ledger (risk_area `chain`) so it is not re-invented. New
+  `invent_chain` tool; the autonomous driver runs one inventory attempt
+  (120s cap) at the accepted end of a run with ≥2 findings
+  (`chain_inventory` event).
+- **Reproducible PoC + POE + retest + pentest report** (5-B-5) — evidence
+  existed but never became a deliverable. `dast/report/poc.py`:
+  `build_poc_curl` rebuilds the curl from the stored raw request (auth
+  headers kept — the PoC documents what was PROVEN); `derive_poe` scores
+  ARTEX-style POE 0–4 deterministically (impact demonstrated → validated →
+  evidence linked → narrative → none), surfaced as `poe` on every
+  `/api/findings` row (single source: `flatten_findings`). `POST
+  /api/findings/{entry}/{index}/retest` replays the proof request and records
+  a `retest_state` verdict — Still-reproducible / Fixed / Cannot-confirm —
+  with the original evidence untouched. `dast/report/pentest_report.py` +
+  `GET /api/report/pentest.md` render the hand-over Markdown (executive
+  summary by severity × POE, per-finding PoC/evidence/POE/retest blocks);
+  Findings tab gains a "Pentest report" button, per-finding "Retest" buttons
+  and POE/verdict badges.
+
+### Fixed (offensive round pre-flight)
+- `diff_responses` advertised to MCP clients always failed with "needs the
+  in-process store"; store-less contexts now fetch both entries from the
+  running dashboard (`GET /api/entry/{id}`, the same route `get_history`
+  uses) and produce the identical delta — clean `dashboard fetch failed`
+  error when nothing answers.
+- `jwt_agent` was registered only transitively (the coordinator imported
+  `has_jwt_target` for its own gating); a refactor away from that import
+  would have silently dropped the agent. Now imported by
+  `dast/agents/__init__` like every other agent.
+- `http2` had no deterministic dispatch rule (planner-pick only). https/wss
+  targets now dispatch it, with a per-(host, port) probe memo in the agent
+  (h2 handling is a server-level property) so exactly one ALPN handshake +
+  desync probe happens per host — no duplicate "HTTP/2 Enabled" markers.
+- (env) this volume's `.venv` was repaired via `uv sync --frozen`: `h2`/
+  `hpack` were missing and the editable install pointed at a stale
+  `/Users/zero` path — the http2 tests could not pass here at all.
+
 ### Added (copilot intelligence round 5-A)
 - **Progress scratchpad** (5-A-1) — the per-turn transcript died at every
   finalize, so the copilot re-derived endpoints from scratch each turn. One

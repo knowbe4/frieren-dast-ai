@@ -123,3 +123,16 @@ def test_token_class_params_stay_uninjected():
                               "value": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"}])
     types = _select_attack_types_for_params(target, None)
     assert "sqli" not in types and "xss" not in types
+
+
+# ── http2: TLS surfaces (4-D agent finally dispatched deterministically) ──────
+
+def test_https_target_dispatches_http2():
+    target = _target(url="https://app.test/items")
+    assert "http2" in _select_attack_types_for_params(target, None)
+
+
+def test_plain_http_target_skips_http2():
+    """Plain-http never negotiates ALPN — dispatching there is pure waste."""
+    target = _target(url="http://app.test/items")
+    assert "http2" not in _select_attack_types_for_params(target, None)

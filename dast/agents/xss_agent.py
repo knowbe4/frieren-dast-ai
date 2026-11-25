@@ -37,6 +37,9 @@ _REFLECTED_RE = re.compile(
     re.IGNORECASE,
 )
 _CONFIRM_MARKER = "DAST_XSS_CONFIRM"
+# Settle window before checking collaborator tokens for blind-XSS callbacks —
+# target-side renderers (email previews, admin queues) fire asynchronously.
+_OOB_SETTLE_SECONDS = 2.0
 
 
 def _param_marker(param_name: str) -> str:
@@ -171,7 +174,9 @@ class XssAgent(VulnAgent):
         tech_context: Optional[str] = build_mutator_context(target, "xss")
 
         for param in target.params:
-            finding = await self._probe_param(target, client, param, seed_payloads, tech_context)
+            finding = await self._probe_param(
+                target, client, param, seed_payloads, tech_context, collaborator
+            )
             if finding:
                 findings.append(finding)
 
@@ -184,6 +189,7 @@ class XssAgent(VulnAgent):
         param: dict,
         seed_payloads: List[str],
         tech_context: Optional[str] = None,
+        collaborator: Optional["CollaboratorService"] = None,
     ) -> Optional[AgentFinding]:
         payloads_to_try = prepend_import_payloads(list(seed_payloads), param["name"], "xss", target)
         tried: set = set()
@@ -347,6 +353,117 @@ class XssAgent(VulnAgent):
                 rationale=mutation.rationale,
             )
             payloads_to_try.append(mutation.payload)
+
+        # In-band confirmation failed for this param — the blind/stored OOB
+        # second channel is exactly what catches sinks that render on another
+        # page (admin previews, email renderers, queued viewers). 5-B-1.
+        if collaborator is not None:
+            return await self._probe_blind_oob(target, client, param, collaborator)
+
+        return None
+
+    async def _probe_blind_oob(
+        self,
+        target: "CheckTarget",
+        client: "httpx.AsyncClient",
+        param: dict,
+        collaborator: "CollaboratorService",
+    ) -> Optional[AgentFinding]:
+        """Blind/stored XSS confirmation via OOB callback (5-B-1).
+
+        Injects the blind_oob payload group carrying unique collaborator tokens;
+        a callback on a token is proof the payload EXECUTED in a real browser
+        somewhere — the channel XBOW uses for stored/blind XSS, which in-band
+        reflection and this scan's own browser can never see. When the inject
+        response looks stored (JSON/204), the likely render pages are also
+        fetched in the headless browser (via the proxy) to trigger execution
+        now instead of waiting for a target-side viewer. Non-destructive: the
+        payloads only reference the collaborator URL.
+
+        interactsh fallback (no local collaborator) is a documented follow-up:
+        the OobCorrelator is a long-lived plugin construct (header_oob_scanner
+        already covers the header channel), and wiring a per-agent poll loop is
+        tracked in the roadmap.
+        """
+        import asyncio
+
+        templates = get_payloads("xss", "blind_oob")
+        if not templates:
+            return None
+        sent: List = []  # (payload, token, resp, injected_url)
+        stored_response = False
+
+        for template in templates:
+            token = collaborator.issue_token()
+            payload = (
+                template
+                .replace("{{COLLAB_HOST}}", collaborator.host)
+                .replace("{{COLLAB_PORT}}", str(collaborator.port))
+                .replace("{{TOKEN}}", token)
+            )
+            try:
+                resp, injected_url = await self._send_probe(target, client, param, payload)
+            except Exception as exc:
+                logger.debug("blind_xss: probe send failed", error=str(exc))
+                continue
+            if resp is None:
+                continue
+            content_type = resp.headers.get("content-type", "").lower()
+            if "application/json" in content_type or resp.status_code == 204:
+                stored_response = True
+            sent.append((payload, token, resp, injected_url))
+
+        if not sent:
+            return None
+
+        if stored_response:
+            # Visit the likely render pages in the browser (same candidates
+            # _check_stored_xss uses) so a locally-renderable sink fires now.
+            cookie_header = target.headers.get("cookie", "") or target.headers.get("Cookie", "")
+            referer = target.headers.get("referer", "") or target.headers.get("Referer", "")
+            render_urls = [u for u in (referer, target.url.split("?")[0]) if u.startswith("http")]
+            for render_url in render_urls[:2]:
+                await _browser_confirm(render_url, self._proxy_port, cookie_header)
+
+        # Target-side renderers (email preview, admin queues) may also fire —
+        # give callbacks a short settle window before checking.
+        await asyncio.sleep(_OOB_SETTLE_SECONDS)
+
+        for payload, token, resp, injected_url in sent:
+            if not collaborator.was_hit(token):
+                continue
+            probe_request, probe_response = _fmt_http_pair(resp)
+            from dast.proxy.plugin_manager import log_event
+            log_event("agent", "finding",
+                      f"Blind XSS confirmed via OOB callback on {target.url}",
+                      url=target.url, finding="Blind XSS (OOB)", source="agent")
+            logger.info("Blind XSS OOB callback", param=param["name"],
+                        url=target.url, token=token)
+            return AgentFinding(
+                title="Blind/Stored XSS — OOB Callback Confirms Remote Execution",
+                severity="high",
+                cwe="CWE-79",
+                attack_type="xss",
+                evidence=(
+                    f"Payload injected into parameter '{param['name']}' via "
+                    f"{target.method} {target.url} fetched the collaborator URL "
+                    f"(token {token!r}) from a rendered page — the payload EXECUTED "
+                    f"in a real browser without any in-band reflection.\n\n"
+                    f"Inject response status: {resp.status_code}\n"
+                    f"Probe request:\n{probe_request}\n\n"
+                    f"Probe response:\n{probe_response[:2000]}"
+                ),
+                confirmed=True,
+                payload=payload,
+                parameter=param["name"],
+                url=target.url,
+                request_method=target.method,
+                bypass_validation=True,
+                raw_request=probe_request,
+                raw_response=probe_response[:2000],
+                probe_request=probe_request,
+                probe_response=probe_response[:2000],
+            )
 
         return None
 

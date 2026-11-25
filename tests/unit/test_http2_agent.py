@@ -17,6 +17,16 @@ from dast.agents.http2_agent import Http2Agent, _build_smuggled_probe
 from dast.scanners.active_checks import CheckTarget
 
 
+@pytest.fixture(autouse=True)
+def _fresh_probe_memo():
+    """Each test gets an empty per-host probe memo (module-level state)."""
+    import dast.agents.http2_agent as mod
+
+    mod._reset_probe_memo()
+    yield
+    mod._reset_probe_memo()
+
+
 def _target(url="http://example.com/app"):
     # plain http → run() skips the TLS ALPN probe, isolating the desync oracle.
     return CheckTarget(method="GET", url=url, headers={}, body=None, params=[])
@@ -111,3 +121,28 @@ async def test_no_data_no_finding(monkeypatch):
     monkeypatch.setattr(mod, "_read_h2_exchange", fake_read)
     findings = await Http2Agent().run(_target(), None, None)
     assert findings == []
+
+
+# ── per-host probe memo ───────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_second_endpoint_of_same_host_is_skipped(monkeypatch):
+    """h2 behavior is a server property: with the https dispatch rule live, the
+    agent must probe once per (host, port) — a second endpoint of the same host
+    returns [] without another exchange."""
+    import dast.agents.http2_agent as mod
+
+    calls = {"n": 0}
+
+    async def fake_read(host, port, use_tls, payload):
+        calls["n"] += 1
+        return b""
+
+    monkeypatch.setattr(mod, "_read_h2_exchange", fake_read)
+    first = await Http2Agent().run(_target("http://example.com/a"), None, None)
+    second = await Http2Agent().run(_target("http://example.com/b"), None, None)
+    other = await Http2Agent().run(_target("http://other.test/a"), None, None)
+
+    assert calls["n"] == 2  # example.com once, other.test once
+    assert second == []
+    assert first == [] and other == []

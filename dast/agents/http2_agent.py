@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import ssl
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
@@ -46,6 +46,19 @@ _READ_TIMEOUT_S = 8.0
 _H2_ALPN = "h2"
 _PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 _CLIENT_SETTINGS = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
+
+# h2 handling is a per-HOST property (ALPN + the framing pipeline are
+# server-level, not per-endpoint). With the https dispatch rule live, every
+# endpoint of a host would otherwise re-run the TLS handshake and re-emit the
+# duplicate "HTTP/2 Enabled" marker — probe once per (host, port) instead.
+# A transient first-probe failure is not retried (same trade as the refresh
+# breaker); the next scan run gets a fresh process.
+_PROBED_HOSTS: Set[Tuple[str, int]] = set()
+
+
+def _reset_probe_memo() -> None:
+    """Test isolation for the per-host probe memo."""
+    _PROBED_HOSTS.clear()
 
 
 def _alpn_supports_h2(host: str, port: int) -> Optional[bool]:
@@ -168,6 +181,10 @@ class Http2Agent(VulnAgent):
             return []
         use_tls = parsed.scheme in ("https", "wss")
         port = parsed.port or (443 if use_tls else 80)
+        memo_key = (host, port)
+        if memo_key in _PROBED_HOSTS:
+            return []
+        _PROBED_HOSTS.add(memo_key)
         findings: List[AgentFinding] = []
 
         # 1) ALPN detection (TLS only).

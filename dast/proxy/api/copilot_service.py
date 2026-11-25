@@ -449,6 +449,113 @@ class CopilotService:
         # is kept only so an older caller setting it still gets closed on shutdown.
         self._shared_browser: Any = None
         self._reaper_task: Any = None
+        # 6-A-1: restore persisted session snapshots so a restarted dashboard
+        # can list and CONTINUE past runs. Best-effort: a broken snapshot dir
+        # never blocks the service.
+        try:
+            from dast.proxy.api.copilot_persist import load_snapshots
+            for sid, data in load_snapshots().items():
+                restored = self._restore_session(sid, data)
+                if restored is not None:
+                    self._sessions[sid] = restored
+            restored_count = sum(1 for s in self._sessions.values() if s.get("_restored"))
+            if restored_count:
+                logger.info("copilot sessions restored from snapshots",
+                            count=restored_count)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("copilot snapshot restore failed", error=str(exc))
+
+    def _restore_session(self, sid: str, data: dict) -> Optional[dict]:
+        """Rebuild a session dict (+ engine conversation state, + autonomous
+        state incl. the mission todolist) from a persisted snapshot. Live
+        objects (tasks, events, browser) are recreated fresh; runs that were
+        mid-flight when the process died come back as status 'interrupted'."""
+        if not isinstance(data, dict) or not data:
+            return None
+        engine = self._init_engine(sid, None)
+        engine_state = data.get("engine_state") or {}
+        for key, value in engine_state.items():
+            try:
+                if key == "_session_cookies" and hasattr(engine, "seed_session_cookies"):
+                    engine.seed_session_cookies(value or {})
+                    continue
+                if isinstance(value, list) and key in ("_seen_calls",
+                                                       "_focus_hosts", "_context_hosts",
+                                                       "_denied_hosts", "_ok_endpoints",
+                                                       "_primed_subapps"):
+                    value = set(value)
+                setattr(engine, key, value)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("snapshot: engine field skipped", field=key, error=str(exc))
+        auto_raw = data.get("autonomous") or {}
+        autonomous = None
+        if auto_raw.get("objective"):
+            from dast.ai.copilot.todolist import MissionTodoList
+            todo = MissionTodoList.from_dict(auto_raw.get("todo") or [])
+            autonomous = {k: v for k, v in auto_raw.items() if k != "todo"}
+            autonomous["todo"] = todo
+            autonomous["stop_event"] = asyncio.Event()
+            autonomous["pause_gate"] = asyncio.Event()
+            autonomous["pause_gate"].set()
+        session = {
+            "engine": engine,
+            "status": data.get("status") or "idle",
+            "created_at": data.get("created_at") or time.time(),
+            "updated_at": data.get("updated_at") or time.time(),
+            "trace": [],
+            "pause": None,
+            "last_reply": data.get("last_reply"),
+            "origin": data.get("origin") or "operator",
+            "escalation": data.get("escalation"),
+            "hypothesis": data.get("hypothesis"),
+            "profile_slug": data.get("profile_slug"),
+            "_downgrade_armed": bool(data.get("_downgrade_armed")),
+            "_profile_activated": bool(data.get("_profile_activated")),
+            "_pause_event": asyncio.Event(),
+            "_pause_result": None,
+            "approved_hosts": set(data.get("approved_hosts") or []),
+            "_task": None,
+            "_agent_browser": None,
+            "autonomous": autonomous,
+            "_restored": True,
+        }
+        if autonomous is not None and autonomous.get("status") == "interrupted":
+            session["status"] = "interrupted"
+        return session
+
+    def resume_session(self, sid: str) -> Dict:
+        """Continue a (possibly restored-from-snapshot) session (6-A-1).
+
+        Autonomous sessions are re-driven with their ORIGINAL objective,
+        config, mission todolist and counters; interactive sessions just need
+        the next operator message (their conversation state is already on the
+        engine). Returns a summary or an error dict."""
+        session = self._sessions.get(sid)
+        if session is None:
+            return {"ok": False, "error": "unknown session"}
+        auto = session.get("autonomous")
+        if auto is not None:
+            if session.get("_task") is not None and not session["_task"].done():
+                return {"ok": False, "error": "session is already running"}
+            auto["stop_event"] = asyncio.Event()
+            auto["pause_gate"] = asyncio.Event()
+            auto["pause_gate"].set()
+            auto["status"] = "running"
+            auto.pop("paused_at", None)
+            session["status"] = "running"
+            session["_restored"] = False
+            auto["_resumed"] = True
+            session["_task"] = spawn_tracked(self._drive_autonomous(sid),
+                                             name=f"copilot-driver-{sid}")
+            logger.info("autonomous session resumed", session_id=sid,
+                        objective=(auto.get("objective") or "")[:80])
+            return {"ok": True, "resumed": "autonomous",
+                    "objective": (auto.get("objective") or "")[:120],
+                    "todo": auto.get("todo").progress() if auto.get("todo") else None}
+        session["status"] = "idle"
+        session["_restored"] = False
+        return {"ok": True, "resumed": "interactive",
+                "messages": len(getattr(session.get("engine"), "messages", []) or [])}
 
     async def _close_session_browser(self, session: dict) -> None:
         """Close and detach this session's own AgentBrowser, if any."""
@@ -533,6 +640,7 @@ class CopilotService:
             hosts = self._effective_hosts(focus_hosts or [], slug) or focus_hosts
         self._sessions[sid] = {
             "engine": self._init_engine(sid, hosts),
+            "session_id": sid,
             "status": "idle",
             "created_at": time.time(),
             "updated_at": time.time(),
@@ -989,6 +1097,14 @@ class CopilotService:
             session["last_reply"] = {"message": f"Internal error: {str(exc)[:300]}",
                                      "blocked_reason": "error"}
             self._cleanup_session(session)
+        finally:
+            # 6-A-1: persist the session snapshot at every turn boundary so a
+            # process restart can list and continue past conversations.
+            try:
+                from dast.proxy.api.copilot_persist import save_snapshot
+                save_snapshot(sid, session)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("snapshot persist failed", session_id=sid, error=str(exc))
 
     # ── Autonomous orchestrator run ──────────────────────────────────────────────
     def run_autonomous(
@@ -1883,6 +1999,14 @@ class CopilotService:
         session["status"] = "idle" if status == "complete" else status
         session["pause"] = None
         session["updated_at"] = time.time()
+
+        # 6-A-1: snapshot the finished (or stopped/error) run so it stays
+        # listable and continuable across process restarts.
+        try:
+            from dast.proxy.api.copilot_persist import save_snapshot
+            save_snapshot(str(session.get("session_id") or ""), session)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("snapshot persist failed", error=str(exc))
 
         # Clean up resources the copilot acquired during the run.
         self._cleanup_session(session)

@@ -298,6 +298,23 @@ def make_router(ctx: DashboardContext) -> APIRouter:
             return JSONResponse({"error": "session not found"}, status_code=404)
         return service.session_dict(sid)
 
+    @router.post("/api/copilot/session/{sid}/continue")
+    async def continue_session(sid: str):
+        """Continue a session across a process restart (6-A-1).
+
+        Autonomous sessions are re-driven with their original objective,
+        config, mission todolist and counters; interactive sessions are marked
+        idle so the next POST /api/copilot/message continues the conversation
+        with full history. Sessions restored from ~/.dast-ai snapshots at boot
+        appear in GET /api/copilot/sessions as status 'interrupted'.
+        """
+        if not service.has(sid):
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        try:
+            return service.resume_session(sid)
+        except Exception as exc:  # noqa: BLE001
+            return JSONResponse({"ok": False, "error": str(exc)[:200]}, status_code=500)
+
     @router.post("/api/copilot/resume/{sid}")
     async def resume(sid: str, body: dict):
         """Answer the current pause. Body: {kind, value}.

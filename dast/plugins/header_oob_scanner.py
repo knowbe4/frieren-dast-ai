@@ -24,7 +24,12 @@ from urllib.parse import urlparse
 
 from dast.payloads.loader import get_value
 from dast.proxy.plugin_base import ProxyPlugin
-from dast.scanners.oob_correlator import OobCorrelator, OobHit, OobInjection
+from dast.scanners.oob_correlator import (
+    OobCorrelator,
+    OobHit,
+    OobInjection,
+    looks_like_static_cdn_origin,
+)
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -115,6 +120,26 @@ def build_finding(hit: OobHit) -> Dict[str, object]:
             "client rendering that response could have produced this callback. Verify that "
             "the interaction comes from the target's infrastructure."
         )
+    elif hit.protocol in ("http", "https") and injection.cdn_static_origin:
+        # The probe response came from a static/CDN edge (object store or CDN),
+        # which has no dynamic application backend to dereference the header.
+        # An HTTP callback here is most likely the CDN's own edge resolver
+        # fetching the Host-like value, not application-origin SSRF — downgrade.
+        finding["title"] = (
+            f"Possible blind SSRF via {injection.name} header — likely CDN/edge "
+            f"callback artifact (needs review)"
+        )
+        finding["severity"] = "info"
+        finding["confirmed"] = False
+        finding["needs_review"] = True
+        finding["confidence"] = 0.3
+        finding["reasoning"] = (
+            "The probe response is served by a CDN-fronted static origin, which has no "
+            "dynamic application backend to parse this header, so the callback likely "
+            "originated at the CDN/edge resolver rather than the application backend. "
+            "Reproduce against the live target and analyze the responses before treating "
+            "this as SSRF — a single non-reproducible edge callback is not a confirmed finding."
+        )
     return finding
 
 
@@ -178,8 +203,13 @@ class HeaderOobScannerPlugin(ProxyPlugin):
             logger.warning("Header OOB probe failed", url=entry.url, error=str(exc))
             return
         response_text = response.text or ""
+        # Does the probe response look like a static/CDN edge (no dynamic backend
+        # to dereference a header)? A header-keyed callback from such an origin is
+        # an edge resolver / cache artifact, not application-origin SSRF.
+        cdn_static_origin = looks_like_static_cdn_origin(getattr(response, "headers", None))
         for injection in injections:
             injection.reflected = injection.value in response_text
+            injection.cdn_static_origin = cdn_static_origin
         self._correlator.track()
         logger.debug("Header OOB probe sent", url=entry.url, headers=len(injections),
                      status=response.status_code)

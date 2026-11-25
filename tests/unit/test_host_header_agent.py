@@ -93,6 +93,26 @@ def test_oob_callback_confirms_high():
     assert {f.parameter for f in findings} == {"host", "x-forwarded-host"}
 
 
+def test_oob_callback_on_cdn_static_origin_held_for_review():
+    # A CDN-fronted static origin (object store behind a CDN) can emit a single
+    # edge-resolver callback that is not application-origin SSRF. With no link
+    # reflection, hold it for review instead of confirming a high.
+    agent = hh.HostHeaderAgent()
+    collab = _FakeCollaborator(hit=True)
+    resp = _resp(body="static content")
+    resp.headers = {"content-type": "text/html", "server": "AmazonS3",
+                    "x-amz-cf-id": "edge", "via": "1.1 cloudfront"}
+    send = AsyncMock(return_value=resp)
+    with patch.object(hh, "_send", new=send), \
+         patch.object(hh, "_OOB_SETTLE_SECONDS", 0):
+        findings = _run(agent, _target(), collaborator=collab)
+    assert len(findings) == 2  # host + x-forwarded-host
+    assert all(f.severity == "info" for f in findings)
+    assert all(f.confirmed is False for f in findings)
+    assert all(f.needs_review is True for f in findings)
+    assert all(f.bypass_validation is False for f in findings)
+
+
 def test_location_reflection_flagged_medium():
     agent = hh.HostHeaderAgent()
     # Both probes (Host and X-Forwarded-Host) get the same reflecting response.

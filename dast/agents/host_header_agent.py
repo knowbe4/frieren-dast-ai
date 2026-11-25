@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from dast.ai.agent_base import AgentFinding, VulnAgent
 from dast.scanners.active_checks import _fmt_http_pair, _send
+from dast.scanners.oob_correlator import looks_like_static_cdn_origin
 from dast.utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -104,6 +105,37 @@ class HostHeaderAgent(VulnAgent):
                 await asyncio.sleep(_OOB_SETTLE_SECONDS)
                 if collaborator.was_hit(token):
                     raw_request, raw_response = _fmt_http_pair(resp)
+                    link_reflected = self._link_reflection(resp, marker_host)
+                    cdn_edge = looks_like_static_cdn_origin(getattr(resp, "headers", None))
+                    if cdn_edge and not link_reflected:
+                        # The response is served by a CDN-fronted static origin with no
+                        # dynamic backend to dereference the header, so the callback most
+                        # likely came from the CDN/edge resolver, not the application.
+                        # Downgrade to needs-review instead of a confirmed high.
+                        findings.append(AgentFinding(
+                            title=f"Possible Host Header Injection — likely CDN/edge callback artifact ({header_name})",
+                            severity="info",
+                            cwe="CWE-644",
+                            attack_type="host_header",
+                            evidence=(
+                                f"Overriding {header_name} with {marker_host} produced an OOB callback "
+                                f"(token {token!r}), but the response is served by a CDN-fronted static "
+                                f"origin with no dynamic backend to parse the header — the callback likely "
+                                f"originated at the CDN/edge resolver. Reproduce and analyze the responses "
+                                f"before treating this as host-header injection / SSRF."
+                            ),
+                            payload=marker_host,
+                            parameter=header_name,
+                            url=target.url,
+                            request_method=target.method,
+                            confirmed=False,
+                            needs_review=True,
+                            confidence=0.3,
+                            bypass_validation=False,
+                            raw_request=raw_request,
+                            raw_response=raw_response,
+                        ))
+                        continue
                     findings.append(AgentFinding(
                         title=f"Host Header Injection — Outbound Request To Attacker Host ({header_name})",
                         severity="high",

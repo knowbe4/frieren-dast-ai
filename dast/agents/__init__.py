@@ -5,6 +5,7 @@ This module must be imported before run_active_checks() is called.
 
 from dast.agents import (  # noqa: F401
     auth_agent,
+    authz_ladder_agent,
     blazor_agent,
     cache_poisoning_agent,
     cache_deception_agent,

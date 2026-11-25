@@ -809,6 +809,16 @@ def _select_attack_types_for_params(
         # GET/HEAD only (the agent hard-gates; state-changing methods never sent).
         if _ADMIN_PATH_RE_BFLA.search(target.url):
             candidate_types.add("bfla")
+        # authz_ladder (5-B-3): the role-ladder sweep — needs >=2 sessions on
+        # DISTINCT roles so a low → high rung actually exists; the agent
+        # hard-gates on the same prerequisite and never sends state-changing
+        # methods.
+        _ladder_sessions = getattr(target, "named_sessions", None) or []
+        if len({
+            (getattr(s, "role", "") or "").lower()
+            for s in _ladder_sessions if getattr(s, "role", "")
+        }) >= 2:
+            candidate_types.add("authz_ladder")
     # bfla version-downgrade half: /vN/ URLs answer with the SAME credentials
     if _VERSION_RE_BFLA.match(target.url):
         candidate_types.add("bfla")

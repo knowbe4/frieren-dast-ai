@@ -426,6 +426,19 @@ def make_router(ctx: DashboardContext) -> APIRouter:
         session["status"] = "idle"
         return {"ok": True}
 
+    @router.delete("/api/copilot/session/{sid}")
+    async def delete_session(sid: str):
+        """Cancel, close browser, and remove a copilot session."""
+        session = service.get(sid)
+        if session is None:
+            return JSONResponse({"error": "session not found"}, status_code=404)
+        task: Optional[asyncio.Task] = session.get("_task")
+        if task and not task.done():
+            task.cancel()
+        service._cleanup_session(session)
+        service._sessions.pop(sid, None)
+        return {"ok": True, "session_id": sid}
+
     @router.websocket("/ws/copilot")
     async def copilot_ws(ws: WebSocket):
         await ws.accept()

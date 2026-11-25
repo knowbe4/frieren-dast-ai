@@ -71,6 +71,12 @@ _DETERMINISTIC_PROBE_TOOLS = frozenset({
     "oob_poll", "web_cache_deception_probe", "prototype_pollution_probe",
 })
 
+# Read-only observation tools exempt from the no-progress watchdog: they return the
+# current page state without changing it, so identical results are expected (a snapshot
+# of a static page looks the same every time). The absolute _MAX_NORMALIZED_REPEATS cap
+# still bounds them, so the model can't spam them indefinitely.
+_NOPROGRESS_EXEMPT_TOOLS = frozenset({"browser_snapshot"})
+
 
 class RefreshTier(IntEnum):
     """Bearer-refresh escalation tiers, cheapest -> most expensive. ``refresh_bearer``
@@ -1870,12 +1876,23 @@ class CopilotSession:
                     # for the same normalized signature. A new outcome resets the no-progress
                     # streak (productive repeat); the same outcome grows it so the watchdog
                     # trips on genuine spinning, not on a fixed repeat count.
+                    # Observation-only tools (browser_snapshot) are exempt: they return current
+                    # page state without changing it, so identical results are expected.
+                    _noprogress_warn = ""
                     _oc = _outcome_fingerprint(result)
-                    if self._sig_outcomes.get(_norm_sig) == _oc:
-                        self._sig_noprogress[_norm_sig] = \
-                            self._sig_noprogress.get(_norm_sig, 0) + 1
-                    else:
-                        self._sig_noprogress[_norm_sig] = 0
+                    if tool_name not in _NOPROGRESS_EXEMPT_TOOLS:
+                        if self._sig_outcomes.get(_norm_sig) == _oc:
+                            self._sig_noprogress[_norm_sig] = \
+                                self._sig_noprogress.get(_norm_sig, 0) + 1
+                        else:
+                            self._sig_noprogress[_norm_sig] = 0
+                        if self._sig_noprogress.get(_norm_sig, 0) >= _MAX_NOPROGRESS_REPEATS:
+                            _noprogress_warn = (
+                                "[SYSTEM] This call returned the same result again "
+                                "with no progress. You MUST change approach — use a "
+                                "different tool, endpoint, or parameters, or conclude "
+                                "your analysis. The next identical call will terminate "
+                                "your turn.\n\n")
                     self._sig_outcomes[_norm_sig] = _oc
 
                     if await self._auth_gate(
@@ -1987,8 +2004,8 @@ class CopilotSession:
                     # observation from the generic cap so the field reaches the model intact.
                     if isinstance(result, dict) and result.get("full_value"):
                         entry["observation_cap"] = _EXTRACT_FULL_OBSERVATION_CHARS
-                    await _observe(entry, _auth_note + _strip_guidance
-                                   + _summarize_result(result))
+                    await _observe(entry, _noprogress_warn + _auth_note
+                                   + _strip_guidance + _summarize_result(result))
                     # A successful state-changing request invalidates earlier read
                     # dedup keys: the copilot must be able to re-issue a prior read
                     # to observe the NEW state (e.g. GET /load after DELETE). Reset

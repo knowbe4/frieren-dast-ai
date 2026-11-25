@@ -58,6 +58,23 @@ def _resolve(template: str, host: str, port: int, token: str) -> str:
     )
 
 
+# Cloud metadata endpoints whose readable body IS the SSRF impact (5-B-2).
+_METADATA_TARGET_RE = re.compile(
+    r"169\.254\.169\.254|metadata\.google\.internal|169\.254\.170\.2|100\.100\.100\.200",
+    re.IGNORECASE,
+)
+
+# Long credential-shaped values (AWS keys, JWTs, opaque tokens) — redacted to a
+# short prefix before the metadata body leaves the agent (no full secrets in
+# findings/reports; the evidence stays verifiable by shape, not by value).
+_SECRET_VALUE_RE = re.compile(r"([A-Za-z0-9+/=_.\-]{24,})")
+
+
+def _redact_secrets(text: str) -> str:
+    """Redact credential-shaped values to a 6-char prefix + marker."""
+    return _SECRET_VALUE_RE.sub(lambda m: m.group(1)[:6] + "…[redacted]", text)
+
+
 class SsrfAgent(VulnAgent):
     name = "SSRF Agent"
     attack_type = "ssrf"
@@ -138,6 +155,10 @@ class SsrfAgent(VulnAgent):
         oob_templates = get_filtered_payloads("ssrf", target) or (
             get_payloads("ssrf", "oob_http") + get_payloads("ssrf", "internal_probe")
         )
+        # 5-B-2: redirect-chain bypass group — always worth one probe when a
+        # collaborator is available (the allowlist sees the collaborator, the
+        # server-side fetch follows our 302 to internal space).
+        oob_templates = list(oob_templates) + list(get_payloads("ssrf", "redirect_chain"))
         payloads_to_try = []
         token_map = {}
         tech_context = build_mutator_context(target, "ssrf")
@@ -153,6 +174,35 @@ class SsrfAgent(VulnAgent):
         for payload, token in payloads_to_try:
             resp = await self._send_probe(target, client, param, payload)
             await asyncio.sleep(1.5)
+
+            # 5-B-2 redirect-chain proof: the payload pointed the collaborator's
+            # 302 back at /follow/<TOKEN> — if the fetch FOLLOWED the redirect,
+            # that second-stage request landed here. Deterministic allowlist-
+            # bypass proof (redirect/ prefix distinguishes the group).
+            if payload.startswith(f"http://{collaborator.host}:{collaborator.port}/redirect/") \
+                    and collaborator.was_hit(f"follow/{token}"):
+                raw_request, raw_response = _fmt_http_pair(resp) if resp else ("", "")
+                return AgentFinding(
+                    title="SSRF via Redirect-Chain Allowlist Bypass",
+                    severity="critical",
+                    cwe="CWE-918",
+                    attack_type="ssrf",
+                    evidence=(
+                        f"The server fetched the collaborator URL (allowlisted as "
+                        f"external) and FOLLOWED its 302 — the second-stage request "
+                        f"to follow/{token} landed on the collaborator. URL "
+                        f"allowlists that trust the initial host are bypassed via "
+                        f"redirect chains. Internal redirects served by the "
+                        f"collaborator reach private/metadata space only."
+                    ),
+                    payload=payload,
+                    parameter=param["name"],
+                    url=target.url,
+                    request_method=target.method,
+                    bypass_validation=True,
+                    raw_request=raw_request,
+                    raw_response=raw_response,
+                )
 
             if collaborator.was_hit(token):
                 raw_request, raw_response = _fmt_http_pair(resp) if resp else ("", "")
@@ -179,6 +229,16 @@ class SsrfAgent(VulnAgent):
                 if _is_graphql_echo(resp.text, payload):
                     continue
                 raw_request, raw_response = _fmt_http_pair(resp)
+                # 5-B-2 impact: when the hit is a cloud metadata endpoint, the
+                # response body IS the impact — attach it (capped + redacted,
+                # no full secrets) so the finding demonstrates readable impact
+                # instead of mere detection.
+                extract_data = None
+                if _METADATA_TARGET_RE.search(payload):
+                    extract_data = {
+                        "note": "cloud metadata readable via SSRF (GET read-only; capped + redacted)",
+                        "metadata_body": _redact_secrets(resp.text)[:800],
+                    }
                 return AgentFinding(
                     title="Server-Side Request Forgery (SSRF) — Internal Response Detected",
                     severity="critical",
@@ -192,6 +252,7 @@ class SsrfAgent(VulnAgent):
                     bypass_validation=False,
                     raw_request=raw_request,
                     raw_response=raw_response,
+                    extracted_data=extract_data,
                 )
 
             # Blocked? Try a mutated bypass

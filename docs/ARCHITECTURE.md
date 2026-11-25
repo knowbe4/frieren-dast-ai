@@ -20,7 +20,7 @@ flowchart TD
 
     store --> passive["Passive Scanner<br/>91 rules · no extra requests"]
     store --> coord["Coordinator<br/>LLM: plan → run → validate"]
-    coord --> agents["Vuln Agents<br/>~37, parallel per endpoint"]
+    coord --> agents["Vuln Agents<br/>38, parallel per endpoint"]
 
     copilot["AI Copilot<br/>interactive / autonomous"] -.->|"replays through"| proxy
 
@@ -38,9 +38,9 @@ flowchart TD
 | **MITM Proxy** (:8080) | Terminates TLS per host; all browser/tool traffic flows through it | `dast/proxy/proxy_server.py` |
 | **Session Store** | In-memory requests/responses + cookie jar — the single source both engines read | `dast/proxy/session_store.py` |
 | **Passive Scanner** | 91 YAML rules fire on each response (headers, cookies, CORS, secrets, errors), no extra traffic | `dast/plugins/passive_scanner.py`, `dast/passive_rules/**` |
-| **Coordinator → Vuln Agents** | LLM selects which of ~37 agents to run per endpoint, runs them in parallel, validates the output | `dast/ai/coordinator.py`, `dast/agents/**` |
+| **Coordinator → Vuln Agents** | LLM selects which of the 38 agents to run per endpoint, runs them in parallel, validates the output | `dast/ai/coordinator.py`, `dast/agents/**` |
 | **AI Copilot** | Interactive/autonomous loop — reads app knowledge, plans with the LLM, drives a Playwright browser + tools to confirm issues by hand | `dast/ai/copilot/**` |
-| **Tool layer + AI Gateway** | 66 shared tools and a multi-provider LLM gateway, shared by the copilot, agents, and the MCP server | `dast/tools/**`, `dast/ai/providers.py`, `dast/mcp/server.py` |
+| **Tool layer + AI Gateway** | 68 shared tools and a multi-provider LLM gateway, shared by the copilot, agents, and the MCP server | `dast/tools/**`, `dast/ai/providers.py`, `dast/mcp/server.py` |
 | **Dashboard** (:8088) | FastAPI + WebSocket UI: live findings, history, copilot panel, runtime config | `dast/proxy/dashboard_server.py` |
 
 The rest of this document details each box below.
@@ -612,15 +612,18 @@ dast/
 │   ├── providers.py          Multi-provider AI gateway (gateway default, bedrock/local fallback)
 │   ├── payload_generator.py  Standalone scan mode
 │   ├── response_analyzer.py  Standalone scan mode (legacy)
+│   ├── chain_inventor.py     Composes attack chains from local findings (5-B-4)
+│   ├── attack_subagent.py    XBOW-style per-finding escalation loop (5-C-1)
 │   └── copilot/              Interactive/autonomous AI pentester
 │       ├── session.py        The turn loop: plan → call tools → observe → record
 │       ├── context_brief.py  Builds the per-turn brief (app knowledge, scope, leads)
 │       ├── prompt_blocks.py  Reusable prompt sections (router, leads, coverage)
+│       ├── todolist.py       Mission todolist with prerequisites (autonomous runs)
 │       └── wrapup.py         Salvage + scratchpad persistence before a forced end
 │
 ├── tools/                    Shared tool registry — used by the copilot AND the MCP server
-│                             66 tools: send_request, browser_fetch, sqli_probe,
-│                             graphql_scope_probe, login profiles, app_knowledge, ...
+│                             68 tools: send_request, browser_fetch, sqli_probe,
+│                             attack_finding (XBOW subagent), invent_chain, ...
 │
 ├── payloads/                 Seed payloads in YAML — edit without touching code
 │   ├── loader.py             Cached YAML loader
@@ -689,6 +692,8 @@ dast/
 │   └── refresh_worker.py     Background re-auth on 401/redirect-to-login detection
 ├── attack/                   Standalone scan mode (legacy attack engine)
 ├── report/                   JSON + Markdown + SARIF 2.1.0 export
+│   ├── poc.py                Reproducible curl PoC + deterministic POE 0-4 (5-B-5)
+│   └── pentest_report.py     Deliverable Markdown pentest report (5-B-5)
 └── utils/
     └── logger.py             structlog structured logging
 ```

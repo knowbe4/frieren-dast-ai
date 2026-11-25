@@ -15,8 +15,12 @@ from __future__ import annotations
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from dast.session import site_map, subapp_map
+from dast.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def subapp_for_path(path: str, site: str = "") -> Optional[str]:
@@ -398,3 +402,60 @@ def attach(headers: Dict[str, str], *, transport: str,
         result.attached_bearer = True
 
     return result
+
+
+async def resolve_request_auth(ctx: Any, url: str, method: str) -> Dict[str, Any]:
+    """Resolve the SAME auth ``send_request`` uses, for a raw tool that builds its own client.
+
+    ONE implementation shared by sqli_probe, graphql_scope_probe and graphql_sweep so the
+    breadth/scope/injection tools all authenticate identically on browser-preferred,
+    origin-gated hosts instead of each re-deriving (and drifting on) cookie/Bearer sourcing.
+
+    Returns ``{"cookies", "bearer_rec", "csrf_token"}`` ready to feed into :func:`attach`:
+      - cookies: the active session's jar for the host. When a copilot ``session_name`` is
+        present AND the store exposes ``get_named_session_cookies_for_host``, the NAMED session
+        is the source of truth (a login profile's cookies live there, not in the global jar);
+        otherwise falls back to the global ``get_cookies_for_host`` (non-copilot / MCP callers).
+      - bearer_rec: the fresh per-sub-app Bearer (engine ``_ensure_fresh_bearer`` when available,
+        then an in-session ``_select_bearer`` capture, else a history scan).
+      - csrf_token: a token from observed traffic for state-changing methods.
+    Never raises; any lookup failure degrades to the global jar / no token."""
+    store = getattr(ctx, "store", None)
+    parsed = urlparse(url)
+    host, path = parsed.hostname or "", parsed.path or "/"
+
+    jar_cookie_map: Dict[str, str] = {}
+    session_name = getattr(getattr(ctx, "_session", None), "session_name", None)
+    if store is not None:
+        try:
+            if session_name and hasattr(store, "get_named_session_cookies_for_host"):
+                jar = store.get_named_session_cookies_for_host(session_name, host) or []
+            else:
+                jar = store.get_cookies_for_host(host) or []
+            jar_cookie_map = {c.get("name"): c.get("value", "") for c in jar if c.get("name")}
+        except Exception as exc:
+            logger.debug("resolve_request_auth: cookie jar lookup failed", host=host, error=str(exc))
+
+    rec = None
+    session = getattr(ctx, "_session", None)
+    try:
+        if session is not None and store is not None and hasattr(session, "_ensure_fresh_bearer"):
+            rec = await session._ensure_fresh_bearer(
+                store, host, path, browser=getattr(ctx, "browser", None))
+        elif session is not None and hasattr(session, "_select_bearer"):
+            if store is not None and hasattr(session, "_capture_bearer_tokens"):
+                session._capture_bearer_tokens(store, host)
+            rec = session._select_bearer(host, path)
+        elif store is not None:
+            rec = scan_history_bearer(store, host, path)
+    except Exception as exc:
+        logger.debug("resolve_request_auth: bearer resolution failed", host=host, error=str(exc))
+
+    csrf_token = None
+    if store is not None and method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            csrf_token = scan_history_csrf(store, host, exclude_source="copilot")
+        except Exception as exc:
+            logger.debug("resolve_request_auth: csrf resolution failed", host=host, error=str(exc))
+
+    return {"cookies": jar_cookie_map or None, "bearer_rec": rec, "csrf_token": csrf_token}

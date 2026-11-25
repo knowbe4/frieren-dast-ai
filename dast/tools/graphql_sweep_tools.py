@@ -164,25 +164,29 @@ async def _probe_operation(
         })
         try:
             import httpx
-            from urllib.parse import urlparse as _urlparse_gql
+
+            from dast.session.auth_provider import attach as _attach
+            from dast.session.auth_provider import resolve_request_auth
 
             req_headers: Dict[str, str] = {
                 "content-type": "application/json",
                 "accept": "application/json",
             }
-            if ctx.store is not None:
-                _host = _urlparse_gql(url).hostname or ""
-                try:
-                    jar_cookies = ctx.store.get_cookies_for_host(_host) or []
-                    if jar_cookies:
-                        cookie_header = "; ".join(
-                            f"{c['name']}={c.get('value', '')}"
-                            for c in jar_cookies if c.get("name")
-                        )
-                        if cookie_header:
-                            req_headers["cookie"] = cookie_header
-                except Exception:
-                    pass
+            # Resolve auth the same way send_request / sqli_probe / scope_probe do:
+            # named-session cookies (when a copilot session_name is present) + per-sub-app
+            # Bearer + CSRF, attached via the shared helper. This is what lets the sweep
+            # authenticate on browser-preferred / origin-gated hosts whose login-profile
+            # cookies live in a NAMED session, not the global jar. Falls back to the global
+            # jar for non-copilot / MCP callers.
+            try:
+                auth = await resolve_request_auth(ctx, url, "POST")
+                _attach(
+                    req_headers, transport="api",
+                    cookies=auth["cookies"], bearer_rec=auth["bearer_rec"],
+                    csrf_token=auth["csrf_token"],
+                )
+            except Exception as exc:
+                logger.debug("graphql_sweep: auth resolution failed", error=str(exc))
 
             _source = getattr(ctx, "source_label", None) or "agent"
             req_headers["x-dast-source"] = str(_source)

@@ -18,10 +18,11 @@ callbacks.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 from dast.utils.logger import get_logger
 
@@ -54,6 +55,7 @@ class OobInjection:
     value: str         # the exact value sent
     sent_at: float
     reflected: bool = False  # the value came back in the probe response body
+    cdn_static_origin: bool = False  # probe response looks like a static/CDN edge
 
 
 @dataclass
@@ -80,6 +82,44 @@ def interaction_labels(interaction: Dict[str, Any]) -> List[str]:
         if isinstance(value, str) and value:
             labels.extend(label for label in value.lower().split(".") if label)
     return labels
+
+
+# A response served by a static/CDN edge (object store or CDN) has no dynamic
+# application backend to parse a header value, so an OOB callback keyed off a
+# Host-like header injected into such a request is an edge resolver / cache
+# artifact (the CDN itself resolving/fetching the value), NOT an
+# application-origin SSRF. These signals distinguish that case.
+_CDN_SERVER_RE = re.compile(
+    r"amazons3|cloudfront|cloudflare|akamai|fastly|google\s*frontend|\bgws\b|vercel|netlify|varnish",
+    re.IGNORECASE,
+)
+# Response header names that only a CDN / edge cache emits.
+_CDN_HEADER_NAMES = (
+    "x-amz-cf-id", "x-amz-cf-pop", "x-cache", "cf-ray", "x-served-by",
+    "x-fastly-request-id", "x-vercel-id", "x-nf-request-id",
+)
+
+
+def looks_like_static_cdn_origin(headers: Optional[Mapping[str, Any]]) -> bool:
+    """True when response headers indicate a static/CDN edge origin.
+
+    Signals (any one suffices): a ``Server`` header naming a static/CDN origin
+    (object store or CDN), a ``Via`` header naming a CDN, or a CDN-only cache
+    header (``x-cache``, ``x-amz-cf-id``, ...). Such an origin has no dynamic
+    backend to dereference a header, so a header-keyed OOB callback is an edge
+    artifact rather than application SSRF.
+    """
+    if not headers:
+        return False
+    try:
+        lowered = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+    except Exception:
+        return False
+    if _CDN_SERVER_RE.search(lowered.get("server", "")):
+        return True
+    if _CDN_SERVER_RE.search(lowered.get("via", "")):
+        return True
+    return any(name in lowered for name in _CDN_HEADER_NAMES)
 
 
 def _default_session_factory() -> Any:

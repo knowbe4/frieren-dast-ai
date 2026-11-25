@@ -39,6 +39,7 @@ from dast.tools import idor_tools as _idor_tools  # noqa: F401
 from dast.tools import login_tools as _login_tools  # noqa: F401
 from dast.tools import idor_scan_tools as _idor_scan_tools  # noqa: F401
 from dast.tools import oob_tools as _oob_tools  # noqa: F401
+from dast.tools import scan_output_tools as _scan_output_tools  # noqa: F401
 from dast.tools import session_tools as _session_tools  # noqa: F401
 from dast.tools import transport_capability_tools as _transport_capability_tools  # noqa: F401
 from dast.tools import prime_tools as _prime_tools  # noqa: F401

@@ -340,6 +340,85 @@ def make_router(ctx: DashboardContext) -> APIRouter:
                  "skipped": 0}
         return {"ok": True, **stats}
 
+    # ── scan-output import: nmap XML / nuclei JSONL (6-A-2) ──────────────────
+    def _store_scan_output_entry(pl: dict, finding: dict | None):
+        """Persist one imported scan-output payload as a synthetic entry and
+        queue it for the active-scan pipeline (the deterministic agents — and
+        through them the 5-C attack sub-agents — verify it live)."""
+        import time as _time
+        import uuid as _uuid
+        from urllib.parse import urlparse as _urlparse
+
+        from dast.proxy.session_store import ProxyEntry
+
+        parsed = _urlparse(pl["url"])
+        entry = ProxyEntry(
+            id=f"import-{int(_time.time() * 1000)}-{_uuid.uuid4().hex[:8]}",
+            method="GET", url=pl["url"], host=parsed.netloc,
+            path=parsed.path or "/", request_headers={}, request_body=None,
+            response_status=None, source="imported",
+        )
+        entry.import_key = pl["key"]
+        if finding:
+            entry.findings.append(dict(finding))
+        store.add_synthetic_entry(entry, notify=False)
+        entry.queued_for_scan = True
+        if scan_queue_state:
+            scan_queue_state.enqueue(entry.id, entry.method, entry.url,
+                                     entry.host, operation="")
+        return entry.id
+
+    async def _import_scan_output(kind: str, request):
+        raw = await request.body()
+        if len(raw) > 64 * 1024 * 1024:
+            return JSONResponse(
+                {"error": f"{kind} file too large (64 MiB cap)"}, status_code=413)
+        try:
+            text = raw.decode("utf-8", errors="replace")
+            if kind == "nmap":
+                from dast.importers.scan_output_import import import_nmap_xml
+                parsed = import_nmap_xml(text)
+            else:
+                from dast.importers.scan_output_import import import_nuclei_jsonl
+                parsed = import_nuclei_jsonl(text)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+        existing_keys = {e.import_key for e in store.all_entries() if e.import_key}
+        added = 0
+        for pl in parsed.get("entries", []):
+            if pl["key"] in existing_keys:
+                continue
+            entry_id = _store_scan_output_entry(pl, pl.get("finding"))
+            if entry_id:
+                existing_keys.add(pl["key"])
+                added += 1
+                if scan_queue is not None:
+                    await scan_queue.put(entry_id)
+
+        stats = parsed.get("stats", {})
+        out = {"ok": True, "kind": kind, "parsed": len(parsed.get("entries", [])),
+               "added": added, "errors": stats.get("errors", []),
+               "skipped_over_cap": stats.get("skipped_over_cap", 0)}
+        if kind == "nmap":
+            out["other_services"] = parsed.get("other_services", [])[:50]
+        return out
+
+    @router.post("/api/history/import/nmap")
+    async def import_history_nmap(request: "Request"):
+        """Import an nmap XML output (-oX): every open HTTP(S) service becomes an
+        imported GET entry queued for active scanning; non-HTTP services are
+        returned as context. Idempotent via deterministic import keys (6-A-2)."""
+        return await _import_scan_output("nmap", request)
+
+    @router.post("/api/history/import/nuclei")
+    async def import_history_nuclei(request: "Request"):
+        """Import nuclei JSONL output (-json): each finding becomes an imported
+        stub (import_status='queued') on a synthetic entry queued for the scan
+        pipeline — frieren VERIFIES the external finding live. Idempotent via
+        deterministic import keys (6-A-2)."""
+        return await _import_scan_output("nuclei", request)
+
     @router.get("/api/history/export/har")
     async def export_history_har():
         """Download the in-scope history as a HAR 1.2 file (3-I). Stable (ts, id)

@@ -772,6 +772,12 @@ _TOOL_PHASES: Dict[str, set] = {
 # XBOW pivot (prove it or rule it out) must never be buried in the compact list.
 _ALWAYS_PRIORITY = {"send_request", "get_findings", "record_finding",
                     "record_coverage", "diff_responses", "attack_finding"}
+# In explore-manually mode (SPA explorer found too few routes), these tools are
+# moved OUT of the always-priority set so the LLM sees browser/recon tools
+# prominently and API-first tools only in the compact "also available" list.
+_EXPLORE_DEPRIORITIZE = frozenset({
+    "send_request", "graphql_fuzz", "graphql_sweep", "run_scan", "scan_surface",
+})
 _PHASE_ORDER = ["recon", "auth", "scan", "escalate", "report"]
 _FULL_MENU_TOOL_COUNT = 24  # at or below this, a full menu IS the clean menu
 
@@ -798,13 +804,15 @@ def infer_phase(recent_tools: List[str]) -> Optional[str]:
     return None
 
 
-def _render_phased_menu(tool_defs: List[Dict[str, Any]], phase: Optional[str]) -> str:
+def _render_phased_menu(tool_defs: List[Dict[str, Any]], phase: Optional[str],
+                        *, explore_mode: bool = False) -> str:
     """Phase-aware menu: the current phase's tools (+ the always-priority
     escalation/reporting core) render in full; everything else compresses to a
     single name line. Unknown phase or a small registry → full menu."""
     if phase is None or len(tool_defs) <= _FULL_MENU_TOOL_COUNT:
         return _render_tool_menu(tool_defs)
-    phase_set = set(_TOOL_PHASES.get(phase, set())) | _ALWAYS_PRIORITY
+    always = (_ALWAYS_PRIORITY - _EXPLORE_DEPRIORITIZE) if explore_mode else _ALWAYS_PRIORITY
+    phase_set = set(_TOOL_PHASES.get(phase, set())) | always
     priority = [d for d in tool_defs if d["name"] in phase_set]
     rest = [d["name"] for d in tool_defs if d["name"] not in phase_set]
     lines = [f"## Current phase: {phase.upper()} — tools for this phase in full:",
@@ -1417,10 +1425,10 @@ class CopilotSession:
         schema_by_tool = {t["name"]: t["input_schema"] for t in tool_defs}
         # 5-C-3: the menu adapts to the phase the copilot is in (recon → auth →
         # scan → escalate → report), inferred from the ordered scratchpad.
-        tool_menu = _render_phased_menu(
-            tool_defs,
-            infer_phase([entry.get("tool", "") for entry in self._scratchpad[-8:]]),
-        )
+        explore_mode = bool(getattr(tool_ctx, "explore_mode", False))
+        phase = ("recon" if explore_mode
+                 else infer_phase([entry.get("tool", "") for entry in self._scratchpad[-8:]]))
+        tool_menu = _render_phased_menu(tool_defs, phase, explore_mode=explore_mode)
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
         # Ground the turn in what the scanner already learned about the hosts in

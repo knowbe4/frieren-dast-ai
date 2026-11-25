@@ -159,7 +159,8 @@ _ESCALATE_REASONS = frozenset({
 # auto-nudges it to proceed instead of pausing the operator. The "hard" reasons
 # (auth_required/out_of_scope/need_authorization/waf_block) genuinely need operator
 # action and still pause immediately.
-_SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value"})
+_SOFT_ESCALATE_REASONS = frozenset({"need_human", "need_value", "need_authorization",
+                                    "need_authorisation"})
 # Soft escalations auto-nudged before a real human pause, per no-progress streak.
 _MAX_AUTO_GUIDANCE_NUDGES = 3
 
@@ -2583,8 +2584,9 @@ class CopilotService:
                 "- scan_surface periodically to test what you discover\n"
                 "DO NOT use send_request or graphql_fuzz/graphql_sweep for exploration — the app "
                 "requires client-side auth headers those tools cannot provide. Use browser_fetch "
-                "if you need to make authenticated API calls. Map the full attack surface BEFORE "
-                "testing depth.\n\n"
+                "if you need to make authenticated API calls. NEVER pass a 'headers' argument "
+                "to any tool — auth cookies and tokens are auto-injected by the engine. "
+                "Map the full attack surface BEFORE testing depth.\n\n"
             )
         else:
             breadth_note = ""

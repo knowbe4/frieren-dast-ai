@@ -65,6 +65,12 @@ async def run_tool(ctx: ToolContext, name: str, arguments: Dict[str, Any]) -> Di
     if getattr(ctx, "read_only", False) and name in read_only.BLOCKED_TOOLS:
         logger.info("read-only mode: refused tool", tool=name)
         return read_only.blocked_tool_error(name)
+    schema_props = set((tool.input_schema.get("properties") or {}).keys())
+    if schema_props and arguments:
+        extra = set(arguments.keys()) - schema_props
+        if extra:
+            arguments = {k: v for k, v in arguments.items() if k in schema_props}
+            logger.debug("run_tool: dropped extra args", tool=name, extra=sorted(extra))
     try:
         result = await tool.handler(ctx, arguments or {})
         if not isinstance(result, dict):

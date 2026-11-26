@@ -266,6 +266,11 @@ _AUTONOMOUS_START = (
     "Include title, severity, description, and steps (request/response evidence).\n"
     "After recording, clean up: DELETE created objects, revert PATCHed fields to original.\n"
     "For PATCH: GET original state FIRST, test, record finding, then revert.\n\n"
+    "PASSIVE / HARDENING FINDINGS — also call record_finding for passive observations you "
+    "spot during exploration or in scan_surface results: missing security headers (CSP, HSTS, "
+    "X-Frame-Options), sensitive data in JWT payloads, cookies without HttpOnly/Secure flags, "
+    "cacheable authenticated responses. Use severity low/medium and the specific attack_type "
+    "(e.g. 'sensitive_data', 'missing_header', 'hardening'). These are part of the deliverable.\n\n"
     "PENTEST MINDSET — be resilient, not passive:\n"
     "- If a request fails (401, 302 to login, timeout), retry with a different approach "
     "before asking the operator. Try: re-login with browser_login, use cookies from "
@@ -2567,7 +2572,8 @@ class CopilotService:
                 "the high-value leads for business-logic, auth, and access-control issues that "
                 "automated payload injection misses. Use browser tools to interact with the app, "
                 "send_request to test parameter manipulation hypotheses, and idor_probe for stored-"
-                "object BOLA. Focus on state-changing endpoints with identity-bearing parameters.\n\n"
+                "object BOLA. Focus on state-changing endpoints with identity-bearing parameters.\n"
+                "Record passive findings (missing headers, JWT issues, cookie flags) with record_finding as you go.\n\n"
             )
         elif auto.get("initial_explore_done"):
             breadth_note = (
@@ -2586,7 +2592,8 @@ class CopilotService:
                 "requires client-side auth headers those tools cannot provide. Use browser_fetch "
                 "if you need to make authenticated API calls. NEVER pass a 'headers' argument "
                 "to any tool — auth cookies and tokens are auto-injected by the engine. "
-                "Map the full attack surface BEFORE testing depth.\n\n"
+                "Map the full attack surface BEFORE testing depth.\n"
+                "Record passive findings (missing headers, JWT issues, cookie flags) with record_finding as you go.\n\n"
             )
         else:
             breadth_note = ""

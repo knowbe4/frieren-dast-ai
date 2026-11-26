@@ -1399,7 +1399,7 @@ class CopilotSession:
         """Run one operator turn. Appends the operator message and the copilot's
         reply to the history; returns the reply. Never raises — a fatal error is
         surfaced as a reply message with blocked_reason='error'."""
-        from dast.tools import all_tools, run_tool
+        from dast.tools import all_tools, get_tool, run_tool
         from dast.triage.validator import _looks_like_auth_wall, _sanitise_cookies
 
         self.messages.append({"role": "operator", "content": operator_text})
@@ -1767,6 +1767,18 @@ class CopilotSession:
                     tool_args = decision.get("tool_args") or {}
                     if not isinstance(tool_args, dict):
                         tool_args = {}
+
+                    # Strip `headers` for tools whose schema doesn't include it.
+                    # The LLM persistently pastes captured Cookie/JWT/CSRF into
+                    # this arg; for tools with no headers param it wastes turns
+                    # and pollutes the dedup key.
+                    _tool_def = get_tool(tool_name)
+                    if _tool_def and "headers" not in (
+                            _tool_def.input_schema.get("properties") or {}):
+                        if tool_args.pop("headers", None) is not None:
+                            logger.debug("stripped spurious headers arg",
+                                         tool=tool_name,
+                                         session_id=self.session_id)
 
                     # record_finding host defaulting: when the model records a finding with a
                     # missing / placeholder host, backfill the URL from the most recent in-scope

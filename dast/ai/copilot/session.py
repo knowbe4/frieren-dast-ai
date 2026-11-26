@@ -2021,6 +2021,7 @@ class CopilotSession:
                                     self._session_cookies[name] = morsel.value
                             except Exception:
                                 pass
+                    login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
                     if tool_name in ("send_request", "browser_navigate", "browser_fetch"):
                         status = result.get("status")
                         request_url = str(tool_args.get("url") or result.get("url") or "")
@@ -2031,11 +2032,12 @@ class CopilotSession:
                         flipped = self._auth_flip(host, endpoint, status)
                         if not self._relogin_in_progress and self._last_login is not None:
                             final_url = str(result.get("final_url") or result.get("url") or "").lower()
-                            login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
+                            _requested_is_login = any(p in request_url.lower() for p in login_paths)
+                            _landed_on_login = final_url and any(p in final_url for p in login_paths)
                             session_expired = (
-                                (status == 302 and any(p in final_url for p in login_paths))
-                                or status == 401
+                                status == 401
                                 or flipped
+                                or (_landed_on_login and not _requested_is_login)
                             )
                             if session_expired and host:
                                 # One refresh policy: the ladder escalates (re-scan -> wait for
@@ -2048,19 +2050,28 @@ class CopilotSession:
                                     browser=getattr(tool_ctx, "browser", None),
                                     tool_ctx=tool_ctx,
                                     max_tier=RefreshTier.RELOGIN,
-                                    reason="auth-flip" if flipped else "401")
+                                    reason=("auth-flip" if flipped
+                                            else "401" if status == 401
+                                            else "login-redirect"))
                                 if outcome.acted:
                                     self._apply_session_auth(tool_ctx, tool_args)
                                     result = await run_tool(tool_ctx, tool_name, tool_args)
                                     self._auth_flip(host, endpoint, result.get("status"))
 
-                    # Transport fallback: an API request that STILL 401s after the Bearer
-                    # refresh is re-issued via the browser session, which rides the SPA's live
-                    # in-memory token the API path cannot carry (the short-TTL in-memory-token
-                    # case). Fires independently of auto-relogin — it only needs the live browser.
+                    # Transport fallback: an API request that STILL 401s (or lands on a
+                    # login page) after the Bearer refresh is re-issued via the browser
+                    # session, which rides the SPA's live in-memory token the API path
+                    # cannot carry. Fires independently of auto-relogin.
+                    _retry_final = str(result.get("final_url") or "").lower()
+                    _still_auth_walled = (
+                        result.get("status") == 401
+                        or (_retry_final
+                            and any(p in _retry_final for p in login_paths)
+                            and not any(p in request_url.lower() for p in login_paths))
+                    )
                     if (
                         tool_name == "send_request"
-                        and result.get("status") == 401
+                        and _still_auth_walled
                         and getattr(tool_ctx, "browser", None) is not None
                     ):
                         fallback = await self._browser_fallback(tool_ctx, tool_args, run_tool)

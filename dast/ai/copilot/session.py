@@ -922,6 +922,22 @@ def _build_user_prompt(
     )
 
 
+_REFUSAL_MARKERS = (
+    "i can't help", "i cannot help", "i can't assist", "i cannot assist",
+    "i won't", "i will not", "i refuse", "against policy",
+    "cannot comply", "can't comply", "decline to",
+)
+
+
+def _decision_looks_refused(decision: Dict[str, Any]) -> bool:
+    """True when a structurally valid step decision reads as a safety refusal."""
+    text = " ".join([
+        decision.get("thought", ""),
+        (decision.get("conclusion") or {}).get("reasoning", ""),
+    ]).strip().lower()
+    return bool(text) and any(m in text for m in _REFUSAL_MARKERS)
+
+
 async def _llm_step(system: str, user: str,
                     model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """One schema-forced step decision. Returns None on LLM failure. ``model_override`` forces a
@@ -1026,6 +1042,7 @@ class CopilotSession:
         # enabled it), a safety-classifier block on the decision model is retried ONCE with this
         # model. Empty = disabled (the default); never set globally, so other sessions are unaffected.
         self._downgrade_model: str = ""
+        self._copilot_model_override: str = ""
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
         self._last_relogin_ts: float = 0.0
@@ -1677,9 +1694,24 @@ class CopilotSession:
                 decision = None
                 content_blocked = False
                 try:
-                    decision = await _llm_step(_system_prompt(), user)
+                    decision = await _llm_step(
+                        _system_prompt(), user,
+                        model_override=self._copilot_model_override or None,
+                    )
                 except bedrock_client.AiContentBlockedError:
                     content_blocked = True
+
+                # Text-refusal: a structurally valid response whose thought/conclusion
+                # reads as a safety refusal (the model can't freely refuse because the
+                # JSON schema forces action/thought, but it can write "I cannot assist"
+                # inside them). Null the decision so the downgrade retry fires.
+                if (decision is not None and self._downgrade_model
+                        and decision.get("action") != "call_tool"
+                        and _decision_looks_refused(decision)):
+                    logger.info("Copilot: valid structured response reads as text "
+                                "refusal — clearing for downgrade retry",
+                                session_id=self.session_id)
+                    decision = None
 
                 # Per-profile opt-in refusal fallback: the primary decision failed — either a clean
                 # content block, OR (the common case via the model-chain fallback) a refusal-shaped

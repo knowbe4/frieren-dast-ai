@@ -2468,6 +2468,8 @@ class CopilotService:
         if not hosts:
             return
 
+        blocked_urls: set = auto.setdefault("_graphql_blocked_urls", set())
+
         gql_urls = set()
         try:
             for entry in store.in_scope_entries():
@@ -2488,6 +2490,9 @@ class CopilotService:
         for gql_url in gql_urls:
             if stop_event.is_set():
                 return
+            if gql_url in blocked_urls:
+                logger.debug("auto-graphql: skipping known-blocked endpoint", url=gql_url)
+                continue
             intro = await _call("graphql_introspect", {"url": gql_url})
             op_tool = "graphql_sweep" if intro.get("ok") else "graphql_fuzz"
             logger.info("auto-graphql: testing endpoint", url=gql_url, via=op_tool)
@@ -2497,11 +2502,17 @@ class CopilotService:
                 if stop_event.is_set():
                     return
                 result = await _call(op_tool, {"url": gql_url})
-                if result.get("auth_blocked") or result.get("error"):
+                if result.get("auth_blocked"):
+                    blocked_urls.add(gql_url)
+                    logger.info("auto-graphql: endpoint auth_blocked, marking for skip",
+                                url=gql_url)
+                    break
+                if result.get("error"):
                     consecutive_blocked += 1
                     if consecutive_blocked >= 2:
-                        logger.info("auto-graphql: endpoint blocked/erroring, skipping",
-                                    url=gql_url, reason="auth_blocked or error")
+                        logger.info("auto-graphql: endpoint erroring, marking for skip",
+                                    url=gql_url)
+                        blocked_urls.add(gql_url)
                         break
                 else:
                     consecutive_blocked = 0

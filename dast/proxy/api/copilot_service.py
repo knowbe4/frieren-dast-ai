@@ -2786,11 +2786,19 @@ class CopilotService:
                 # "progress" and never trip the stuck detector. Track turns whose new
                 # traffic had NO 2xx at all and stop if that persists — otherwise the
                 # run floods a target that is uniformly rejecting it.
+                # Guard: if the copilot's own turn completed normally (not stuck,
+                # not refused, not blocked), the session is still authenticated —
+                # non-2xx entries are from background scans, not session loss.
+                copilot_turn_ok = (
+                    blocked_reason is None
+                    and reply is not None
+                    and getattr(reply, "message", None)
+                )
                 counts = self._response_counts(scope_hosts)
                 new_entries = counts[0] - last_counts[0]
                 new_ok = counts[1] - last_counts[1]
                 last_counts = counts
-                if new_entries >= _UNIFORM_FAIL_MIN_NEW and new_ok <= 0:
+                if new_entries >= _UNIFORM_FAIL_MIN_NEW and new_ok <= 0 and not copilot_turn_ok:
                     consec_fail_turns += 1
                 else:
                     consec_fail_turns = 0

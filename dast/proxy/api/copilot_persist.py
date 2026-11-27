@@ -82,10 +82,14 @@ def build_snapshot(sid: str, session: dict) -> Dict:
     autonomous = session.get("autonomous")
     auto_state: Dict = {}
     if isinstance(autonomous, dict):
-        auto_state = {
-            k: v for k, v in autonomous.items()
-            if k not in _TRANSIENT_AUTONOMOUS_KEYS and _jsonable(v)
-        }
+        auto_state = {}
+        for k, v in autonomous.items():
+            if k in _TRANSIENT_AUTONOMOUS_KEYS:
+                continue
+            if isinstance(v, set):
+                v = sorted(v)
+            if _jsonable(v):
+                auto_state[k] = v
         todo = autonomous.get("todo")
         if todo is not None and hasattr(todo, "to_dict"):
             auto_state["todo"] = todo.to_dict()

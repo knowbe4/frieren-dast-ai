@@ -65,7 +65,7 @@ def _sql_error_re() -> re.Pattern:
 # A `/graphql` path *segment*: /graphql, /graphql/, /graphql/<suffix>, /api/graphql.
 # Deliberately a segment match, not a bare substring, so /graphql-docs and the like
 # do not false-positive.
-_GRAPHQL_PATH_RE = re.compile(r"/graphql(?:/|$)", re.IGNORECASE)
+GRAPHQL_PATH_RE = re.compile(r"/graphql(?:/|$)", re.IGNORECASE)
 
 
 def graphql_path_matches(path: str) -> bool:
@@ -75,7 +75,7 @@ def graphql_path_matches(path: str) -> bool:
     as a GraphQL endpoint by path — otherwise one matched `/graphql/<suffix>` (e.g.
     `/graphql/dashboards`) while the other, keyed on an exact trailing `/graphql`,
     missed it and never registered the endpoint for introspection."""
-    return bool(_GRAPHQL_PATH_RE.search(path or ""))
+    return bool(GRAPHQL_PATH_RE.search(path or ""))
 
 
 def _is_graphql(entry: "ProxyEntry") -> bool:

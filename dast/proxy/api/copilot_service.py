@@ -22,7 +22,7 @@ import contextlib
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from dast.ai.prompt_safety import wrap_untrusted
 from dast.session.account_state import AuthProbeConfig
@@ -2468,13 +2468,26 @@ class CopilotService:
         if not hosts:
             return
 
-        blocked_urls: set = auto.setdefault("_graphql_blocked_urls", set())
+        blocked_urls: set = auto.get("_graphql_blocked_urls") or []
+        blocked_urls = set(blocked_urls)
+        auto["_graphql_blocked_urls"] = blocked_urls
 
         gql_urls = set()
         try:
+            from dast.plugins.graphql_analyzer import GRAPHQL_PATH_RE
             for entry in store.in_scope_entries():
                 if _is_graphql(entry) and (getattr(entry, "host", "") or "").split(":")[0] in hosts:
-                    gql_urls.add(entry.url)
+                    # Normalize to the base GraphQL endpoint: strip path segments
+                    # after /graphql (injection payloads in sub-paths like
+                    # /graphql/save/<payload> would otherwise each create a separate
+                    # "endpoint" that gets introspected and fuzz-tested individually).
+                    _gql_match = GRAPHQL_PATH_RE.search(getattr(entry, "path", "") or "")
+                    if _gql_match:
+                        _base_path = (getattr(entry, "path", "") or "")[:_gql_match.end()].rstrip("/")
+                        _parsed = urlparse(entry.url)
+                        gql_urls.add(urlunparse((_parsed.scheme, _parsed.netloc, _base_path, "", "", "")))
+                    else:
+                        gql_urls.add(entry.url)
         except Exception as exc:  # noqa: BLE001
             logger.debug("auto-graphql: enumeration failed", error=str(exc))
             return
@@ -2626,7 +2639,7 @@ class CopilotService:
         last_progress = self._progress_snapshot(scope_hosts)
         stuck_turns = 0
         last_counts = self._response_counts(scope_hosts)
-        consec_fail_turns = 0
+        consec_fail_turns = auto.get("consec_fail_turns", 0)
         last_keepalive = time.time()
         auto["status"] = "running"
         await self._broadcast_autonomous(sid, "started", {
@@ -2802,12 +2815,14 @@ class CopilotService:
                     consec_fail_turns += 1
                 else:
                     consec_fail_turns = 0
+                auto["consec_fail_turns"] = consec_fail_turns
                 if consec_fail_turns >= _MAX_UNIFORM_FAIL_TURNS:
                     # Uniform rejection is also what an expired session looks like: try ONE
                     # re-login per run before stopping (unbounded would loop on a real block).
                     reauth = await self._breaker_reauth(sid, session)
                     if reauth:
                         consec_fail_turns = 0
+                        auto["consec_fail_turns"] = consec_fail_turns
                     else:
                         tail = " (re-auth also failed)" if reauth is False else ""
                         self._finish_autonomous(

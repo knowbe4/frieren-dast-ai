@@ -26,11 +26,12 @@ async function gqlLoadEndpoints() {
         : '<option value="">No endpoints discovered yet</option>';
       if (urls.includes(current)) sel.value = current;
     }
-    // Note: we deliberately do NOT auto-select the first endpoint here — doing
-    // so would auto-fetch/auto-introspect on the user's behalf. The user picks
-    // an endpoint explicitly, and introspection is always a manual action.
+    // When the dropdown auto-selects an endpoint (first option), sync the schema
+    // view to it so the user does not have to click the already-selected entry.
     if (_gqlSelectedEndpoint && !urls.includes(_gqlSelectedEndpoint)) {
       await gqlSelectEndpoint('');
+    } else if (sel && sel.value && sel.value !== _gqlSelectedEndpoint) {
+      await gqlSelectEndpoint(sel.value);
     }
   } catch (e) {
     console.error('gqlLoadEndpoints:', e);

@@ -386,6 +386,11 @@ class SpaExplorer:
                 frame_counts.append((fr.url[:60], fc))
         except Exception as exc:
             logger.debug("explorer: frame census failed", error=str(exc))
+        iframe_total = sum(fc for _, fc in frame_counts if fc > 0)
+        if count < 5 and iframe_total >= 5:
+            count = iframe_total
+            logger.info("explorer: main frame empty but iframes have %d elements — using iframe count",
+                        iframe_total)
         # Accessibility-tree census: the AX tree surfaces roles even inside shadow
         # DOM (incl. closed) that querySelectorAll cannot reach. If the DOM census
         # is low but the AX tree is rich, the nav lives in web components and we

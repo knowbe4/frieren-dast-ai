@@ -176,6 +176,13 @@ class JwtTesterPlugin(ProxyPlugin):
                     entry.method, entry.url, headers=no_auth_headers,
                     content=body.encode() if body else None,
                 )
+                if (no_auth_resp.status_code not in (401, 403)
+                        and baseline_status in (401, 403)):
+                    log_event("JWT Tester", "info",
+                              "Skipping — endpoint accessible without JWT "
+                              f"(no-auth {no_auth_resp.status_code}, baseline {baseline_status})",
+                              url=entry.url, source="plugin")
+                    return
                 # If unauthenticated request gets same success status and non-trivially
                 # similar body length, the JWT isn't doing auth — bail out entirely.
                 if (no_auth_resp.status_code == baseline_status
@@ -195,7 +202,16 @@ class JwtTesterPlugin(ProxyPlugin):
                 # Probe must return same success status as baseline
                 if resp.status_code != baseline_status:
                     if baseline_status in (401, 403) and resp.status_code == 200:
-                        return True  # auth bypass: was protected, now open
+                        # Potential auth bypass — but only if the endpoint is
+                        # truly auth-gated (no-auth also gets rejected) and
+                        # the probe response looks like API data, not a public
+                        # page or introspection dump.
+                        ct = (resp.headers.get("content-type") or "").lower()
+                        if ("json" not in ct and "xml" not in ct):
+                            return False
+                        if len(resp.text) < 50:
+                            return False
+                        return True
                     return False
                 # Both returned a rejection status — the JWT was refused, not accepted
                 if resp.status_code in (401, 403):
@@ -271,7 +287,8 @@ class JwtTesterPlugin(ProxyPlugin):
                     "evidence": full_evidence,
                     "payload": payload_str[:200],
                     "parameter": header_name,
-                    "confirmed": True,
+                    "confirmed": False,
+                    "needs_review": True,
                     "validated_by": ["passive", "pattern"],
                     "bypass_validation": False,
                     "snippet": resp_snippet,

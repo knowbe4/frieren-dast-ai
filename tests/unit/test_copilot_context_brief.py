@@ -168,7 +168,7 @@ async def test_send_injects_project_context_into_prompt():
 
     captured: dict = {}
 
-    async def fake_step(system: str, user: str):
+    async def fake_step(system: str, user: str, **_kwargs):
         captured["user"] = user
         return {"action": "reply", "message": "done", "thought": "t"}
 

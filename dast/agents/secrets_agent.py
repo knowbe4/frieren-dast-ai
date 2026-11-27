@@ -23,6 +23,19 @@ if TYPE_CHECKING:
     from dast.scanners.active_checks import CheckTarget
     from dast.scanners.collaborator import CollaboratorService
 
+def _luhn_check(digits: str) -> bool:
+    """Luhn checksum — all real card numbers pass; random digit runs almost never do."""
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        n = int(d)
+        if i % 2 == 1:
+            n *= 2
+            if n > 9:
+                n -= 9
+        total += n
+    return total % 10 == 0
+
+
 _PATTERNS: list = [
     (
         # Negative lookahead excludes keys followed by % or / (presigned URL key+date separator)
@@ -88,6 +101,9 @@ class SecretsAgent(VulnAgent):
         for pattern, title, severity, cwe in _PATTERNS:
             m = pattern.search(body)
             if m:
+                # Credit card numbers must pass Luhn — suppresses geo coordinates and random IDs
+                if title == "Credit Card Number Exposed" and not _luhn_check(m.group()):
+                    continue
                 snippet = body[max(0, m.start() - 200):m.end() + 200]
                 # Suppress AWS keys that appear inside presigned S3 URLs
                 if "AWS" in title and _is_presigned_url_context(snippet):

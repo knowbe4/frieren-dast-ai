@@ -63,6 +63,16 @@ class JwtAnalyzerPlugin(ProxyPlugin):
         # (host, sha256(token)) already analysed: one set of findings per token,
         # not one per request that carries it.
         self._seen_tokens: set[tuple[str, str]] = set()
+        self._findings_emitted: set[tuple[str, str]] = set()
+
+    def _should_emit(self, host: str, title: str) -> bool:
+        """Host-level dedup for design-pattern findings (PII, missing exp).
+        alg:none is per-token (it's about a specific token's algorithm)."""
+        key = (host, title)
+        if key in self._findings_emitted:
+            return False
+        self._findings_emitted.add(key)
+        return True
 
     async def on_entry(self, entry: "ProxyEntry", store: "SessionStore") -> None:
         # Our own probes may carry forged tokens (e.g. alg:none attempts).
@@ -117,36 +127,38 @@ class JwtAnalyzerPlugin(ProxyPlugin):
 
             # Missing exp
             if "exp" not in payload:
-                store.add_finding(
-                    entry.id,
-                    {
-                        "title": "JWT Missing Expiration (exp) Claim",
-                        "severity": "medium",
-                        "cwe": "CWE-613",
-                        "attack_type": "jwt",
-                        "evidence": "JWT payload has no exp claim — token never expires",
-                        "confirmed": True,
-                        "validated_by": ["pattern"],
-                    },
-                    "vulnerable",
-                )
+                if self._should_emit(getattr(entry, "host", "") or "", "JWT Missing Expiration (exp) Claim"):
+                    store.add_finding(
+                        entry.id,
+                        {
+                            "title": "JWT Missing Expiration (exp) Claim",
+                            "severity": "medium",
+                            "cwe": "CWE-613",
+                            "attack_type": "jwt",
+                            "evidence": "JWT payload has no exp claim — token never expires",
+                            "confirmed": True,
+                            "validated_by": ["pattern"],
+                        },
+                        "vulnerable",
+                    )
 
             # PII in payload
             pii_found = [k for k in payload if k.lower() in _PII_KEYS and payload[k]]
             if pii_found:
-                store.add_finding(
-                    entry.id,
-                    {
-                        "title": "Sensitive Data in JWT Payload",
-                        "severity": "medium",
-                        "cwe": "CWE-312",
-                        "attack_type": "jwt",
-                        "evidence": (
-                            f"JWT payload contains potentially sensitive fields: "
-                            f"{', '.join(pii_found)}. JWT payloads are base64-encoded, not encrypted."
-                        ),
-                        "confirmed": True,
-                        "validated_by": ["pattern"],
-                    },
-                    "vulnerable",
-                )
+                if self._should_emit(getattr(entry, "host", "") or "", "Sensitive Data in JWT Payload"):
+                    store.add_finding(
+                        entry.id,
+                        {
+                            "title": "Sensitive Data in JWT Payload",
+                            "severity": "medium",
+                            "cwe": "CWE-312",
+                            "attack_type": "jwt",
+                            "evidence": (
+                                f"JWT payload contains potentially sensitive fields: "
+                                f"{', '.join(pii_found)}. JWT payloads are base64-encoded, not encrypted."
+                            ),
+                            "confirmed": True,
+                            "validated_by": ["pattern"],
+                        },
+                        "vulnerable",
+                    )

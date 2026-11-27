@@ -46,6 +46,7 @@ _OPERATION_BUCKET = {"query": "queries", "mutation": "mutations"}
 _DEFAULT_MAX_OPS = 250
 _HARD_MAX_OPS = 1000
 _CONCURRENCY = 6
+_CONCURRENCY_BROWSER = 2
 _REQUEST_TIMEOUT = 10.0
 _MAX_FLAGGED_RETURNED = 40
 _CANARY_SIZE = 5
@@ -213,6 +214,56 @@ async def _probe_operation(
                 "classification": classification, "flagged": flagged}
 
 
+async def _probe_operation_browser(
+    ctx: ToolContext, url: str, schema: Dict[str, Any], kind: str, field_name: str,
+    semaphore: asyncio.Semaphore,
+) -> Dict[str, Any]:
+    """Like _probe_operation but routes through browser_fetch (Playwright)."""
+    from dast.graphql.query_builder import build_operation
+    from dast.tools.base import run_tool
+
+    async with semaphore:
+        try:
+            operation = build_operation(schema, kind, field_name)
+        except Exception as exc:
+            return {"kind": kind, "field": field_name,
+                    "classification": "build_error", "flagged": False,
+                    "detail": str(exc)[:120]}
+
+        variables = operation["variables"]
+        if kind == "mutation":
+            if not _mutation_has_required_args(schema, field_name):
+                return {"kind": kind, "field": field_name,
+                        "classification": "skipped_zero_arg_mutation", "flagged": True,
+                        "detail": "no required args — not auto-fired; test manually"}
+            variables = {}
+
+        body = json.dumps({
+            "query": operation["query"],
+            "variables": variables,
+            "operationName": operation["operation_name"],
+        })
+
+        result = await run_tool(ctx, "browser_fetch", {
+            "url": url, "method": "POST", "body": body,
+            "headers": {"Content-Type": "application/json", "Accept": "application/json"},
+        })
+
+        if not result.get("ok"):
+            return {"kind": kind, "field": field_name,
+                    "classification": "request_error", "flagged": False,
+                    "detail": result.get("error", "browser_fetch failed")[:120]}
+
+        status = result.get("status", 0)
+        try:
+            data = json.loads(result.get("body", ""))
+        except Exception:
+            data = None
+        classification, flagged = _classify(status, data)
+        return {"kind": kind, "field": field_name, "status": status,
+                "classification": classification, "flagged": flagged}
+
+
 async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, Any]:
     url = str(args.get("url", "")).strip()
     if not url:
@@ -279,30 +330,52 @@ async def _graphql_sweep(ctx: ToolContext, args: Dict[str, Any]) -> Dict[str, An
     canary_blocked = sum(
         1 for r in canary_results if r.get("classification") == "auth_blocked"
     )
+    use_browser = False
     if canary_blocked == canary_size and len(batch) > canary_size:
-        logger.warning("graphql_sweep: all canary probes auth_blocked, aborting sweep",
-                       url=url, canary_size=canary_size)
-        for kind, field_name in canary_batch:
-            tested.add(f"{kind}:{field_name}")
-        return {
-            "ok": False,
-            "url": url,
-            "error": (f"all {canary_size} canary probes returned auth_blocked "
-                      f"(401/403) — the session has no access to this endpoint. "
-                      f"Authenticate first or skip this host."),
-            "operations_tested_now": canary_size,
-            "operations_remaining": len(pending) - canary_size,
-        }
+        if getattr(ctx, "browser", None) is not None:
+            logger.info("graphql_sweep: canaries auth_blocked via API, trying browser_fetch",
+                        url=url, canary_size=canary_size)
+            browser_sem = asyncio.Semaphore(_CONCURRENCY_BROWSER)
+            test_kind, test_field = canary_batch[0]
+            browser_canary = await _probe_operation_browser(
+                ctx, url, schema, test_kind, test_field, browser_sem)
+            if browser_canary.get("classification") != "auth_blocked":
+                use_browser = True
+                canary_results = await asyncio.gather(*[
+                    _probe_operation_browser(ctx, url, schema, k, f, browser_sem)
+                    for k, f in canary_batch
+                ])
+                canary_blocked = sum(
+                    1 for r in canary_results if r.get("classification") == "auth_blocked"
+                )
+            else:
+                logger.warning("graphql_sweep: browser_fetch also auth_blocked", url=url)
+
+        if canary_blocked == canary_size:
+            for kind, field_name in canary_batch:
+                tested.add(f"{kind}:{field_name}")
+            return {
+                "ok": False,
+                "url": url,
+                "auth_blocked": True,
+                "error": (f"all {canary_size} canary probes returned auth_blocked "
+                          f"(401/403) — the session has no access to this endpoint. "
+                          f"Authenticate first or skip this host."),
+                "operations_tested_now": canary_size,
+                "operations_remaining": len(pending) - canary_size,
+            }
 
     # Fire the rest in chunks so an accumulating-failure breaker can stop a doomed
     # sweep partway instead of blasting every remaining operation.
+    probe_fn = _probe_operation_browser if use_browser else _probe_operation
+    batch_sem = asyncio.Semaphore(_CONCURRENCY_BROWSER if use_browser else _CONCURRENCY)
     remaining_batch = batch[canary_size:]
     results = list(canary_results)
     stopped_early = False
     for start in range(0, len(remaining_batch), _BREAKER_CHUNK):
         chunk = remaining_batch[start:start + _BREAKER_CHUNK]
         results.extend(await asyncio.gather(*[
-            _probe_operation(ctx, url, schema, kind, field_name, semaphore)
+            probe_fn(ctx, url, schema, kind, field_name, batch_sem)
             for kind, field_name in chunk
         ]))
         blocked = sum(1 for r in results

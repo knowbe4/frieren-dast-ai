@@ -772,6 +772,12 @@ _TOOL_PHASES: Dict[str, set] = {
 # XBOW pivot (prove it or rule it out) must never be buried in the compact list.
 _ALWAYS_PRIORITY = {"send_request", "get_findings", "record_finding",
                     "record_coverage", "diff_responses", "attack_finding"}
+# In explore-manually mode (SPA explorer found too few routes), these tools are
+# moved OUT of the always-priority set so the LLM sees browser/recon tools
+# prominently and API-first tools only in the compact "also available" list.
+_EXPLORE_DEPRIORITIZE = frozenset({
+    "send_request", "graphql_fuzz", "graphql_sweep", "run_scan", "scan_surface",
+})
 _PHASE_ORDER = ["recon", "auth", "scan", "escalate", "report"]
 _FULL_MENU_TOOL_COUNT = 24  # at or below this, a full menu IS the clean menu
 
@@ -798,13 +804,15 @@ def infer_phase(recent_tools: List[str]) -> Optional[str]:
     return None
 
 
-def _render_phased_menu(tool_defs: List[Dict[str, Any]], phase: Optional[str]) -> str:
+def _render_phased_menu(tool_defs: List[Dict[str, Any]], phase: Optional[str],
+                        *, explore_mode: bool = False) -> str:
     """Phase-aware menu: the current phase's tools (+ the always-priority
     escalation/reporting core) render in full; everything else compresses to a
     single name line. Unknown phase or a small registry → full menu."""
     if phase is None or len(tool_defs) <= _FULL_MENU_TOOL_COUNT:
         return _render_tool_menu(tool_defs)
-    phase_set = set(_TOOL_PHASES.get(phase, set())) | _ALWAYS_PRIORITY
+    always = (_ALWAYS_PRIORITY - _EXPLORE_DEPRIORITIZE) if explore_mode else _ALWAYS_PRIORITY
+    phase_set = set(_TOOL_PHASES.get(phase, set())) | always
     priority = [d for d in tool_defs if d["name"] in phase_set]
     rest = [d["name"] for d in tool_defs if d["name"] not in phase_set]
     lines = [f"## Current phase: {phase.upper()} — tools for this phase in full:",
@@ -914,6 +922,22 @@ def _build_user_prompt(
     )
 
 
+_REFUSAL_MARKERS = (
+    "i can't help", "i cannot help", "i can't assist", "i cannot assist",
+    "i won't", "i will not", "i refuse", "against policy",
+    "cannot comply", "can't comply", "decline to",
+)
+
+
+def _decision_looks_refused(decision: Dict[str, Any]) -> bool:
+    """True when a structurally valid step decision reads as a safety refusal."""
+    text = " ".join([
+        decision.get("thought", ""),
+        (decision.get("conclusion") or {}).get("reasoning", ""),
+    ]).strip().lower()
+    return bool(text) and any(m in text for m in _REFUSAL_MARKERS)
+
+
 async def _llm_step(system: str, user: str,
                     model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """One schema-forced step decision. Returns None on LLM failure. ``model_override`` forces a
@@ -1018,6 +1042,7 @@ class CopilotSession:
         # enabled it), a safety-classifier block on the decision model is retried ONCE with this
         # model. Empty = disabled (the default); never set globally, so other sessions are unaffected.
         self._downgrade_model: str = ""
+        self._copilot_model_override: str = ""
         self._last_login: Optional[Dict[str, str]] = None
         self._relogin_in_progress: bool = False
         self._last_relogin_ts: float = 0.0
@@ -1391,7 +1416,7 @@ class CopilotSession:
         """Run one operator turn. Appends the operator message and the copilot's
         reply to the history; returns the reply. Never raises — a fatal error is
         surfaced as a reply message with blocked_reason='error'."""
-        from dast.tools import all_tools, run_tool
+        from dast.tools import all_tools, get_tool, run_tool
         from dast.triage.validator import _looks_like_auth_wall, _sanitise_cookies
 
         self.messages.append({"role": "operator", "content": operator_text})
@@ -1417,10 +1442,10 @@ class CopilotSession:
         schema_by_tool = {t["name"]: t["input_schema"] for t in tool_defs}
         # 5-C-3: the menu adapts to the phase the copilot is in (recon → auth →
         # scan → escalate → report), inferred from the ordered scratchpad.
-        tool_menu = _render_phased_menu(
-            tool_defs,
-            infer_phase([entry.get("tool", "") for entry in self._scratchpad[-8:]]),
-        )
+        explore_mode = bool(getattr(tool_ctx, "explore_mode", False))
+        phase = ("recon" if explore_mode
+                 else infer_phase([entry.get("tool", "") for entry in self._scratchpad[-8:]]))
+        tool_menu = _render_phased_menu(tool_defs, phase, explore_mode=explore_mode)
         approved_hosts: set = getattr(tool_ctx, "approved_hosts", set())
 
         # Ground the turn in what the scanner already learned about the hosts in
@@ -1669,9 +1694,24 @@ class CopilotSession:
                 decision = None
                 content_blocked = False
                 try:
-                    decision = await _llm_step(_system_prompt(), user)
+                    decision = await _llm_step(
+                        _system_prompt(), user,
+                        model_override=self._copilot_model_override or None,
+                    )
                 except bedrock_client.AiContentBlockedError:
                     content_blocked = True
+
+                # Text-refusal: a structurally valid response whose thought/conclusion
+                # reads as a safety refusal (the model can't freely refuse because the
+                # JSON schema forces action/thought, but it can write "I cannot assist"
+                # inside them). Null the decision so the downgrade retry fires.
+                if (decision is not None and self._downgrade_model
+                        and decision.get("action") != "call_tool"
+                        and _decision_looks_refused(decision)):
+                    logger.info("Copilot: valid structured response reads as text "
+                                "refusal — clearing for downgrade retry",
+                                session_id=self.session_id)
+                    decision = None
 
                 # Per-profile opt-in refusal fallback: the primary decision failed — either a clean
                 # content block, OR (the common case via the model-chain fallback) a refusal-shaped
@@ -1759,6 +1799,18 @@ class CopilotSession:
                     tool_args = decision.get("tool_args") or {}
                     if not isinstance(tool_args, dict):
                         tool_args = {}
+
+                    # Strip `headers` for tools whose schema doesn't include it.
+                    # The LLM persistently pastes captured Cookie/JWT/CSRF into
+                    # this arg; for tools with no headers param it wastes turns
+                    # and pollutes the dedup key.
+                    _tool_def = get_tool(tool_name)
+                    if _tool_def and "headers" not in (
+                            _tool_def.input_schema.get("properties") or {}):
+                        if tool_args.pop("headers", None) is not None:
+                            logger.debug("stripped spurious headers arg",
+                                         tool=tool_name,
+                                         session_id=self.session_id)
 
                     # record_finding host defaulting: when the model records a finding with a
                     # missing / placeholder host, backfill the URL from the most recent in-scope
@@ -2001,6 +2053,7 @@ class CopilotSession:
                                     self._session_cookies[name] = morsel.value
                             except Exception:
                                 pass
+                    login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
                     if tool_name in ("send_request", "browser_navigate", "browser_fetch"):
                         status = result.get("status")
                         request_url = str(tool_args.get("url") or result.get("url") or "")
@@ -2011,11 +2064,12 @@ class CopilotSession:
                         flipped = self._auth_flip(host, endpoint, status)
                         if not self._relogin_in_progress and self._last_login is not None:
                             final_url = str(result.get("final_url") or result.get("url") or "").lower()
-                            login_paths = ("/login", "/signin", "/sign_in", "/sign-in")
+                            _requested_is_login = any(p in request_url.lower() for p in login_paths)
+                            _landed_on_login = final_url and any(p in final_url for p in login_paths)
                             session_expired = (
-                                (status == 302 and any(p in final_url for p in login_paths))
-                                or status == 401
+                                status == 401
                                 or flipped
+                                or (_landed_on_login and not _requested_is_login)
                             )
                             if session_expired and host:
                                 # One refresh policy: the ladder escalates (re-scan -> wait for
@@ -2028,19 +2082,28 @@ class CopilotSession:
                                     browser=getattr(tool_ctx, "browser", None),
                                     tool_ctx=tool_ctx,
                                     max_tier=RefreshTier.RELOGIN,
-                                    reason="auth-flip" if flipped else "401")
+                                    reason=("auth-flip" if flipped
+                                            else "401" if status == 401
+                                            else "login-redirect"))
                                 if outcome.acted:
                                     self._apply_session_auth(tool_ctx, tool_args)
                                     result = await run_tool(tool_ctx, tool_name, tool_args)
                                     self._auth_flip(host, endpoint, result.get("status"))
 
-                    # Transport fallback: an API request that STILL 401s after the Bearer
-                    # refresh is re-issued via the browser session, which rides the SPA's live
-                    # in-memory token the API path cannot carry (the short-TTL in-memory-token
-                    # case). Fires independently of auto-relogin — it only needs the live browser.
+                    # Transport fallback: an API request that STILL 401s (or lands on a
+                    # login page) after the Bearer refresh is re-issued via the browser
+                    # session, which rides the SPA's live in-memory token the API path
+                    # cannot carry. Fires independently of auto-relogin.
+                    _retry_final = str(result.get("final_url") or "").lower()
+                    _still_auth_walled = (
+                        result.get("status") == 401
+                        or (_retry_final
+                            and any(p in _retry_final for p in login_paths)
+                            and not any(p in request_url.lower() for p in login_paths))
+                    )
                     if (
                         tool_name == "send_request"
-                        and result.get("status") == 401
+                        and _still_auth_walled
                         and getattr(tool_ctx, "browser", None) is not None
                     ):
                         fallback = await self._browser_fallback(tool_ctx, tool_args, run_tool)
